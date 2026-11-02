@@ -493,19 +493,19 @@ fn snapshot_lake_source_incremental_and_reseed_paths_body() {
     assert_eq!(dest.current_version(), version);
     assert_eq!(report.rows_written, 0);
 
-    // A full-save version inside the range forces a reseed.
+    // A full-save version inside the range needs no reseed: the change
+    // functions report a rewritten table as whole-file deletions plus the new
+    // files' insertions, and the multiset check confirms the result, so the
+    // full-sync watermark stays at the seed.
     let mut source = open_lake(&src_dir).unwrap();
     db.execute("INSERT INTO t VALUES (300, 'full');").unwrap();
     source.write_from_store(&db).unwrap();
     let full = source.current_version();
     let report = run(&mut dest, job);
     assert_eq!(report.tables_failed, 0, "{}", report.message);
-    assert_eq!(
-        table_state(&dest, job, "main.t")
-            .unwrap()
-            .last_full_sync_version,
-        Some(full)
-    );
+    let state = table_state(&dest, job, "main.t").unwrap();
+    assert_eq!(state.last_source_version, Some(full));
+    assert_eq!(state.last_full_sync_version, Some(2));
     assert_same_rows(
         &lake_table_rows(&dest, "main.t"),
         &lake_table_rows(&source, "main.t"),

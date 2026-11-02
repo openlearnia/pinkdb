@@ -54,9 +54,21 @@ pub fn table_from(source: &str) -> String {
     name
 }
 
-/// The statements that load `source` into `db.table`.
-pub fn import_sql(source: &str, reader: &str, db: &str, table: &str, mode: &str) -> String {
-    let target = format!("{}.{}", quote_ident(db), quote_ident(table));
+/// The statements that load `source` into `db.schema.table`.
+pub fn import_sql(
+    source: &str,
+    reader: &str,
+    db: &str,
+    schema: &str,
+    table: &str,
+    mode: &str,
+) -> String {
+    let target = format!(
+        "{}.{}.{}",
+        quote_ident(db),
+        quote_ident(schema),
+        quote_ident(table)
+    );
     let select = format!("SELECT * FROM {reader}({})", quote_string(source));
     match mode {
         "append" => format!("INSERT INTO {target} {select};"),
@@ -74,6 +86,19 @@ pub fn ImportDialog() -> impl IntoView {
     let table = RwSignal::new(String::new());
     let mode = RwSignal::new("create".to_string());
     let database = RwSignal::new(app.db.get_untracked());
+    // The import's database is not the app's: another one lands in `main`.
+    let target_schema = move |db: &str| -> String {
+        let schema = if db.eq_ignore_ascii_case(&app.db.get()) {
+            app.schema.get()
+        } else {
+            String::new()
+        };
+        if schema.is_empty() {
+            "main".to_string()
+        } else {
+            schema
+        }
+    };
     let preview = RwSignal::new(None::<StatementResult>);
     let busy = RwSignal::new(false);
     let message = RwSignal::new(None::<Result<String, String>>);
@@ -115,6 +140,7 @@ pub fn ImportDialog() -> impl IntoView {
                 quote_string(src.trim())
             ),
             db: Some(app.db.get_untracked()),
+            schema: Some(app.schema.get_untracked()),
             run_id: api::run_id(),
             worksheet_id: String::new(),
         };
@@ -147,10 +173,12 @@ pub fn ImportDialog() -> impl IntoView {
             return;
         }
         let reader = reader_for(&src, &format.get_untracked());
+        let db = database.get_untracked();
         let mut sql = import_sql(
             src.trim(),
             reader,
-            &database.get_untracked(),
+            &db,
+            &target_schema(&db),
             name.trim(),
             &mode.get_untracked(),
         );
@@ -248,10 +276,12 @@ pub fn ImportDialog() -> impl IntoView {
         if src.trim().is_empty() || name.trim().is_empty() {
             return None;
         }
+        let db = database.get();
         let mut sql = import_sql(
             src.trim(),
             reader_for(&src, &format.get()),
-            &database.get(),
+            &db,
+            &target_schema(&db),
             name.trim(),
             &mode.get(),
         );
@@ -444,16 +474,23 @@ mod tests {
     #[test]
     fn import_statements_quote_everything() {
         assert_eq!(
-            import_sql("s3://b/o'k.csv", "read_csv", "main", "Orders", "create"),
-            "CREATE TABLE main.\"Orders\" AS SELECT * FROM read_csv('s3://b/o''k.csv');"
+            import_sql(
+                "s3://b/o'k.csv",
+                "read_csv",
+                "main",
+                "main",
+                "Orders",
+                "create"
+            ),
+            "CREATE TABLE main.main.\"Orders\" AS SELECT * FROM read_csv('s3://b/o''k.csv');"
         );
         assert!(
-            import_sql("x.csv", "read_csv", "main", "t", "replace")
-                .starts_with("DROP TABLE IF EXISTS main.t;")
+            import_sql("x.csv", "read_csv", "main", "main", "t", "replace")
+                .starts_with("DROP TABLE IF EXISTS main.main.t;")
         );
         assert!(
-            import_sql("x.csv", "read_csv", "main", "t", "append")
-                .starts_with("INSERT INTO main.t SELECT")
+            import_sql("x.csv", "read_csv", "main", "main", "t", "append")
+                .starts_with("INSERT INTO main.main.t SELECT")
         );
     }
 }

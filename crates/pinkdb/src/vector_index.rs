@@ -79,7 +79,12 @@ impl Clone for Box<dyn VectorIndex> {
 
 /// One index-provider extension.
 /// A deserialized graph waiting to be attached to its table slot.
-pub(crate) type HydratedVectorIndex = (String, String, usize, Box<dyn VectorIndex>);
+pub(crate) type HydratedVectorIndex = (
+    crate::storage::SchemaPath,
+    String,
+    usize,
+    Box<dyn VectorIndex>,
+);
 
 pub trait VectorIndexProvider: Send + Sync + Debug {
     /// The name after `USING` (case-insensitive), e.g. `hnsw`.

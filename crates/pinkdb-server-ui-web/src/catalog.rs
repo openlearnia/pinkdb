@@ -20,7 +20,7 @@ pub fn CatalogPage() -> impl IntoView {
         let object = app
             .selected
             .get()
-            .and_then(|(db, name)| app.object(&db, &name));
+            .and_then(|(db, schema, name)| app.object(&db, &schema, &name));
         let loading =
             app.selected.with(Option::is_some) && app.catalog.with(|c| c.objects.is_empty());
         match object {
@@ -48,6 +48,8 @@ fn DatabasePage() -> impl IntoView {
             c.objects
                 .iter()
                 .filter(|o| o.database.eq_ignore_ascii_case(&db))
+                // Schemas have a node in the tree, not a row in this list.
+                .filter(|o| o.kind != "SCHEMA")
                 .cloned()
                 .collect()
         });
@@ -353,7 +355,7 @@ fn ObjectPage(object: CatalogObject) -> impl IntoView {
                     <Icon name="database" size=14 />
                     <button class="btn btn--ghost btn--sm crumbs__link" on:click=move |_| {
                         app.selected.set(None);
-                        app.db.set(back.clone());
+                        app.use_database(back.clone());
                     }>
                         {object.database.clone()}
                     </button>
@@ -449,6 +451,7 @@ fn Preview(object: CatalogObject) -> impl IntoView {
     let request = QueryRequest {
         sql: preview_sql(&object).replace("LIMIT 100", "LIMIT 50"),
         db: Some(object.database.clone()),
+        schema: Some(object.schema.clone()),
         run_id: api::run_id(),
         worksheet_id: String::new(),
     };

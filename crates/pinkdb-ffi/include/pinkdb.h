@@ -73,7 +73,7 @@ enum {
     PINKDB_STMT_ALTERED_TABLE = 16,
     /* Wave 48 RBAC statements. The *_USER / *_ROLE kinds return the user or
      * role name; GRANTED / REVOKED return the grant's description
-     * ("SELECT ON TABLE main.t TO alice"). */
+     * ("SELECT ON TABLE main.main.t TO alice"). */
     PINKDB_STMT_CREATED_USER = 17,
     PINKDB_STMT_ALTERED_USER = 18,
     PINKDB_STMT_DROPPED_USER = 19,
@@ -82,7 +82,10 @@ enum {
     PINKDB_STMT_GRANTED = 22,
     PINKDB_STMT_REVOKED = 23,
     /* SET VARIABLE (wave 95c): pinkdb_result_name returns the variable. */
-    PINKDB_STMT_SET_VARIABLE = 24
+    PINKDB_STMT_SET_VARIABLE = 24,
+    /* Wave 131b schema DDL: pinkdb_result_name returns the schema name. */
+    PINKDB_STMT_CREATED_SCHEMA = 25,
+    PINKDB_STMT_DROPPED_SCHEMA = 26
 };
 
 /* Value / column type tags. */
@@ -108,6 +111,9 @@ enum {
     /* v1 additive: a FLOAT[N] array — the 4-byte counterpart of
        PINKDB_TYPE_ARRAY. See PINKDB_ARRAY_FLOAT_TAG. */
     PINKDB_TYPE_ARRAY_FLOAT = 12
+    /* UUID columns report PINKDB_TYPE_VARCHAR and carry the canonical
+       lowercase text form: the ABI has no 128-bit cell, so it is not a tag of
+       its own. */
 };
 
 /* An ARRAY's type tag: the type in the low byte, the element count above it.

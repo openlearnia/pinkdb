@@ -16,9 +16,12 @@
 //!
 //! # Reads and writes
 //!
+//! - Lake schemas are the database's schemas: a lake schema `s` of database
+//!   `d` is schema `d.s`, spelled as the lake spells it and matched
+//!   case-insensitively. A lake this engine creates starts with `main`.
 //! - A **read-only** lake is served by the lake's lazy, statistics-first
-//!   [`AttachedLake`] behind an alias that renames the lake's one schema to
-//!   the database's name, so `main.t` in the lake is `<name>.t` here.
+//!   [`AttachedLake`], aliased once per lake schema, so `s.t` in the lake is
+//!   `<name>.s.t` here.
 //! - A **writable** lake is materialized into the store when it is opened.
 //!   Statements change those tables like any others; after every committed
 //!   unit the engine publishes each lake database whose tables or image
@@ -46,15 +49,15 @@
 //! as `unavailable`, every statement that touches it errors, and every other
 //! database works.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::attached::{AtSpec, AttachedLake, AttachedScan, AttachedTable, PrunePredicate};
 use crate::catalog_image::load_database_image;
-use crate::storage::{DataTable, DbCatalog, PinkDb};
-use crate::types::{PinkDbError, Result, Value};
+use crate::storage::{DataTable, DbCatalog, PinkDb, SchemaCatalog};
+use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::DataChunk;
 
 /// The memo name a WAL record's lake-version pins are stored under. The
@@ -95,6 +98,17 @@ pub struct LakeSpec {
     pub read_only: bool,
     /// `VERSION n`: a read-only attachment pinned to one lake version.
     pub version: Option<u64>,
+    /// `DATA_INLINING_ROW_LIMIT n`: rows per data file before a new one is
+    /// started. The lake catalog's own setting applies when `None`.
+    pub data_inlining_row_limit: Option<u64>,
+    /// `CREATE_IF_NOT_EXISTS`: create the lake when it does not exist yet.
+    pub create_if_not_exists: bool,
+    /// The data-file format the attachment declares for new tables (wave
+    /// 132b): `Some("parquet")` for `ATTACH 'ducklake:…'`, whose catalogs are
+    /// Parquet so another DuckLake reader can read what pinkdb writes. `None`
+    /// keeps the build default except where the catalog records its own
+    /// `data_file_format` option.
+    pub data_file_format: Option<String>,
 }
 
 /// What a host's [`DatabaseOpener`] is asked to open: the spec resolved
@@ -115,11 +129,25 @@ pub struct LakeOpenRequest {
     /// Create the lake (`CREATE DATABASE … TYPE LAKE`); otherwise it must
     /// exist.
     pub create: bool,
+    /// Open an existing lake, or create it when the location holds none
+    /// (`ATTACH … CREATE_IF_NOT_EXISTS`, and every `ducklake:` attach).
+    pub create_if_missing: bool,
     /// The lake lives under the store's lake directory.
     pub managed: bool,
     /// The store is opening (a reopen or a replay): an opener may wait out a
     /// stale lease a crashed predecessor left behind.
     pub startup: bool,
+    /// The S3 credentials of a secret whose scope covers the data (or the
+    /// catalog) location; `None` lets the opener fall back to the environment.
+    pub s3: Option<crate::secret::S3Secret>,
+    /// The Postgres password of a secret whose scope covers the catalog; the
+    /// catalog location itself never carries one.
+    pub postgres_password: Option<crate::secret::Password>,
+    /// `DATA_INLINING_ROW_LIMIT` (`None`: the lake catalog's own setting).
+    pub data_inlining_row_limit: Option<u64>,
+    /// The data-file format the attachment declares for new tables (see
+    /// [`LakeSpec::data_file_format`]).
+    pub data_file_format: Option<String>,
 }
 
 /// A writable lake's content at the version it was opened at.
@@ -128,8 +156,8 @@ pub struct LakeContent {
     /// The database image ([`PinkDb::to_database_image`]) the lake carries,
     /// if any (a lake written by another tool has none).
     pub image: Option<Vec<u8>>,
-    /// The lake's tables, by name (the lake's one schema stripped).
-    pub tables: Vec<(String, Arc<DataTable>)>,
+    /// The lake's tables, by schema and table name.
+    pub tables: Vec<(String, String, Arc<DataTable>)>,
 }
 
 /// One open lake database, as the engine sees it. Implemented by pink-lake.
@@ -141,17 +169,90 @@ pub trait LakeDatabase: fmt::Debug + Send + Sync {
     /// The version the database currently reflects: the pinned version of
     /// a read-only lake, the last published one of a writable lake.
     fn version(&self) -> u64;
+    /// Every schema the lake offers, in the lake's spelling. Empty schemas
+    /// are included: the engine keeps one database schema per name.
+    fn schemas(&self) -> Result<Vec<String>>;
     /// A read-only lake's lazy reader, its tables keyed by the lake's own
-    /// schema (the engine aliases it to the database).
+    /// schema (the engine aliases each one to the database).
     fn reader(&self) -> Result<Arc<dyn AttachedLake>>;
     /// A writable lake's image and tables at [`LakeDatabase::version`].
     fn content(&self) -> Result<LakeContent>;
-    /// Publish one commit of a writable lake: `tables` are the database's
-    /// tables after the commit and `image` its metadata, written as one lake
+    /// Publish one commit of a writable lake: `schemas` are the database's
+    /// schemas and `tables` its tables after the commit, written as one lake
     /// version. Returns the new version.
-    fn publish(&self, image: &[u8], tables: &[(String, Arc<DataTable>)]) -> Result<u64>;
+    fn publish(
+        &self,
+        image: &[u8],
+        schemas: &[String],
+        tables: &[(String, String, Arc<DataTable>)],
+    ) -> Result<u64>;
     /// The lake's tables at an older version (a WAL record's pinned read).
-    fn tables_at(&self, version: u64) -> Result<Vec<(String, Arc<DataTable>)>>;
+    fn tables_at(&self, version: u64) -> Result<Vec<(String, String, Arc<DataTable>)>>;
+    /// Bind one DuckLake function call: its output columns, without reading
+    /// data. `Ok(None)` means this lake does not know the function.
+    fn function_schema(&self, _call: &LakeFunctionCall) -> Result<Option<Vec<(String, DataType)>>> {
+        Ok(None)
+    }
+    /// Whether the named DuckLake function writes the lake.
+    fn function_mutates(&self, _name: &str) -> bool {
+        false
+    }
+    /// Run a read-only DuckLake function on a borrowed lake.
+    fn call_read(&self, _call: &LakeFunctionCall) -> Result<DataTable> {
+        Err(PinkDbError::Execution(
+            "this lake backend does not implement DuckLake functions".to_string(),
+        ))
+    }
+    /// Run a writing DuckLake function on an exclusive lake, then make the
+    /// lake's new state visible to the engine.
+    fn call_write(&self, _call: &LakeFunctionCall) -> Result<DataTable> {
+        Err(PinkDbError::Execution(
+            "this lake backend does not implement DuckLake functions".to_string(),
+        ))
+    }
+}
+
+/// One evaluated DuckLake function call, in DuckDB's argument shape: the
+/// first positional argument names the lake database.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LakeFunctionCall {
+    pub name: String,
+    pub positional: Vec<Value>,
+    pub named: Vec<(String, Value)>,
+}
+
+impl LakeFunctionCall {
+    /// Convert a table-function call (`SELECT * FROM ducklake_…`) to the
+    /// lake-function shape.
+    pub fn from_table_call(
+        name: &str,
+        args: &[crate::table_source::TableFunctionArg],
+    ) -> LakeFunctionCall {
+        let mut positional = Vec::new();
+        let mut named = Vec::new();
+        for arg in args {
+            match &arg.name {
+                Some(name) => named.push((name.to_ascii_lowercase(), arg.value.clone())),
+                None => positional.push(arg.value.clone()),
+            }
+        }
+        LakeFunctionCall {
+            name: name.to_string(),
+            positional,
+            named,
+        }
+    }
+
+    /// The lake database the first positional argument names.
+    pub fn database(&self) -> Result<&str> {
+        match self.positional.first() {
+            Some(Value::Varchar(db)) if !db.is_empty() => Ok(db),
+            _ => Err(PinkDbError::Type(format!(
+                "{}: the first argument must be the name of a lake database",
+                self.name
+            ))),
+        }
+    }
 }
 
 /// Opens lakes for the engine. Registered once per process by the host.
@@ -230,8 +331,12 @@ pub(crate) struct LakeSlot {
     spec: LakeSpec,
     /// The open lake, or why it could not be opened.
     state: std::result::Result<Arc<dyn LakeDatabase>, String>,
-    /// A read-only lake's aliased reader, as registered with the store.
-    reader: Option<Arc<dyn AttachedLake>>,
+    /// A read-only lake's aliased readers, one per schema, as registered
+    /// with the store.
+    readers: Vec<Arc<dyn AttachedLake>>,
+    /// Every schema the lake offers, in the lake's spelling (empty schemas
+    /// included): a lake database's catalog holds one schema per name.
+    schemas: Vec<String>,
     /// A writable lake's last published state: the dirty check compares
     /// against it, and a failed publish restores it.
     published: Mutex<Option<Published>>,
@@ -297,7 +402,13 @@ pub fn redact_location(location: &str) -> String {
 /// The local path inside a catalog location, if it names one (`pink:`,
 /// `sqlite:` or a bare path; never a URL).
 fn local_catalog_path(location: &str) -> Option<(&str, &str)> {
-    if location.contains("://") {
+    // A URL, a libpq conninfo (`host=… dbname=…`) and a named remote catalog
+    // are never paths: `postgres:` takes the rest of the string as libpq
+    // conninfo, which contains `=` and no `://`.
+    if location.contains("://")
+        || location.starts_with("postgres:")
+        || location.split_whitespace().any(|word| word.contains('='))
+    {
         return None;
     }
     for prefix in ["pink:", "sqlite:"] {
@@ -306,6 +417,121 @@ fn local_catalog_path(location: &str) -> Option<(&str, &str)> {
         }
     }
     Some(("", location))
+}
+
+/// Split a password out of a Postgres catalog location, returning the
+/// location without it and the password. Both libpq spellings are handled: a
+/// URI (`postgres://user:pw@host/db`) and a conninfo
+/// (`postgres:host=h dbname=d password=pw`). The password is percent-decoded
+/// (URI) or unquoted (conninfo) — it is about to become a secret value.
+pub(crate) fn split_catalog_password(location: &str) -> (String, Option<String>) {
+    if let Some((scheme, rest)) = location.split_once("://") {
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, tail) = rest.split_at(end);
+        let Some((userinfo, host)) = authority.rsplit_once('@') else {
+            return (location.to_string(), None);
+        };
+        let (user, password) = match userinfo.split_once(':') {
+            Some((user, password)) => (user, Some(percent_decode(password))),
+            None => (userinfo, None),
+        };
+        return (format!("{scheme}://{user}@{host}{tail}"), password);
+    }
+    let (prefix, body) = match location.strip_prefix("postgres:") {
+        Some(body) => ("postgres:", body),
+        None => ("", location),
+    };
+    let (body, password) = remove_conninfo_password(body);
+    (format!("{prefix}{body}"), password)
+}
+
+/// Drop every `password=…` pair from a libpq conninfo, keeping the other
+/// pairs (and their quoting) as written.
+fn remove_conninfo_password(input: &str) -> (String, Option<String>) {
+    let bytes = input.as_bytes();
+    let mut pairs: Vec<String> = Vec::new();
+    let mut password = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i == bytes.len() {
+            break;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key = &input[start..i];
+        if i == bytes.len() || bytes[i] != b'=' {
+            // Not a `key=value` pair: keep the rest verbatim.
+            pairs.push(input[start..].trim().to_string());
+            break;
+        }
+        i += 1;
+        let value_start = i;
+        if i < bytes.len() && bytes[i] == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' if i + 1 < bytes.len() => i += 2,
+                    b'\'' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+        } else {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+        }
+        let raw = &input[value_start..i];
+        if key.eq_ignore_ascii_case("password") {
+            password = Some(unquote_conninfo(raw));
+        } else {
+            pairs.push(format!("{key}={raw}"));
+        }
+    }
+    (pairs.join(" "), password)
+}
+
+fn unquote_conninfo(raw: &str) -> String {
+    if let Some(inner) = raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            out.push(if c == '\\' {
+                chars.next().unwrap_or(c)
+            } else {
+                c
+            });
+        }
+        out
+    } else {
+        raw.to_string()
+    }
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&text[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A relative local path resolved against `base`.
@@ -317,59 +543,47 @@ fn resolve_path(base: Option<&Path>, path: &str) -> String {
     }
 }
 
-/// An aliased read-only lake: the lake's one schema is the database's name.
+/// An aliased read-only lake schema: the lake schema `s` of database `d` is
+/// the database's schema `s`, so `d.s.t` reads the lake's `s.t`.
 #[derive(Debug)]
 struct AliasedLake {
     inner: Arc<dyn AttachedLake>,
-    /// The lake's own schema name, as its tables carry it.
+    /// The database the lake was attached as.
+    alias: String,
+    /// The lake schema this reader serves, in the lake's spelling.
     schema: String,
     tables: Vec<AttachedTable>,
 }
 
 impl AliasedLake {
-    fn new(inner: Arc<dyn AttachedLake>, alias: &str) -> Result<Self> {
-        let mut schemas: Vec<String> = Vec::new();
+    /// The reader for one lake schema of a read-only lake database.
+    fn new(inner: Arc<dyn AttachedLake>, alias: &str, schema: &str) -> Self {
+        let mut display = schema.to_string();
+        let mut tables = Vec::new();
         for t in inner.tables() {
-            if !schemas.iter().any(|s| s.eq_ignore_ascii_case(&t.db)) {
-                schemas.push(t.db.clone());
+            if !t.db.eq_ignore_ascii_case(schema) {
+                continue;
             }
-        }
-        if schemas.len() > 1 {
-            return Err(multi_schema_error(inner.location(), &schemas));
-        }
-        let schema = schemas.pop().unwrap_or_else(|| "main".to_string());
-        let tables = inner
-            .tables()
-            .iter()
-            .map(|t| AttachedTable {
+            display = t.db.clone();
+            tables.push(AttachedTable {
                 db: alias.to_string(),
+                schema_name: t.db.clone(),
                 ..t.clone()
-            })
-            .collect();
-        Ok(Self {
+            });
+        }
+        Self {
             inner,
-            schema,
+            alias: alias.to_string(),
+            schema: display,
             tables,
-        })
+        }
     }
 
     fn rename(&self, mut t: AttachedTable) -> AttachedTable {
-        if let Some(first) = self.tables.first() {
-            t.db = first.db.clone();
-        }
+        t.db = self.alias.clone();
+        t.schema_name = self.schema.clone();
         t
     }
-}
-
-/// The refusal for a lake whose tables live in more than one schema.
-pub fn multi_schema_error(location: &str, schemas: &[String]) -> PinkDbError {
-    PinkDbError::Catalog(format!(
-        "lake {} has tables in {} schemas ({}); a lake database exposes one schema in this \
-         version",
-        redact_location(location),
-        schemas.len(),
-        schemas.join(", ")
-    ))
 }
 
 impl AttachedLake for AliasedLake {
@@ -448,7 +662,7 @@ impl AttachedLake for AliasedLake {
 
 /// Saved tables of the lake databases a replayed record pinned to an older
 /// version, restored once the record ran.
-pub(crate) type PinBackup = Vec<(String, HashMap<String, DataTable>, u64)>;
+pub(crate) type PinBackup = Vec<(String, BTreeMap<String, HashMap<String, DataTable>>, u64)>;
 
 impl PinkDb {
     /// The directory managed lakes live in (`CREATE DATABASE n (TYPE LAKE)`
@@ -606,11 +820,22 @@ impl PinkDb {
         };
         Ok(LakeOpenRequest {
             database: name.to_string(),
+            // A secret scoped to the data location (or the catalog, for an
+            // S3 catalog) supplies the object-store credentials; without one
+            // the opener falls back to `AWS_*` as before.
+            s3: self.s3_secret_for(&catalog, &self.session).or_else(|| {
+                data.as_deref()
+                    .and_then(|d| self.s3_secret_for(d, &self.session))
+            }),
+            postgres_password: self.postgres_password_for(&catalog, &self.session),
+            data_inlining_row_limit: spec.data_inlining_row_limit,
+            data_file_format: spec.data_file_format.clone(),
             catalog,
             data,
             read_only: spec.read_only,
             version: spec.version,
             create,
+            create_if_missing: spec.create_if_not_exists && !spec.read_only,
             managed,
             startup,
         })
@@ -644,23 +869,56 @@ impl PinkDb {
             }
             let handle = database_opener()?.open(&request)?;
             let storage = DbStorage::Lake(spec.clone());
+            let mut schemas = handle.schemas()?;
+            if schemas.is_empty() {
+                schemas.push("main".to_string());
+            }
             if handle.read_only() {
-                let reader: Arc<dyn AttachedLake> =
-                    Arc::new(AliasedLake::new(handle.reader()?, name)?);
-                return Ok::<_, PinkDbError>((handle, Some(reader), None));
+                let reader = handle.reader()?;
+                // A pinned version can hold a schema the head no longer has:
+                // its tables need a reader too.
+                for t in reader.tables() {
+                    if !schemas.iter().any(|s| s.eq_ignore_ascii_case(&t.db)) {
+                        schemas.push(t.db.clone());
+                    }
+                }
+                let readers = schemas
+                    .iter()
+                    .map(|schema| {
+                        Arc::new(AliasedLake::new(Arc::clone(&reader), name, schema))
+                            as Arc<dyn AttachedLake>
+                    })
+                    .collect();
+                return Ok::<_, PinkDbError>((handle, readers, schemas, None));
             }
             let content = handle.content()?;
             let mut catalog =
                 load_database_image(name, storage, content.image.as_deref(), &content.tables)?;
             catalog.lake_version = handle.version();
+            // The lake's schema list is the truth: an image older than a
+            // schema the lake gained (or one written by another tool) still
+            // gets that schema.
+            for schema in &schemas {
+                catalog
+                    .schemas
+                    .entry(schema.to_ascii_lowercase())
+                    .or_insert_with(|| SchemaCatalog::empty(schema));
+            }
+            schemas = catalog.schemas.values().map(|s| s.name.clone()).collect();
             let image = self.catalog_image_of(&catalog)?;
-            Ok((handle, None, Some(Published { catalog, image })))
+            Ok((
+                handle,
+                Vec::new(),
+                schemas,
+                Some(Published { catalog, image }),
+            ))
         })();
         match opened {
-            Ok((handle, reader, published)) => Ok(Arc::new(LakeSlot {
+            Ok((handle, readers, schemas, published)) => Ok(Arc::new(LakeSlot {
                 spec: spec.clone(),
                 state: Ok(handle),
-                reader,
+                readers,
+                schemas,
                 published: Mutex::new(published),
             })),
             Err(e) if startup => Ok(unavailable_slot(spec, e.to_string())),
@@ -688,14 +946,19 @@ impl PinkDb {
             (Ok(handle), None) => {
                 let mut cat = DbCatalog::empty(name, storage);
                 cat.lake_version = handle.version();
+                for schema in &slot.schemas {
+                    cat.schemas
+                        .entry(schema.to_ascii_lowercase())
+                        .or_insert_with(|| SchemaCatalog::empty(schema));
+                }
                 cat
             }
             (Err(_), _) => DbCatalog::empty(name, storage),
         };
-        if let Some(reader) = &slot.reader
-            && !self.attached_lakes.iter().any(|l| Arc::ptr_eq(l, reader))
-        {
-            self.attached_lakes.push(Arc::clone(reader));
+        for reader in &slot.readers {
+            if !self.attached_lakes.iter().any(|l| Arc::ptr_eq(l, reader)) {
+                self.attached_lakes.push(Arc::clone(reader));
+            }
         }
         self.databases.insert(key.clone(), catalog);
         self.lakes
@@ -790,8 +1053,10 @@ impl PinkDb {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&key);
-        if let Some(reader) = slot.as_ref().and_then(|s| s.reader.as_ref()) {
-            self.attached_lakes.retain(|l| !Arc::ptr_eq(l, reader));
+        if let Some(slot) = slot.as_ref() {
+            for reader in &slot.readers {
+                self.attached_lakes.retain(|l| !Arc::ptr_eq(l, reader));
+            }
         }
         self.databases.remove(&key);
         Ok(true)
@@ -811,7 +1076,7 @@ impl PinkDb {
             .map(|(_, slot)| slot)
             .collect();
         for slot in &slots {
-            if let Some(reader) = &slot.reader {
+            for reader in &slot.readers {
                 self.attached_lakes.retain(|l| !Arc::ptr_eq(l, reader));
             }
         }
@@ -868,7 +1133,7 @@ impl PinkDb {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .values()
-            .any(|s| s.reader.as_ref().is_some_and(|r| Arc::ptr_eq(r, lake)))
+            .any(|s| s.readers.iter().any(|r| Arc::ptr_eq(r, lake)))
     }
 
     /// The storage a write to database `db` lands in.
@@ -909,6 +1174,15 @@ impl PinkDb {
         Ok(out)
     }
 
+    /// Refuse a catalog write (a schema create or drop) in a read-only or
+    /// unavailable lake database; a local database passes.
+    pub(crate) fn refuse_lake_write(&self, db: &str) -> Result<()> {
+        if let StorageKey::Lake(name) = self.storage_key(db) {
+            self.write_storages(std::iter::once(&name))?;
+        }
+        Ok(())
+    }
+
     /// Refuse a unit that writes more than one storage.
     pub(crate) fn refuse_mixed_storages(
         &self,
@@ -935,19 +1209,23 @@ impl PinkDb {
     ) -> BTreeSet<String> {
         use crate::plan::LogicalPlan as P;
         let mut out: BTreeSet<String> = self
-            .plan_writes_of(plan, default_db)
+            .plan_writes_of(plan, &crate::storage::SchemaPath::main(default_db))
             .into_iter()
-            .map(|(db, _)| db)
+            .map(|(ns, _)| ns.db().to_string())
             .collect();
-        let db_of = |db: &Option<String>| db.as_deref().unwrap_or(default_db).to_ascii_lowercase();
+        let db_of = |ns: &Option<crate::storage::SchemaPath>| {
+            ns.as_ref()
+                .map(|n| n.db().to_string())
+                .unwrap_or_else(|| default_db.to_string())
+        };
         match plan {
-            P::CreateMacro { db, .. }
-            | P::DropMacro { db, .. }
-            | P::CreateProcedure { db, .. }
-            | P::DropProcedure { db, .. }
-            | P::CreateTrigger { db, .. }
-            | P::DropTrigger { db, .. } => {
-                out.insert(db_of(db));
+            P::CreateMacro { ns, .. }
+            | P::DropMacro { ns, .. }
+            | P::CreateProcedure { ns, .. }
+            | P::DropProcedure { ns, .. }
+            | P::CreateTrigger { ns, .. }
+            | P::DropTrigger { ns, .. } => {
+                out.insert(db_of(ns));
             }
             _ => {}
         }
@@ -1002,8 +1280,8 @@ impl PinkDb {
             return Ok(BTreeSet::new());
         }
         let mut dbs = self.plan_written_dbs(plan, default_db);
-        for (db, _) in self.proc_frame.writes() {
-            dbs.insert(db);
+        for (ns, _) in self.proc_frame.writes() {
+            dbs.insert(ns.db().to_string());
         }
         let mut storages = self.write_storages(&dbs)?;
         storages.extend(txn_storages.iter().cloned());
@@ -1053,6 +1331,169 @@ impl PinkDb {
         scratch.metadata_image()
     }
 
+    /// Resolve a DuckLake function's first argument to its lake database.
+    fn lake_function_target(&self, call: &LakeFunctionCall) -> Result<(String, Arc<LakeSlot>)> {
+        let name = call.database()?.to_string();
+        let key = name.to_ascii_lowercase();
+        let Some(cat) = self.databases.get(&key) else {
+            return Err(PinkDbError::Catalog(format!(
+                "{}: database \"{name}\" does not exist",
+                call.name
+            )));
+        };
+        if !matches!(cat.storage, DbStorage::Lake(_)) {
+            return Err(PinkDbError::Catalog(format!(
+                "{}: database \"{name}\" is not a lake database",
+                call.name
+            )));
+        }
+        let slot = self.lake_slot(&key).ok_or_else(|| {
+            PinkDbError::Catalog(format!(
+                "{}: database \"{name}\" is not a lake database",
+                call.name
+            ))
+        })?;
+        if let Err(reason) = &slot.state {
+            return Err(PinkDbError::Execution(format!(
+                "{}: lake database \"{name}\" is unavailable: {reason}",
+                call.name
+            )));
+        }
+        Ok((key, slot))
+    }
+
+    /// The output columns of a DuckLake function call. Only the catalog is
+    /// read, so binding a statement does no lake I/O.
+    pub(crate) fn lake_function_schema(
+        &self,
+        call: &LakeFunctionCall,
+    ) -> Result<Option<Vec<(String, DataType)>>> {
+        let (_, slot) = self.lake_function_target(call)?;
+        let Some(handle) = slot.handle() else {
+            return Ok(None);
+        };
+        handle.function_schema(call)
+    }
+
+    /// Whether a DuckLake function name writes the lake.
+    pub(crate) fn lake_function_mutates(&self, call: &LakeFunctionCall) -> bool {
+        match self.lake_function_target(call) {
+            Ok((_, slot)) => slot
+                .handle()
+                .is_some_and(|handle| handle.function_mutates(&call.name)),
+            Err(_) => false,
+        }
+    }
+
+    /// Run a read-only DuckLake function. `ducklake_last_committed_snapshot`
+    /// is session state, so the engine answers it here rather than in the
+    /// lake handle (which does not know which connection committed).
+    pub(crate) fn lake_function_read(&self, call: &LakeFunctionCall) -> Result<DataTable> {
+        let (db, slot) = self.lake_function_target(call)?;
+        let handle = slot.handle().ok_or_else(|| {
+            PinkDbError::Execution(format!("lake database \"{db}\" is unavailable"))
+        })?;
+        if call
+            .name
+            .eq_ignore_ascii_case("ducklake_last_committed_snapshot")
+        {
+            let schema = handle.function_schema(call)?.ok_or_else(|| {
+                PinkDbError::Catalog(format!("unknown DuckLake function \"{}\"", call.name))
+            })?;
+            let mut table = DataTable::new(call.name.clone(), schema)?;
+            table.append_row(vec![match self.session.last_lake_commit(&db) {
+                Some(id) => Value::Bigint(id as i64),
+                None => Value::Null,
+            }])?;
+            return Ok(table);
+        }
+        handle.call_read(call)
+    }
+
+    /// Run a writing DuckLake function, then make its committed lake state
+    /// the engine's view of that database. The engine's catalog holds the
+    /// same rows as the lake's base; leaving it stale would let the next
+    /// publish overwrite the function's work.
+    pub(crate) fn lake_function_write(&mut self, call: &LakeFunctionCall) -> Result<DataTable> {
+        let (db, slot) = self.lake_function_target(call)?;
+        let handle = slot.handle().cloned().ok_or_else(|| {
+            PinkDbError::Execution(format!("lake database \"{db}\" is unavailable"))
+        })?;
+        if handle.read_only() {
+            return Err(PinkDbError::Execution(format!(
+                "{}: database \"{db}\" is a read-only lake; attach it without READ_ONLY to write",
+                call.name
+            )));
+        }
+        let before = handle.version();
+        let table = handle.call_write(call)?;
+        let after = handle.version();
+        if after != before {
+            self.refresh_lake_function(&db, &slot, &handle)?;
+            self.session
+                .set_last_lake_commit(&db, after.saturating_sub(1));
+        }
+        Ok(table)
+    }
+
+    /// Replace the live catalog's tables with the lake's current tables while
+    /// keeping engine-only metadata (constraints, indexes).
+    fn refresh_lake_function(
+        &mut self,
+        key: &str,
+        slot: &LakeSlot,
+        handle: &Arc<dyn LakeDatabase>,
+    ) -> Result<()> {
+        let content = handle.content()?;
+        let mut cat = self
+            .databases
+            .remove(key)
+            .ok_or_else(|| PinkDbError::Catalog(format!("database \"{key}\" does not exist")))?;
+        cat.lake_version = handle.version();
+        let current: BTreeMap<(String, String), (String, String, Arc<DataTable>)> = content
+            .tables
+            .into_iter()
+            .map(|(schema, table, data)| {
+                (
+                    (schema.to_ascii_lowercase(), table.to_ascii_lowercase()),
+                    (schema, table, data),
+                )
+            })
+            .collect();
+        for (schema_key, schema) in cat.schemas.iter_mut() {
+            schema
+                .tables
+                .retain(|table, _| current.contains_key(&(schema_key.clone(), table.clone())));
+        }
+        for ((schema_key, table_key), (schema, _table, fresh)) in current {
+            let sc = cat
+                .schemas
+                .entry(schema_key)
+                .or_insert_with(|| SchemaCatalog::empty(&schema));
+            match sc.tables.get_mut(&table_key) {
+                Some(existing) => {
+                    let mut next = (*fresh).clone();
+                    next.constraints = existing.constraints.clone();
+                    next.indexes = existing.indexes.clone();
+                    next.vector_indexes = existing.vector_indexes.clone();
+                    next.indexes_stale = !next.indexes.is_empty();
+                    next.key_index = None;
+                    *existing = next;
+                }
+                None => {
+                    sc.tables.insert(table_key, (*fresh).clone());
+                }
+            }
+        }
+        let image = self.catalog_image_of(&cat)?;
+        *slot.published.lock().unwrap_or_else(|p| p.into_inner()) = Some(Published {
+            catalog: cat.clone(),
+            image,
+        });
+        self.databases.insert(key.to_string(), cat);
+        Ok(())
+    }
+
     /// The writable lake databases whose tables or metadata changed since
     /// their last publish.
     pub(crate) fn dirty_lake_databases(&self) -> Result<Vec<String>> {
@@ -1074,14 +1515,14 @@ impl PinkDb {
             let Some(published) = published.as_ref() else {
                 continue;
             };
-            let same_tables = cat.tables.len() == published.catalog.tables.len()
-                && cat.tables.iter().all(|(name, t)| {
-                    published
-                        .catalog
-                        .tables
-                        .get(name)
-                        .is_some_and(|p| p.version == t.version)
-                });
+            let same_tables = cat.schemas.iter().all(|(schema, sc)| {
+                published.catalog.schemas.get(schema).is_some_and(|p| {
+                    sc.tables.len() == p.tables.len()
+                        && sc.tables.iter().all(|(name, t)| {
+                            p.tables.get(name).is_some_and(|p| p.version == t.version)
+                        })
+                })
+            }) && cat.schemas.len() == published.catalog.schemas.len();
             if !same_tables || self.catalog_image_of(cat)? != published.image {
                 out.push(key);
             }
@@ -1104,12 +1545,17 @@ impl PinkDb {
                 continue;
             };
             let image = self.catalog_image_of(cat)?;
-            let tables: Vec<(String, Arc<DataTable>)> = cat
-                .tables
+            let schemas: Vec<String> = cat.schemas.values().map(|s| s.name.clone()).collect();
+            let tables: Vec<(String, String, Arc<DataTable>)> = cat
+                .schemas
                 .values()
-                .map(|t| (t.name.clone(), Arc::new(t.clone())))
+                .flat_map(|sc| {
+                    sc.tables
+                        .values()
+                        .map(|t| (sc.name.clone(), t.name.clone(), Arc::new(t.clone())))
+                })
                 .collect();
-            match handle.publish(&image, &tables) {
+            match handle.publish(&image, &schemas, &tables) {
                 Ok(version) => {
                     if let Some(cat) = self.databases.get_mut(key) {
                         cat.lake_version = version;
@@ -1119,6 +1565,8 @@ impl PinkDb {
                                 image,
                             });
                     }
+                    self.session
+                        .set_last_lake_commit(key, version.saturating_sub(1));
                 }
                 Err(e) => {
                     let restored = slot
@@ -1170,7 +1618,7 @@ impl PinkDb {
             return Vec::new();
         }
         let mut dbs: BTreeSet<&str> = BTreeSet::new();
-        for (db, _) in sets.table_pairs() {
+        for (db, _, _) in sets.table_refs() {
             dbs.insert(db.as_str());
         }
         dbs.into_iter()
@@ -1221,13 +1669,20 @@ impl PinkDb {
                 ))
             })?;
             let cat = self.databases.get_mut(db).expect("checked above");
-            let mut pinned = HashMap::new();
-            for (name, table) in tables {
+            let mut pinned: BTreeMap<String, HashMap<String, DataTable>> = BTreeMap::new();
+            for (schema, name, table) in tables {
                 let mut table = (*table).clone();
                 table.name = name.clone();
-                pinned.insert(name.to_ascii_lowercase(), table);
+                pinned
+                    .entry(schema.to_ascii_lowercase())
+                    .or_default()
+                    .insert(name.to_ascii_lowercase(), table);
             }
-            let saved = std::mem::replace(&mut cat.tables, pinned);
+            let mut saved = BTreeMap::new();
+            for (key, schema) in &mut cat.schemas {
+                let tables = pinned.get(key).cloned().unwrap_or_default();
+                saved.insert(key.clone(), std::mem::replace(&mut schema.tables, tables));
+            }
             let saved_version = std::mem::replace(&mut cat.lake_version, version);
             backup.push((db.clone(), saved, saved_version));
         }
@@ -1237,9 +1692,13 @@ impl PinkDb {
     /// After a replayed record ran: put back what [`PinkDb::apply_replay_pins`]
     /// swapped out.
     pub(crate) fn restore_replay_pins(&mut self, backup: PinBackup) {
-        for (db, tables, version) in backup {
+        for (db, schemas, version) in backup {
             if let Some(cat) = self.databases.get_mut(&db) {
-                cat.tables = tables;
+                for (key, tables) in schemas {
+                    if let Some(schema) = cat.schemas.get_mut(&key) {
+                        schema.tables = tables;
+                    }
+                }
                 cat.lake_version = version;
             }
         }
@@ -1250,16 +1709,24 @@ impl PinkDb {
     /// counters `(loads, columns, files)`, sorted by database.
     pub fn lake_decode_stats(&self) -> Vec<(Option<String>, String, u64, u64, u64)> {
         let slots = self.lakes.slots.lock().unwrap_or_else(|p| p.into_inner());
+        // A lake database has one reader per lake schema, all sharing the
+        // lake's counters: report the lake once, from its first schema.
         let mut out: Vec<(Option<String>, String, u64, u64, u64)> = self
             .attached_lakes
             .iter()
-            .map(|lake| {
+            .filter_map(|lake| {
                 let database = slots
                     .iter()
-                    .find(|(_, s)| s.reader.as_ref().is_some_and(|r| Arc::ptr_eq(r, lake)))
+                    .find(|(_, s)| s.readers.first().is_some_and(|r| Arc::ptr_eq(r, lake)))
                     .map(|(key, _)| self.database_display_name(key));
+                let in_slot = slots
+                    .iter()
+                    .any(|(_, s)| s.readers.iter().any(|r| Arc::ptr_eq(r, lake)));
+                if in_slot && database.is_none() {
+                    return None;
+                }
                 let (loads, columns, files) = lake.decode_stats();
-                (database, lake.location().to_string(), loads, columns, files)
+                Some((database, lake.location().to_string(), loads, columns, files))
             })
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1286,7 +1753,8 @@ fn unavailable_slot(spec: &LakeSpec, reason: String) -> Arc<LakeSlot> {
     Arc::new(LakeSlot {
         spec: spec.clone(),
         state: Err(reason),
-        reader: None,
+        readers: Vec::new(),
+        schemas: Vec::new(),
         published: Mutex::new(None),
     })
 }
@@ -1321,6 +1789,9 @@ mod tests {
             data: None,
             read_only: false,
             version: None,
+            data_inlining_row_limit: None,
+            create_if_not_exists: false,
+            data_file_format: None,
         };
         let r = db
             .lake_request("a", &spec("sqlite:x.sqlite"), false, false)
@@ -1339,11 +1810,20 @@ mod tests {
             data: None,
             read_only: false,
             version: None,
+            data_inlining_row_limit: None,
+            create_if_not_exists: false,
+            data_file_format: None,
         };
         let r = db.lake_request("Sales", &managed, true, false).unwrap();
         assert_eq!(r.catalog, "pink:/data/lakes/sales/catalog.pink");
         assert_eq!(r.data.as_deref(), Some("/data/lakes/sales/data"));
         assert!(r.managed);
+        // A libpq conninfo carries no `://`; it is still a remote catalog and
+        // must never be resolved against the lake directory.
+        let r = db
+            .lake_request("a", &spec("postgres:host=h dbname=db"), false, false)
+            .unwrap();
+        assert_eq!(r.catalog, "postgres:host=h dbname=db");
         let err = db
             .lake_request("a", &spec("postgres://u:pw@h/db"), false, false)
             .unwrap_err()

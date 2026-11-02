@@ -68,7 +68,7 @@ fn sql_surfaces_round_trip_through_a_real_file() {
     assert_eq!(rows[0][2], Value::Double(1.5));
     assert_eq!(rows[0][3], Value::Date(19723));
     assert_eq!(rows[0][4], Value::Timestamp(1_704_110_400_000_001));
-    assert_eq!(rows[0][5], Value::Decimal(12345, 4));
+    assert_eq!(rows[0][5], Value::decimal(12345, 4));
     assert_eq!(
         rows[0][6],
         Value::Interval {

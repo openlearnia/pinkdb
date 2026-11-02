@@ -220,8 +220,13 @@ impl PrunePredicate {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttachedTable {
     /// Database name as the lake's catalog wrote it (display casing; lookups
-    /// are case-insensitive like every catalog name).
+    /// are case-insensitive like every catalog name). A session attachment
+    /// names its own database by the lake's schema; a lake *database* aliases
+    /// every schema into one database and carries the schema here.
     pub db: String,
+    /// Schema name the table lives in (display casing, case-insensitive
+    /// lookups). Session attachments and raw lakes keep `main`.
+    pub schema_name: String,
     /// Table name as the lake's catalog wrote it.
     pub table: String,
     /// Exact row count of the table's single data file, cross-checked
@@ -473,24 +478,32 @@ impl PinkDb {
         // fails leaves the session exactly as it was.
         let mut seen = std::collections::HashSet::new();
         for t in &tables {
-            if !seen.insert((t.db.to_ascii_lowercase(), t.table.to_ascii_lowercase())) {
+            let ns = crate::storage::SchemaPath::new(&t.db, &t.schema_name);
+            if !seen.insert((
+                t.db.to_ascii_lowercase(),
+                t.schema_name.to_ascii_lowercase(),
+                t.table.to_ascii_lowercase(),
+            )) {
                 return Err(PinkDbError::Catalog(format!(
-                    "lake {location} offers table \"{}.{}\" twice; refusing to attach",
-                    t.db, t.table
+                    "lake {location} offers table \"{ns}.{}\" twice; refusing to attach",
+                    t.table
                 )));
             }
-            if self.table_in(&t.db, &t.table).is_ok() {
+            if self.table_in(&ns, &t.table).is_ok() {
                 return Err(PinkDbError::Catalog(format!(
-                    "cannot attach lake {location}: table \"{}.{}\" already exists in the \
+                    "cannot attach lake {location}: table \"{ns}.{}\" already exists in the \
                      session store; drop it or attach a different lake",
-                    t.db, t.table
+                    t.table
                 )));
             }
-            if let Some(other) = self.attached_location_in(&t.db, &t.table) {
+            if let Some(other) = self
+                .attached_lookup(&t.db, &t.schema_name, &t.table)
+                .map(|(_, lake)| lake.location())
+            {
                 return Err(PinkDbError::Catalog(format!(
-                    "cannot attach lake {location}: table \"{}.{}\" is already attached from \
+                    "cannot attach lake {location}: table \"{ns}.{}\" is already attached from \
                      lake {other}; detach it first",
-                    t.db, t.table
+                    t.table
                 )));
             }
         }
@@ -540,29 +553,31 @@ impl PinkDb {
             .collect()
     }
 
-    /// The location of the attached lake offering `db.table`, if any.
+    /// The location of the attached lake offering `db.main.name`, if any.
     pub fn attached_location_in(&self, db: &str, name: &str) -> Option<String> {
-        self.attached_lookup(db, name)
+        self.attached_lookup(db, "main", name)
             .map(|(_, lake)| lake.location().to_string())
     }
 
-    /// One attached table descriptor, if `db.table` is attached.
+    /// One attached table descriptor, if `db.main.name` is attached.
     pub fn attached_table_in(&self, db: &str, name: &str) -> Option<AttachedTable> {
-        self.attached_lookup(db, name).map(|(t, _)| t.clone())
+        self.attached_lookup(db, "main", name)
+            .map(|(t, _)| t.clone())
     }
 
-    /// The attached table and its lake, if `db.table` is attached.
+    /// The attached table and its lake, if `db.schema.name` is attached.
     pub(crate) fn attached_lookup(
         &self,
         db: &str,
+        schema: &str,
         name: &str,
     ) -> Option<(&AttachedTable, &Arc<dyn AttachedLake>)> {
         for lake in &self.attached_lakes {
-            if let Some(t) = lake
-                .tables()
-                .iter()
-                .find(|t| t.db.eq_ignore_ascii_case(db) && t.table.eq_ignore_ascii_case(name))
-            {
+            if let Some(t) = lake.tables().iter().find(|t| {
+                t.db.eq_ignore_ascii_case(db)
+                    && t.schema_name.eq_ignore_ascii_case(schema)
+                    && t.table.eq_ignore_ascii_case(name)
+            }) {
                 return Some((t, lake));
             }
         }
@@ -572,13 +587,17 @@ impl PinkDb {
     /// The schema of a table visible to queries: a store table first, else an
     /// attached lake table. Anything else keeps the store's "not found"
     /// error unchanged.
-    pub fn visible_table_schema(&self, db: &str, name: &str) -> Result<Vec<(String, DataType)>> {
-        match self.table_in(db, name) {
+    pub fn visible_table_schema(
+        &self,
+        ns: &crate::storage::SchemaPath,
+        name: &str,
+    ) -> Result<Vec<(String, DataType)>> {
+        match self.table_in(ns, name) {
             Ok(t) => Ok(t.schema()),
-            Err(e) => match self.attached_lookup(db, name) {
+            Err(e) => match self.attached_lookup(ns.db(), ns.schema(), name) {
                 Some((t, _)) => Ok(t.schema.clone()),
                 // A lake database that could not be opened says why.
-                None => Err(self.unavailable_lake(db).unwrap_or(e)),
+                None => Err(self.unavailable_lake(ns.db()).unwrap_or(e)),
             },
         }
     }
@@ -590,15 +609,16 @@ impl PinkDb {
     /// in. An unknown table keeps the store's normal "not found" error.
     pub fn visible_table_schema_at(
         &self,
-        db: &str,
+        ns: &crate::storage::SchemaPath,
         name: &str,
         at: AtSpec,
     ) -> Result<Vec<(String, DataType)>> {
-        match self.attached_lookup(db, name) {
+        let db = ns.db();
+        match self.attached_lookup(db, ns.schema(), name) {
             Some((_, lake)) => Ok(lake.table_at(db, name, at)?.schema),
-            None => match self.table_in(db, name) {
+            None => match self.table_in(ns, name) {
                 Ok(_) => Err(PinkDbError::Catalog(format!(
-                    "table \"{db}.{name}\" has no snapshot history: AT ({at}) time travel \
+                    "table \"{ns}.{name}\" has no snapshot history: AT ({at}) time travel \
                      works on tables of lake databases"
                 ))),
                 Err(e) => Err(e),
@@ -608,22 +628,28 @@ impl PinkDb {
 
     /// The read-only refusal for a mutation targeting an attached table,
     /// if it is one.
-    pub(crate) fn attached_read_only(&self, db: &str, name: &str) -> Option<PinkDbError> {
-        self.attached_lookup(db, name).map(|(_, lake)| {
-            if self.is_lake_reader(lake) {
-                PinkDbError::Execution(format!(
-                    "table \"{db}.{name}\" is in database \"{db}\", a read-only lake ({}); \
+    pub(crate) fn attached_read_only(
+        &self,
+        ns: &crate::storage::SchemaPath,
+        name: &str,
+    ) -> Option<PinkDbError> {
+        let db = ns.db();
+        self.attached_lookup(db, ns.schema(), name)
+            .map(|(_, lake)| {
+                if self.is_lake_reader(lake) {
+                    PinkDbError::Execution(format!(
+                        "table \"{db}.{name}\" is in database \"{db}\", a read-only lake ({}); \
                      attach it without READ_ONLY to write",
-                    lake.location()
-                ))
-            } else {
-                PinkDbError::Execution(format!(
-                    "table \"{db}.{name}\" is attached read-only from lake {} (attached \
+                        lake.location()
+                    ))
+                } else {
+                    PinkDbError::Execution(format!(
+                        "table \"{db}.{name}\" is attached read-only from lake {} (attached \
                      lake tables are read-only); ATTACH the lake as a database to write",
-                    lake.location()
-                ))
-            }
-        })
+                        lake.location()
+                    ))
+                }
+            })
     }
 
     /// Refuse a statement that is about to be WAL-logged and reads a table a
@@ -642,15 +668,17 @@ impl PinkDb {
         if !self.is_durable() || self.attached_lakes.is_empty() {
             return Ok(());
         }
+        let session = self.current_ns().clone();
         let mut reads = std::collections::HashSet::new();
-        crate::plan::collect_tables_read(plan, self.current_db(), &mut reads);
+        crate::plan::collect_tables_read(plan, &session, &mut reads);
         // A materialized-view refresh re-evaluates its defining query: the
         // base tables are reads the plan itself cannot name (wave 80).
-        for (db, table) in self.mv_reads_of(plan, self.current_db()) {
-            reads.insert((db, table));
+        for (ns, table) in self.mv_reads_of(plan, &session) {
+            reads.insert((ns, table));
         }
-        for (db, table) in reads {
-            if let Some((_, lake)) = self.attached_lookup(&db, &table)
+        for (ns, table) in reads {
+            let db = ns.db();
+            if let Some((_, lake)) = self.attached_lookup(db, ns.schema(), &table)
                 && !self.is_lake_reader(lake)
             {
                 return Err(PinkDbError::Execution(format!(
@@ -728,6 +756,7 @@ mod tests {
                 location: location.to_string(),
                 tables: vec![AttachedTable {
                     db: db.to_string(),
+                    schema_name: "main".to_string(),
                     table: table.to_string(),
                     rows: rows.len() as u64,
                     schema,
@@ -893,6 +922,7 @@ mod tests {
                 location: location.to_string(),
                 tables: vec![AttachedTable {
                     db: "main".to_string(),
+                    schema_name: "main".to_string(),
                     table: "t".to_string(),
                     rows: rows.len() as u64,
                     schema,
@@ -1784,6 +1814,7 @@ mod tests {
             let (_, (schema, rows)) = self.data.iter().find(|(v, _)| *v == version)?;
             Some(AttachedTable {
                 db: "main".to_string(),
+                schema_name: "main".to_string(),
                 table: "t".to_string(),
                 rows: rows.len() as u64,
                 schema: schema.clone(),
@@ -2137,7 +2168,10 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("Scan main.t AT (VERSION => 2)"), "{text}");
+        assert!(
+            text.contains("Scan main.main.t AT (VERSION => 2)"),
+            "{text}"
+        );
         let rows = query(
             &mut db,
             "EXPLAIN SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '1970-01-01 00:00:02.5');",

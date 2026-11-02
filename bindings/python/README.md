@@ -134,7 +134,7 @@ layer; `Connection` in the DB-API section above is the same class plus
 
 | Attribute | Contents |
 |---|---|
-| `kind` | `selected`, `created`, `inserted`, `updated`, `deleted`, `began`, `committed`, `rolledback`, `created_view`, `dropped_table`, `dropped_view`, `created_database`, `dropped_database`, `used`, `loaded_extension`, `checkpointed`, `altered_table`, `created_user`, `altered_user`, `dropped_user`, `created_role`, `dropped_role`, `granted`, `revoked` |
+| `kind` | `selected`, `created`, `inserted`, `updated`, `deleted`, `began`, `committed`, `rolledback`, `created_view`, `dropped_table`, `dropped_view`, `created_database`, `dropped_database`, `used`, `loaded_extension`, `checkpointed`, `altered_table`, `created_user`, `altered_user`, `dropped_user`, `created_role`, `dropped_role`, `granted`, `revoked`, `set_variable`, `created_schema`, `dropped_schema` |
 | `columns` / `column_types` | SELECT column names and types (`boolean`, `integer`, `bigint`, `double`, `varchar`, `date`, `timestamp`, `decimal`, `interval`) |
 | `rows` | SELECT rows as Python values (see mapping below) |
 | `affected` | row count for INSERT/UPDATE/DELETE, else 0 |

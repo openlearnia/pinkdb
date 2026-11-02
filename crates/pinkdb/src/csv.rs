@@ -1036,10 +1036,14 @@ fn field_value(text: &str, dtype: DataType) -> Result<Value> {
                 )));
             }
         }
+        DataType::Uuid => Value::Uuid(
+            crate::uuid::parse(text)
+                .ok_or_else(|| PinkDbError::Type(format!("cannot parse \"{text}\" as UUID")))?,
+        ),
         DataType::Decimal { precision, scale } => {
             let v = crate::types::parse_decimal_str(text, precision, scale)
                 .map_err(PinkDbError::Type)?;
-            Value::Decimal(v, scale)
+            Value::decimal(v, scale)
         }
         DataType::Interval => match crate::types::parse_interval(text) {
             Some(iv) => Value::Interval {

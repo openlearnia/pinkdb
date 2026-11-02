@@ -207,10 +207,13 @@ pub const WAL_MAGIC: &[u8; 8] = b"PINKWAL1";
 /// (wave 45o) extends the record payload with the frame's touched-object set
 /// (see [`FrameSets`]), which is what optimistic multi-writer commits
 /// validate against; version 5 (wave 107c) appends the replay memo of the
-/// record's `external_io` host-scalar calls (see [`ExtCall`]). Every durable
-/// open rewrites legacy files in place under the write lease; an older build
-/// refuses a v5 file with a clean version error before it reads any record.
-pub const WAL_VERSION: u32 = 5;
+/// record's `external_io` host-scalar calls (see [`ExtCall`]); version 6 (wave
+/// 132b) appends the record's persistent-secret section (see
+/// [`SECRETS_MARKER`]) when the record changed the store's secrets. Every
+/// durable open rewrites a v2/v3 file in place under the write lease; an
+/// older build refuses a v6 file with a clean version error before it reads
+/// any record.
+pub const WAL_VERSION: u32 = 6;
 /// An engine WAL payload detached from a local WAL file. Object-backed
 /// catalog stores use this framing so each immutable object is one logical
 /// WAL record without inheriting a local file's generation, LSN, or nonce.
@@ -1112,6 +1115,10 @@ pub(crate) struct Record {
     sets: Option<FrameSets>,
     /// The external-call memo (payload v5); empty for a legacy record.
     memo: Vec<ExtCall>,
+    /// The store's persistent secrets after this record's statements ran
+    /// (wave 132b), in their own section. `None` = no section, so replay
+    /// keeps whatever the checkpoint and earlier records installed.
+    secrets: Option<Vec<crate::secret::Secret>>,
 }
 
 /// Default WAL size that triggers an automatic checkpoint after a commit
@@ -1142,11 +1149,11 @@ pub struct Wal {
     /// Set after a write/sync failure: appends are refused so a retry can
     /// never append a duplicate record after a partially durable write.
     poisoned: Option<String>,
-    /// The replay session's database after the records appended so far
-    /// (`None` = unknown, so the next append prefixes unconditionally).
+    /// The replay session's `(database, schema)` after the records appended
+    /// so far (`None` = unknown, so the next append prefixes unconditionally).
     /// Multi-connection appends emit a `USE` prefix whenever their session
-    /// differs, so every record replays in the database it was executed in.
-    session_db: Option<String>,
+    /// differs, so every record replays where it was executed.
+    session_db: Option<crate::storage::SchemaPath>,
     /// Extension paths whose `LOAD EXTENSION` the CURRENT WAL generation
     /// already covers: a record touching such an extension is not prefixed
     /// again. Seeded after recovery from the extensions replay loaded (the
@@ -1894,6 +1901,7 @@ impl Wal {
         &mut self,
         stmts: &[String],
         sets: Option<&FrameSets>,
+        secrets: Option<&[crate::secret::Secret]>,
         memo: &[ExtCall],
     ) -> Result<()> {
         if let Some(msg) = &self.poisoned {
@@ -1914,7 +1922,7 @@ impl Wal {
         if let Some(s) = &mut sets {
             s.canonicalize();
         }
-        let payload = encode_payload(stmts, sets.as_ref(), memo)?;
+        let payload = encode_payload(stmts, sets.as_ref(), secrets, memo)?;
         let len = record_len_guard(payload.len())?;
         let portable = encode_portable_record(&payload)?;
         let lsn = self.last_lsn.checked_add(1).ok_or_else(|| {
@@ -1983,8 +1991,8 @@ impl Wal {
     /// Record the replay-session database after the records appended so far.
     /// Called after recovery (the replay leaves the session wherever the last
     /// record did) and by the embedded path (whose session is the store's).
-    pub(crate) fn set_session_db(&mut self, db: &str) {
-        self.session_db = Some(db.to_string());
+    pub(crate) fn set_session_db(&mut self, ns: &crate::storage::SchemaPath) {
+        self.session_db = Some(ns.clone());
     }
 
     /// Mark extension paths as already covered by the current WAL generation.
@@ -2027,25 +2035,26 @@ impl Wal {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_in_session(
         &mut self,
-        db_before: Option<&str>,
-        db_after: &str,
+        db_before: Option<&crate::storage::SchemaPath>,
+        db_after: &crate::storage::SchemaPath,
         stmts: &[String],
         touched_extensions: &[String],
         loaded_extensions: &[String],
         sets: Option<&FrameSets>,
+        secrets: Option<&[crate::secret::Secret]>,
         memo: &[ExtCall],
     ) -> Result<()> {
         let mut rec: Vec<String> = Vec::with_capacity(stmts.len() + touched_extensions.len() + 1);
         if let Some(before) = db_before
-            && !self
-                .session_db
-                .as_deref()
-                .is_some_and(|s| s.eq_ignore_ascii_case(before))
+            && self.session_db.as_ref() != Some(before)
         {
-            // Quote the name: databases may hold spaces/keywords when
-            // created with a quoted identifier (`CREATE DATABASE
-            // "My Db"`).
-            rec.push(format!("USE \"{}\"", before.replace('"', "\"\"")));
+            // Quote both parts: databases and schemas may hold spaces,
+            // dots or keywords when created with a quoted identifier.
+            rec.push(format!(
+                "USE \"{}\".\"{}\"",
+                before.db().replace('"', "\"\""),
+                before.schema().replace('"', "\"\"")
+            ));
         }
         let mut prefixed: HashSet<&str> = HashSet::new();
         for path in touched_extensions {
@@ -2059,14 +2068,14 @@ impl Wal {
             rec.push(format!("LOAD EXTENSION '{}'", path.replace('\'', "''")));
         }
         rec.extend_from_slice(stmts);
-        self.append(&rec, sets, memo)?;
+        self.append(&rec, sets, secrets, memo)?;
         // Covered only after a successful append.
         self.tracked_extensions
             .extend(touched_extensions.iter().cloned());
         self.tracked_extensions
             .extend(loaded_extensions.iter().cloned());
         match db_before {
-            Some(_) => self.session_db = Some(db_after.to_string()),
+            Some(_) => self.session_db = Some(db_after.clone()),
             None => self.session_db = None,
         }
         Ok(())
@@ -2235,13 +2244,14 @@ fn decode_portable_record(bytes: &[u8], lsn: u64) -> Result<Record> {
             "catalog WAL record checksum mismatch".to_string(),
         ));
     }
-    let (stmts, sets, memo) = decode_payload(payload).map_err(|message| {
+    let (stmts, sets, secrets, memo) = decode_payload(payload).map_err(|message| {
         PinkDbError::Execution(format!("invalid catalog WAL record: {message}"))
     })?;
     Ok(Record {
         lsn,
         stmts,
         sets,
+        secrets,
         memo,
     })
 }
@@ -2256,11 +2266,12 @@ fn record_len_guard(len: usize) -> Result<u32> {
 }
 
 /// The catalog objects one committed unit touches: every table any of its
-/// statements reads or writes, plus the databases its `CREATE/DROP DATABASE`
-/// statements name. Wave 45o stores this in every WAL frame (payload v4), so
-/// commit validation can compare a transaction's read∪write set with the
-/// frames another writer published **without** re-binding their SQL against a
-/// store that may hold uncommitted state.
+/// statements reads or writes, plus the schemas and databases its
+/// `CREATE/DROP SCHEMA` / `CREATE/DROP DATABASE` statements name. Wave 45o
+/// stores this in every WAL frame (payload v4), so commit validation can
+/// compare a transaction's read∪write set with the frames another writer
+/// published **without** re-binding their SQL against a store that may hold
+/// uncommitted state.
 ///
 /// Granularity is table-level, exactly like the in-process commit check
 /// (`db.rs`), and the frame's *read* half is included: a transaction that
@@ -2269,18 +2280,39 @@ fn record_len_guard(len: usize) -> Result<u32> {
 /// lowercased) keeps the encoded bytes deterministic.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct FrameSets {
-    /// `(database, table)`, lowercased.
-    tables: Vec<(String, String)>,
+    /// `(database, schema, table)`, lowercased.
+    tables: Vec<(String, String, String)>,
+    /// Schemas created or dropped by the frame, lowercased `(db, schema)`
+    /// pairs.
+    schemas: Vec<(String, String)>,
     /// Databases created or dropped by the frame, lowercased.
     dbs: Vec<String>,
 }
 
 impl FrameSets {
-    /// Record a `(database, table)` dependency (called for both reads and
-    /// writes; duplicates are removed by [`FrameSets::canonicalize`]).
-    pub(crate) fn add_table(&mut self, db: &str, table: &str) {
-        self.tables
-            .push((db.to_ascii_lowercase(), table.to_ascii_lowercase()));
+    /// Record a `(database, schema, table)` dependency (called for both reads
+    /// and writes; duplicates are removed by [`FrameSets::canonicalize`]).
+    ///
+    /// A temporary table is session-local, so it can never conflict with — or
+    /// be rebuilt by — another session's replay; dropping it here keeps a
+    /// transaction's touched set from naming `temp` at all.
+    pub(crate) fn add_table(&mut self, ns: &crate::storage::SchemaPath, table: &str) {
+        if ns.temp_id().is_some() {
+            return;
+        }
+        self.tables.push((
+            ns.db().to_ascii_lowercase(),
+            ns.schema().to_ascii_lowercase(),
+            table.to_ascii_lowercase(),
+        ));
+    }
+
+    /// Record a schema-level mutation (`CREATE/DROP SCHEMA`).
+    pub(crate) fn add_schema(&mut self, ns: &crate::storage::SchemaPath) {
+        self.schemas.push((
+            ns.db().to_ascii_lowercase(),
+            ns.schema().to_ascii_lowercase(),
+        ));
     }
 
     /// Record a database-level mutation (`CREATE/DROP DATABASE`).
@@ -2288,22 +2320,24 @@ impl FrameSets {
         self.dbs.push(db.to_ascii_lowercase());
     }
 
-    /// The `(database, table)` pairs (canonical after
+    /// The `(database, schema, table)` triples (canonical after
     /// [`FrameSets::canonicalize`]).
-    pub(crate) fn table_pairs(&self) -> &[(String, String)] {
+    pub(crate) fn table_refs(&self) -> &[(String, String, String)] {
         &self.tables
     }
 
     /// Record a whole other touched-set (transaction accumulation).
     pub(crate) fn extend(&mut self, other: &FrameSets) {
         self.tables.extend_from_slice(&other.tables);
+        self.schemas.extend_from_slice(&other.schemas);
         self.dbs.extend_from_slice(&other.dbs);
     }
 
-    /// Record only `other`'s database-level mutations. Used by COMMIT's
-    /// conflict set, which takes its tables from the transaction's own
-    /// read/write sets rather than its buffered statements' touched set.
+    /// Record only `other`'s schema- and database-level mutations. Used by
+    /// COMMIT's conflict set, which takes its tables from the transaction's
+    /// own read/write sets rather than its buffered statements' touched set.
     pub(crate) fn extend_databases(&mut self, other: &FrameSets) {
+        self.schemas.extend_from_slice(&other.schemas);
         self.dbs.extend_from_slice(&other.dbs);
     }
 
@@ -2311,6 +2345,8 @@ impl FrameSets {
     pub(crate) fn canonicalize(&mut self) {
         self.tables.sort();
         self.tables.dedup();
+        self.schemas.sort();
+        self.schemas.dedup();
         self.dbs.sort();
         self.dbs.dedup();
     }
@@ -2319,25 +2355,70 @@ impl FrameSets {
     /// the first conflicting object, or `None` when the two are disjoint.
     /// Both sides must be canonicalized.
     pub(crate) fn conflict_with(&self, ours: &FrameSets) -> Option<String> {
-        for db in &self.dbs {
-            if ours.dbs.contains(db) {
-                return Some(format!("database \"{db}\""));
-            }
+        // A conflict always pairs one side's *mutation* with the *other*
+        // side's object: a frame that creates a database and a table in it
+        // touched nothing that an unrelated frame's table could invalidate.
+        //
+        // A database mutation conflicts with the other side's schemas and
+        // tables of that database (conservative for `CREATE DATABASE`).
+        let db = self.dbs.iter().find(|db| {
+            both(&self.dbs, &ours.dbs, db)
+                || ours.schemas.iter().any(|(sdb, _)| sdb == *db)
+                || ours.tables.iter().any(|(tdb, _, _)| tdb == *db)
+        });
+        if let Some(db) = db {
+            return Some(format!("database \"{db}\""));
         }
-        for (db, table) in &self.tables {
-            if ours.tables.contains(&(db.clone(), table.clone())) || ours.dbs.contains(db) {
-                return Some(format!("table \"{db}.{table}\""));
-            }
+        let db = ours.dbs.iter().find(|db| {
+            self.schemas.iter().any(|(sdb, _)| sdb == *db)
+                || self.tables.iter().any(|(tdb, _, _)| tdb == *db)
+        });
+        if let Some(db) = db {
+            return Some(format!("database \"{db}\""));
         }
-        // Our database-level `DROP DATABASE` conflicts with a frame whose
-        // tables live in that database (conservative for `CREATE DATABASE`).
-        for db in &ours.dbs {
-            if self.tables.iter().any(|(tdb, _)| tdb == db) {
-                return Some(format!("database \"{db}\""));
+        // A schema mutation conflicts with the other side's same schema or any
+        // table of it.
+        let schema = self.schemas.iter().find(|(db, schema)| {
+            both(&self.schemas, &ours.schemas, &(db.clone(), schema.clone()))
+                || ours
+                    .tables
+                    .iter()
+                    .any(|(tdb, ts, _)| tdb == db && ts == schema)
+        });
+        if let Some((db, schema)) = schema {
+            return Some(format!("schema \"{db}.{schema}\""));
+        }
+        let schema = ours.schemas.iter().find(|(db, schema)| {
+            self.tables
+                .iter()
+                .any(|(tdb, ts, _)| tdb == db && ts == schema)
+        });
+        if let Some((db, schema)) = schema {
+            return Some(format!("schema \"{db}.{schema}\""));
+        }
+        for (db, schema, table) in &self.tables {
+            if both(
+                &self.tables,
+                &ours.tables,
+                &(db.clone(), schema.clone(), table.clone()),
+            ) {
+                // A `main`-schema table keeps the `db.table` wording (the
+                // schema level is invisible to SQL until wave 131b).
+                return Some(if schema == "main" {
+                    format!("table \"{db}.{table}\"")
+                } else {
+                    format!("table \"{db}.{schema}.{table}\"")
+                });
             }
         }
         None
     }
+}
+
+/// Is `item` in both sets? (The conflict checks are symmetric, and one side
+/// is always `self`.)
+fn both<T: PartialEq>(a: &[T], b: &[T], item: &T) -> bool {
+    a.iter().any(|x| x == item) && b.iter().any(|x| x == item)
 }
 
 /// `sets_len` value marking a frame whose touched set is unknown (a record
@@ -2346,19 +2427,40 @@ impl FrameSets {
 /// reach a validation window it is treated as conflicting (conservative).
 const SETS_UNKNOWN: u32 = u32::MAX;
 
-/// Encode the frame's touched set (payload v4, format 1):
-/// `u8 ver(=1) | u32 n_tables | n*(u16 db_len | db | u16 t_len | t) |
+/// Marks the optional secret-snapshot section that follows the touched sets
+/// (wave 132b). A payload without secrets is byte-identical to a v5 one, so
+/// the marker is the whole version gate: it is larger than any possible
+/// record length, which no statement length can be. A build that predates
+/// the section refuses the record (its first "statement length" overruns the
+/// payload), never misreads it.
+const SECRETS_MARKER: u32 = 0x5343_5254;
+
+/// Encode the frame's touched set (payload v4, format 2):
+/// `u8 ver(=2) | u32 n_tables | n*(u16 db_len | db | u16 s_len | s |
+///  u16 t_len | t) | u32 n_schemas | n*(u16 db_len | db | u16 s_len | s) |
 ///  u32 n_dbs | n*(u16 db_len | db)`.
 fn encode_sets(sets: &FrameSets) -> Result<Vec<u8>> {
     let mut sets = sets.clone();
     sets.canonicalize();
     let mut out = Vec::with_capacity(1 + 4 + sets.dbs.len() * 10);
-    out.push(1u8);
+    out.push(2u8);
     let n = u32::try_from(sets.tables.len())
         .map_err(|_| PinkDbError::Execution("too many tables in one WAL record".to_string()))?;
     out.extend_from_slice(&n.to_le_bytes());
-    for (db, table) in &sets.tables {
-        for name in [db.as_str(), table.as_str()] {
+    for (db, schema, table) in &sets.tables {
+        for name in [db.as_str(), schema.as_str(), table.as_str()] {
+            let l = u16::try_from(name.len()).map_err(|_| {
+                PinkDbError::Execution("name too long for a WAL record".to_string())
+            })?;
+            out.extend_from_slice(&l.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+        }
+    }
+    let n = u32::try_from(sets.schemas.len())
+        .map_err(|_| PinkDbError::Execution("too many schemas in one WAL record".to_string()))?;
+    out.extend_from_slice(&n.to_le_bytes());
+    for (db, schema) in &sets.schemas {
+        for name in [db.as_str(), schema.as_str()] {
             let l = u16::try_from(name.len()).map_err(|_| {
                 PinkDbError::Execution("name too long for a WAL record".to_string())
             })?;
@@ -2378,7 +2480,7 @@ fn encode_sets(sets: &FrameSets) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decode the sets section written by [`encode_sets`] (payload format 1).
+/// Decode the sets section written by [`encode_sets`] (payload format 2).
 fn decode_sets(bytes: &[u8]) -> std::result::Result<FrameSets, String> {
     let mut pos = 0usize;
     let need = |pos: usize, n: usize| -> std::result::Result<(), String> {
@@ -2389,8 +2491,11 @@ fn decode_sets(bytes: &[u8]) -> std::result::Result<FrameSets, String> {
         }
     };
     need(pos, 1)?;
-    if bytes[pos] != 1 {
-        return Err(format!("unsupported frame-sets format {}", bytes[pos]));
+    if bytes[pos] != 2 {
+        return Err(format!(
+            "unsupported frame-sets format {} (this build writes format 2)",
+            bytes[pos]
+        ));
     }
     pos += 1;
     let u32_at = |pos: &mut usize| -> std::result::Result<u32, String> {
@@ -2411,14 +2516,24 @@ fn decode_sets(bytes: &[u8]) -> std::result::Result<FrameSets, String> {
         Ok(s)
     };
     let nt = u32_at(&mut pos)? as usize;
-    if nt > bytes.len() / 4 {
+    if nt > bytes.len() / 6 {
         return Err(format!("implausible frame-sets table count {nt}"));
     }
     let mut sets = FrameSets::default();
     for _ in 0..nt {
         let db = str_at(&mut pos)?;
+        let schema = str_at(&mut pos)?;
         let table = str_at(&mut pos)?;
-        sets.tables.push((db, table));
+        sets.tables.push((db, schema, table));
+    }
+    let ns = u32_at(&mut pos)? as usize;
+    if ns > bytes.len() / 4 {
+        return Err(format!("implausible frame-sets schema count {ns}"));
+    }
+    for _ in 0..ns {
+        let db = str_at(&mut pos)?;
+        let schema = str_at(&mut pos)?;
+        sets.schemas.push((db, schema));
     }
     let nd = u32_at(&mut pos)? as usize;
     if nd > bytes.len() / 2 {
@@ -2439,7 +2554,12 @@ fn decode_sets(bytes: &[u8]) -> std::result::Result<FrameSets, String> {
 /// `sets_len` is [`SETS_UNKNOWN`] when the frame's touched set is unknown (a
 /// legacy record adopted by an upgrade), else the [`encode_sets`] block's
 /// byte length.
-fn encode_payload(stmts: &[String], sets: Option<&FrameSets>, memo: &[ExtCall]) -> Result<Vec<u8>> {
+fn encode_payload(
+    stmts: &[String],
+    sets: Option<&FrameSets>,
+    secrets: Option<&[crate::secret::Secret]>,
+    memo: &[ExtCall],
+) -> Result<Vec<u8>> {
     let count = u32::try_from(stmts.len()).map_err(|_| {
         PinkDbError::Execution("transaction has too many statements for one WAL record".to_string())
     })?;
@@ -2452,8 +2572,17 @@ fn encode_payload(stmts: &[String], sets: Option<&FrameSets>, memo: &[ExtCall]) 
             .map_err(|_| PinkDbError::Execution("frame sets too large".to_string()))?,
         None => SETS_UNKNOWN,
     };
+    let secrets_bytes = match secrets {
+        Some(secrets) => {
+            let mut out = Vec::new();
+            out.extend_from_slice(&SECRETS_MARKER.to_le_bytes());
+            encode_secrets(&mut out, secrets)?;
+            out
+        }
+        None => Vec::new(),
+    };
     let memo_bytes = encode_ext_calls(memo)?;
-    let mut total = 8usize + sets_bytes.len();
+    let mut total = 8usize + sets_bytes.len() + secrets_bytes.len();
     for s in stmts {
         let n = u32::try_from(s.len()).map_err(|_| {
             PinkDbError::Execution("statement is too large for a WAL record".to_string())
@@ -2471,6 +2600,7 @@ fn encode_payload(stmts: &[String], sets: Option<&FrameSets>, memo: &[ExtCall]) 
     out.extend_from_slice(&count.to_le_bytes());
     out.extend_from_slice(&sets_len.to_le_bytes());
     out.extend_from_slice(&sets_bytes);
+    out.extend_from_slice(&secrets_bytes);
     for s in stmts {
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
         out.extend_from_slice(s.as_bytes());
@@ -2494,6 +2624,7 @@ const VALUE_DECIMAL: u8 = 8;
 const VALUE_INTERVAL: u8 = 9;
 const VALUE_VARIANT: u8 = 10;
 const VALUE_ARRAY: u8 = 11;
+const VALUE_UUID: u8 = 12;
 
 fn encode_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     let n = u32::try_from(bytes.len()).map_err(|_| {
@@ -2537,7 +2668,9 @@ fn encode_value(out: &mut Vec<u8>, value: &crate::types::Value) -> Result<()> {
             out.push(VALUE_TIMESTAMP);
             out.extend_from_slice(&t.to_le_bytes());
         }
-        Value::Decimal(v, scale) => {
+        Value::Decimal {
+            value: v, scale, ..
+        } => {
             out.push(VALUE_DECIMAL);
             out.extend_from_slice(&v.to_le_bytes());
             out.push(*scale);
@@ -2561,6 +2694,10 @@ fn encode_value(out: &mut Vec<u8>, value: &crate::types::Value) -> Result<()> {
         Value::Array(a) => {
             out.push(VALUE_ARRAY);
             encode_bytes(out, &crate::array::encode_cell(a))?;
+        }
+        Value::Uuid(bits) => {
+            out.push(VALUE_UUID);
+            out.extend_from_slice(&bits.to_le_bytes());
         }
     }
     Ok(())
@@ -2661,7 +2798,7 @@ fn decode_value(r: &mut Payload<'_>) -> std::result::Result<Value, String> {
         VALUE_DECIMAL => {
             let value = r.i128()?;
             let scale = r.u8()?;
-            Value::Decimal(value, scale)
+            Value::decimal(value, scale)
         }
         VALUE_INTERVAL => Value::Interval {
             months: r.i32()?,
@@ -2675,6 +2812,12 @@ fn decode_value(r: &mut Payload<'_>) -> std::result::Result<Value, String> {
         VALUE_ARRAY => {
             let value = crate::array::decode_cell(r.bytes()?).map_err(|e| e.to_string())?;
             Value::Array(std::sync::Arc::new(value))
+        }
+        VALUE_UUID => {
+            let bytes = r.take(16)?;
+            Value::Uuid(u128::from_le_bytes(
+                bytes.try_into().expect("16 bytes were read"),
+            ))
         }
         other => return Err(format!("unknown WAL memo value tag {other}")),
     })
@@ -2758,8 +2901,14 @@ fn decode_payload_legacy(payload: &[u8]) -> std::result::Result<Vec<String>, Str
     Ok(stmts)
 }
 
-/// A decoded payload: its statements, the touched sets and the replay memo.
-type PayloadParts = (Vec<String>, Option<FrameSets>, Vec<ExtCall>);
+/// A decoded payload: its statements, the touched sets, the secret snapshot
+/// and the replay memo.
+type PayloadParts = (
+    Vec<String>,
+    Option<FrameSets>,
+    Option<Vec<crate::secret::Secret>>,
+    Vec<ExtCall>,
+);
 
 /// Bounds-checked v4/v5 payload decode. `Err` means a CRC-valid record is
 /// malformed (hard error on replay, never a silent drop).
@@ -2769,7 +2918,7 @@ fn decode_payload(payload: &[u8]) -> std::result::Result<PayloadParts, String> {
     }
     let count = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes")) as usize;
     let sets_len = u32::from_le_bytes(payload[4..8].try_into().expect("4 bytes"));
-    let (sets, stmts_start) = if sets_len == SETS_UNKNOWN {
+    let (sets, sets_end) = if sets_len == SETS_UNKNOWN {
         (None, 8usize)
     } else {
         let n = sets_len as usize;
@@ -2781,9 +2930,95 @@ fn decode_payload(payload: &[u8]) -> std::result::Result<PayloadParts, String> {
         }
         (Some(decode_sets(&payload[8..8 + n])?), 8 + n)
     };
+    let (secrets, stmts_start) = decode_secrets(payload, sets_end)?;
     let (stmts, pos) = decode_statements(payload, stmts_start, count)?;
     let memo = decode_ext_calls(payload, pos)?;
-    Ok((stmts, sets, memo))
+    Ok((stmts, sets, secrets, memo))
+}
+
+/// Decode the optional secret section at `pos` (wave 132b). Absent when the
+/// marker is missing, which is the v4/v5 layout.
+fn decode_secrets(
+    payload: &[u8],
+    pos: usize,
+) -> std::result::Result<(Option<Vec<crate::secret::Secret>>, usize), String> {
+    if payload.len().saturating_sub(pos) < 4 {
+        return Ok((None, pos));
+    }
+    if u32::from_le_bytes(payload[pos..pos + 4].try_into().expect("4 bytes")) != SECRETS_MARKER {
+        return Ok((None, pos));
+    }
+    let mut r = Payload::new(payload, pos + 4);
+    let count = r.u32()? as usize;
+    if count > payload.len() / 8 + 1 {
+        return Err(format!("implausible secret count {count}"));
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = std::str::from_utf8(r.bytes()?)
+            .map_err(|_| "secret name is not UTF-8".to_string())?
+            .to_string();
+        let Some(type_) = crate::secret::SecretType::from_tag(r.u8()?) else {
+            return Err("unknown secret type tag".to_string());
+        };
+        let n_scopes = r.u32()? as usize;
+        if n_scopes > r.remaining() {
+            return Err("truncated secret scopes".to_string());
+        }
+        let mut scopes = Vec::with_capacity(n_scopes);
+        for _ in 0..n_scopes {
+            scopes.push(
+                std::str::from_utf8(r.bytes()?)
+                    .map_err(|_| "secret scope is not UTF-8".to_string())?
+                    .to_string(),
+            );
+        }
+        let n_fields = r.u32()? as usize;
+        if n_fields > r.remaining() {
+            return Err("truncated secret fields".to_string());
+        }
+        let mut fields = std::collections::BTreeMap::new();
+        for _ in 0..n_fields {
+            let key = std::str::from_utf8(r.bytes()?)
+                .map_err(|_| "secret field name is not UTF-8".to_string())?
+                .to_string();
+            let value = std::str::from_utf8(r.bytes()?)
+                .map_err(|_| "secret field value is not UTF-8".to_string())?
+                .to_string();
+            fields.insert(key, value);
+        }
+        out.push(crate::secret::Secret::from_stored(
+            name, type_, fields, scopes,
+        ));
+    }
+    Ok((Some(out), r.pos))
+}
+
+/// Encode the secret-snapshot entries that follow [`SECRETS_MARKER`].
+fn encode_secrets(out: &mut Vec<u8>, secrets: &[crate::secret::Secret]) -> Result<()> {
+    let count = u32::try_from(secrets.len())
+        .map_err(|_| PinkDbError::Execution("too many secrets for one WAL record".to_string()))?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for secret in secrets {
+        let name = secret.name().as_bytes();
+        let n = u32::try_from(name.len())
+            .map_err(|_| PinkDbError::Execution("secret name is too long".to_string()))?;
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(name);
+        out.push(secret.type_().tag());
+        let scopes = secret.scopes();
+        out.extend_from_slice(&(scopes.len() as u32).to_le_bytes());
+        for scope in scopes {
+            encode_bytes(out, scope.as_bytes())?;
+        }
+        let fields = secret.fields();
+        out.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+        for (key, value) in fields {
+            encode_bytes(out, key.as_bytes())?;
+            encode_bytes(out, value.as_bytes())?;
+        }
+    }
+    Ok(())
 }
 
 /// Parse records from `start` onward. A short read, or an LSN that does not
@@ -2835,7 +3070,7 @@ fn parse_records(
         if end > data.len() {
             break;
         }
-        let (stmts, sets, memo) = match cipher {
+        let (stmts, sets, secrets, memo) = match cipher {
             Some(c) => {
                 let next = ordinal_base
                     .checked_add(ordinal)
@@ -2865,6 +3100,7 @@ fn parse_records(
                                 decode_payload_legacy(&plain).map_err(|e| {
                                     format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
                                 })?,
+                                None,
                                 None,
                                 Vec::new(),
                             )
@@ -2906,6 +3142,7 @@ fn parse_records(
                             format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
                         })?,
                         None,
+                        None,
                         Vec::new(),
                     )
                 }
@@ -2915,6 +3152,7 @@ fn parse_records(
             lsn,
             stmts,
             sets,
+            secrets,
             memo,
         });
         prev = lsn;
@@ -2953,7 +3191,12 @@ fn rewrite_encrypted(
             Some((1, last_lsn)),
         )?)?;
         for rec in records {
-            let payload = encode_payload(&rec.stmts, rec.sets.as_ref(), &rec.memo)?;
+            let payload = encode_payload(
+                &rec.stmts,
+                rec.sets.as_ref(),
+                rec.secrets.as_deref(),
+                &rec.memo,
+            )?;
             let len = record_len_guard(payload.len())?;
             let ct = fresh.seal(rec.lsn, &payload)?;
             f.write_all(&len.to_le_bytes())?;
@@ -2992,7 +3235,7 @@ fn upgrade_plain(path: &Path, data: &[u8], generation: u64, records_start: usize
     let slot = slot_bytes(1, last_lsn, WAL_SLOT_DOMAIN);
     out[WAL_SLOT_A as usize..WAL_SLOT_A as usize + SLOT_LEN].copy_from_slice(&slot);
     for rec in &records {
-        let payload = encode_payload(&rec.stmts, None, &rec.memo)?;
+        let payload = encode_payload(&rec.stmts, None, rec.secrets.as_deref(), &rec.memo)?;
         let len = record_len_guard(payload.len())?;
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(&rec.lsn.to_le_bytes());
@@ -4102,7 +4345,7 @@ impl PinkDb {
         }
         // Replay leaves the session wherever the last record did (a logged
         // `USE` or the start at `main`): later appends must know that.
-        handle.set_session_db(db.current_db());
+        handle.set_session_db(db.current_ns());
         // Every extension replay loaded is covered by the current WAL
         // generation (the live WAL is exactly what was just replayed): a
         // later record touching it must not emit a redundant prefix.
@@ -4222,7 +4465,7 @@ impl PinkDb {
         let wal_path = wal.path.clone();
         let ckpt = wal.checkpoint_path.clone();
         let tmp = tmp_path(&ckpt);
-        let local_session = self.current_db.clone();
+        let local_session = self.current_ns().clone();
         let mut mutated = false;
 
         // 1. Recovery state machine (idempotent under the lease): finish an
@@ -4305,13 +4548,13 @@ impl PinkDb {
             for rec in &records {
                 wal.journal_push(rec.lsn, rec.sets.clone());
             }
-        } else if self.database_exists(&local_session) {
+        } else if self.schema_exists(&local_session) {
             // No new frames: the local session is still valid (a full
             // rebuild adopted the checkpoint's default session).
-            self.set_current_db(&local_session);
+            self.set_current_ns(local_session);
         } else {
-            let fallback = self.fallback_db();
-            self.set_current_db(&fallback);
+            let fallback = crate::storage::SchemaPath::main(&self.fallback_db());
+            self.set_current_ns(fallback);
         }
 
         // 5. Bookkeeping: the applied position and the epoch cache.
@@ -4575,7 +4818,7 @@ impl PinkDb {
             }
         }
         if !records.is_empty() {
-            let local_session = self.current_db.clone();
+            let local_session = self.current_ns().clone();
             self.replay_frames(&mut wal, &records, &local_session)?;
             for rec in &records {
                 wal.journal_push(rec.lsn, rec.sets.clone());
@@ -4644,7 +4887,7 @@ impl PinkDb {
         &mut self,
         wal: &mut Wal,
         records: &[Record],
-        local_session: &str,
+        local_session: &crate::storage::SchemaPath,
     ) -> Result<()> {
         // Two callers: the refresh (never inside an embedded transaction) and
         // the optimistic commit check, where an open transaction's changes
@@ -4656,10 +4899,10 @@ impl PinkDb {
         // lineage database falls back (the record then cannot name it either
         // — it was appended bare precisely because the database vanished).
         let start = match wal.session_db.clone() {
-            Some(s) if self.database_exists(&s) => s,
-            _ => self.fallback_db(),
+            Some(ns) if self.schema_exists(&ns) => ns,
+            _ => self.fallback_ns(),
         };
-        self.set_current_db(&start);
+        self.set_current_ns(start);
         // H5: a replayed `LOAD EXTENSION` is never auto-loaded. The record
         // may name an extension this process already has mapped (the
         // registry is process-local and never persisted, so a registry
@@ -4672,6 +4915,11 @@ impl PinkDb {
         let previously_loaded: HashSet<String> =
             self.loaded_extension_paths().into_iter().collect();
         self.replaying = true;
+        // A frame may carry a procedure that writes a temp table as well as a
+        // persistent one. Its temp effect belongs to the session that ran it,
+        // not to this store's embedded session, so replay into a throwaway
+        // catalog set and restore the live one afterwards.
+        let saved_temp = std::mem::take(&mut self.temp);
         let mut result = Ok(());
         for rec in records {
             if let Err(e) = replay_record(self, rec) {
@@ -4679,6 +4927,7 @@ impl PinkDb {
                 break;
             }
         }
+        self.temp = saved_temp;
         self.replaying = false;
         if result.is_ok() {
             // Extensions these frames loaded are covered by the current WAL
@@ -4695,15 +4944,15 @@ impl PinkDb {
                 .collect();
             wal.seed_tracked_extensions(newly_loaded);
             // The replay session after the last record is the new lineage.
-            wal.set_session_db(self.current_db());
+            wal.set_session_db(self.current_ns());
         }
         // H2c: never let another process's `USE` jump this process's local
         // session; if it vanished under the refresh, fall back.
-        if self.database_exists(local_session) {
-            self.set_current_db(local_session);
+        if self.schema_exists(local_session) {
+            self.set_current_ns(local_session.clone());
         } else {
-            let fallback = self.fallback_db();
-            self.set_current_db(&fallback);
+            let fallback = crate::storage::SchemaPath::main(&self.fallback_db());
+            self.set_current_ns(fallback);
         }
         self.wal = stashed_wal;
         result
@@ -4825,7 +5074,7 @@ impl PinkDb {
         // A fresh WAL generation replays from the checkpoint's session
         // default (the checkpoint does not store a session): reset the
         // tracked replay session so later appends `USE`-prefix correctly.
-        let fallback = self.fallback_db();
+        let fallback = crate::storage::SchemaPath::main(&self.fallback_db());
         guard_wal.set_session_db(&fallback);
         // Index definitions and their maps ride in the published `.pink`
         // itself (flags bit 3, wave 79), atomically with the data, so the
@@ -4866,7 +5115,7 @@ impl PinkDb {
             .iter()
             .map(|(lsn, bytes)| decode_portable_record(bytes, *lsn))
             .collect::<Result<Vec<_>>>()?;
-        let local_session = self.current_db.clone();
+        let local_session = self.current_ns().clone();
         let stashed_wal = self.wal.take();
         self.replaying = true;
         let result = decoded
@@ -4874,11 +5123,11 @@ impl PinkDb {
             .try_for_each(|record| replay_record(self, record));
         self.replaying = false;
         self.wal = stashed_wal;
-        if self.database_exists(&local_session) {
-            self.set_current_db(&local_session);
+        if self.schema_exists(&local_session) {
+            self.set_current_ns(local_session);
         } else {
-            let fallback = self.fallback_db();
-            self.set_current_db(&fallback);
+            let fallback = crate::storage::SchemaPath::main(&self.fallback_db());
+            self.set_current_ns(fallback);
         }
         result
     }
@@ -5088,6 +5337,12 @@ fn normalized_path(p: &Path) -> Option<PathBuf> {
 /// Apply one recovered record: every statement must replay cleanly. A
 /// CRC-valid record that fails to parse/bind/execute is a hard error.
 fn replay_record(db: &mut PinkDb, rec: &Record) -> Result<()> {
+    // A record that changed the store's secrets carries the whole persistent
+    // set (values in their own section, never in the statement text); install
+    // it before the statements so an `ATTACH` finds its password.
+    if let Some(secrets) = &rec.secrets {
+        db.install_persistent_secrets(secrets.clone());
+    }
     // Every `external_io` host scalar of this record is served from the
     // record's memo, never called: a replay must not reach a provider (it may
     // have no key and no network) and must reproduce the original vectors.
@@ -5097,6 +5352,19 @@ fn replay_record(db: &mut PinkDb, rec: &Record) -> Result<()> {
         PinkDbError::Execution(format!("WAL replay failed at lsn {}: {e}", rec.lsn))
     })?;
     let previous = db.set_ext_replay(Some(std::sync::Arc::new(ReplayMemo::new(&rec.memo))));
+    // The record's volatile seeds are taken in the order it recorded them, so
+    // every statement (and every trigger action or `CALL` body inside one)
+    // draws exactly the seed its original run drew.
+    db.volatile.clear();
+    db.set_replay_seeds(
+        rec.memo
+            .iter()
+            .filter(|call| {
+                call.name
+                    .eq_ignore_ascii_case(crate::sql::binder::SEED_MEMO)
+            })
+            .filter_map(|call| crate::sql::binder::seed_reading(&call.result)),
+    );
     let mut outcome = Ok(());
     for sql in &rec.stmts {
         if let Err(e) = db.execute(sql) {
@@ -5109,6 +5377,7 @@ fn replay_record(db: &mut PinkDb, rec: &Record) -> Result<()> {
     }
     db.set_ext_replay(previous);
     db.restore_replay_pins(pins);
+    db.volatile.clear();
     outcome
 }
 
@@ -5120,6 +5389,33 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn a_record_that_lost_its_seed_fails_closed() {
+        // A store, its clients and any lake may already hold the values a
+        // statement's seed produced, so a replay that cannot find the seed
+        // must stop instead of drawing fresh ones.
+        let mut db = crate::PinkDb::with_databases(["main"]);
+        db.execute("CREATE TABLE t (id UUID);").unwrap();
+        let rec = Record {
+            lsn: 1,
+            stmts: vec!["INSERT INTO t SELECT uuid() FROM range(2);".to_string()],
+            sets: None,
+            secrets: None,
+            memo: Vec::new(),
+        };
+        let err = replay_record(&mut db, &rec).unwrap_err().to_string();
+        assert!(err.contains("does not carry a seed"), "{err}");
+        let results = db.execute("SELECT count(*) FROM t;").unwrap();
+        assert_eq!(
+            results,
+            vec![QueryResult::Selected {
+                names: vec!["count(*)".to_string()],
+                types: vec![crate::types::DataType::Bigint],
+                rows: vec![vec![Value::Bigint(0)]],
+            }]
+        );
+    }
 
     #[test]
     fn the_replay_memo_matches_calls_exactly_by_hash() {
@@ -5554,7 +5850,7 @@ mod tests {
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(&Wal::header_fresh(generation)).unwrap();
         for (lsn, stmts) in records {
-            let payload = encode_payload(stmts, None, &[]).unwrap();
+            let payload = encode_payload(stmts, None, None, &[]).unwrap();
             f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
             f.write_all(&lsn.to_le_bytes()).unwrap();
             f.write_all(&crc32(&payload).to_le_bytes()).unwrap();
@@ -6075,16 +6371,17 @@ mod tests {
         );
 
         // A future version is refused cleanly through the same BadVersion
-        // path an older build would use to refuse our version 5 (that
-        // direction cannot be executed from this tree).
+        // path an older build would use to refuse ours (that direction cannot
+        // be executed from this tree).
         let mut future = Vec::new();
         future.extend_from_slice(WAL_MAGIC);
-        future.extend_from_slice(&6u32.to_le_bytes());
+        future.extend_from_slice(&(WAL_VERSION + 1).to_le_bytes());
         future.extend_from_slice(b"payload-bytes");
         std::fs::write(wal_path(&p), &future).unwrap();
         let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
         assert!(
-            err.to_string().contains("version 6 is not supported"),
+            err.to_string()
+                .contains(&format!("version {} is not supported", WAL_VERSION + 1)),
             "{err}"
         );
 
@@ -6164,10 +6461,13 @@ mod tests {
         assert_eq!(info.replayed_records, 2);
         assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![0, 1, 2]);
 
-        // The file is now v5: 96-byte header, the records re-encoded in the
-        // v5 payload layout (same statements, same LSNs, same order).
+        // The file is now current: 96-byte header, the records re-encoded in
+        // the current payload layout (same statements, same LSNs, same order).
         let data = std::fs::read(&wal).unwrap();
-        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 5);
+        assert_eq!(
+            u32::from_le_bytes(data[8..12].try_into().unwrap()),
+            WAL_VERSION
+        );
         assert_eq!(
             u32::from_le_bytes(data[36..40].try_into().unwrap()),
             crc32(&data[..36])
@@ -6366,7 +6666,7 @@ mod tests {
             assert!(err.to_string().contains("exceeds the u32"), "{err}");
         }
         // Real encodings stay far under the limit.
-        let payload = encode_payload(&["SELECT 1".to_string()], None, &[]).unwrap();
+        let payload = encode_payload(&["SELECT 1".to_string()], None, None, &[]).unwrap();
         assert!(payload.len() < 100);
     }
 
@@ -6488,7 +6788,7 @@ mod tests {
         let wal = wal_path(&p);
         let mut data = std::fs::read(&wal).unwrap();
         let sql = "LOAD EXTENSION '/nonexistent/pinkdb-h5-test.dylib';";
-        let payload = encode_payload(&[sql.to_string()], None, &[]).unwrap();
+        let payload = encode_payload(&[sql.to_string()], None, None, &[]).unwrap();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&2u64.to_le_bytes());
         data.extend_from_slice(&crc32(&payload).to_le_bytes());
@@ -6584,7 +6884,7 @@ mod tests {
         let wal = wal_path(&p);
         let mut data = std::fs::read(&wal).unwrap();
         let payload =
-            encode_payload(&["INSERT INTO t VALUES (7);".to_string()], None, &[]).unwrap();
+            encode_payload(&["INSERT INTO t VALUES (7);".to_string()], None, None, &[]).unwrap();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&2u64.to_le_bytes());
         data.extend_from_slice(&crc32(&payload).to_le_bytes());
@@ -8808,8 +9108,8 @@ mod tests {
             let upgraded = std::fs::read(&wal).unwrap();
             assert_eq!(
                 u32::from_le_bytes(upgraded[8..12].try_into().unwrap()),
-                5,
-                "the upgrade published a v5 header"
+                WAL_VERSION,
+                "the upgrade published the current header version"
             );
             assert!(!upgrade.exists(), "the temp was renamed over the WAL");
 
@@ -9007,7 +9307,27 @@ mod tests {
     fn sets_of(tables: &[(&str, &str)], dbs: &[&str]) -> FrameSets {
         let mut s = FrameSets::default();
         for (db, t) in tables {
-            s.add_table(db, t);
+            s.add_table(&crate::storage::SchemaPath::new(db, "main"), t);
+        }
+        for d in dbs {
+            s.add_database(d);
+        }
+        s.canonicalize();
+        s
+    }
+
+    /// [`sets_of`] with explicit schemas.
+    fn sets_of_ns(
+        tables: &[(&str, &str, &str)],
+        schemas: &[(&str, &str)],
+        dbs: &[&str],
+    ) -> FrameSets {
+        let mut s = FrameSets::default();
+        for (db, schema, t) in tables {
+            s.add_table(&crate::storage::SchemaPath::new(db, schema), t);
+        }
+        for (db, schema) in schemas {
+            s.add_schema(&crate::storage::SchemaPath::new(db, schema));
         }
         for d in dbs {
             s.add_database(d);
@@ -9038,6 +9358,41 @@ mod tests {
         let mut back = durable(&p);
         assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![1]);
         assert_eq!(ints(&mut back, "SELECT a FROM u;"), vec![2]);
+        cleanup(&p);
+    }
+
+    /// Review fix: a foreign frame that created a database and a table in it
+    /// carries both in one touched set. A writer touching an unrelated table
+    /// must still commit — otherwise every frame with a database mutation
+    /// would conflict with every other writer.
+    #[test]
+    fn optimistic_frame_with_its_own_database_objects_does_not_conflict() {
+        let p = tmp_ckpt("optownobjects");
+        let mut a = durable(&p);
+        a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let mut b = durable(&p);
+        b.execute("BEGIN; INSERT INTO t VALUES (2);").unwrap();
+        // A second writer's frame: `CREATE DATABASE x` plus a table in it, so
+        // its set names the database, the schema and the table.
+        {
+            let wal = b.durable_handle().expect("durable");
+            let mut guard = wal.lock().unwrap();
+            guard
+                .append(
+                    &["CREATE DATABASE x;".to_string()],
+                    Some(&sets_of_ns(&[("x", "main", "u")], &[], &["x"])),
+                    None,
+                    &[],
+                )
+                .unwrap();
+        }
+        b.execute("COMMIT;").unwrap();
+        assert_eq!(ints(&mut b, "SELECT a FROM t ORDER BY a;"), vec![2]);
+        drop(a);
+        drop(b);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![2]);
+        assert!(back.list_databases().iter().any(|d| d == "x"));
         cleanup(&p);
     }
 
@@ -9183,6 +9538,7 @@ mod tests {
                 .append(
                     &["INSERT INTO t VALUES (9);".to_string()],
                     Some(&sets_of(&[("main", "t")], &[])),
+                    None,
                     &[],
                 )
                 .unwrap();
@@ -9416,10 +9772,13 @@ mod tests {
             .into_iter()
             .find(|r| r.stmts.iter().any(|s| s.contains("CREATE INDEX")))
             .expect("create-index record");
-        assert_eq!(rec.stmts, vec!["CREATE INDEX \"i x\" ON main.t(\"b b\")"]);
         assert_eq!(
-            rec.sets.as_ref().expect("known touched set").table_pairs(),
-            &[("main".to_string(), "t".to_string())]
+            rec.stmts,
+            vec!["CREATE INDEX \"i x\" ON main.main.t(\"b b\")"]
+        );
+        assert_eq!(
+            rec.sets.as_ref().expect("known touched set").table_refs(),
+            &[("main".to_string(), "main".to_string(), "t".to_string())]
         );
 
         db.execute("DROP INDEX \"i x\";").unwrap();
@@ -9427,10 +9786,10 @@ mod tests {
             .into_iter()
             .find(|r| r.stmts.iter().any(|s| s.contains("DROP INDEX")))
             .expect("drop-index record");
-        assert_eq!(rec.stmts, vec!["DROP INDEX main.\"i x\""]);
+        assert_eq!(rec.stmts, vec!["DROP INDEX main.main.\"i x\""]);
         assert_eq!(
-            rec.sets.as_ref().expect("known touched set").table_pairs(),
-            &[("main".to_string(), "t".to_string())]
+            rec.sets.as_ref().expect("known touched set").table_refs(),
+            &[("main".to_string(), "main".to_string(), "t".to_string())]
         );
 
         // A checkpoint publishes the definitions (and maps) inside `.pink`
@@ -9560,5 +9919,92 @@ mod tests {
         assert_eq!(db.table_in("main", "t").unwrap().indexes.len(), 0);
         assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
         cleanup(&p);
+    }
+
+    /// Wave 131a: the frame sets carry `(db, schema, table)` triples and
+    /// `(db, schema)` pairs; the encoding round-trips both, and the older
+    /// format is refused instead of decoded.
+    #[test]
+    fn frame_sets_round_trip_triples_and_schema_pairs() {
+        let sets = sets_of_ns(
+            &[("db", "s", "t"), ("db2", "main", "u")],
+            &[("db", "s"), ("db2", "main")],
+            &["db", "db2"],
+        );
+        let back = decode_sets(&encode_sets(&sets).unwrap()).unwrap();
+        assert_eq!(back.table_refs(), sets.table_refs());
+        assert_eq!(back.schemas, sets.schemas);
+        assert_eq!(back.dbs, sets.dbs);
+        // Format 1 carried `(db, table)` pairs: a stale payload must not be
+        // silently read as triples.
+        let err = decode_sets(&[1u8]).unwrap_err();
+        assert!(err.contains("frame-sets format 1"), "{err}");
+    }
+
+    /// Review fix: a conflict pairs one side's mutation with the *other*
+    /// side's objects. A frame that creates a database and a table in it (its
+    /// own `dbs` and `tables` both name `x`) therefore does not conflict with
+    /// an unrelated frame, and neither does one that creates a schema
+    /// alongside a table in that schema.
+    #[test]
+    fn a_frames_own_objects_do_not_conflict() {
+        let unrelated = sets_of(&[("main", "u")], &[]);
+        let created_db = sets_of_ns(&[("x", "main", "t")], &[], &["x"]);
+        let created_schema = sets_of_ns(&[("db", "s", "t")], &[("db", "s")], &[]);
+        for own in [&created_db, &created_schema] {
+            assert_eq!(own.conflict_with(&unrelated), None);
+            assert_eq!(unrelated.conflict_with(own), None);
+        }
+    }
+
+    /// Review fix: every cross pairing still conflicts, in both directions.
+    #[test]
+    fn a_database_or_schema_mutation_conflicts_with_the_other_side() {
+        let other_schema = sets_of_ns(&[], &[("db", "s")], &[]);
+        let other_table = sets_of_ns(&[("db", "main", "t")], &[], &[]);
+        let drop_db = sets_of(&[], &["db"]);
+        for other in [&other_schema, &other_table] {
+            assert_eq!(
+                drop_db.conflict_with(other).as_deref(),
+                Some("database \"db\""),
+                "a database mutation conflicts with the other side's objects"
+            );
+            assert_eq!(
+                other.conflict_with(&drop_db).as_deref(),
+                Some("database \"db\""),
+                "the pairing is symmetric"
+            );
+        }
+        let drop_schema = sets_of_ns(&[], &[("db", "s")], &[]);
+        let table = sets_of_ns(&[("db", "s", "t")], &[], &[]);
+        assert_eq!(
+            drop_schema.conflict_with(&table).as_deref(),
+            Some("schema \"db.s\"")
+        );
+        assert_eq!(
+            table.conflict_with(&drop_schema).as_deref(),
+            Some("schema \"db.s\"")
+        );
+    }
+
+    /// Wave 131a: a schema mutation conflicts with any table of that schema
+    /// (and nothing outside it).
+    #[test]
+    fn a_schema_mutation_conflicts_with_a_table_of_that_schema() {
+        let drop = sets_of_ns(&[], &[("db", "s")], &[]);
+        let write = sets_of_ns(&[("db", "s", "t")], &[], &[]);
+        assert_eq!(
+            drop.conflict_with(&write).as_deref(),
+            Some("schema \"db.s\"")
+        );
+        // A table of another schema or database is disjoint.
+        assert_eq!(
+            drop.conflict_with(&sets_of_ns(&[("db", "other", "t")], &[], &[])),
+            None
+        );
+        assert_eq!(
+            drop.conflict_with(&sets_of_ns(&[("db2", "s", "t")], &[], &[])),
+            None
+        );
     }
 }

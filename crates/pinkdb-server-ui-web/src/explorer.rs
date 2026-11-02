@@ -4,7 +4,7 @@
 
 use leptos::prelude::*;
 use pinkdb_server_ui_api::sql::{quote_ident, quote_string};
-use pinkdb_server_ui_api::{CatalogObject, DEFAULT_SCHEMA, DeleteWorksheet, Worksheet};
+use pinkdb_server_ui_api::{CatalogObject, DeleteWorksheet, Worksheet};
 use wasm_bindgen::JsCast;
 
 use crate::api;
@@ -37,14 +37,11 @@ pub fn node_key(path: &[&str]) -> String {
 }
 
 /// The schemas the tree shows for a database, in order: those its objects
-/// name, or the default one for a database with none.
+/// (the `SCHEMA` rows included) name.
 pub fn schemas_of<'a>(objects: impl Iterator<Item = &'a CatalogObject>) -> Vec<String> {
     let mut schemas: Vec<String> = objects.map(|o| o.schema.clone()).collect();
     schemas.sort_by_key(|s| s.to_ascii_lowercase());
     schemas.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-    if schemas.is_empty() {
-        schemas.push(DEFAULT_SCHEMA.to_string());
-    }
     schemas
 }
 
@@ -67,8 +64,9 @@ fn remember(app: App, key: String, filter: RwSignal<String>) -> impl Fn(web_sys:
 /// The SQL that previews a relation.
 pub fn preview_sql(object: &CatalogObject) -> String {
     format!(
-        "SELECT * FROM {}.{} LIMIT 100;",
+        "SELECT * FROM {}.{}.{} LIMIT 100;",
         quote_ident(&object.database),
+        quote_ident(&object.schema),
         quote_ident(&object.name)
     )
 }
@@ -76,24 +74,30 @@ pub fn preview_sql(object: &CatalogObject) -> String {
 /// The SQL that shows a lake table's history.
 pub fn lake_sql(object: &CatalogObject) -> String {
     format!(
-        "SELECT * FROM {}.{} AT (VERSION => 1) LIMIT 100;\nSELECT * FROM lake_changes({}) LIMIT 100;\n",
+        "SELECT * FROM {}.{}.{} AT (VERSION => 1) LIMIT 100;\nSELECT * FROM lake_changes({}) LIMIT 100;\n",
         quote_ident(&object.database),
+        quote_ident(&object.schema),
         quote_ident(&object.name),
         quote_string(&object.name)
     )
 }
 
-/// The name to insert for an object (qualified outside the current database).
+/// The name to insert for an object (qualified outside the current
+/// database and schema).
 pub fn insert_name(app: &App, object: &CatalogObject) -> String {
     if object
         .database
         .eq_ignore_ascii_case(&app.db.get_untracked())
+        && object
+            .schema
+            .eq_ignore_ascii_case(&app.schema.get_untracked())
     {
         quote_ident(&object.name)
     } else {
         format!(
-            "{}.{}",
+            "{}.{}.{}",
             quote_ident(&object.database),
+            quote_ident(&object.schema),
             quote_ident(&object.name)
         )
     }
@@ -297,7 +301,10 @@ fn CatalogTree(filter: RwSignal<String>) -> impl IntoView {
                             .iter()
                             .filter(|o| o.schema.eq_ignore_ascii_case(&schema))
                             .collect();
-                        let n_objects = in_schema.len();
+                        let n_objects = in_schema
+                            .iter()
+                            .filter(|o| o.kind != "SCHEMA")
+                            .count();
                         let folders = GROUPS
                             .iter()
                             .filter_map(|(kind, label)| {
@@ -374,8 +381,7 @@ fn CatalogTree(filter: RwSignal<String>) -> impl IntoView {
                                                 title="Run the worksheet's statements in this database"
                                                 on:click=move |ev| {
                                                     ev.prevent_default();
-                                                    app.db.set(db_name.clone());
-                                                    app.load_catalog();
+                                                    app.use_database(db_name.clone());
                                                 }
                                             >
                                                 "Use"
@@ -419,7 +425,11 @@ fn ObjectItem(object: CatalogObject, filter: RwSignal<String>) -> impl IntoView 
         ),
         None => object.kind.to_ascii_lowercase(),
     };
-    let key = (object.database.clone(), object.name.clone());
+    let key = (
+        object.database.clone(),
+        object.schema.clone(),
+        object.name.clone(),
+    );
     let selected = move || app.selected.get().as_ref() == Some(&key);
     let in_catalog = move || app.section.get() == Section::Catalog;
     let icon = kind_icon(&object.kind);
@@ -759,14 +769,23 @@ mod tests {
     }
 
     #[test]
-    fn a_database_shows_its_schemas_or_the_default_one() {
-        assert_eq!(schemas_of(std::iter::empty()), vec![DEFAULT_SCHEMA]);
+    fn a_database_shows_its_schemas() {
+        assert_eq!(schemas_of(std::iter::empty()), Vec::<String>::new());
         let objects = [
             object("main", "t"),
             object("MAIN", "u"),
             object("audit", "v"),
         ];
         assert_eq!(schemas_of(objects.iter()), vec!["audit", "main"]);
+    }
+
+    #[test]
+    fn generated_sql_quotes_every_part() {
+        let odd = object("a b", "x\"y");
+        assert_eq!(
+            preview_sql(&odd),
+            "SELECT * FROM main.\"a b\".\"x\"\"y\" LIMIT 100;"
+        );
     }
 
     #[test]

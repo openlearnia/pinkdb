@@ -54,12 +54,12 @@ fn store() -> Database {
         "CREATE TABLE pinkdb_memory.atoms (id VARCHAR, text VARCHAR)",
         "CREATE TABLE pinkdb_memory.atom_vectors (atom VARCHAR, v FLOAT[3])",
         "CREATE TABLE pinkdb_agent.sessions (id VARCHAR)",
-        "CREATE TABLE main.secret (x INTEGER)",
-        "INSERT INTO main.secret VALUES (42)",
+        "CREATE TABLE main.main.secret (x INTEGER)",
+        "INSERT INTO main.main.secret VALUES (42)",
         // A view inside the allowed database, and one outside it.
-        "CREATE VIEW pinkdb_memory.peek AS SELECT * FROM main.secret",
-        "CREATE VIEW main.peek AS SELECT * FROM main.secret",
-        "CREATE MACRO leak() AS TABLE SELECT * FROM main.secret",
+        "CREATE VIEW pinkdb_memory.peek AS SELECT * FROM main.main.secret",
+        "CREATE VIEW main.main.peek AS SELECT * FROM main.main.secret",
+        "CREATE MACRO leak() AS TABLE SELECT * FROM main.main.secret",
     ] {
         conn.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
@@ -119,7 +119,7 @@ fn the_channel_reads_and_writes_its_own_database() {
     let text = ok(&db, &policy, "SELECT text FROM pinkdb_memory.atoms");
     assert!(text.contains("TPC-H"), "{text}");
     // The write rule is unchanged: one database, its own.
-    let text = refused(&db, &policy, "INSERT INTO main.secret VALUES (1)");
+    let text = refused(&db, &policy, "INSERT INTO main.main.secret VALUES (1)");
     assert!(text.contains("writes outside it"), "{text}");
 }
 
@@ -129,15 +129,15 @@ fn a_user_table_is_refused_every_way_a_read_can_reach_it() {
     let policy = memory_channel(true);
     for sql in [
         // Directly.
-        "SELECT * FROM main.secret",
+        "SELECT * FROM main.main.secret",
         // Through a view, from inside the allowed database and from outside.
         "SELECT * FROM pinkdb_memory.peek",
-        "SELECT * FROM main.peek",
+        "SELECT * FROM main.main.peek",
         // Through a CTE and through a macro body.
-        "WITH c AS (SELECT * FROM main.secret) SELECT * FROM c",
+        "WITH c AS (SELECT * FROM main.main.secret) SELECT * FROM c",
         "SELECT * FROM leak()",
         // Through a subquery, which is a different plan node.
-        "SELECT (SELECT max(x) FROM main.secret) AS m",
+        "SELECT (SELECT max(x) FROM main.main.secret) AS m",
     ] {
         let text = refused(&db, &policy, sql);
         assert!(
@@ -156,7 +156,7 @@ fn the_channel_reads_only_its_own_statistics() {
     let policy = memory_channel(false);
     for sql in [
         // Inside the allowed database: allowed below, refused nowhere.
-        "SELECT * FROM pinkdb_column_stats('main.secret')",
+        "SELECT * FROM pinkdb_column_stats('main.main.secret')",
         "SELECT * FROM pinkdb_column_stats('pinkdb_agent.sessions')",
         // The all-tables form spans every database, so it is refused too.
         "SELECT * FROM pinkdb_column_stats()",
@@ -229,7 +229,7 @@ fn the_agent_channel_is_confined_the_same_way() {
     let text = ok(&db, &policy, "SELECT id FROM pinkdb_agent.sessions");
     assert!(text.contains("s1"), "{text}");
     for sql in [
-        "SELECT * FROM main.secret",
+        "SELECT * FROM main.main.secret",
         "SELECT * FROM pinkdb_memory.atoms",
         "WITH c AS (SELECT * FROM pinkdb_memory.atoms) SELECT * FROM c",
     ] {
@@ -321,7 +321,7 @@ fn the_state_store_answers_as_the_caller() {
     let bob = who("bob");
     assert!(bob.contains("\"bob\"") && !bob.contains("analyst"), "{bob}");
     // And it gains no privilege: the policy still confines the channel.
-    let text = run_as(&warehouse, "alice", &policy, "SELECT * FROM main.t").1;
+    let text = run_as(&warehouse, "alice", &policy, "SELECT * FROM main.main.t").1;
     assert!(
         text.contains("error") || text.contains("not found"),
         "{text}"

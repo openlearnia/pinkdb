@@ -144,8 +144,13 @@ fn push_value(out: &mut String, v: &Value) {
             }
             out.push(']');
         }
-        // Canonical DuckDB-style display text.
-        Value::Date(_) | Value::Timestamp(_) | Value::Decimal(..) | Value::Interval { .. } => {
+        // Canonical DuckDB-style display text (a UUID crosses as its
+        // lowercase 8-4-4-4-12 form, like the C ABI).
+        Value::Date(_)
+        | Value::Timestamp(_)
+        | Value::Decimal { .. }
+        | Value::Interval { .. }
+        | Value::Uuid(_) => {
             push_json_string(out, &v.to_string());
         }
     }
@@ -172,6 +177,8 @@ fn result_kind(r: &QueryResult) -> &'static str {
         QueryResult::DroppedView { .. } => "DroppedView",
         QueryResult::CreatedDatabase { .. } => "CreatedDatabase",
         QueryResult::DroppedDatabase { .. } => "DroppedDatabase",
+        QueryResult::CreatedSchema { .. } => "CreatedSchema",
+        QueryResult::DroppedSchema { .. } => "DroppedSchema",
         QueryResult::Used { .. } => "Used",
         QueryResult::SetVariable { .. } => "SetVariable",
         QueryResult::LoadedExtension { .. } => "LoadedExtension",
@@ -222,7 +229,9 @@ fn result_message(r: &QueryResult) -> String {
         QueryResult::DroppedView { name } => format!("View {name} dropped."),
         QueryResult::CreatedDatabase { name } => format!("Database {name} created."),
         QueryResult::DroppedDatabase { name } => format!("Database {name} dropped."),
-        QueryResult::Used { db } => format!("Using database {db}."),
+        QueryResult::CreatedSchema { name } => format!("Schema {name} created."),
+        QueryResult::DroppedSchema { name } => format!("Schema {name} dropped."),
+        QueryResult::Used { db, schema } => format!("Using {db}.{schema}."),
         // DuckDB prints nothing for `SET VARIABLE`.
         QueryResult::SetVariable { .. } => String::new(),
         QueryResult::LoadedExtension { name } => format!("Extension {name} loaded."),
@@ -583,7 +592,7 @@ mod tests {
     fn temporal_and_exact_values_cross_as_display_text() {
         assert_eq!(json_of(&Value::Date(19_737)), "\"2024-01-15\"");
         assert_eq!(
-            json_of(&Value::Decimal(12_345, 2)),
+            json_of(&Value::decimal(12_345, 2)),
             "\"123.45\"",
             "DECIMAL crosses as its Display text"
         );

@@ -11,9 +11,9 @@
 //!     for every column (schema order)
 //!       column chunk = page index + pages
 //!
-//! footer: store metadata (databases, tables, schemas, column defaults,
-//!   constraints, index definitions + statistics, materialized views,
-//!   procedures, macros, RBAC) and, per table, the row count and the
+//! footer: store metadata (databases, their schemas, tables, column
+//!   defaults as SQL text, constraints, index definitions + statistics, materialized
+//!   views, procedures, macros, RBAC) and, per table, the row count and the
 //!   row-group directory:
 //!     row groups [ { rows,
 //!                    per column: offset, length, page count,
@@ -107,7 +107,8 @@ use rayon::prelude::*;
 
 use crate::crypto::EncryptionKey;
 use crate::storage::{
-    DataTable, ForeignKeyConstraint, Index, KeyConstraint, KeyKind, PinkDb, TableConstraints,
+    DataTable, ForeignKeyConstraint, Index, KeyConstraint, KeyKind, PinkDb, SchemaPath,
+    TableConstraints,
 };
 use crate::strings::StrVec;
 #[cfg(test)]
@@ -132,15 +133,21 @@ pub const ROW_GROUP_ROWS: usize = 122_880;
 pub const CHUNKS_PER_ROW_GROUP: usize = ROW_GROUP_ROWS / CHUNK_SIZE;
 
 /// The footer's own version word (bumped when the footer layout changes).
-/// Version 3 (wave 124) adds every database's storage after its name; a
-/// version-2 file is refused as written by an older pinkdb.
-const FOOTER_VERSION: u32 = 3;
+/// Version 4 (wave 131a) puts every database's catalog sections under its
+/// schemas. Version 5 (wave 139a) stores a column DEFAULT as its SQL text
+/// instead of an encoded constant value; the text is rebound at load. Version
+/// 6 (wave 132b) always carries the store's persistent-secret section and a
+/// lake's declared data-file format. Files written by older builds are
+/// refused.
+const FOOTER_VERSION: u32 = 6;
 
 /// A database's storage tag in the footer: rows in the file.
 const STORAGE_LOCAL: u8 = 0;
-/// A database's storage tag in the footer: a lake (its location follows,
-/// and the database carries no tables or catalog sections in the file).
-const STORAGE_LAKE: u8 = 1;
+/// A database's storage tag in the footer: a lake (its location, its options
+/// and the data-file format it declares for new tables follow, and the
+/// database carries no tables or catalog sections in the file). Tag 1 — the
+/// pre-wave-132b lake row — is not read, like every other older layout.
+const STORAGE_LAKE: u8 = 2;
 
 /// Flags bit 0: every table carries the constraint section described in the
 /// module docs. Set iff at least one table has constraints.
@@ -151,7 +158,7 @@ const FLAG_CONSTRAINTS: u32 = 0x1;
 /// DEFAULT.
 const FLAG_DEFAULTS: u32 = 0x2;
 
-/// Flags bit 2: every database carries the materialized-view section
+/// Flags bit 2: every schema carries the materialized-view section
 /// (wave 80: name, refresh policy, defining SQL, last refresh stamp, refresh
 /// count) after its tables. Set iff at least one database has a materialized
 /// view.
@@ -169,7 +176,7 @@ const FLAG_VECTOR_INDEXES: u32 = 0x100;
 #[cfg(test)]
 pub(crate) const FLAG_PROCEDURES_FOR_TEST: u32 = FLAG_PROCEDURES;
 
-/// Flags bit 4: every database carries the stored-procedure section (wave
+/// Flags bit 4: every schema carries the stored-procedure section (wave
 /// 44: name, typed parameters, language tag, body text) after its tables
 /// and materialized views. Set iff at least one database has a procedure.
 const FLAG_PROCEDURES: u32 = 0x10;
@@ -180,7 +187,7 @@ const FLAG_PROCEDURES: u32 = 0x10;
 /// after every database. Set iff the store has any RBAC data.
 const FLAG_RBAC: u32 = 0x20;
 
-/// Flags bit 6: every database carries the SQL-macro section (wave 77: the
+/// Flags bit 6: every schema carries the SQL-macro section (wave 77: the
 /// name and the full `CREATE MACRO` statement text) after its tables and
 /// before its materialized-view section. Set iff at least one database has
 /// a macro.
@@ -190,30 +197,15 @@ const FLAG_RBAC: u32 = 0x20;
 /// must already be in the catalog when that rebind runs.
 const FLAG_MACROS: u32 = 0x40;
 
-/// Wave 100: the file carries a per-database trigger section. Each trigger is
+/// Wave 100: the file carries a per-schema trigger section. Each trigger is
 /// stored as the `CREATE TRIGGER …` text it was created from — a definition is
 /// re-parsed on load, exactly like a macro or a materialized view, so nothing
 /// is duplicated between the catalog and the file.
 const FLAG_TRIGGERS: u32 = 0x80;
 
-/// Column-default value tags (one byte per non-NULL default).
-const VD_BOOL: u8 = 0;
-const VD_I32: u8 = 1;
-const VD_I64: u8 = 2;
-const VD_F64_BITS: u8 = 3;
-const VD_VARCHAR: u8 = 4;
-const VD_DATE: u8 = 5;
-const VD_TIMESTAMP: u8 = 6;
-const VD_DECIMAL: u8 = 7;
-const VD_INTERVAL: u8 = 8;
-const VD_VARIANT: u8 = 9;
-/// ARRAY rides [`crate::array::encode_cell`]'s self-describing bytes
-/// (`u32 length | element kind | elements`).
-const VD_ARRAY: u8 = 10;
-
-/// Statistics value tags in the footer's per-chunk statistics block: the
-/// same shapes as the default-value tags, plus an explicit "no value" tag
-/// (an empty or all-NULL column has neither a min nor a max).
+/// Statistics value tags in the footer's per-chunk statistics block, plus an
+/// explicit "no value" tag (an empty or all-NULL column has neither a min nor
+/// a max).
 const SV_NONE: u8 = 0;
 const SV_BOOL: u8 = 1;
 const SV_I32: u8 = 2;
@@ -224,6 +216,7 @@ const SV_DATE: u8 = 6;
 const SV_TIMESTAMP: u8 = 7;
 const SV_DECIMAL: u8 = 8;
 const SV_INTERVAL: u8 = 9;
+const SV_UUID: u8 = 10;
 
 /// Constraint-section kinds (one byte per constraint).
 const CK_PRIMARY_KEY: u8 = 0;
@@ -390,6 +383,8 @@ pub struct SavedPathStats {
 pub struct SavedTableStats {
     /// Database name the table lives in.
     pub db: String,
+    /// Schema name (the catalog key) the table lives in.
+    pub schema: String,
     /// Table name.
     pub table: String,
     /// Exact row count.
@@ -422,6 +417,8 @@ fn dtype_tag(t: DataType) -> u8 {
         // ARRAY's tag is incomplete like DECIMAL's: the schema writer stores
         // the element kind and length immediately after it.
         DataType::Array { .. } => 10,
+        // UUID is a fixed 16-byte payload, so the tag carries no parameters.
+        DataType::Uuid => 11,
     }
 }
 
@@ -435,6 +432,7 @@ fn dtype_from_tag(b: u8) -> Result<DataType> {
         5 => Ok(DataType::Date),
         6 => Ok(DataType::Timestamp),
         9 => Ok(DataType::Variant),
+        11 => Ok(DataType::Uuid),
         _ => Err(PinkDbError::Execution(format!(
             "corrupt file: bad dtype tag {b}"
         ))),
@@ -1864,6 +1862,22 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
             }
             best = Some((ENC_PLAIN, w.buf));
         }
+        // UUID: `u32 row count | raw 16-byte little-endian values`, the same
+        // shape as wide DECIMAL. Invalid rows are zeroed so the bytes stay
+        // deterministic; the validity bitmap wins on decode.
+        DataType::Uuid => {
+            let VectorData::Uuid(values) = v.data() else {
+                unreachable!("uuid chunk has a non-uuid payload")
+            };
+            let nulls = v.has_nulls();
+            let mut w = Writer::new();
+            w.u32(values.len() as u32);
+            for (i, &x) in values.iter().enumerate() {
+                let x = if nulls && !v.is_valid(i) { 0 } else { x };
+                w.bytes(&x.to_le_bytes());
+            }
+            best = Some((ENC_PLAIN, w.buf));
+        }
         // INTERVAL: `u32 row count | months(i32) days(i32) micros(i64)` each.
         DataType::Interval => {
             let VectorData::Interval(values) = v.data() else {
@@ -2443,6 +2457,17 @@ fn decode_payload(dtype: DataType, tag: u8, r: &mut Reader) -> Result<(VectorDat
                 n,
             ))
         }
+        (DataType::Uuid, ENC_PLAIN) => {
+            let n = r.chunk_count("chunk length")?;
+            let mut values = Vec::with_capacity(n);
+            for _ in 0..n {
+                let b = r.take(16)?;
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(b);
+                values.push(u128::from_le_bytes(arr));
+            }
+            Ok((VectorData::Uuid(values), n))
+        }
         (DataType::Interval, ENC_PLAIN) => {
             let n = r.chunk_count("chunk length")?;
             let mut values = Vec::with_capacity(n);
@@ -2807,7 +2832,7 @@ struct TableDir {
     name: String,
     schema: Vec<(String, DataType)>,
     constraints: TableConstraints,
-    defaults: Vec<Option<Value>>,
+    defaults: Vec<Option<String>>,
     indexes: Vec<IndexDef>,
     vector_indexes: Vec<VectorIndexFile>,
     row_count: u64,
@@ -2819,11 +2844,11 @@ struct TableDir {
     zones: Vec<Vec<crate::stats::Zone>>,
 }
 
-/// One database's footer entry: its tables and its catalog sections.
+/// One schema's footer entry: its tables and its catalog sections.
 #[derive(Debug)]
-struct DbDir {
+struct SchemaDir {
+    /// The display name (the key is its lowercased form).
     name: String,
-    storage: crate::lake_db::DbStorage,
     tables: Vec<TableDir>,
     macros: Vec<crate::macros::MacroDef>,
     materialized_views: Vec<crate::storage::MaterializedViewDef>,
@@ -2831,11 +2856,20 @@ struct DbDir {
     triggers: Vec<crate::trigger::TriggerDef>,
 }
 
+/// One database's footer entry: its storage and its schemas (sorted by key).
+#[derive(Debug)]
+struct DbDir {
+    name: String,
+    storage: crate::lake_db::DbStorage,
+    schemas: Vec<SchemaDir>,
+}
+
 /// The parsed footer of a `PINKDB06` file.
 #[derive(Debug)]
 struct StoreFooter {
     databases: Vec<DbDir>,
     rbac: Option<crate::rbac::RbacCatalog>,
+    secrets: Vec<crate::secret::Secret>,
 }
 
 /// One encoded page (one engine chunk): its framed bytes and its statistics.
@@ -3004,7 +3038,9 @@ fn write_stat_value(w: &mut Writer, v: Option<&Value>) {
             w.u8(SV_TIMESTAMP);
             w.i64(*t);
         }
-        Some(Value::Decimal(x, scale)) => {
+        Some(Value::Decimal {
+            value: x, scale, ..
+        }) => {
             w.u8(SV_DECIMAL);
             w.bytes(&x.to_le_bytes());
             w.u8(*scale);
@@ -3018,6 +3054,10 @@ fn write_stat_value(w: &mut Writer, v: Option<&Value>) {
             w.i32(*months);
             w.i32(*days);
             w.i64(*micros);
+        }
+        Some(Value::Uuid(bits)) => {
+            w.u8(SV_UUID);
+            w.bytes(&bits.to_le_bytes());
         }
         Some(Value::Null) => w.u8(SV_NONE),
         // VARIANT columns carry no min/max: the total order spans kinds, so the
@@ -3056,13 +3096,19 @@ fn read_stat_value(r: &mut Reader) -> Result<Option<Value>> {
             if scale > 38 {
                 return r.err("bad DECIMAL statistics scale");
             }
-            Some(Value::Decimal(x, scale))
+            Some(Value::decimal(x, scale))
         }
         SV_INTERVAL => Some(Value::Interval {
             months: r.i32()?,
             days: r.i32()?,
             micros: r.i64()?,
         }),
+        SV_UUID => {
+            let b = r.take(16)?;
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(b);
+            Some(Value::Uuid(u128::from_le_bytes(arr)))
+        }
         other => {
             return Err(PinkDbError::Execution(format!(
                 "corrupt file: unknown statistics value tag {other}"
@@ -3324,34 +3370,23 @@ impl PinkDb {
     ) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
         // The optional catalog sections exist iff some object needs them (the
         // flags word is written in the footer, so decide it up front).
-        let with_constraints = self.list_databases().iter().any(|db| {
-            self.list_tables_in(db).iter().any(|t| {
-                self.table_in(db, t)
-                    .is_ok_and(|t| !t.constraints.is_empty())
-            })
-        });
-        let with_defaults = self.list_databases().iter().any(|db| {
-            self.list_tables_in(db).iter().any(|t| {
-                self.table_in(db, t)
-                    .is_ok_and(|t| t.columns.iter().any(|c| c.default.is_some()))
-            })
-        });
+        let all_tables: Vec<&crate::storage::DataTable> = self
+            .list_databases()
+            .iter()
+            .flat_map(|db| self.all_tables_of(db))
+            .map(|(_, _, t)| t)
+            .collect();
+        let with_constraints = all_tables.iter().any(|t| !t.constraints.is_empty());
+        let with_defaults = all_tables
+            .iter()
+            .any(|t| t.columns.iter().any(|c| c.default.is_some()));
+        let with_indexes = all_tables.iter().any(|t| !t.indexes.is_empty());
+        let with_vectors = all_tables.iter().any(|t| !t.vector_indexes.is_empty());
         let with_mvs = self.has_materialized_views();
         let with_procedures = self.has_procedures();
         let with_triggers = self.has_triggers();
         let with_macros = self.has_macros();
         let with_rbac = self.has_rbac_data();
-        let with_indexes = self.list_databases().iter().any(|db| {
-            self.list_tables_in(db)
-                .iter()
-                .any(|t| self.table_in(db, t).is_ok_and(|t| !t.indexes.is_empty()))
-        });
-        let with_vectors = self.list_databases().iter().any(|db| {
-            self.list_tables_in(db).iter().any(|t| {
-                self.table_in(db, t)
-                    .is_ok_and(|t| !t.vector_indexes.is_empty())
-            })
-        });
         let flags = if with_constraints {
             FLAG_CONSTRAINTS
         } else {
@@ -3378,80 +3413,100 @@ impl PinkDb {
             // A lake database's tables and catalog objects live in its lake:
             // the file records only where that is.
             let lake = matches!(storage, crate::lake_db::DbStorage::Lake(_));
-            let mut names = if lake {
-                Vec::new()
-            } else {
-                self.list_tables_in(dbname)
-            };
-            names.sort();
-            let mut tables: Vec<TableDir> = Vec::with_capacity(names.len());
-            for name in &names {
-                let t = self.table_in(dbname, name)?;
-                // Wave 96b: the engine catalog image carries schemas and
-                // table metadata only; the rows live in the lake.
-                let dir = if omit_rows {
-                    TableDir {
-                        name: name.clone(),
-                        schema: t.schema(),
-                        constraints: t.constraints.clone(),
-                        defaults: t.columns.iter().map(|c| c.default.clone()).collect(),
-                        indexes: index_defs_without_rows(t),
-                        // A rows-free catalog image cannot carry a graph
-                        // whose nodes are row ids; vector indexes are only
-                        // built on native tables, whose rows are omitted too.
-                        vector_indexes: Vec::new(),
-                        row_count: 0,
-                        row_groups: Vec::new(),
-                        // No rows, no statistics: readers treat the column
-                        // facts as unknown until the rows arrive.
-                        stats: crate::stats::TableStats::unknown(t.columns.len(), 0),
-                        zones: vec![Vec::new(); t.columns.len()],
+            let mut schemas: Vec<SchemaDir> = Vec::new();
+            if !lake {
+                let cat = self
+                    .databases
+                    .get(&dbname.to_ascii_lowercase())
+                    .ok_or_else(|| {
+                        PinkDbError::Catalog(format!("database \"{dbname}\" not found"))
+                    })?;
+                for (skey, scat) in &cat.schemas {
+                    let ns = SchemaPath::new(dbname, skey);
+                    let mut names = self.list_tables_in(&ns);
+                    names.sort();
+                    let mut tables: Vec<TableDir> = Vec::with_capacity(names.len());
+                    for name in &names {
+                        let t = self.table_in(&ns, name)?;
+                        // Wave 96b: the engine catalog image carries schemas
+                        // and table metadata only; the rows live in the lake.
+                        let dir = if omit_rows {
+                            TableDir {
+                                name: name.clone(),
+                                schema: t.schema(),
+                                constraints: t.constraints.clone(),
+                                defaults: t
+                                    .columns
+                                    .iter()
+                                    .map(|c| c.default.as_ref().map(|d| d.text.clone()))
+                                    .collect(),
+                                indexes: index_defs_without_rows(t),
+                                // A rows-free catalog image cannot carry a
+                                // graph whose nodes are row ids; vector
+                                // indexes are only built on native tables,
+                                // whose rows are omitted too.
+                                vector_indexes: Vec::new(),
+                                row_count: 0,
+                                row_groups: Vec::new(),
+                                // No rows, no statistics: readers treat the
+                                // column facts as unknown until the rows
+                                // arrive.
+                                stats: crate::stats::TableStats::unknown(t.columns.len(), 0),
+                                zones: vec![Vec::new(); t.columns.len()],
+                            }
+                        } else {
+                            write_table(
+                                &mut data,
+                                &ns,
+                                name,
+                                t,
+                                parallel,
+                                collect_stats,
+                                &mut saved,
+                            )?
+                        };
+                        tables.push(dir);
                     }
-                } else {
-                    write_table(
-                        &mut data,
-                        dbname,
-                        name,
-                        t,
-                        parallel,
-                        collect_stats,
-                        &mut saved,
-                    )?
-                };
-                tables.push(dir);
+                    schemas.push(SchemaDir {
+                        name: scat.name.clone(),
+                        tables,
+                        // Name order, not map order: a reopened store's
+                        // tables must be byte-identical to the saved ones.
+                        macros: if with_macros {
+                            self.macros_in(&ns).into_iter().map(|(_, d)| d).collect()
+                        } else {
+                            Vec::new()
+                        },
+                        materialized_views: if with_mvs {
+                            self.materialized_views_in(&ns)
+                                .into_iter()
+                                .map(|(_, d)| d)
+                                .collect()
+                        } else {
+                            Vec::new()
+                        },
+                        procedures: if with_procedures {
+                            self.procedures_in(&ns)
+                                .into_iter()
+                                .map(|(_, d)| d)
+                                .collect()
+                        } else {
+                            Vec::new()
+                        },
+                        // Creation order is the firing order, so the slice is
+                        // written as stored — never sorted.
+                        triggers: if with_triggers {
+                            scat.triggers.clone()
+                        } else {
+                            Vec::new()
+                        },
+                    });
+                }
             }
             db_dirs.push(DbDir {
                 name: dbname.clone(),
                 storage,
-                tables,
-                macros: if with_macros && !lake {
-                    self.macros_in(dbname).into_iter().map(|(_, d)| d).collect()
-                } else {
-                    Vec::new()
-                },
-                materialized_views: if with_mvs && !lake {
-                    self.materialized_views_in(dbname)
-                        .into_iter()
-                        .map(|(_, d)| d)
-                        .collect()
-                } else {
-                    Vec::new()
-                },
-                procedures: if with_procedures && !lake {
-                    self.procedures_in(dbname)
-                        .into_iter()
-                        .map(|(_, d)| d)
-                        .collect()
-                } else {
-                    Vec::new()
-                },
-                // Creation order is the firing order, so the slice is written
-                // as stored — never sorted.
-                triggers: if with_triggers && !lake {
-                    self.triggers_in(dbname).to_vec()
-                } else {
-                    Vec::new()
-                },
+                schemas,
             });
         }
 
@@ -3463,68 +3518,76 @@ impl PinkDb {
         for dbdir in &db_dirs {
             fw.str(&dbdir.name);
             write_storage(&mut fw, &dbdir.storage);
-            fw.u32(dbdir.tables.len() as u32);
-            for tdir in &dbdir.tables {
-                fw.str(&tdir.name);
-                fw.u32(tdir.schema.len() as u32);
-                for (col, dtype) in &tdir.schema {
-                    fw.str(col);
-                    fw.u8(dtype_tag(*dtype));
-                    if let DataType::Decimal { precision, scale } = dtype {
-                        fw.u8(*precision);
-                        fw.u8(*scale);
+            fw.u32(dbdir.schemas.len() as u32);
+            for sdir in &dbdir.schemas {
+                fw.str(&sdir.name);
+                fw.u32(sdir.tables.len() as u32);
+                for tdir in &sdir.tables {
+                    fw.str(&tdir.name);
+                    fw.u32(tdir.schema.len() as u32);
+                    for (col, dtype) in &tdir.schema {
+                        fw.str(col);
+                        fw.u8(dtype_tag(*dtype));
+                        if let DataType::Decimal { precision, scale } = dtype {
+                            fw.u8(*precision);
+                            fw.u8(*scale);
+                        }
+                        if let DataType::Array { elem, len } = dtype {
+                            fw.u8(elem.tag());
+                            fw.u32(*len);
+                        }
                     }
-                    if let DataType::Array { elem, len } = dtype {
-                        fw.u8(elem.tag());
-                        fw.u32(*len);
+                    if with_constraints {
+                        write_constraints(&mut fw, &tdir.constraints);
                     }
-                }
-                if with_constraints {
-                    write_constraints(&mut fw, &tdir.constraints);
-                }
-                if with_defaults {
-                    write_defaults(&mut fw, &tdir.defaults);
-                }
-                if with_indexes {
-                    write_index_defs(&mut fw, &tdir.indexes);
-                }
-                if with_vectors {
-                    write_vector_index_defs(&mut fw, &tdir.vector_indexes);
-                }
-                fw.u64(tdir.row_count);
-                fw.u32(tdir.row_groups.len() as u32);
-                for rg in &tdir.row_groups {
-                    fw.u64(rg.rows);
-                    for col in &rg.columns {
-                        fw.u64(col.offset);
-                        fw.u64(col.length);
-                        fw.u32(col.page_count);
-                        fw.u32(col.encodings);
-                        fw.u32(col.crc32c);
-                        fw.u64(col.null_count);
-                        fw.u64(col.nan_count);
-                        write_stat_value(&mut fw, col.min.as_ref());
-                        write_stat_value(&mut fw, col.max.as_ref());
+                    if with_defaults {
+                        write_defaults(&mut fw, &tdir.defaults);
                     }
+                    if with_indexes {
+                        write_index_defs(&mut fw, &tdir.indexes);
+                    }
+                    if with_vectors {
+                        write_vector_index_defs(&mut fw, &tdir.vector_indexes);
+                    }
+                    fw.u64(tdir.row_count);
+                    fw.u32(tdir.row_groups.len() as u32);
+                    for rg in &tdir.row_groups {
+                        fw.u64(rg.rows);
+                        for col in &rg.columns {
+                            fw.u64(col.offset);
+                            fw.u64(col.length);
+                            fw.u32(col.page_count);
+                            fw.u32(col.encodings);
+                            fw.u32(col.crc32c);
+                            fw.u64(col.null_count);
+                            fw.u64(col.nan_count);
+                            write_stat_value(&mut fw, col.min.as_ref());
+                            write_stat_value(&mut fw, col.max.as_ref());
+                        }
+                    }
+                    write_table_stats(&mut fw, &tdir.stats, &tdir.zones);
                 }
-                write_table_stats(&mut fw, &tdir.stats, &tdir.zones);
-            }
-            if with_macros {
-                write_macro_defs(&mut fw, &dbdir.macros);
-            }
-            if with_mvs {
-                write_materialized_view_defs(&mut fw, &dbdir.materialized_views);
-            }
-            if with_procedures {
-                write_procedure_defs(&mut fw, &dbdir.procedures);
-            }
-            if with_triggers {
-                write_trigger_defs(&mut fw, &dbdir.triggers);
+                if with_macros {
+                    write_macro_defs(&mut fw, &sdir.macros);
+                }
+                if with_mvs {
+                    write_materialized_view_defs(&mut fw, &sdir.materialized_views);
+                }
+                if with_procedures {
+                    write_procedure_defs(&mut fw, &sdir.procedures);
+                }
+                if with_triggers {
+                    write_trigger_defs(&mut fw, &sdir.triggers);
+                }
             }
         }
         if with_rbac {
             write_rbac(&mut fw, self);
         }
+        // Wave 132b: unconditional — a section that is present even when empty
+        // is what lets a load replace the checkpoint's secrets instead of
+        // keeping stale ones.
+        write_secrets(&mut fw, self);
         let footer = fw.buf;
         // The footer, then the trailer: the footer's CRC32C, its length and
         // the magic.
@@ -3761,102 +3824,138 @@ impl PinkDb {
             if let Some(cat) = db.databases.get_mut(&dbdir.name.to_ascii_lowercase()) {
                 cat.storage = dbdir.storage.clone();
             }
-            for tdir in &dbdir.tables {
-                db.create_table_with_constraints_in(
-                    &dbdir.name,
-                    &tdir.name,
-                    tdir.schema.clone(),
-                    tdir.constraints.clone(),
-                )?;
-                let t = db.table_mut_in(&dbdir.name, &tdir.name)?;
-                for (col, d) in t.columns.iter_mut().zip(tdir.defaults.iter()) {
-                    col.default = d.clone();
+            for sdir in &dbdir.schemas {
+                let ns = SchemaPath::new(&dbdir.name, &sdir.name);
+                db.create_schema(&ns, true)?;
+                db.set_schema_display(&ns, &sdir.name)?;
+                for tdir in &sdir.tables {
+                    db.create_table_with_constraints_in(
+                        &ns,
+                        &tdir.name,
+                        tdir.schema.clone(),
+                        tdir.constraints.clone(),
+                    )?;
+                    // Defaults are stored as SQL text; rebind them against
+                    // the restored schema so a clock default is ready to
+                    // evaluate on later inserts.
+                    let rebound: Vec<Option<crate::plan::ColumnDefault>> = tdir
+                        .defaults
+                        .iter()
+                        .zip(tdir.schema.iter())
+                        .map(|(text, (_, dtype))| match text {
+                            Some(text) => Ok(Some(crate::sql::binder::bind_stored_default(
+                                &db, &ns, text, *dtype,
+                            )?)),
+                            None => Ok(None),
+                        })
+                        .collect::<Result<_>>()?;
+                    let t = db.table_mut_in(&ns, &tdir.name)?;
+                    for (col, d) in t.columns.iter_mut().zip(rebound) {
+                        col.default = d;
+                    }
                 }
             }
         }
         // The data region: every column chunk is verified on its own CRC32C
         // and decoded in parallel.
         for dbdir in &footer.databases {
-            for tdir in &dbdir.tables {
-                load_table_data(data, &mut db, &dbdir.name, tdir)?;
+            for sdir in &dbdir.schemas {
+                let ns = SchemaPath::new(&dbdir.name, &sdir.name);
+                for tdir in &sdir.tables {
+                    load_table_data(data, &mut db, &ns, tdir)?;
+                }
             }
         }
         // The index definitions (the maps are rebuilt from the rows).
         for dbdir in &footer.databases {
-            for tdir in &dbdir.tables {
-                if tdir.indexes.is_empty() {
-                    continue;
+            for sdir in &dbdir.schemas {
+                let ns = SchemaPath::new(&dbdir.name, &sdir.name);
+                for tdir in &sdir.tables {
+                    if tdir.indexes.is_empty() {
+                        continue;
+                    }
+                    let t = db.table_mut_in(&ns, &tdir.name)?;
+                    apply_indexes(t, &tdir.indexes)?;
                 }
-                let t = db.table_mut_in(&dbdir.name, &tdir.name)?;
-                apply_indexes(t, &tdir.indexes)?;
             }
         }
         // Vector index definitions keep their serialized graph until the
         // provider extension is loaded (CLI/server do that right after open;
         // any mutation or indexed query before that is a clear refusal).
         for dbdir in &footer.databases {
-            for tdir in &dbdir.tables {
-                if tdir.vector_indexes.is_empty() {
-                    continue;
-                }
-                let t = db.table_mut_in(&dbdir.name, &tdir.name)?;
-                let mut defs = Vec::with_capacity(tdir.vector_indexes.len());
-                for def in &tdir.vector_indexes {
-                    if def.column >= t.columns.len() {
-                        return Err(PinkDbError::Execution(format!(
-                            "corrupt file: vector index \"{}\" names column {} of a {}-column \
-                             table",
-                            def.name,
-                            def.column,
-                            t.columns.len()
-                        )));
+            for sdir in &dbdir.schemas {
+                let ns = SchemaPath::new(&dbdir.name, &sdir.name);
+                for tdir in &sdir.tables {
+                    if tdir.vector_indexes.is_empty() {
+                        continue;
                     }
-                    if t.indexes.iter().any(|i| i.name == def.name)
-                        || defs
-                            .iter()
-                            .any(|d: &crate::storage::VectorIndexDef| d.name == def.name)
-                    {
-                        return Err(PinkDbError::Execution(format!(
-                            "corrupt file: index \"{}\" is defined twice",
-                            def.name
-                        )));
+                    let t = db.table_mut_in(&ns, &tdir.name)?;
+                    let mut defs = Vec::with_capacity(tdir.vector_indexes.len());
+                    for def in &tdir.vector_indexes {
+                        if def.column >= t.columns.len() {
+                            return Err(PinkDbError::Execution(format!(
+                                "corrupt file: vector index \"{}\" names column {} of a {}-column \
+                                 table",
+                                def.name,
+                                def.column,
+                                t.columns.len()
+                            )));
+                        }
+                        if t.indexes.iter().any(|i| i.name == def.name)
+                            || defs
+                                .iter()
+                                .any(|d: &crate::storage::VectorIndexDef| d.name == def.name)
+                        {
+                            return Err(PinkDbError::Execution(format!(
+                                "corrupt file: index \"{}\" is defined twice",
+                                def.name
+                            )));
+                        }
+                        defs.push(crate::storage::VectorIndexDef {
+                            name: def.name.clone(),
+                            column: def.column,
+                            provider: def.provider.to_ascii_lowercase(),
+                            options: def.options.clone(),
+                            index: None,
+                            blob: Some(std::sync::Arc::from(def.blob.clone().into_boxed_slice())),
+                        });
                     }
-                    defs.push(crate::storage::VectorIndexDef {
-                        name: def.name.clone(),
-                        column: def.column,
-                        provider: def.provider.to_ascii_lowercase(),
-                        options: def.options.clone(),
-                        index: None,
-                        blob: Some(std::sync::Arc::from(def.blob.clone().into_boxed_slice())),
-                    });
+                    t.vector_indexes = defs;
                 }
-                t.vector_indexes = defs;
             }
         }
         // The catalog sections: macros first (an MV's defining SQL may call
         // a macro and is rebound at load), then the materialized views, then
-        // the procedures, then the store-global RBAC section.
+        // the procedures, then the store-global RBAC section. Every object
+        // lands in the schema it was saved in.
         for dbdir in &footer.databases {
-            for def in &dbdir.macros {
-                db.macros_insert_in(&dbdir.name, def.name.to_ascii_lowercase(), def.clone())?;
-            }
-            for def in &dbdir.materialized_views {
-                let mut def = def.clone();
-                def.query = crate::mv::rebind_query(&db, &dbdir.name, &def.query_sql).ok();
-                db.materialized_views_insert_in(&dbdir.name, def.name.to_ascii_lowercase(), def)?;
-            }
-            for def in &dbdir.procedures {
-                db.procedures_insert_in(&dbdir.name, def.name.to_ascii_lowercase(), def.clone())?;
-            }
-            // Triggers last: a definition is only used when a statement fires
-            // it, so its table must be loaded first (it already is).
-            for def in &dbdir.triggers {
-                db.triggers_insert_in(&dbdir.name, def.clone())?;
+            for sdir in &dbdir.schemas {
+                let ns = SchemaPath::new(&dbdir.name, &sdir.name);
+                for def in &sdir.macros {
+                    db.macros_insert_in(&ns, def.name.to_ascii_lowercase(), def.clone())?;
+                }
+                for def in &sdir.materialized_views {
+                    let mut def = def.clone();
+                    def.query = crate::mv::rebind_query(&db, &ns, &def.query_sql).ok();
+                    db.materialized_views_insert_in(&ns, def.name.to_ascii_lowercase(), def)?;
+                }
+                for def in &sdir.procedures {
+                    db.procedures_insert_in(&ns, def.name.to_ascii_lowercase(), def.clone())?;
+                }
+                // Triggers last: a definition is only used when a statement
+                // fires it, so its table must be loaded first (it already is).
+                for def in &sdir.triggers {
+                    db.triggers_insert_in(&ns, def.clone())?;
+                }
             }
         }
         if let Some(rbac) = footer.rbac {
             *db.rbac_mut() = rbac;
         }
+        // Wave 132b: the store's secrets must exist before the checkpoint's
+        // lakes are reopened (a lake's postgres catalog password lives in
+        // one), and `reopen_lake_databases` runs right after this load.
+        db.install_persistent_secrets(footer.secrets);
         if db.list_databases().is_empty() {
             db.create_database("main")?;
         }
@@ -3880,7 +3979,7 @@ pub fn is_pinkdb06(bytes: &[u8]) -> bool {
 /// entry.
 fn write_table(
     data: &mut Writer,
-    dbname: &str,
+    ns: &crate::storage::SchemaPath,
     name: &str,
     t: &DataTable,
     parallel: bool,
@@ -3909,8 +4008,9 @@ fn write_table(
                 let total: u64 = strs.iter().map(|s| s.len() as u64).sum();
                 if !varchar_offsets_fit(total) {
                     return Err(PinkDbError::Execution(format!(
-                        "table \"{dbname}.{name}\" has a VARCHAR chunk of {total} \
-                             bytes, over the .pink format's u32 string-offset limit"
+                        "table \"{}.{name}\" has a VARCHAR chunk of {total} \
+                             bytes, over the .pink format's u32 string-offset limit",
+                        ns.db()
                     )));
                 }
             }
@@ -3939,7 +4039,8 @@ fn write_table(
     }
     if collect_stats {
         let mut entry = SavedTableStats {
-            db: dbname.to_string(),
+            db: ns.db().to_string(),
+            schema: ns.schema().to_string(),
             table: name.to_string(),
             rows: t.num_rows() as u64,
             columns: schema
@@ -4025,7 +4126,11 @@ fn write_table(
         name: name.to_string(),
         schema,
         constraints: t.constraints.clone(),
-        defaults: t.columns.iter().map(|c| c.default.clone()).collect(),
+        defaults: t
+            .columns
+            .iter()
+            .map(|c| c.default.as_ref().map(|d| d.text.clone()))
+            .collect(),
         indexes: index_defs(t),
         vector_indexes: vector_index_defs(t)?,
         row_count: t.num_rows() as u64,
@@ -4103,7 +4208,9 @@ fn check_footer_version(version: u32) -> Result<()> {
 
 /// A database's storage, after its name in the footer:
 /// `u8 STORAGE_LOCAL` or `u8 STORAGE_LAKE | u8 has_catalog [str catalog] |
-/// u8 has_data [str data] | u8 read_only | u8 has_version [u64 version]`.
+/// u8 has_data [str data] | u8 read_only | u8 has_version [u64 version] |
+/// has_data_inlining_row_limit [u64] | create_if_not_exists |
+/// has_data_file_format [str]`.
 fn write_storage(fw: &mut Writer, storage: &crate::lake_db::DbStorage) {
     match storage {
         crate::lake_db::DbStorage::Local => fw.u8(STORAGE_LOCAL),
@@ -4126,12 +4233,28 @@ fn write_storage(fw: &mut Writer, storage: &crate::lake_db::DbStorage) {
                 }
                 None => fw.u8(0),
             }
+            match spec.data_inlining_row_limit {
+                Some(n) => {
+                    fw.u8(1);
+                    fw.u64(n);
+                }
+                None => fw.u8(0),
+            }
+            fw.u8(u8::from(spec.create_if_not_exists));
+            match spec.data_file_format.as_deref() {
+                Some(id) => {
+                    fw.u8(1);
+                    fw.str(id);
+                }
+                None => fw.u8(0),
+            }
         }
     }
 }
 
 fn read_storage(r: &mut Reader<'_>) -> Result<crate::lake_db::DbStorage> {
-    match r.u8()? {
+    let tag = r.u8()?;
+    match tag {
         STORAGE_LOCAL => Ok(crate::lake_db::DbStorage::Local),
         STORAGE_LAKE => {
             let mut text = || -> Result<Option<String>> {
@@ -4163,11 +4286,41 @@ fn read_storage(r: &mut Reader<'_>) -> Result<crate::lake_db::DbStorage> {
                     )));
                 }
             };
+            let data_inlining_row_limit = match r.u8()? {
+                0 => None,
+                1 => Some(r.u64()?),
+                t => {
+                    return Err(PinkDbError::Execution(format!(
+                        "corrupt file: bad data-inlining row limit flag {t}"
+                    )));
+                }
+            };
+            let create_if_not_exists = match r.u8()? {
+                0 => false,
+                1 => true,
+                t => {
+                    return Err(PinkDbError::Execution(format!(
+                        "corrupt file: bad create-if-not-exists flag {t}"
+                    )));
+                }
+            };
+            let data_file_format = match r.u8()? {
+                0 => None,
+                1 => Some(r.str()?),
+                t => {
+                    return Err(PinkDbError::Execution(format!(
+                        "corrupt file: bad data-file format flag {t}"
+                    )));
+                }
+            };
             Ok(crate::lake_db::DbStorage::Lake(crate::lake_db::LakeSpec {
                 catalog,
                 data,
                 read_only,
                 version,
+                data_inlining_row_limit,
+                create_if_not_exists,
+                data_file_format,
             }))
         }
         t => Err(PinkDbError::Execution(format!(
@@ -4364,34 +4517,37 @@ pub fn read_layout(region: &[u8], crc32c: Option<u32>) -> Result<PinkLayout> {
             .databases
             .iter()
             .flat_map(|db| {
-                db.tables.iter().map(move |t| PinkTableLayout {
-                    db: db.name.clone(),
-                    table: t.name.clone(),
-                    schema: t.schema.clone(),
-                    row_count: t.row_count,
-                    row_groups: t
-                        .row_groups
-                        .iter()
-                        .map(|rg| PinkRowGroup {
-                            rows: rg.rows,
-                            columns: rg
-                                .columns
-                                .iter()
-                                .map(|c| PinkColumnChunk {
-                                    offset: c.offset,
-                                    length: c.length,
-                                    page_count: c.page_count,
-                                    encodings: c.encodings,
-                                    crc32c: c.crc32c,
-                                    null_count: c.null_count,
-                                    nan_count: c.nan_count,
-                                    min: c.min.clone(),
-                                    max: c.max.clone(),
-                                })
-                                .collect(),
-                        })
-                        .collect(),
-                })
+                db.schemas
+                    .iter()
+                    .flat_map(|s| s.tables.iter())
+                    .map(move |t| PinkTableLayout {
+                        db: db.name.clone(),
+                        table: t.name.clone(),
+                        schema: t.schema.clone(),
+                        row_count: t.row_count,
+                        row_groups: t
+                            .row_groups
+                            .iter()
+                            .map(|rg| PinkRowGroup {
+                                rows: rg.rows,
+                                columns: rg
+                                    .columns
+                                    .iter()
+                                    .map(|c| PinkColumnChunk {
+                                        offset: c.offset,
+                                        length: c.length,
+                                        page_count: c.page_count,
+                                        encodings: c.encodings,
+                                        crc32c: c.crc32c,
+                                        null_count: c.null_count,
+                                        nan_count: c.nan_count,
+                                        min: c.min.clone(),
+                                        max: c.max.clone(),
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                    })
             })
             .collect(),
     })
@@ -4560,6 +4716,7 @@ fn null_vector(dtype: DataType, rows: usize) -> Vector {
             precision,
             scale,
         },
+        DataType::Uuid => VectorData::Uuid(vec![0; rows]),
         DataType::Interval => VectorData::Interval(vec![
             crate::types::Interval {
                 months: 0,
@@ -4695,173 +4852,215 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
     for _ in 0..n_dbs {
         let name = r.str()?;
         let storage = read_storage(&mut r)?;
-        let n_tables = r.u32()? as usize;
-        if n_tables > r.remaining() / 8 + 1 {
-            return r.err("table count exceeds the remaining file");
+        let lake = matches!(storage, crate::lake_db::DbStorage::Lake(_));
+        let n_schemas = r.u32()? as usize;
+        // Each schema costs at least 8 bytes (its name's length prefix).
+        if n_schemas > r.remaining() / 8 + 1 {
+            return r.err("schema count exceeds the remaining file");
         }
-        let mut tables = Vec::with_capacity(n_tables);
-        for _ in 0..n_tables {
-            let tname = r.str()?;
-            let n_cols = r.u32()? as usize;
-            // Each column costs at least 5 bytes (name length + dtype tag).
-            if n_cols > r.remaining() / 5 {
-                return r.err("column count exceeds the remaining file");
+        let mut schemas = Vec::with_capacity(n_schemas);
+        // The writer emits schema keys strictly ascending; a repeated key
+        // would merge two schemas' objects on load instead of failing.
+        let mut last_schema: Option<String> = None;
+        for _ in 0..n_schemas {
+            let sname = r.str()?;
+            let key = sname.to_ascii_lowercase();
+            if last_schema
+                .as_deref()
+                .is_some_and(|prev| prev >= key.as_str())
+            {
+                return r.err("schema names are not in strictly ascending order");
             }
-            let mut schema = Vec::with_capacity(n_cols);
-            for _ in 0..n_cols {
-                let col = r.str()?;
-                let tag = r.u8()?;
-                let dtype = match tag {
-                    7 => {
-                        let precision = r.u8()?;
-                        let scale = r.u8()?;
-                        crate::types::decimal_type(precision, scale).ok_or_else(|| {
-                            PinkDbError::Execution(
-                                "corrupt file: bad DECIMAL precision/scale".to_string(),
-                            )
-                        })?
-                    }
-                    8 => DataType::Interval,
-                    10 => {
-                        let elem_tag = r.u8()?;
-                        let elem =
-                            crate::types::ArrayElem::from_tag(elem_tag).ok_or_else(|| {
-                                PinkDbError::Execution(format!(
-                                    "corrupt file: bad ARRAY element kind {elem_tag}"
-                                ))
-                            })?;
-                        let len = r.u32()?;
-                        crate::types::array_type(elem, len).ok_or_else(|| {
-                            PinkDbError::Execution(
-                                "corrupt file: bad ARRAY element count".to_string(),
-                            )
-                        })?
-                    }
-                    other => dtype_from_tag(other)?,
-                };
-                schema.push((col, dtype));
+            last_schema = Some(key);
+            let n_tables = r.u32()? as usize;
+            if n_tables > r.remaining() / 8 + 1 {
+                return r.err("table count exceeds the remaining file");
             }
-            let tconstraints = if constraints {
-                read_constraints(&mut r, n_cols)?
-            } else {
-                TableConstraints::default()
-            };
-            let tdefaults = if defaults {
-                let decoded = read_defaults(&mut r, n_cols)?;
-                for ((name, dtype), d) in schema.iter().zip(decoded.iter()) {
-                    if let Some(v) = d
-                        && !default_matches(v, *dtype)
-                    {
-                        return r.err(&format!(
-                            "default value of column \"{name}\" does not match its type"
-                        ));
-                    }
+            let mut tables = Vec::with_capacity(n_tables);
+            for _ in 0..n_tables {
+                let tname = r.str()?;
+                let n_cols = r.u32()? as usize;
+                // Each column costs at least 5 bytes (name length + dtype tag).
+                if n_cols > r.remaining() / 5 {
+                    return r.err("column count exceeds the remaining file");
                 }
-                decoded
-            } else {
-                vec![None; n_cols]
-            };
-            let tindexes = if indexes {
-                read_index_defs(&mut r)?
-            } else {
-                Vec::new()
-            };
-            let tvectors = if vectors {
-                read_vector_index_defs(&mut r)?
-            } else {
-                Vec::new()
-            };
-            let row_count = r.u64()?;
-            let n_groups = r.u32()? as usize;
-            // Each row group costs at least 8 bytes (its row count) plus one
-            // entry per column.
-            if n_groups > r.remaining() / 8 + 1 {
-                return r.err("row-group count exceeds the remaining file");
-            }
-            let mut row_groups = Vec::with_capacity(n_groups);
-            for _ in 0..n_groups {
-                let rows = r.u64()?;
-                let mut columns = Vec::with_capacity(n_cols);
+                let mut schema = Vec::with_capacity(n_cols);
                 for _ in 0..n_cols {
-                    let offset = r.u64()?;
-                    let length = r.u64()?;
-                    let page_count = r.u32()?;
-                    let encodings = r.u32()?;
-                    let crc = r.u32()?;
-                    let null_count = r.u64()?;
-                    let nan_count = r.u64()?;
-                    let min = read_stat_value(&mut r)?;
-                    let max = read_stat_value(&mut r)?;
-                    columns.push(ColumnChunkDir {
-                        offset,
-                        length,
-                        page_count,
-                        encodings,
-                        crc32c: crc,
-                        null_count,
-                        nan_count,
-                        min,
-                        max,
-                    });
+                    let col = r.str()?;
+                    let tag = r.u8()?;
+                    let dtype = match tag {
+                        7 => {
+                            let precision = r.u8()?;
+                            let scale = r.u8()?;
+                            crate::types::decimal_type(precision, scale).ok_or_else(|| {
+                                PinkDbError::Execution(
+                                    "corrupt file: bad DECIMAL precision/scale".to_string(),
+                                )
+                            })?
+                        }
+                        8 => DataType::Interval,
+                        10 => {
+                            let elem_tag = r.u8()?;
+                            let elem =
+                                crate::types::ArrayElem::from_tag(elem_tag).ok_or_else(|| {
+                                    PinkDbError::Execution(format!(
+                                        "corrupt file: bad ARRAY element kind {elem_tag}"
+                                    ))
+                                })?;
+                            let len = r.u32()?;
+                            crate::types::array_type(elem, len).ok_or_else(|| {
+                                PinkDbError::Execution(
+                                    "corrupt file: bad ARRAY element count".to_string(),
+                                )
+                            })?
+                        }
+                        other => dtype_from_tag(other)?,
+                    };
+                    schema.push((col, dtype));
                 }
-                row_groups.push(RowGroupDir { rows, columns });
+                let tconstraints = if constraints {
+                    read_constraints(&mut r, n_cols)?
+                } else {
+                    TableConstraints::default()
+                };
+                let tdefaults = if defaults {
+                    read_defaults(&mut r, n_cols)?
+                } else {
+                    vec![None; n_cols]
+                };
+                let tindexes = if indexes {
+                    read_index_defs(&mut r)?
+                } else {
+                    Vec::new()
+                };
+                let tvectors = if vectors {
+                    read_vector_index_defs(&mut r)?
+                } else {
+                    Vec::new()
+                };
+                let row_count = r.u64()?;
+                let n_groups = r.u32()? as usize;
+                // Each row group costs at least 8 bytes (its row count) plus one
+                // entry per column.
+                if n_groups > r.remaining() / 8 + 1 {
+                    return r.err("row-group count exceeds the remaining file");
+                }
+                let mut row_groups = Vec::with_capacity(n_groups);
+                for _ in 0..n_groups {
+                    let rows = r.u64()?;
+                    let mut columns = Vec::with_capacity(n_cols);
+                    for _ in 0..n_cols {
+                        let offset = r.u64()?;
+                        let length = r.u64()?;
+                        let page_count = r.u32()?;
+                        let encodings = r.u32()?;
+                        let crc = r.u32()?;
+                        let null_count = r.u64()?;
+                        let nan_count = r.u64()?;
+                        let min = read_stat_value(&mut r)?;
+                        let max = read_stat_value(&mut r)?;
+                        columns.push(ColumnChunkDir {
+                            offset,
+                            length,
+                            page_count,
+                            encodings,
+                            crc32c: crc,
+                            null_count,
+                            nan_count,
+                            min,
+                            max,
+                        });
+                    }
+                    row_groups.push(RowGroupDir { rows, columns });
+                }
+                let (tstats, tzones) = read_table_stats(&mut r, n_cols, row_count)?;
+                tables.push(TableDir {
+                    name: tname,
+                    schema,
+                    constraints: tconstraints,
+                    defaults: tdefaults,
+                    indexes: tindexes,
+                    vector_indexes: tvectors,
+                    row_count,
+                    row_groups,
+                    stats: tstats,
+                    zones: tzones,
+                });
             }
-            let (tstats, tzones) = read_table_stats(&mut r, n_cols, row_count)?;
-            tables.push(TableDir {
-                name: tname,
-                schema,
-                constraints: tconstraints,
-                defaults: tdefaults,
-                indexes: tindexes,
-                vector_indexes: tvectors,
-                row_count,
-                row_groups,
-                stats: tstats,
-                zones: tzones,
+            let dmacros = if macros {
+                read_macro_defs(&mut r)?
+            } else {
+                Vec::new()
+            };
+            let dmvs = if mvs {
+                read_materialized_view_defs(&mut r)?
+            } else {
+                Vec::new()
+            };
+            let dprocs = if procedures {
+                read_procedure_defs(&mut r)?
+            } else {
+                Vec::new()
+            };
+            let dtriggers = if triggers {
+                read_trigger_defs(&mut r, &name, &sname)?
+            } else {
+                Vec::new()
+            };
+            schemas.push(SchemaDir {
+                name: sname,
+                tables,
+                macros: dmacros,
+                materialized_views: dmvs,
+                procedures: dprocs,
+                triggers: dtriggers,
             });
         }
-        let dmacros = if macros {
-            read_macro_defs(&mut r)?
-        } else {
-            Vec::new()
-        };
-        let dmvs = if mvs {
-            read_materialized_view_defs(&mut r)?
-        } else {
-            Vec::new()
-        };
-        let dprocs = if procedures {
-            read_procedure_defs(&mut r)?
-        } else {
-            Vec::new()
-        };
-        let dtriggers = if triggers {
-            read_trigger_defs(&mut r, &name)?
-        } else {
-            Vec::new()
-        };
+        // A local database always has its `main` schema, and a schema name
+        // never repeats (the catalog keys on the lowercased name).
+        if !lake
+            && !schemas
+                .iter()
+                .any(|sd| sd.name.eq_ignore_ascii_case("main"))
+        {
+            return Err(PinkDbError::Execution(format!(
+                "corrupt file: database \"{name}\" has no main schema"
+            )));
+        }
+        for (i, sd) in schemas.iter().enumerate() {
+            if schemas[..i]
+                .iter()
+                .any(|o| o.name.eq_ignore_ascii_case(&sd.name))
+            {
+                return Err(PinkDbError::Execution(format!(
+                    "corrupt file: database \"{name}\" defines schema \"{}\" twice",
+                    sd.name
+                )));
+            }
+        }
         databases.push(DbDir {
             name,
             storage,
-            tables,
-            macros: dmacros,
-            materialized_views: dmvs,
-            procedures: dprocs,
-            triggers: dtriggers,
+            schemas,
         });
     }
     let rbac = if rbac { Some(read_rbac(&mut r)?) } else { None };
+    let secrets = read_secrets(&mut r)?;
     if !r.end() {
         return Err(PinkDbError::Execution(
             "corrupt file: trailing bytes after the footer".to_string(),
         ));
     }
-    Ok(StoreFooter { databases, rbac })
+    Ok(StoreFooter {
+        databases,
+        rbac,
+        secrets,
+    })
 }
 
 /// Load one table's data region: every column chunk is read, its CRC32C is
 /// verified and its pages are decoded. The columns are decoded in parallel.
-fn load_table_data(data: &[u8], db: &mut PinkDb, dbname: &str, tdir: &TableDir) -> Result<()> {
+fn load_table_data(data: &[u8], db: &mut PinkDb, ns: &SchemaPath, tdir: &TableDir) -> Result<()> {
     let n_cols = tdir.schema.len();
     // The decoded pages per column: `pages[column][row group][page]`.
     let decoded: Vec<Vec<Vec<Arc<Vector>>>> = (0..n_cols)
@@ -4883,7 +5082,7 @@ fn load_table_data(data: &[u8], db: &mut PinkDb, dbname: &str, tdir: &TableDir) 
     }
     // Assemble the table chunk by chunk (every column shares the chunk
     // boundaries: the writer's invariant).
-    let t = db.table_mut_in(dbname, &tdir.name)?;
+    let t = db.table_mut_in(ns, &tdir.name)?;
     // The append merges a short page into a partly filled tail chunk, so the
     // loaded chunks keep the writer's boundaries only when every page but
     // the last is full. A table whose interior chunks shrank (deletes, small
@@ -5118,167 +5317,28 @@ fn read_constraints(r: &mut Reader, n_cols: usize) -> Result<TableConstraints> {
     Ok(out)
 }
 
-/// Encode every column's DEFAULT (wave 65): one presence byte per column,
-/// then the value bytes of the ones that have a default (a NULL default is
-/// simply absent — it means the same on read).
-fn write_defaults(w: &mut Writer, defaults: &[Option<Value>]) {
+/// Encode every column's DEFAULT: one presence byte per column, then the
+/// expression text of the ones that have a default. A NULL default is absent.
+fn write_defaults(w: &mut Writer, defaults: &[Option<String>]) {
     for d in defaults {
         match d {
-            Some(v) if !v.is_null() => {
+            Some(text) => {
                 w.u8(1);
-                write_default_value(w, v);
+                w.str(text);
             }
-            _ => w.u8(0),
+            None => w.u8(0),
         }
     }
 }
 
-/// One default value's bytes: a tag byte plus its payload.
-fn write_default_value(w: &mut Writer, v: &Value) {
-    match v {
-        // Unreachable: `write_defaults` treats a NULL default as absent. A
-        // total match keeps the encoder honest.
-        Value::Null => w.u8(VD_BOOL),
-        Value::Boolean(b) => {
-            w.u8(VD_BOOL);
-            w.u8(*b as u8);
-        }
-        Value::Integer(i) => {
-            w.u8(VD_I32);
-            w.u32(*i as u32);
-        }
-        Value::Bigint(i) => {
-            w.u8(VD_I64);
-            w.u64(*i as u64);
-        }
-        Value::Double(x) => {
-            w.u8(VD_F64_BITS);
-            w.u64(x.to_bits());
-        }
-        Value::Varchar(s) => {
-            w.u8(VD_VARCHAR);
-            w.str(s);
-        }
-        Value::Date(d) => {
-            w.u8(VD_DATE);
-            w.u32(*d as u32);
-        }
-        Value::Timestamp(t) => {
-            w.u8(VD_TIMESTAMP);
-            w.u64(*t as u64);
-        }
-        Value::Decimal(x, scale) => {
-            w.u8(VD_DECIMAL);
-            w.bytes(&x.to_le_bytes());
-            w.u8(*scale);
-        }
-        Value::Interval {
-            months,
-            days,
-            micros,
-        } => {
-            w.u8(VD_INTERVAL);
-            w.u32(*months as u32);
-            w.u32(*days as u32);
-            w.u64(*micros as u64);
-        }
-        Value::Variant(v) => {
-            let mut bytes = Vec::new();
-            crate::variant::encode(v, &mut bytes);
-            w.u8(VD_VARIANT);
-            w.u32(bytes.len() as u32);
-            w.bytes(&bytes);
-        }
-        Value::Array(a) => {
-            let bytes = crate::array::encode_cell(a);
-            w.u8(VD_ARRAY);
-            w.u32(bytes.len() as u32);
-            w.bytes(&bytes);
-        }
-    }
-}
-
-/// Decode the per-column default section. Every tag is validated; an unknown
-/// tag or a truncated payload is a corrupt-file error.
-fn read_defaults(r: &mut Reader, n_cols: usize) -> Result<Vec<Option<Value>>> {
+/// Decode the per-column default section; the text is rebound to a typed
+/// expression when the table is loaded.
+fn read_defaults(r: &mut Reader, n_cols: usize) -> Result<Vec<Option<String>>> {
     let mut out = Vec::with_capacity(n_cols);
     for _ in 0..n_cols {
-        if r.u8()? == 0 {
-            out.push(None);
-            continue;
-        }
-        let tag = r.u8()?;
-        let v = match tag {
-            VD_BOOL => Value::Boolean(match r.u8()? {
-                0 => false,
-                1 => true,
-                _ => return r.err("bad BOOLEAN default byte"),
-            }),
-            VD_I32 => Value::Integer(r.i32()?),
-            VD_I64 => Value::Bigint(r.i64()?),
-            VD_F64_BITS => Value::Double(f64::from_bits(r.u64()?)),
-            VD_VARCHAR => Value::Varchar(r.str()?),
-            VD_DATE => Value::Date(r.i32()?),
-            VD_TIMESTAMP => Value::Timestamp(r.i64()?),
-            VD_DECIMAL => {
-                let b = r.take(16)?;
-                let mut arr = [0u8; 16];
-                arr.copy_from_slice(b);
-                let x = i128::from_le_bytes(arr);
-                let scale = r.u8()?;
-                if scale > 38 {
-                    return r.err("bad DECIMAL default scale");
-                }
-                Value::Decimal(x, scale)
-            }
-            VD_INTERVAL => Value::Interval {
-                months: r.i32()?,
-                days: r.i32()?,
-                micros: r.i64()?,
-            },
-            VD_VARIANT => {
-                let n = r.u32()? as usize;
-                let bytes = r.take(n)?;
-                match crate::variant::decode(bytes) {
-                    Ok(v) => Value::Variant(Arc::new(v)),
-                    Err(_) => return r.err("bad VARIANT default"),
-                }
-            }
-            VD_ARRAY => {
-                let n = r.u32()? as usize;
-                let bytes = r.take(n)?;
-                match crate::array::decode_cell(bytes) {
-                    Ok(v) => Value::Array(Arc::new(v)),
-                    Err(_) => return r.err("bad ARRAY default"),
-                }
-            }
-            other => {
-                return Err(PinkDbError::Execution(format!(
-                    "corrupt file: unknown default value tag {other}"
-                )));
-            }
-        };
-        out.push(Some(v));
+        out.push(if r.u8()? == 0 { None } else { Some(r.str()?) });
     }
     Ok(out)
-}
-
-/// Whether a decoded default value has exactly its column's type (a tampered
-/// file cannot smuggle a mistyped default into later INSERTs).
-fn default_matches(v: &Value, dtype: DataType) -> bool {
-    match (v, dtype) {
-        (Value::Boolean(_), DataType::Boolean)
-        | (Value::Integer(_), DataType::Integer)
-        | (Value::Bigint(_), DataType::Bigint)
-        | (Value::Double(_), DataType::Double)
-        | (Value::Varchar(_), DataType::Varchar)
-        | (Value::Date(_), DataType::Date)
-        | (Value::Timestamp(_), DataType::Timestamp)
-        | (Value::Interval { .. }, DataType::Interval) => true,
-        (Value::Decimal(_, s), DataType::Decimal { scale, .. }) => *s == scale,
-        (Value::Variant(_), DataType::Variant) => true,
-        _ => false,
-    }
 }
 
 /// Policy tags in a materialized-view section (wave 80).
@@ -5476,7 +5536,11 @@ fn write_trigger_defs(w: &mut Writer, defs: &[crate::trigger::TriggerDef]) {
 /// Decode one database's trigger section, re-parsing each `CREATE TRIGGER`
 /// text. A body that no longer parses is a corrupt file (it parsed when the
 /// trigger was created).
-fn read_trigger_defs(r: &mut Reader, dbname: &str) -> Result<Vec<crate::trigger::TriggerDef>> {
+fn read_trigger_defs(
+    r: &mut Reader,
+    dbname: &str,
+    schema: &str,
+) -> Result<Vec<crate::trigger::TriggerDef>> {
     let n = r.u32()? as usize;
     // Each trigger costs at least 8 bytes (two empty strings' length prefixes).
     if n > r.remaining() / 8 + 1 {
@@ -5499,7 +5563,11 @@ fn read_trigger_defs(r: &mut Reader, dbname: &str) -> Result<Vec<crate::trigger:
                 )));
             }
         };
-        let mut def = crate::trigger::def_from_statement(dbname, &stmt).map_err(|e| {
+        let mut def = crate::trigger::def_from_statement(
+            &crate::storage::SchemaPath::new(dbname, schema),
+            &stmt,
+        )
+        .map_err(|e| {
             PinkDbError::Execution(format!(
                 "corrupt file: trigger \"{name}\" does not parse: {e}"
             ))
@@ -5579,6 +5647,62 @@ fn read_procedure_defs(r: &mut Reader) -> Result<Vec<crate::procedure::Procedure
     Ok(out)
 }
 
+/// Encode the store-global secrets section (wave 132b). The values live here
+/// and nowhere else on disk: the footer is sealed as a whole when the store
+/// is keyed, and a WAL record carries the same list in its own section.
+/// Statement text never does (see `rbac::wal_statement_text`).
+fn write_secrets(w: &mut Writer, db: &PinkDb) {
+    let secrets = db.persistent_secrets();
+    w.u32(secrets.len() as u32);
+    for secret in secrets {
+        w.str(secret.name());
+        w.u8(secret.type_().tag());
+        w.u32(secret.scopes().len() as u32);
+        for scope in secret.scopes() {
+            w.str(scope);
+        }
+        w.u32(secret.fields().len() as u32);
+        for (key, value) in secret.fields() {
+            w.str(key);
+            w.str(value);
+        }
+    }
+}
+
+fn read_secrets(r: &mut Reader) -> Result<Vec<crate::secret::Secret>> {
+    let n = r.u32()? as usize;
+    if n > r.remaining() / 8 + 1 {
+        return r.err("secret count exceeds the remaining file");
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.str()?;
+        let Some(type_) = crate::secret::SecretType::from_tag(r.u8()?) else {
+            return r.err("unknown secret type tag");
+        };
+        let n_scopes = r.u32()? as usize;
+        if n_scopes > r.remaining() / 4 + 1 {
+            return r.err("secret scope count exceeds the remaining file");
+        }
+        let mut scopes = Vec::with_capacity(n_scopes);
+        for _ in 0..n_scopes {
+            scopes.push(r.str()?);
+        }
+        let n_fields = r.u32()? as usize;
+        if n_fields > r.remaining() / 8 + 1 {
+            return r.err("secret field count exceeds the remaining file");
+        }
+        let mut fields = std::collections::BTreeMap::new();
+        for _ in 0..n_fields {
+            fields.insert(r.str()?, r.str()?);
+        }
+        out.push(crate::secret::Secret::from_stored(
+            name, type_, fields, scopes,
+        ));
+    }
+    Ok(out)
+}
+
 /// Encode the store-global RBAC section: the users (display name + Argon2id
 /// PHC password hash), the roles, the role memberships, the table grants, the
 /// database grants and the global `ADMIN` holders, each list sorted by its
@@ -5609,9 +5733,16 @@ fn write_rbac(w: &mut Writer, db: &PinkDb) {
         }
     }
     w.u32(rbac.table_grants.len() as u32);
-    for ((dbname, table), principals) in &rbac.table_grants {
+    for ((dbname, schema, table), principals) in &rbac.table_grants {
         w.str(dbname);
+        w.str(schema);
         w.str(table);
+        write_principal_grants(w, principals);
+    }
+    w.u32(rbac.schema_grants.len() as u32);
+    for ((dbname, schema), principals) in &rbac.schema_grants {
+        w.str(dbname);
+        w.str(schema);
         write_principal_grants(w, principals);
     }
     w.u32(rbac.database_grants.len() as u32);
@@ -5702,10 +5833,28 @@ fn read_rbac(r: &mut Reader) -> Result<crate::rbac::RbacCatalog> {
     }
     for _ in 0..n_table_grants {
         let dbname = r.str()?;
+        let schema = r.str()?;
         let table = r.str()?;
         let principals = read_principal_grants(r)?;
         rbac.table_grants.insert(
-            (dbname.to_ascii_lowercase(), table.to_ascii_lowercase()),
+            (
+                dbname.to_ascii_lowercase(),
+                schema.to_ascii_lowercase(),
+                table.to_ascii_lowercase(),
+            ),
+            principals,
+        );
+    }
+    let n_schema_grants = r.u32()? as usize;
+    if n_schema_grants > r.remaining() / 8 + 1 {
+        return r.err("RBAC schema-grant count exceeds the remaining file");
+    }
+    for _ in 0..n_schema_grants {
+        let dbname = r.str()?;
+        let schema = r.str()?;
+        let principals = read_principal_grants(r)?;
+        rbac.schema_grants.insert(
+            (dbname.to_ascii_lowercase(), schema.to_ascii_lowercase()),
             principals,
         );
     }
@@ -5767,7 +5916,7 @@ fn read_principal_grants(
 /// are ungated (`nan_count` and zero doubles are kept); `pink-lake` applies
 /// the one exactness gate shared with its footer path, so the two cannot
 /// drift apart.
-pub fn table_stats(db: &str, table: &str, src: &DataTable) -> SavedTableStats {
+pub fn table_stats(db: &str, schema_name: &str, table: &str, src: &DataTable) -> SavedTableStats {
     let schema = src.schema();
     let mut accs: Vec<ChunkColumnStats> =
         schema.iter().map(|_| ChunkColumnStats::empty()).collect();
@@ -5780,6 +5929,7 @@ pub fn table_stats(db: &str, table: &str, src: &DataTable) -> SavedTableStats {
     }
     let mut saved = SavedTableStats {
         db: db.to_string(),
+        schema: schema_name.to_string(),
         table: table.to_string(),
         rows: src.num_rows() as u64,
         columns: schema
@@ -5899,6 +6049,19 @@ fn plain_payload(v: &Vector) -> Vec<u8> {
         DataType::Varchar => enc_strs_plain(&varchar_payload(v)),
         DataType::Variant => variant_payload(v),
         DataType::Array { .. } => array_payload(v, 1),
+        DataType::Uuid => {
+            let VectorData::Uuid(values) = v.data() else {
+                unreachable!()
+            };
+            let nulls = v.has_nulls();
+            let mut w = Writer::new();
+            w.u32(values.len() as u32);
+            for (i, &x) in values.iter().enumerate() {
+                let x = if nulls && !v.is_valid(i) { 0 } else { x };
+                w.bytes(&x.to_le_bytes());
+            }
+            w.buf
+        }
         DataType::Decimal { .. } => {
             let VectorData::Decimal { values, .. } = v.data() else {
                 unreachable!()
@@ -6094,9 +6257,9 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
 /// The pinned length and footer checksum of the golden corpus's `PINKDB06`
 /// image (see `golden_pinkdb06_bytes_are_pinned`).
 #[cfg(test)]
-const GOLDEN_V6_LEN: usize = 143_714;
+const GOLDEN_V6_LEN: usize = 143_742;
 #[cfg(test)]
-const GOLDEN_V6_FOOTER_CRC: u32 = 676_117_509;
+const GOLDEN_V6_FOOTER_CRC: u32 = 376_858_327;
 
 #[cfg(test)]
 mod tests {
@@ -6257,25 +6420,143 @@ mod tests {
         }
     }
 
+    /// Relabel a `.pink` file's footer as `version`, fixing its trailer CRC.
+    fn relabel_footer_version(bytes: &mut [u8], version: u32) {
+        let (start, len) = footer_span_raw(bytes).unwrap();
+        bytes[start..start + 4].copy_from_slice(&version.to_le_bytes());
+        let crc = crc32c(&bytes[start..start + len]);
+        bytes[start + len..start + len + 4].copy_from_slice(&crc.to_le_bytes());
+    }
+
     /// Wave 124: footer version 3 records every database's storage. A
-    /// version-2 footer (no storage) is refused as an older pinkdb's.
+    /// version-2 footer (no storage) is refused as an older pinkdb's; later
+    /// waves bumped the footer for schemas (4) and default expressions (5),
+    /// so it refuses 2 the same way.
     #[test]
     fn a_version_two_footer_is_refused_as_an_older_pinkdbs() {
         let mut db = PinkDb::new();
         db.create_table("t", vec![("x".to_string(), DataType::Integer)])
             .unwrap();
         let mut bytes = db.to_bytes().unwrap();
-        let (start, len) = footer_span_raw(&bytes).unwrap();
-        bytes[start..start + 4].copy_from_slice(&2u32.to_le_bytes());
-        let crc = crc32c(&bytes[start..start + len]);
-        let crc_at = start + len;
-        bytes[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+        relabel_footer_version(&mut bytes, 2);
         let err = PinkDb::load_bytes(&bytes).unwrap_err().to_string();
         assert_eq!(
             err,
-            "this .pink file was written by an older pinkdb (footer version 2); this build \
-             reads footer version 3 only"
+            format!(
+                "this .pink file was written by an older pinkdb (footer version 2); this build \
+                 reads footer version {FOOTER_VERSION} only"
+            )
         );
+    }
+
+    /// Wave 131a: a version-3 footer (no schema level) is refused, never read
+    /// as a version-4 layout. Version 4 predates default expressions.
+    #[test]
+    fn a_version_three_footer_is_refused_as_an_older_pinkdbs() {
+        let mut db = PinkDb::new();
+        db.create_table("t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        let mut bytes = db.to_bytes().unwrap();
+        relabel_footer_version(&mut bytes, 3);
+        let err = PinkDb::load_bytes(&bytes).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "this .pink file was written by an older pinkdb (footer version 3); this build \
+                 reads footer version {FOOTER_VERSION} only"
+            )
+        );
+    }
+
+    /// A footer that repeats a schema key (case-insensitively) would merge
+    /// two schemas' objects on load, so it is refused as corrupt.
+    #[test]
+    fn duplicate_schema_keys_are_refused() {
+        let mut fw = Writer::new();
+        fw.u32(FOOTER_VERSION);
+        fw.u32(0); // no optional catalog sections
+        fw.u32(1); // one database
+        fw.str("main");
+        fw.u8(STORAGE_LOCAL);
+        fw.u32(2); // two schemas
+        fw.str("Foo");
+        fw.u32(0); // no tables
+        fw.str("foo");
+        fw.u32(0);
+        let footer = fw.buf;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&footer);
+        bytes.extend_from_slice(&crc32c(&footer).to_le_bytes());
+        bytes.extend_from_slice(&(footer.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(MAGIC_V6);
+        let err = PinkDb::load_bytes(&bytes).unwrap_err().to_string();
+        assert!(
+            err.contains("schema names are not in strictly ascending order"),
+            "{err}"
+        );
+    }
+
+    /// Wave 131a: the footer records every database's schemas, and a reopen
+    /// finds every object in the schema it was saved in — and none in `main`.
+    #[test]
+    fn schemas_and_their_objects_round_trip() {
+        let mut db = PinkDb::new();
+        db.execute(
+            "CREATE DATABASE app; USE app; \
+             CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1); \
+             CREATE MACRO add1(x) AS x + 1; \
+             CREATE MATERIALIZED VIEW mv AS SELECT 42 AS y; \
+             CREATE PROCEDURE p() AS 'BEGIN SELECT 1; END'; \
+             CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW \
+             EXECUTE INSERT INTO t VALUES (9);",
+        )
+        .unwrap();
+        let ns = SchemaPath::new("app", "s");
+        db.create_schema(&ns, false).unwrap();
+        // The grammar that names a schema arrives in wave 131b, so the test
+        // moves the objects the SQL created in `main` into `s` through the
+        // store's catalog maps — the checkpoint then has to put them back.
+        let cat = db.databases.get_mut("app").unwrap();
+        let main = cat.schemas.get_mut("main").unwrap();
+        let (table, mv, proc, trigger, macro_def) = (
+            main.tables.remove("t").unwrap(),
+            main.materialized_views.remove("mv").unwrap(),
+            main.procedures.remove("p").unwrap(),
+            main.triggers.remove(0),
+            main.macros.remove("add1").unwrap(),
+        );
+        let s = cat.schemas.get_mut("s").unwrap();
+        s.tables.insert("t".into(), table);
+        s.materialized_views.insert("mv".into(), mv);
+        s.procedures.insert("p".into(), proc);
+        s.triggers.push(trigger);
+        s.macros.insert("add1".into(), macro_def);
+
+        let back = PinkDb::load_bytes(&db.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            back.list_schemas("app"),
+            vec!["main".to_string(), "s".to_string()]
+        );
+        assert!(back.table_in(&ns, "t").is_ok());
+        assert_eq!(back.table_in(&ns, "t").unwrap().num_rows(), 1);
+        assert!(back.materialized_view_in(&ns, "mv").is_ok());
+        // The defining query rebound at load (in the schema it was saved in).
+        assert!(
+            back.materialized_view_in(&ns, "mv")
+                .unwrap()
+                .query
+                .is_some()
+        );
+        assert!(back.procedure_in(&ns, "p").is_ok());
+        assert_eq!(back.triggers_in(&ns).len(), 1);
+        assert!(back.macro_in(&ns, "add1").is_ok());
+        // Nothing stayed behind in `main`.
+        let main = SchemaPath::main("app");
+        assert!(back.table_in(&main, "t").is_err());
+        assert!(back.materialized_view_in(&main, "mv").is_err());
+        assert!(back.procedure_in(&main, "p").is_err());
+        assert!(back.triggers_in(&main).is_empty());
+        assert!(back.macro_in(&main, "add1").is_err());
     }
 
     /// Wave 124: a lake database round-trips through the footer as its
@@ -6291,6 +6572,9 @@ mod tests {
             data: Some("s3://bucket/lk".to_string()),
             read_only: true,
             version: Some(7),
+            data_inlining_row_limit: Some(1234),
+            create_if_not_exists: true,
+            data_file_format: Some("parquet".to_string()),
         };
         db.databases.get_mut("lk").unwrap().storage = crate::lake_db::DbStorage::Lake(spec.clone());
         let back = PinkDb::load_bytes(&db.to_bytes().unwrap()).unwrap();
@@ -6387,7 +6671,7 @@ mod tests {
         }
         let bytes = db.to_bytes().unwrap();
         let footer = read_store_footer(&bytes).unwrap();
-        let tdir = &footer.databases[0].tables[0];
+        let tdir = &footer.databases[0].schemas[0].tables[0];
         assert_eq!(tdir.row_count, rows as u64);
         assert_eq!(tdir.row_groups.len(), 2, "122,880 + 137 rows = two groups");
         assert_eq!(tdir.row_groups[0].rows, ROW_GROUP_ROWS as u64);
@@ -7191,7 +7475,7 @@ mod tests {
         }
         match dtype {
             DataType::Boolean => Value::Boolean(i.is_multiple_of(3)),
-            DataType::Decimal { scale, .. } => Value::Decimal(
+            DataType::Decimal { scale, .. } => Value::decimal(
                 match i % 6 {
                     0 => 0,
                     1 => -1,
@@ -7202,6 +7486,13 @@ mod tests {
                 },
                 scale,
             ),
+            DataType::Uuid => Value::Uuid(match i % 5 {
+                0 => 0,
+                1 => u128::MAX,
+                2 => 0x550e_8400_e29b_41d4_a716_4466_5544_0000,
+                3 => 0x8000_0000_0000_4000_8000_0000_0000_0000,
+                _ => (i as u128) << 64 | i as u128,
+            }),
             DataType::Interval => Value::Interval {
                 months: match i % 5 {
                     0 => 0,
@@ -7719,7 +8010,7 @@ mod tests {
         );
         // The data region starts at 0: the footer records absolute offsets.
         let footer = read_store_footer(&bytes).unwrap();
-        let dir = &footer.databases[0].tables[0].row_groups[0].columns[0];
+        let dir = &footer.databases[0].schemas[0].tables[0].row_groups[0].columns[0];
         assert_eq!(dir.offset, 0, "the first column chunk starts the file");
     }
 
@@ -8100,7 +8391,7 @@ mod tests {
         };
         for case in 0..2000 {
             let n = (next() % 300) as usize;
-            let dtype = match next() % 10 {
+            let dtype = match next() % 11 {
                 0 => DataType::Boolean,
                 1 => DataType::Integer,
                 2 => DataType::Bigint,
@@ -8113,6 +8404,7 @@ mod tests {
                     scale: 3,
                 },
                 8 => DataType::Interval,
+                9 => DataType::Uuid,
                 _ => DataType::Variant,
             };
             let mut values: Vec<Value> = Vec::with_capacity(n);
@@ -8132,7 +8424,8 @@ mod tests {
                     }
                     DataType::Date => Value::Date(r as i32),
                     DataType::Timestamp => Value::Timestamp(r as i64),
-                    DataType::Decimal { scale, .. } => Value::Decimal(r as i128, scale),
+                    DataType::Uuid => Value::Uuid(u128::from(r) << 64 | u128::from(r >> 1)),
+                    DataType::Decimal { scale, .. } => Value::decimal(r as i128, scale),
                     DataType::Interval => Value::Interval {
                         months: (r % 1000) as i32,
                         days: (r % 60) as i32,
@@ -8302,7 +8595,7 @@ mod tests {
         db.execute("CREATE TABLE t (i INTEGER, v VARCHAR, d DOUBLE, b BOOLEAN);")
             .unwrap();
         db.execute(
-            "INSERT INTO t VALUES (1, 'a', 1.5, true), (2, NULL, -0.0, false), \
+            "INSERT INTO t VALUES (1, 'a', 1.5, true), (2, NULL, -0.0e0, false), \
              (NULL, 'b', 1e300, NULL);",
         )
         .unwrap();
@@ -8355,7 +8648,7 @@ mod tests {
         // The column default.
         assert_eq!(
             back.table("c").unwrap().columns[3].default,
-            Some(Value::Integer(42))
+            Some(crate::plan::ColumnDefault::constant(Value::Integer(42)))
         );
         // The index definition (the map is rebuilt from the rows).
         let t = back.table("c").unwrap();
@@ -8556,7 +8849,7 @@ mod tests {
         )
         .unwrap();
         let t = db.table_in("main", "t").unwrap();
-        let stats = table_stats("main", "t", t);
+        let stats = table_stats("main", "main", "t", t);
         let col = &stats.columns[0];
         assert_eq!(col.min, Some(Value::Boolean(true)), "{col:?}");
         assert_eq!(col.max, Some(Value::Boolean(true)), "{col:?}");
@@ -8564,7 +8857,7 @@ mod tests {
         db.execute("CREATE TABLE f (b BOOLEAN); INSERT INTO f VALUES (false), (false);")
             .unwrap();
         let f = db.table_in("main", "f").unwrap();
-        let stats = table_stats("main", "f", f);
+        let stats = table_stats("main", "main", "f", f);
         let col = &stats.columns[0];
         assert_eq!(col.min, Some(Value::Boolean(false)), "{col:?}");
         assert_eq!(col.max, Some(Value::Boolean(false)), "{col:?}");
@@ -8572,7 +8865,7 @@ mod tests {
         db.execute("CREATE TABLE n (b BOOLEAN); INSERT INTO n VALUES (NULL);")
             .unwrap();
         let n = db.table_in("main", "n").unwrap();
-        let stats = table_stats("main", "n", n);
+        let stats = table_stats("main", "main", "n", n);
         let col = &stats.columns[0];
         assert_eq!(col.min, None, "{col:?}");
         assert_eq!(col.max, None, "{col:?}");
@@ -8935,6 +9228,8 @@ mod tests {
             fw.u32(1); // one database
             fw.str("main");
             fw.u8(STORAGE_LOCAL);
+            fw.u32(1); // one schema
+            fw.str("main");
             fw.u32(1); // one table
             fw.str("t");
             fw.u32(1); // one column
@@ -8973,6 +9268,7 @@ mod tests {
         let user = |w: &mut Writer| {
             user_head(w);
             w.u32(0); // table grants
+            w.u32(0); // schema grants
             w.u32(0); // database grants
             w.u32(0); // admins
         };
@@ -8982,11 +9278,12 @@ mod tests {
             w.u32(1);
             w.str("alice");
             w.str("not-a-hash");
-            w.u32(0);
-            w.u32(0);
-            w.u32(0);
-            w.u32(0);
-            w.u32(0);
+            w.u32(0); // roles
+            w.u32(0); // memberships
+            w.u32(0); // table grants
+            w.u32(0); // schema grants
+            w.u32(0); // database grants
+            w.u32(0); // admins
             w.buf
         });
         let err = PinkDb::load_bytes(&bad_hash).unwrap_err().to_string();
@@ -8998,11 +9295,13 @@ mod tests {
             user_head(&mut w);
             w.u32(1); // table grants: one entry
             w.str("main");
+            w.str("main"); // schema
             w.str("t");
             w.u32(1); // one principal
             w.str("alice");
             w.u32(1); // one privilege
             w.u8(9); // ← unknown
+            w.u32(0); // schema grants
             w.u32(0); // database grants
             w.u32(0); // admins
             w.buf
@@ -9046,7 +9345,7 @@ mod tests {
         db.execute("CREATE INDEX i ON t(a);").unwrap();
         let bytes = db.to_bytes().unwrap();
         let footer = read_store_footer(&bytes).unwrap();
-        let tdir = &footer.databases[0].tables[0];
+        let tdir = &footer.databases[0].schemas[0].tables[0];
         assert_eq!(tdir.indexes.len(), 1);
         assert_eq!(tdir.indexes[0].name, "i");
         assert_eq!(tdir.indexes[0].column, 0);

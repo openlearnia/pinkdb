@@ -18,14 +18,15 @@ use std::sync::Arc;
 
 use super::ast::*;
 use crate::attached::AtSpec;
-use crate::plan::{AlterTablePlan, LogicalPlan, RecursiveStep};
+use crate::plan::{AlterTablePlan, ColumnDefault, LogicalPlan, RecursiveStep};
 use crate::storage::{
-    DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, Session, TableConstraints,
+    DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, SchemaPath, Session,
+    TableConstraints,
 };
 use crate::table_source::{TableFunctionArg, TableFunctionCall};
 use crate::types::{
-    ArrayElem, DECIMAL_MAX_PRECISION, DataType, ExtractField, PinkDbError, Result, Value,
-    extract_field,
+    ArrayElem, DECIMAL_MAX_PRECISION, DataType, ExtractField, POW10_I128, PinkDbError, Result,
+    Value, extract_field,
 };
 
 // ---------- bound expressions ----------
@@ -155,10 +156,12 @@ pub enum ScalarFunc {
     ArrayNegativeInnerProduct,
     /// `contains(s, search)`: whether `search` occurs in `s`.
     Contains,
-    /// `uuid()` / `gen_random_uuid()`: a random version-4 UUID per row, as
-    /// VARCHAR (pinkdb has no UUID type). Volatile: never folded, and refused
-    /// in a WAL-logged statement like any nondeterministic function.
+    /// `uuid()` / `gen_random_uuid()`: a version-4 UUID per row. Volatile:
+    /// never folded, and in a WAL-logged statement derived from the record's
+    /// seed (see [`Volatile`]) so replay reproduces it.
     Uuid,
+    /// `random()`: a DOUBLE in `[0, 1)` per row, seeded like [`ScalarFunc::Uuid`].
+    Random,
 }
 
 impl ScalarFunc {
@@ -208,6 +211,7 @@ impl ScalarFunc {
             "similar_to" => ScalarFunc::SimilarTo,
             "contains" => ScalarFunc::Contains,
             "uuid" | "gen_random_uuid" => ScalarFunc::Uuid,
+            "random" => ScalarFunc::Random,
             _ => return None,
         })
     }
@@ -502,6 +506,21 @@ impl OuterBind {
     }
 }
 
+/// The derivation input of a volatile built-in call site (`uuid()`,
+/// `random()`): the call site's id, fixed at bind and numbered in bind order,
+/// so it is the same for every evaluation of the bound statement. The seed is
+/// not baked in: it belongs to the WAL record being filled
+/// ([`crate::storage::PinkDb::begin_volatile_statement`]), because a later
+/// statement of the same record must draw its own values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Volatile {
+    /// Stable index of the call site within the statement, so two calls in one
+    /// statement draw different values. The statement's seed itself is
+    /// resolved when it evaluates (`PinkDb::volatile_evaluation`): a bind can
+    /// happen before the statement that carries it starts.
+    pub site: u32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundExpr {
     Literal(Value),
@@ -529,6 +548,9 @@ pub enum BoundExpr {
         func: ScalarFunc,
         args: Vec<BoundExpr>,
         dtype: DataType,
+        /// Set for the volatile built-ins: the derivation inputs for this call
+        /// site, fixed at bind so replay reproduces every value.
+        volatile: Option<Volatile>,
     },
     /// Aggregate output column. Index is relative to the agg list until
     /// [`resolve_agg_refs`] rebases it past the group keys.
@@ -755,10 +777,10 @@ impl BoundExpr {
     pub fn contains_dynamic_scalar(&self) -> bool {
         match self {
             BoundExpr::DynamicScalar { .. } => true,
-            // Volatile: a constant-looking `uuid()` must run per row.
+            // Volatile: a constant-looking `uuid()` or `random()` must run per
+            // row, never be folded to a literal.
             BoundExpr::Scalar {
-                func: ScalarFunc::Uuid,
-                ..
+                volatile: Some(_), ..
             } => true,
             BoundExpr::Literal(_)
             | BoundExpr::Column { .. }
@@ -817,7 +839,7 @@ fn fixed_operand_dtype(op: BinaryOp, other: DataType) -> Option<DataType> {
 /// DECIMAL `(precision, scale)` of a value operand: DECIMAL keeps its own,
 /// INTEGER/BIGINT widen like DuckDB (`INTEGER → DECIMAL(10,0)`,
 /// `BIGINT → DECIMAL(19,0)`); anything else (DOUBLE) is not decimal-exact.
-fn decimal_operand_width(t: DataType) -> Option<(u8, u8)> {
+pub(crate) fn decimal_operand_width(t: DataType) -> Option<(u8, u8)> {
     match t {
         DataType::Decimal { precision, scale } => Some((precision, scale)),
         DataType::Integer => Some((10, 0)),
@@ -924,9 +946,9 @@ fn arithmetic_dtype(op: BinaryOp, l: DataType, r: DataType) -> Result<DataType> 
             if matches!(l, DataType::Decimal { .. }) || matches!(r, DataType::Decimal { .. }) {
                 let wa = decimal_operand_width(l).expect("numeric without a decimal width");
                 let wb = decimal_operand_width(r).expect("numeric without a decimal width");
-                // DuckDB: min integer digits + the wider scale.
+                // DuckDB: the wider of the two integer parts + the wider scale.
                 let scale = wa.1.max(wb.1);
-                let int_digits = (wa.0 - wa.1).min(wb.0 - wb.1) as i32;
+                let int_digits = (wa.0 - wa.1).max(wb.0 - wb.1) as i32;
                 return Ok(DataType::Decimal {
                     precision: clamp_precision(int_digits + scale as i32, scale),
                     scale,
@@ -1014,6 +1036,28 @@ fn distance_type_error(func: ScalarFunc) -> PinkDbError {
 /// Element type and length of an ARRAY constructor: the numeric tower over
 /// the argument types (DECIMAL widens to DOUBLE, as in a CAST into a DOUBLE
 /// column) and the argument count. All-NULL arguments have no type to infer.
+/// ARRAY has no DECIMAL element kind (docs/sql-conformance.md), so a
+/// decimal literal element becomes the element's scalar type, as DuckDB's
+/// own `CAST(... AS DOUBLE[])` would make it.
+fn coerce_array_elems(dtype: DataType, args: Vec<BoundExpr>) -> Vec<BoundExpr> {
+    let DataType::Array { elem, .. } = dtype else {
+        return args;
+    };
+    let want = elem.dtype();
+    args.into_iter()
+        .map(|a| {
+            if matches!(a.dtype(), DataType::Decimal { .. }) {
+                BoundExpr::Cast {
+                    expr: Box::new(a),
+                    dtype: want,
+                }
+            } else {
+                a
+            }
+        })
+        .collect()
+}
+
 fn array_ctor_dtype(args: &[BoundExpr]) -> Result<DataType> {
     if args.is_empty() {
         return Err(PinkDbError::Type(
@@ -1132,14 +1176,36 @@ fn clock_function(name: &str) -> Option<ClockKind> {
 /// [`Binder::bind_clock`]); no function name can contain `@`.
 pub(crate) const CLOCK_DEP: &str = "@clock:";
 
-/// The dependency `uuid()` records: no function name can contain `@`.
-const VOLATILE_UUID_DEP: &str = "@volatile:uuid";
-
 /// The replay-memo name a WAL record stores the statement clock under.
 pub(crate) const CLOCK_MEMO: &str = "@clock";
 
-/// The replay-memo entry of a statement whose dependencies include a clock
-/// reading.
+/// The replay-memo name a WAL record stores volatile statement seeds under; no
+/// SQL function can be called `@seed`. A record carries one entry per statement
+/// that drew a volatile value, in the order the statements ran, and a replay
+/// takes them in that same order
+/// ([`crate::storage::PinkDb::begin_volatile_statement`]).
+pub(crate) const SEED_MEMO: &str = "@seed";
+
+/// The memo entry that records one statement's volatile seed; `position` is its
+/// index among the record's seeds.
+pub(crate) fn seed_memo(position: usize, seed: u128) -> crate::wal::ExtCall {
+    crate::wal::ExtCall {
+        name: SEED_MEMO.to_string(),
+        args: vec![Value::Integer(position as i32)],
+        // The memo is WAL payload, so its values use the WAL's encodings.
+        result: Value::Varchar(format!("{seed:032x}")),
+    }
+}
+
+/// The seed a `@seed` memo entry carries.
+pub(crate) fn seed_reading(value: &Value) -> Option<u128> {
+    match value {
+        Value::Varchar(text) => u128::from_str_radix(text, 16).ok(),
+        _ => None,
+    }
+}
+
+/// The memo entry of a statement that read the clock.
 pub(crate) fn clock_memo(deps: &[String]) -> Option<crate::wal::ExtCall> {
     let micros = deps.iter().find_map(|d| clock_reading(d))?;
     Some(crate::wal::ExtCall {
@@ -1155,46 +1221,77 @@ pub(crate) fn clock_reading(dep: &str) -> Option<i64> {
 }
 
 thread_local! {
-    /// `(scope open, reading)` of the statement being bound on this thread.
-    static STATEMENT_CLOCK: std::cell::Cell<(bool, Option<i64>)> =
-        const { std::cell::Cell::new((false, None)) };
+    /// `(scope open, clock reading, next call site)` of the statement being
+    /// bound on this thread: one clock reading and one call-site counter per
+    /// statement, shared by its nested binders.
+    static STATEMENT_SCOPE: std::cell::Cell<(bool, Option<i64>, u32)> =
+        const { std::cell::Cell::new((false, None, 0)) };
 }
 
-/// One statement's clock scope: the outermost bind on a thread opens it, and
-/// every binder inside it shares the first reading. Nested binds (a view or
-/// macro body) join the open scope.
-struct ClockScope {
+/// One statement's clock and call-site scope: the outermost bind on a thread
+/// opens it, and every binder inside it shares the first reading. Nested binds
+/// (a view or macro body) join the open scope.
+struct StatementScope {
     outer: bool,
 }
 
-impl ClockScope {
+impl StatementScope {
     fn enter() -> Self {
-        let outer = !STATEMENT_CLOCK.with(|c| c.get().0);
+        let outer = !STATEMENT_SCOPE.with(|c| c.get().0);
         if outer {
-            STATEMENT_CLOCK.with(|c| c.set((true, None)));
+            STATEMENT_SCOPE.with(|c| c.set((true, None, 0)));
         }
         Self { outer }
     }
 
-    fn reading() -> Option<i64> {
-        STATEMENT_CLOCK.with(|c| c.get().1)
+    fn clock() -> Option<i64> {
+        STATEMENT_SCOPE.with(|c| c.get().1)
     }
 
-    fn record(micros: i64) {
-        STATEMENT_CLOCK.with(|c| {
-            if c.get().0 {
-                c.set((true, Some(micros)));
+    fn record_clock(micros: i64) {
+        STATEMENT_SCOPE.with(|c| {
+            let (open, _, site) = c.get();
+            if open {
+                c.set((true, Some(micros), site));
             }
         });
     }
+
+    /// The next volatile call site's id. Call sites are numbered in bind
+    /// order, so they are stable across replays of the same statement.
+    fn next_site() -> u32 {
+        STATEMENT_SCOPE.with(|c| {
+            let (open, clock, site) = c.get();
+            c.set((open, clock, site.wrapping_add(1)));
+            site
+        })
+    }
 }
 
-impl Drop for ClockScope {
+impl Drop for StatementScope {
     fn drop(&mut self) {
         if self.outer {
-            STATEMENT_CLOCK.with(|c| c.set((false, None)));
+            STATEMENT_SCOPE.with(|c| c.set((false, None, 0)));
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn fresh_seed() -> Result<u128> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|e| {
+        PinkDbError::Execution(format!(
+            "uuid() and random() need OS randomness, which is unavailable: {e}"
+        ))
+    })?;
+    Ok(u128::from_le_bytes(bytes))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn fresh_seed() -> Result<u128> {
+    Err(PinkDbError::Execution(
+        "uuid() and random() need OS randomness, which the wasm build has not".to_string(),
+    ))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1220,12 +1317,18 @@ fn percentile_fraction(name: &str, e: &Expr) -> Result<f64> {
     let p = match e {
         Expr::Literal(Value::Double(p)) => *p,
         Expr::Literal(Value::Integer(i)) => f64::from(*i),
+        Expr::Literal(Value::Decimal { value, scale, .. }) => {
+            crate::types::decimal_to_f64(*value, *scale)
+        }
         Expr::Unary {
             op: UnaryOp::Negate,
             expr,
         } => match &**expr {
             Expr::Literal(Value::Double(p)) => -*p,
             Expr::Literal(Value::Integer(i)) => -f64::from(*i),
+            Expr::Literal(Value::Decimal { value, scale, .. }) => {
+                -crate::types::decimal_to_f64(*value, *scale)
+            }
             _ => f64::NAN,
         },
         _ => f64::NAN,
@@ -1315,12 +1418,69 @@ fn null_of(dtype: DataType) -> BoundExpr {
     }
 }
 
+/// A DECIMAL literal compared with a numeric column is compared in the
+/// column's domain, as DuckDB does (`d = 1.5` casts the literal to DOUBLE,
+/// `i = 2.0` to INTEGER). Resolving it at bind time keeps the filter kernels,
+/// zone-map pruning and index probes on the column's type, with no per-row
+/// conversion of the column. A literal with no exact value in the column's
+/// domain (`i = 1.5` on an INTEGER column) keeps its DECIMAL type; decimal
+/// comparison is exact there.
+fn cast_decimal_literal_to_column(l: BoundExpr, r: BoundExpr) -> (BoundExpr, BoundExpr) {
+    fn in_domain(v: &Value, target: DataType) -> Option<Value> {
+        let Value::Decimal { value, scale, .. } = v else {
+            return None;
+        };
+        // `value / 10^scale` with no remainder is the only exact integer.
+        let p = POW10_I128[*scale as usize];
+        let whole = (value % p == 0).then(|| value / p);
+        Some(match target {
+            DataType::Double => Value::Double(crate::types::decimal_to_f64(*value, *scale)),
+            DataType::Integer => Value::Integer(i32::try_from(whole?).ok()?),
+            DataType::Bigint => Value::Bigint(i64::try_from(whole?).ok()?),
+            _ => return None,
+        })
+    }
+    fn substitute(literal: &BoundExpr, other: &BoundExpr) -> Option<BoundExpr> {
+        match literal {
+            BoundExpr::Literal(v) => in_domain(v, other.dtype()).map(BoundExpr::Literal),
+            _ => None,
+        }
+    }
+    if matches!(r, BoundExpr::Literal(_))
+        && let Some(lit) = substitute(&r, &l)
+    {
+        return (l, lit);
+    }
+    if let Some(lit) = substitute(&l, &r) {
+        return (lit, r);
+    }
+    (l, r)
+}
+
+/// A string literal compared with a UUID is that UUID's text: DuckDB gives
+/// literals the other operand's type implicitly, and every other pair still
+/// has to agree.
+fn cast_uuid_literal(l: BoundExpr, r: BoundExpr) -> (BoundExpr, BoundExpr) {
+    let cast = |e: BoundExpr, t: DataType| BoundExpr::Cast {
+        expr: Box::new(e),
+        dtype: t,
+    };
+    if l.dtype() == DataType::Uuid && matches!(r, BoundExpr::Literal(Value::Varchar(_))) {
+        return (l, cast(r, DataType::Uuid));
+    }
+    if r.dtype() == DataType::Uuid && matches!(l, BoundExpr::Literal(Value::Varchar(_))) {
+        return (cast(l, DataType::Uuid), r);
+    }
+    (l, r)
+}
+
 pub(crate) fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
     if (is_numeric(l) && is_numeric(r))
         || (l == DataType::Varchar && r == DataType::Varchar)
         || (l == DataType::Date && r == DataType::Date)
         || (l == DataType::Timestamp && r == DataType::Timestamp)
         || (l == DataType::Interval && r == DataType::Interval)
+        || (l == DataType::Uuid && r == DataType::Uuid)
         || (l == DataType::Variant && r == DataType::Variant)
     {
         return match op {
@@ -1541,8 +1701,8 @@ struct ScopeTable {
     /// for derived tables, CTEs, table functions and file scans — scopes with
     /// no database, which never match a three-part reference.
     original: Option<String>,
-    /// Database holding the base table/view; `None` when there is none.
-    db: Option<String>,
+    /// Namespace holding the base table/view; `None` when there is none.
+    ns: Option<SchemaPath>,
     /// True when `name` is an alias (which hides `original`, wave 94).
     is_alias: bool,
     /// `excluded` (INSERT ... ON CONFLICT): resolves only when qualified, so
@@ -1555,9 +1715,43 @@ impl ScopeTable {
     /// The `db.table` name this scope resolves under, for error messages.
     /// A scope with no database is named by its effective name.
     fn qualified_name(&self) -> String {
-        match (&self.db, &self.original) {
-            (Some(db), Some(table)) => format!("{db}.{table}"),
+        match (&self.ns, &self.original) {
+            (Some(ns), Some(table)) => format!("{ns}.{table}"),
             _ => self.name.clone(),
+        }
+    }
+
+    /// Does this scope's path end with `qual.table`, ignoring whether the
+    /// scope is aliased? (`t`, `s.t`, `c.s.t` — wave 131's column rule.)
+    fn path_matches(&self, qual: &Qualifier, table: &str) -> bool {
+        if qual.is_empty() {
+            return self.name.eq_ignore_ascii_case(table);
+        }
+        if !self
+            .original
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(table))
+        {
+            return false;
+        }
+        let Some(ns) = &self.ns else {
+            return false;
+        };
+        match &qual.schema {
+            // `s.t` names a schema, but the pre-131 `db.t` spelling still
+            // means that database's `main` schema (DuckDB accepts both).
+            Some(schema) => match qual.catalog.as_deref() {
+                Some(catalog) => {
+                    ns.schema().eq_ignore_ascii_case(schema)
+                        && ns.db().eq_ignore_ascii_case(catalog)
+                }
+                None => {
+                    ns.schema().eq_ignore_ascii_case(schema)
+                        || (ns.schema().eq_ignore_ascii_case("main")
+                            && ns.db().eq_ignore_ascii_case(schema))
+                }
+            },
+            None => false,
         }
     }
 }
@@ -1572,8 +1766,9 @@ struct OuterScope {
 
 struct Binder<'a> {
     db: &'a PinkDb,
-    /// Session database for unqualified names (lowercased when used).
-    default_db: String,
+    /// Session namespace for unqualified names: the current database and
+    /// schema, already lowered by `SchemaPath`.
+    default_ns: SchemaPath,
     tables: Vec<ScopeTable>,
     /// The enclosing blocks, innermost first: a subquery resolves a name its
     /// own FROM does not have here (wave 120). `None` for a top-level block
@@ -1616,6 +1811,11 @@ struct Binder<'a> {
     /// with child scopes: a mutating statement that depends on one is
     /// refused on a durable database (the logged SQL could never replay).
     views_used: Rc<RefCell<Vec<String>>>,
+    /// Session-local temporary tables referenced while binding this
+    /// statement, in first-use order. Shared with child scopes like
+    /// `views_used`: a statement that reads one and writes a persistent local
+    /// table is refused on a durable database.
+    temp_tables_used: Rc<RefCell<Vec<String>>>,
     /// True only for a statement's own binder: a data-modifying CTE is legal
     /// there and nowhere else (DuckDB's top-level rule).
     dml_cte_ok: bool,
@@ -1651,10 +1851,10 @@ struct Binder<'a> {
 }
 
 impl<'a> Binder<'a> {
-    fn new(db: &'a PinkDb, default_db: &str) -> Self {
+    fn new(db: &'a PinkDb, default_ns: &SchemaPath) -> Self {
         Self {
             db,
-            default_db: default_db.to_string(),
+            default_ns: default_ns.clone(),
             tables: Vec::new(),
             outer: None,
             outer_uses: Rc::new(RefCell::new(Vec::new())),
@@ -1682,6 +1882,7 @@ impl<'a> Binder<'a> {
                 })
                 .unwrap_or_default(),
             views_used: Rc::new(RefCell::new(Vec::new())),
+            temp_tables_used: Rc::new(RefCell::new(Vec::new())),
             dml_cte_ok: true,
             dynamic_functions_used: Rc::new(RefCell::new(Vec::new())),
             session: db.session.clone(),
@@ -1711,7 +1912,7 @@ impl<'a> Binder<'a> {
     fn child(&self) -> Self {
         Self {
             db: self.db,
-            default_db: self.default_db.clone(),
+            default_ns: self.default_ns.clone(),
             tables: Vec::new(),
             outer: self.outer.clone(),
             // A nested block that keeps the same outer chain — a derived
@@ -1733,6 +1934,7 @@ impl<'a> Binder<'a> {
             group_masks: Vec::new(),
             ctes: self.ctes.clone(),
             views_used: Rc::clone(&self.views_used),
+            temp_tables_used: Rc::clone(&self.temp_tables_used),
             dml_cte_ok: false,
             dynamic_functions_used: Rc::clone(&self.dynamic_functions_used),
             session: self.session.clone(),
@@ -1866,24 +2068,120 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Resolve a statement's table reference to a concrete database: an
-    /// explicit qualifier must name an existing database; otherwise the
-    /// session's default database is used.
-    fn resolve_db(&self, db: &Option<String>) -> Result<String> {
-        match db {
-            Some(q) => {
-                if !self.db.database_exists(q) {
-                    return Err(PinkDbError::Catalog(format!("database \"{q}\" not found")));
+    /// Resolve a statement's name qualifier to a namespace (wave 131b,
+    /// plan decision 4).
+    ///
+    /// Three parts name a schema outright. Two parts are ambiguous: DuckDB
+    /// reads `x.t` as database `x`, table `t` when such a database exists,
+    /// else as schema `x` of the session database. Writing `main.t` while
+    /// the session is in `main` is the one exception that keeps the
+    /// schema reading, so a table in the `main` schema is still reachable
+    /// from another schema. One part is the session namespace; a bare name
+    /// that names a CTE never reaches here (the caller checks CTEs first).
+    fn resolve_ns(&self, qual: &Qualifier) -> Result<SchemaPath> {
+        if qual
+            .catalog
+            .as_deref()
+            .is_some_and(|db| db.eq_ignore_ascii_case("temp"))
+            || (qual.catalog.is_none()
+                && qual
+                    .schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("temp")))
+        {
+            return match qual.schema.as_deref() {
+                Some(schema)
+                    if !schema.eq_ignore_ascii_case("main")
+                        && !schema.eq_ignore_ascii_case("temp") =>
+                {
+                    Err(PinkDbError::Catalog(format!(
+                        "schema \"{schema}\" not found"
+                    )))
                 }
-                Ok(q.to_ascii_lowercase())
+                _ => Ok(self.temp_ns()),
+            };
+        }
+        match (&qual.catalog, &qual.schema) {
+            (Some(db), Some(schema)) => {
+                let ns = SchemaPath::new(db, schema);
+                if !self.db.database_exists(db) || !self.db.schema_exists(&ns) {
+                    return Err(schema_error(self.db, &ns));
+                }
+                Ok(ns)
             }
-            None => Ok(self.default_db.to_ascii_lowercase()),
+            (None, Some(x)) => {
+                let as_db = SchemaPath::main(x);
+                let as_schema = SchemaPath::new(self.default_ns.db(), x);
+                let db_exists = self.db.database_exists(x);
+                let schema_exists = self.db.schema_exists(&as_schema);
+                // `main.t` while in database `main` reads the same namespace
+                // both ways; every other double hit is genuinely ambiguous.
+                if db_exists && schema_exists && as_db != as_schema {
+                    return Err(PinkDbError::Catalog(format!(
+                        "ambiguous reference to database or schema \"{x}\": \
+                         use {x}.main.t or {}.{x}.t",
+                        self.default_ns.db()
+                    )));
+                }
+                if db_exists {
+                    let ns = as_db;
+                    if !self.db.schema_exists(&ns) {
+                        return Err(schema_error(self.db, &ns));
+                    }
+                    return Ok(ns);
+                }
+                if !self.db.schema_exists(&as_schema) {
+                    return Err(schema_error(self.db, &as_schema));
+                }
+                Ok(as_schema)
+            }
+            (None, None) => Ok(self.default_ns.clone()),
+            (Some(db), None) => Err(PinkDbError::Catalog(format!(
+                "database \"{db}\" needs a schema and a table"
+            ))),
         }
     }
 
     /// Session-local views referenced while binding, in first-use order.
     fn views_used(&self) -> Vec<String> {
         self.views_used.borrow().clone()
+    }
+
+    /// The session's `temp.main` namespace.
+    fn temp_ns(&self) -> SchemaPath {
+        SchemaPath::temp(self.session.id())
+    }
+
+    /// Resolve a *table* reference. An unqualified name that names a table in
+    /// the session's `temp.main` resolves there first (DuckDB's search path),
+    /// then in the session namespace; an explicit `temp.…` always does. A bare
+    /// `main.` prefix searches temp too: DuckDB resolves `main.t` to
+    /// `temp.main.t` when that exists.
+    fn resolve_table_ns(&self, qual: &Qualifier, name: &str) -> Result<SchemaPath> {
+        let searches_temp = qual.catalog.is_none()
+            && qual
+                .schema
+                .as_deref()
+                .is_none_or(|schema| schema.eq_ignore_ascii_case("main"));
+        let ns = if searches_temp && self.db.table_in(self.temp_ns(), name).is_ok() {
+            self.temp_ns()
+        } else {
+            self.resolve_ns(qual)?
+        };
+        if ns.temp_id().is_some() {
+            self.temp_tables_used
+                .borrow_mut()
+                .push(name.to_ascii_lowercase());
+        }
+        Ok(ns)
+    }
+
+    /// Temporary tables referenced while binding, lowercased, deduped.
+    fn temp_tables_used(&self) -> Vec<String> {
+        let mut names = self.temp_tables_used.borrow().clone();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Extension sources (dynamic-function and package names, lowercased)
@@ -1910,15 +2208,15 @@ impl<'a> Binder<'a> {
     /// blocks (wave 120). A hit in an enclosing block is an
     /// [`BoundExpr::OuterRef`]; a name no block has keeps the innermost
     /// block's error message.
-    fn lookup_column(&self, db: Option<&str>, table: Option<&str>, col: &str) -> Result<BoundExpr> {
-        if let Some((index, dtype)) = Self::lookup_in_scope(&self.tables, db, table, col)? {
+    fn lookup_column(&self, qual: &Qualifier, table: Option<&str>, col: &str) -> Result<BoundExpr> {
+        if let Some((index, dtype)) = Self::lookup_in_scope(&self.tables, qual, table, col)? {
             return Ok(BoundExpr::Column { index, dtype });
         }
-        let miss = Self::missing_column_message(&self.tables, db, table, col);
+        let miss = Self::missing_column_message(&self.tables, qual, table, col);
         let mut scope = self.outer.as_deref();
         let mut depth = 0usize;
         while let Some(outer) = scope {
-            if let Some((index, dtype)) = Self::lookup_in_scope(&outer.tables, db, table, col)? {
+            if let Some((index, dtype)) = Self::lookup_in_scope(&outer.tables, qual, table, col)? {
                 let mut uses = self.outer_uses.borrow_mut();
                 if !uses.contains(&(depth, index)) {
                     uses.push((depth, index));
@@ -1970,37 +2268,37 @@ impl<'a> Binder<'a> {
     /// reference used.
     fn missing_column_message(
         tables: &[ScopeTable],
-        db: Option<&str>,
+        qual: &Qualifier,
         table: Option<&str>,
         col: &str,
     ) -> PinkDbError {
-        match (db, table) {
-            (Some(qdb), Some(qtable)) => {
-                let in_scope = tables.iter().any(|t| {
-                    t.db.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(qdb))
-                        && t.original
-                            .as_deref()
-                            .is_some_and(|n| n.eq_ignore_ascii_case(qtable))
-                });
+        match table {
+            // A plain `t.c` miss keeps the pre-wave-131 wording: it reports
+            // the column, not a missing table (aliases and CTEs reach it too).
+            Some(qtable) if qual.is_empty() => {
+                PinkDbError::Catalog(format!("no column \"{qtable}.{col}\""))
+            }
+            Some(qtable) => {
+                let written = format!("{}{qtable}.{col}", qual_text(qual));
+                let in_scope = tables.iter().any(|t| t.path_matches(qual, qtable));
                 if in_scope {
-                    PinkDbError::Catalog(format!("no column \"{qdb}.{qtable}.{col}\""))
+                    PinkDbError::Catalog(format!("no column \"{written}\""))
                 } else {
                     PinkDbError::Catalog(format!(
-                        "no table \"{qdb}.{qtable}\" in this query's FROM clause"
+                        "no table \"{}{qtable}\" in this query's FROM clause",
+                        qual_text(qual)
                     ))
                 }
             }
-            (None, Some(q)) => PinkDbError::Catalog(format!("no column \"{q}.{col}\"")),
-            (None, None) => PinkDbError::Catalog(format!("no column \"{col}\"")),
-            (Some(_), None) => unreachable!("a database qualifier implies a table qualifier"),
+            None => PinkDbError::Catalog(format!("no column \"{col}\"")),
         }
     }
 
     /// Resolve a column reference against this block's FROM scope alone.
     ///
-    /// - `db.table.column` (wave 94): `db.table` must be an **unaliased** base
-    ///   table or view of database `db` (an alias hides the original name);
-    ///   derived tables, CTEs, table functions and file scans never match.
+    /// - `c.s.t.column` / `s.t.column` (wave 131): the prefix must match a
+    ///   base table or view's namespace path and original name; an alias
+    ///   hides the original name (Postgres / DuckDB rule).
     /// - `table.column`: matches by effective name; a name shared by two
     ///   entries (only possible across databases) is ambiguous.
     /// - `column`: today's bare-name ambiguity rule.
@@ -2009,30 +2307,24 @@ impl<'a> Binder<'a> {
     /// the enclosing blocks; `Err` is a decision only this block can make.
     fn lookup_in_scope(
         tables: &[ScopeTable],
-        db: Option<&str>,
+        qual: &Qualifier,
         table: Option<&str>,
         col: &str,
     ) -> Result<Option<(usize, DataType)>> {
-        if let Some(qdb) = db {
-            let qtable = table.expect("a database qualifier implies a table qualifier");
+        if !qual.is_empty() {
+            let Some(qtable) = table else {
+                return Ok(None);
+            };
             let mut found: Option<(usize, DataType)> = None;
             let mut aliased_as: Option<&str> = None;
-            // An unaliased entry wins over any aliased one of the same name:
-            // `db.t` stays visible when `db.t AS x` is also joined in.
             let mut unaliased_in_scope = false;
             let mut base = 0;
             for t in tables {
-                let same_table = t.db.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(qdb))
-                    && t.original
-                        .as_deref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(qtable));
-                if !same_table {
+                if !t.path_matches(qual, qtable) {
                     base += t.columns.len();
                     continue;
                 }
                 if t.is_alias {
-                    // An alias hides the original table name (Postgres /
-                    // DuckDB rule): remember it to name the workaround.
                     if aliased_as.is_none() {
                         aliased_as = Some(&t.name);
                     }
@@ -2058,8 +2350,9 @@ impl<'a> Binder<'a> {
                 && !unaliased_in_scope
             {
                 return Err(PinkDbError::Catalog(format!(
-                    "table \"{qdb}.{qtable}\" is aliased as \"{alias}\" in this query; \
-                     refer to its columns as {alias}.{col}"
+                    "table \"{}{qtable}\" is aliased as \"{alias}\" in this query; \
+                     refer to its columns as {alias}.{col}",
+                    qual_text(qual)
                 )));
             }
             return Ok(None);
@@ -2138,10 +2431,12 @@ impl<'a> Binder<'a> {
             args.push(self.bind_expr(item, aggs, allow_agg)?);
         }
         let dtype = array_ctor_dtype(&args)?;
+        let args = coerce_array_elems(dtype, args);
         Ok(BoundExpr::Scalar {
             func: ScalarFunc::ArrayValue,
             args,
             dtype,
+            volatile: None,
         })
     }
 
@@ -2153,6 +2448,10 @@ impl<'a> Binder<'a> {
     ) -> Result<BoundExpr> {
         match expr {
             Expr::Literal(v) => Ok(BoundExpr::Literal(v.clone())),
+            Expr::Default => Err(PinkDbError::Parse(
+                "DEFAULT is only allowed in an INSERT values row or an UPDATE SET value"
+                    .to_string(),
+            )),
             Expr::ArrayLiteral(items) => self.bind_array_literal(items, aggs, allow_agg),
             Expr::Parameter(index) => self.bind_parameter(*index),
             Expr::Star => Err(PinkDbError::Parse(
@@ -2161,11 +2460,11 @@ impl<'a> Binder<'a> {
             Expr::QualifiedStar { .. } => Err(PinkDbError::Parse(
                 "`t.*` is only valid in the projection list".to_string(),
             )),
-            Expr::Column { db, table, name } => {
+            Expr::Column { qual, table, name } => {
                 // Wave 44: a procedure call's variables shadow columns. The
                 // variable's *value* is bound as a literal (never SQL text).
                 // Wave 94: only unqualified names can be variables.
-                if db.is_none()
+                if qual.is_empty()
                     && table.is_none()
                     && let Some(value) = self.params.as_ref().and_then(|slots| slots.variable(name))
                 {
@@ -2174,7 +2473,7 @@ impl<'a> Binder<'a> {
                 // Wave 100: `NEW.col` / `OLD.col` in a trigger body resolve
                 // to the firing row's values, bound as literals — the row
                 // image lives on the store, not in a table scope.
-                if db.is_none()
+                if qual.is_empty()
                     && let Some(qualifier) = table
                     && let Some(value) = self
                         .params
@@ -2186,7 +2485,7 @@ impl<'a> Binder<'a> {
                 // Alias substitution (`... ORDER BY x`), with a cycle guard so
                 // `SELECT x AS x` resolves to the column instead of recursing.
                 // Only unqualified names are select aliases.
-                if db.is_none() && table.is_none() && self.allow_alias {
+                if qual.is_empty() && table.is_none() && self.allow_alias {
                     let key = name.to_ascii_lowercase();
                     if !self.resolving.contains(&key)
                         && let Some(aliased) = self.aliases.get(&key).cloned()
@@ -2197,14 +2496,7 @@ impl<'a> Binder<'a> {
                         return bound;
                     }
                 }
-                // A database qualifier resolves like a FROM reference: the
-                // database must exist (wave 94).
-                if let Some(q) = db
-                    && !self.db.database_exists(q)
-                {
-                    return Err(PinkDbError::Catalog(format!("database \"{q}\" not found")));
-                }
-                match self.lookup_column(db.as_deref(), table.as_deref(), name) {
+                match self.lookup_column(qual, table.as_deref(), name) {
                     Ok(bound) => Ok(bound),
                     Err(e) => {
                         // `v.a` where `v` is a VARIANT *column*, not a table:
@@ -2212,12 +2504,12 @@ impl<'a> Binder<'a> {
                         // over the column instead. (Wave 94's db.table.column
                         // form wins whenever it resolves, so a three-part name
                         // never changes meaning.)
-                        if db.is_none()
+                        if qual.is_empty()
                             && let Some(qualifier) = table
                             && let Ok(BoundExpr::Column {
                                 index,
                                 dtype: DataType::Variant,
-                            }) = self.lookup_column(None, None, qualifier)
+                            }) = self.lookup_column(&Qualifier::none(), None, qualifier)
                         {
                             let mut acc = BoundExpr::Column {
                                 index,
@@ -2231,6 +2523,7 @@ impl<'a> Binder<'a> {
                                         BoundExpr::Literal(Value::Varchar(part.to_string())),
                                     ],
                                     dtype: DataType::Variant,
+                                    volatile: None,
                                 };
                             }
                             return Ok(acc);
@@ -2249,6 +2542,7 @@ impl<'a> Binder<'a> {
                     return self.bind_is_distinct(*op, left, right, aggs, allow_agg);
                 }
                 let (l, r) = self.bind_binary_operands(*op, left, right, aggs, allow_agg)?;
+                let (l, r) = cast_uuid_literal(l, r);
                 let dtype = match op {
                     BinaryOp::And | BinaryOp::Or => {
                         if l.dtype() != DataType::Boolean || r.dtype() != DataType::Boolean {
@@ -2281,6 +2575,7 @@ impl<'a> Binder<'a> {
                             }
                             _ => (l, r),
                         };
+                        let (l, r) = cast_decimal_literal_to_column(l, r);
                         let (l, r) = match comparison_ok(*op, l.dtype(), r.dtype()) {
                             Ok(()) => (l, r),
                             Err(error) => {
@@ -2378,21 +2673,32 @@ impl<'a> Binder<'a> {
                 }
             }
             Expr::Function {
+                qual,
                 name,
                 args,
                 distinct,
                 filter,
-            } => self.bind_function(name, args, *distinct, filter.as_deref(), aggs, allow_agg),
+            } => self.bind_function(
+                qual.as_ref(),
+                name,
+                args,
+                *distinct,
+                filter.as_deref(),
+                aggs,
+                allow_agg,
+            ),
             Expr::NamedArg { .. } => Err(PinkDbError::Parse(
                 "named arguments are only supported in a macro call".to_string(),
             )),
             Expr::Window {
+                qual,
                 name,
                 args,
                 over,
                 distinct,
                 filter,
             } => self.bind_window(
+                qual.as_ref(),
                 name,
                 args,
                 over,
@@ -2441,6 +2747,7 @@ impl<'a> Binder<'a> {
                     func: ScalarFunc::TryCast,
                     args: vec![bound],
                     dtype: *dtype,
+                    volatile: None,
                 })
             }
             Expr::Subscript { base, index } => {
@@ -2462,6 +2769,7 @@ impl<'a> Binder<'a> {
                             func: ScalarFunc::ArrayExtract,
                             args: vec![base, index],
                             dtype: elem.dtype(),
+                            volatile: None,
                         })
                     }
                     // `v['a']` / `v[1]`: a VARIANT member, by name or by
@@ -2475,12 +2783,14 @@ impl<'a> Binder<'a> {
                                 func: ScalarFunc::VariantIndex,
                                 args: vec![base, index],
                                 dtype: DataType::Variant,
+                                volatile: None,
                             })
                         } else if index.dtype() == DataType::Varchar {
                             Ok(BoundExpr::Scalar {
                                 func: ScalarFunc::VariantField,
                                 args: vec![base, index],
                                 dtype: DataType::Variant,
+                                volatile: None,
                             })
                         } else {
                             Err(PinkDbError::Type(format!(
@@ -2494,6 +2804,7 @@ impl<'a> Binder<'a> {
                         func: ScalarFunc::StringSlice,
                         args: vec![base, index.clone(), index],
                         dtype: DataType::Varchar,
+                        volatile: None,
                     }),
                     t => Err(PinkDbError::Type(format!(
                         "subscripting a {t} is not supported: only VARCHAR and VARIANT have \
@@ -2530,6 +2841,7 @@ impl<'a> Binder<'a> {
                     func: ScalarFunc::StringSlice,
                     args: vec![base, from, to],
                     dtype: DataType::Varchar,
+                    volatile: None,
                 })
             }
             Expr::Cast { expr, dtype } => {
@@ -2606,7 +2918,7 @@ impl<'a> Binder<'a> {
             }
             Expr::ScalarSubquery(q) => {
                 let (outer, query) = self.bind_subquery(q)?;
-                let schema = plan_schema(self.db, &self.default_db, &self.ctes, &query)?;
+                let schema = plan_schema(self.db, &self.default_ns, &self.ctes, &query)?;
                 if schema.len() != 1 {
                     return Err(PinkDbError::Execution(
                         "scalar subquery must return exactly one column".to_string(),
@@ -2639,7 +2951,7 @@ impl<'a> Binder<'a> {
                 }
                 let bound = self.bind_expr(expr, aggs, allow_agg)?;
                 let (outer, sub) = self.bind_subquery(query)?;
-                let schema = plan_schema(self.db, &self.default_db, &self.ctes, &sub)?;
+                let schema = plan_schema(self.db, &self.default_ns, &self.ctes, &sub)?;
                 if schema.len() != 1 {
                     return Err(PinkDbError::Execution(
                         "IN subquery must return exactly one column".to_string(),
@@ -2731,6 +3043,7 @@ impl<'a> Binder<'a> {
     #[allow(clippy::too_many_arguments)]
     fn bind_window(
         &mut self,
+        qual: &Qualifier,
         name: &str,
         args: &[Expr],
         over: &OverSpec,
@@ -2739,6 +3052,12 @@ impl<'a> Binder<'a> {
         aggs: &mut Vec<BoundAgg>,
         allow_agg: bool,
     ) -> Result<BoundExpr> {
+        if !qual.is_empty() {
+            return Err(PinkDbError::Catalog(format!(
+                "function \"{}{name}\" not found",
+                qual_text(qual)
+            )));
+        }
         if !self.allow_win {
             return Err(PinkDbError::Execution(
                 "window functions are not allowed in WHERE, GROUP BY, or HAVING (use a subquery)"
@@ -3033,15 +3352,23 @@ impl<'a> Binder<'a> {
     /// clear error, matching DuckDB.
     fn bind_scalar_macro(
         &mut self,
+        qual: &Qualifier,
         name: &str,
         args: &[Expr],
         distinct: bool,
         aggs: &mut Vec<BoundAgg>,
         allow_agg: bool,
     ) -> Result<Option<BoundExpr>> {
-        let def = match self.db.macro_in(&self.default_db, name) {
+        let ns = self.resolve_ns(qual)?;
+        let def = match self.db.macro_in(&ns, name) {
             Ok(def) => def.clone(),
-            Err(_) => return Ok(None),
+            Err(_) if qual.is_empty() => return Ok(None),
+            Err(_) => {
+                return Err(PinkDbError::Catalog(format!(
+                    "function \"{}{name}\" not found",
+                    qual_text(qual)
+                )));
+            }
         };
         if def.is_table() {
             return Err(PinkDbError::Catalog(format!(
@@ -3308,8 +3635,10 @@ impl<'a> Binder<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bind_function(
         &mut self,
+        qual: &Qualifier,
         name: &str,
         args: &[Expr],
         distinct: bool,
@@ -3317,6 +3646,73 @@ impl<'a> Binder<'a> {
         aggs: &mut Vec<BoundAgg>,
         allow_agg: bool,
     ) -> Result<BoundExpr> {
+        // Built-ins and extension functions are never schema-qualified; a
+        // qualified name can only name a stored macro in that namespace.
+        if !qual.is_empty() {
+            return match self.bind_scalar_macro(qual, name, args, distinct, aggs, allow_agg)? {
+                Some(bound) => Ok(bound),
+                None => Err(PinkDbError::Catalog(format!(
+                    "function \"{}{name}\" not found",
+                    qual_text(qual)
+                ))),
+            };
+        }
+        // Session-position functions (wave 131b): DuckDB answers the current
+        // database/schema. There is no LIST type yet, so `current_schemas`
+        // returns the same `[...]` text `variant_keys()` uses for arrays.
+        if ["current_database", "current_schema", "current_schemas"]
+            .iter()
+            .any(|n| name.eq_ignore_ascii_case(n))
+        {
+            let text = if name.eq_ignore_ascii_case("current_database") {
+                if !args.is_empty() {
+                    return Err(PinkDbError::Execution(
+                        "current_database() takes no arguments".to_string(),
+                    ));
+                }
+                self.default_ns.db().to_string()
+            } else if name.eq_ignore_ascii_case("current_schema") {
+                if !args.is_empty() {
+                    return Err(PinkDbError::Execution(
+                        "current_schema() takes no arguments".to_string(),
+                    ));
+                }
+                self.db
+                    .schema(&self.default_ns)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|_| self.default_ns.schema().to_string())
+            } else {
+                let implicit = match args {
+                    [Expr::Literal(Value::Boolean(b))] => *b,
+                    [_] => {
+                        return Err(PinkDbError::Type(
+                            "current_schemas() needs a BOOLEAN argument".to_string(),
+                        ));
+                    }
+                    _ => {
+                        return Err(PinkDbError::Execution(
+                            "current_schemas() takes one BOOLEAN argument".to_string(),
+                        ));
+                    }
+                };
+                let current = self
+                    .db
+                    .schema(&self.default_ns)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|_| self.default_ns.schema().to_string());
+                if implicit {
+                    let mut names = vec!["main".to_string(), current];
+                    names.push("pg_catalog".to_string());
+                    names.dedup();
+                    format!("[{}]", names.join(", "))
+                } else if self.default_ns.schema() == "main" {
+                    "[]".to_string()
+                } else {
+                    format!("[{current}]")
+                }
+            };
+            return Ok(BoundExpr::Literal(crate::types::Value::Varchar(text)));
+        }
         // `GROUPING` is grouping-set syntax, not a function: resolve it before
         // macros and the aggregate/scalar tables.
         if name.eq_ignore_ascii_case("grouping") {
@@ -3383,7 +3779,9 @@ impl<'a> Binder<'a> {
         if let Some(func) = json_mutator_from_name(name) {
             return self.bind_json_mutator(func, name, args, aggs, allow_agg);
         }
-        if let Some(bound) = self.bind_scalar_macro(name, args, distinct, aggs, allow_agg)? {
+        if let Some(bound) =
+            self.bind_scalar_macro(&Qualifier::none(), name, args, distinct, aggs, allow_agg)?
+        {
             return Ok(bound);
         }
         if let Some(kind) = clock_function(name) {
@@ -3488,18 +3886,18 @@ impl<'a> Binder<'a> {
             }
             let dtype = scalar_dtype(func, &bound)?;
             let bound = coerce_scalar_args(func, dtype, bound)?;
-            if func == ScalarFunc::Uuid {
-                // Volatile: a WAL-logged statement refuses it (see
-                // `bind_tracked_with`).
-                let mut deps = self.dynamic_functions_used.borrow_mut();
-                if !deps.iter().any(|d| d == VOLATILE_UUID_DEP) {
-                    deps.push(VOLATILE_UUID_DEP.to_string());
-                }
-            }
+            let volatile = if matches!(func, ScalarFunc::Uuid | ScalarFunc::Random) {
+                Some(Volatile {
+                    site: StatementScope::next_site(),
+                })
+            } else {
+                None
+            };
             return Ok(BoundExpr::Scalar {
                 func,
                 args: bound,
                 dtype,
+                volatile,
             });
         }
         // Not a built-in: a loaded extension may provide it (case-insensitive)
@@ -3636,12 +4034,12 @@ impl<'a> Binder<'a> {
             .ext_replay()
             .and_then(|memo| recorded(memo.get(CLOCK_MEMO, &[])))
             .or_else(|| recorded(self.db.txn_memo_result(CLOCK_MEMO, &[])))
-            .or_else(ClockScope::reading)
+            .or_else(StatementScope::clock)
         {
             Some(t) => t,
             None => wall_clock_micros()?,
         };
-        ClockScope::record(micros);
+        StatementScope::record_clock(micros);
         deps.push(format!("{CLOCK_DEP}{micros}"));
         Ok(micros)
     }
@@ -3743,6 +4141,7 @@ impl<'a> Binder<'a> {
             func,
             args: bound,
             dtype,
+            volatile: None,
         })
     }
 
@@ -3950,7 +4349,7 @@ impl<'a> Binder<'a> {
                 // that selects it must be constant (a cast or a negation of
                 // one still is).
                 let values: Vec<Option<&Value>> = bound.iter().map(const_value).collect();
-                reads(&values, &self.default_db)?
+                reads(&values, self.default_ns.db())?
                     .into_iter()
                     .map(|(db, table)| (db.to_ascii_lowercase(), table.to_ascii_lowercase()))
                     .collect()
@@ -4335,6 +4734,7 @@ fn coerce_scalar_args(
     let want = match func {
         ScalarFunc::Concat => DataType::Varchar,
         ScalarFunc::Greatest | ScalarFunc::Least | ScalarFunc::Mod => dtype,
+        ScalarFunc::ArrayValue => return Ok(coerce_array_elems(dtype, args)),
         _ => return Ok(args),
     };
     args.into_iter()
@@ -4405,6 +4805,7 @@ fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
                 && t != DataType::Timestamp
                 && t != DataType::Interval
                 && t != DataType::Variant
+                && t != DataType::Uuid
                 && !matches!(t, DataType::Array { .. })
             {
                 return Err(PinkDbError::Type(
@@ -4695,7 +5096,11 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
         }
         ScalarFunc::Uuid => {
             arity(&[0])?;
-            Ok(DataType::Varchar)
+            Ok(DataType::Uuid)
+        }
+        ScalarFunc::Random => {
+            arity(&[0])?;
+            Ok(DataType::Double)
         }
         ScalarFunc::JsonSet | ScalarFunc::JsonInsert | ScalarFunc::JsonReplace => {
             unreachable!("bound by bind_json_mutator")
@@ -4911,9 +5316,43 @@ fn projection_name(expr: &Expr) -> String {
     }
 }
 
+/// Render a written `catalog.schema.` prefix (empty when unqualified) for
+/// diagnostics and output names.
+/// Whether a written qualifier names this schema path. A one-part prefix can
+/// be either the database or the schema (`db.t` / `s.t`); two parts name both.
+fn qual_matches_ns(qual: &Qualifier, ns: &SchemaPath) -> bool {
+    match (&qual.catalog, &qual.schema) {
+        (None, None) => true,
+        (None, Some(x)) => x.eq_ignore_ascii_case(ns.schema()) || x.eq_ignore_ascii_case(ns.db()),
+        (Some(c), Some(s)) => {
+            c.eq_ignore_ascii_case(ns.db()) && s.eq_ignore_ascii_case(ns.schema())
+        }
+        (Some(_), None) => false,
+    }
+}
+
+/// The error a privilege check reports.
+fn qual_text(qual: &Qualifier) -> String {
+    let mut out = String::new();
+    if let Some(c) = &qual.catalog {
+        out.push_str(c);
+        out.push('.');
+    }
+    if let Some(s) = &qual.schema {
+        out.push_str(s);
+        out.push('.');
+    }
+    out
+}
+
 fn default_name(expr: &Expr) -> String {
     match expr {
+        // DuckDB renders a string literal with its quotes (and doubled inner
+        // quotes), so `SELECT s NOT LIKE 'a%'` names the column
+        // `(s !~~ 'a%')`. Other literals have an unambiguous text form.
+        Expr::Literal(Value::Varchar(s)) => format!("'{}'", s.replace('\'', "''")),
         Expr::Literal(v) => v.to_string(),
+        Expr::Default => "DEFAULT".to_string(),
         Expr::ArrayLiteral(items) => format!(
             "[{}]",
             items
@@ -4926,15 +5365,18 @@ fn default_name(expr: &Expr) -> String {
         // first; the display name keeps `SELECT ?`-style output sensible.
         Expr::Parameter(i) => format!("?{}", i + 1),
         Expr::Star => "*".to_string(),
-        Expr::Column { db, table, name } => match (db, table) {
-            (Some(d), Some(t)) => format!("{d}.{t}.{name}"),
-            (None, Some(t)) => format!("{t}.{name}"),
-            _ => name.clone(),
-        },
-        Expr::QualifiedStar { db, table } => match db {
-            Some(d) => format!("{d}.{table}.*"),
-            None => format!("{table}.*"),
-        },
+        Expr::Column { qual, table, name } => {
+            let mut out = qual_text(qual);
+            if let Some(t) = table {
+                out.push_str(t);
+                out.push('.');
+            }
+            out.push_str(name);
+            out
+        }
+        Expr::QualifiedStar { qual, table } => {
+            format!("{}{table}.*", qual_text(qual))
+        }
         Expr::Binary { op, left, right } => {
             let sym = match op {
                 BinaryOp::Add => "+",
@@ -4943,15 +5385,16 @@ fn default_name(expr: &Expr) -> String {
                 BinaryOp::Divide => "/",
                 BinaryOp::Modulo => "%",
                 BinaryOp::Eq => "=",
-                BinaryOp::NotEq => "<>",
+                BinaryOp::NotEq => "!=",
                 BinaryOp::Lt => "<",
                 BinaryOp::LtEq => "<=",
                 BinaryOp::Gt => ">",
                 BinaryOp::GtEq => ">=",
                 BinaryOp::And => "AND",
                 BinaryOp::Or => "OR",
-                BinaryOp::Like => "LIKE",
-                BinaryOp::NotLike => "NOT LIKE",
+                // DuckDB's internal spellings: `~~` is LIKE, `!~~` NOT LIKE.
+                BinaryOp::Like => "~~",
+                BinaryOp::NotLike => "!~~",
                 BinaryOp::Concat => "||",
                 BinaryOp::IsDistinctFrom => "IS DISTINCT FROM",
                 BinaryOp::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
@@ -4960,12 +5403,12 @@ fn default_name(expr: &Expr) -> String {
         }
         Expr::Unary { op, expr } => match op {
             UnaryOp::Not => format!("(NOT {})", default_name(expr)),
-            UnaryOp::Negate => format!("(-{})", default_name(expr)),
+            UnaryOp::Negate => format!("(-({}))", default_name(expr)),
             UnaryOp::Plus => default_name(expr),
         },
         Expr::IsNull { expr, negated } => {
-            let not = if *negated { " NOT" } else { "" };
-            format!("({}{not} IS NULL)", default_name(expr))
+            let not = if *negated { " IS NOT NULL" } else { " IS NULL" };
+            format!("({}{not})", default_name(expr))
         }
         Expr::Between {
             expr,
@@ -4973,13 +5416,17 @@ fn default_name(expr: &Expr) -> String {
             high,
             negated,
         } => {
-            let not = if *negated { "NOT " } else { "" };
-            format!(
-                "({} {not}BETWEEN {} AND {})",
+            let text = format!(
+                "({} BETWEEN {} AND {})",
                 default_name(expr),
                 default_name(low),
                 default_name(high)
-            )
+            );
+            if *negated {
+                format!("(NOT {text})")
+            } else {
+                text
+            }
         }
         Expr::Function {
             name,
@@ -5039,10 +5486,12 @@ fn default_name(expr: &Expr) -> String {
         }
         Expr::Coalesce(args) => {
             let inner: Vec<String> = args.iter().map(default_name).collect();
-            format!("coalesce({})", inner.join(", "))
+            format!("COALESCE({})", inner.join(", "))
         }
-        Expr::Cast { expr, dtype } => format!("cast({} as {dtype})", default_name(expr)),
-        Expr::TryCast { expr, dtype } => format!("try_cast({} as {dtype})", default_name(expr)),
+        // DuckDB spells CAST in upper case in expression text, and both
+        // `CAST(x AS INT)` and `x::INT` name the result `CAST(x AS INTEGER)`.
+        Expr::Cast { expr, dtype } => format!("CAST({} AS {dtype})", default_name(expr)),
+        Expr::TryCast { expr, dtype } => format!("TRY_CAST({} AS {dtype})", default_name(expr)),
         Expr::Subscript { base, index } => {
             format!("{}[{}]", default_name(base), default_name(index))
         }
@@ -5417,10 +5866,16 @@ fn map_bound_expr(
                 expr: Box::new(go(*expr, f)?),
                 negated,
             },
-            BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+            BoundExpr::Scalar {
+                func,
+                args,
+                dtype,
+                volatile,
+            } => BoundExpr::Scalar {
                 func,
                 args: args.into_iter().map(|a| go(a, f)).collect::<Result<_>>()?,
                 dtype,
+                volatile,
             },
             BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
                 expr: Box::new(go(*expr, f)?),
@@ -6083,7 +6538,7 @@ impl Binder<'_> {
         // general expression rewrite; one nested deeper keeps the fallback.
         let mut i = 0;
         while i < flat.len() {
-            let dtypes: Vec<DataType> = plan_schema(self.db, &self.default_db, &self.ctes, &plan)?
+            let dtypes: Vec<DataType> = plan_schema(self.db, &self.default_ns, &self.ctes, &plan)?
                 .into_iter()
                 .map(|(_, t)| t)
                 .collect();
@@ -6130,7 +6585,7 @@ impl Binder<'_> {
                     | BoundExpr::Not(_)
             ) {
                 let dtypes: Vec<DataType> =
-                    plan_schema(self.db, &self.default_db, &self.ctes, &plan)?
+                    plan_schema(self.db, &self.default_ns, &self.ctes, &plan)?
                         .into_iter()
                         .map(|(_, t)| t)
                         .collect();
@@ -6169,7 +6624,7 @@ impl Binder<'_> {
         let mut expr = conjunct.clone();
         let mut changed = false;
         loop {
-            let dtypes: Vec<DataType> = plan_schema(self.db, &self.default_db, &self.ctes, &plan)?
+            let dtypes: Vec<DataType> = plan_schema(self.db, &self.default_ns, &self.ctes, &plan)?
                 .into_iter()
                 .map(|(_, d)| d)
                 .collect();
@@ -6502,7 +6957,7 @@ impl Binder<'_> {
             "lifted base still reads the enclosing row: {:?}",
             lifted.base
         );
-        let base_width = plan_schema(self.db, &self.default_db, &self.ctes, &lifted.base)?.len();
+        let base_width = plan_schema(self.db, &self.default_ns, &self.ctes, &lifted.base)?.len();
         Ok(Some(CorrelatedBody {
             base: lifted.base,
             base_width,
@@ -6849,13 +7304,19 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
             right: Box::new(rebase_to_keys(right, keys)?),
             dtype: *dtype,
         },
-        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => BoundExpr::Scalar {
             func: *func,
             args: args
                 .iter()
                 .map(|a| rebase_to_keys(a, keys))
                 .collect::<Option<Vec<_>>>()?,
             dtype: *dtype,
+            volatile: *volatile,
         },
         BoundExpr::DynamicScalar {
             name,
@@ -6934,13 +7395,19 @@ fn resolve_window_refs(expr: BoundExpr, input_width: usize) -> BoundExpr {
             expr: Box::new(resolve_window_refs(*expr, input_width)),
             negated,
         },
-        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => BoundExpr::Scalar {
             func,
             args: args
                 .into_iter()
                 .map(|a| resolve_window_refs(a, input_width))
                 .collect(),
             dtype,
+            volatile,
         },
         BoundExpr::DynamicScalar {
             name,
@@ -7030,13 +7497,19 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
             expr: Box::new(resolve_agg_refs(*expr, num_keys)),
             negated,
         },
-        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => BoundExpr::Scalar {
             func,
             args: args
                 .into_iter()
                 .map(|a| resolve_agg_refs(a, num_keys))
                 .collect(),
             dtype,
+            volatile,
         },
         BoundExpr::DynamicScalar {
             name,
@@ -7284,11 +7757,11 @@ fn scan_width(binder: &Binder<'_>) -> usize {
     binder.tables.iter().map(|t| t.columns.len()).sum()
 }
 
-/// Bind one statement against `db`, with `default_db` as the session's
+/// Bind one statement against `db`, with `default_ns` as the session's
 /// current database for unqualified names. The returned plan borrows nothing
 /// from `db`.
-pub fn bind(db: &PinkDb, stmt: &Statement, default_db: &str) -> Result<LogicalPlan> {
-    Ok(bind_tracked(db, stmt, default_db)?.0)
+pub fn bind(db: &PinkDb, stmt: &Statement, default_ns: &SchemaPath) -> Result<LogicalPlan> {
+    Ok(bind_tracked(db, stmt, default_ns)?.0)
 }
 
 /// [`bind`] plus the extension sources the statement references, in
@@ -7300,9 +7773,9 @@ pub fn bind(db: &PinkDb, stmt: &Statement, default_db: &str) -> Result<LogicalPl
 pub(crate) fn bind_tracked(
     db: &PinkDb,
     stmt: &Statement,
-    default_db: &str,
+    default_ns: &SchemaPath,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    bind_tracked_with(db, stmt, default_db, None, &db.session)
+    bind_tracked_with(db, stmt, default_ns, None, &db.session)
 }
 
 /// [`bind_tracked`] in an explicit session: a network connection binds against
@@ -7310,10 +7783,10 @@ pub(crate) fn bind_tracked(
 pub(crate) fn bind_tracked_in(
     db: &PinkDb,
     stmt: &Statement,
-    default_db: &str,
+    default_ns: &SchemaPath,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    bind_tracked_with(db, stmt, default_db, None, session)
+    bind_tracked_with(db, stmt, default_ns, None, session)
 }
 
 /// [`bind_tracked`] for a `?`-parameterized statement: `params` carries one
@@ -7338,11 +7811,11 @@ pub(crate) fn bind_tracked_in(
 pub(crate) fn bind_tracked_with(
     db: &PinkDb,
     stmt: &Statement,
-    default_db: &str,
+    default_ns: &SchemaPath,
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let (plan, deps) = bind_tracked_plan(db, stmt, default_db, params, session)?;
+    let (plan, deps) = bind_tracked_plan(db, stmt, default_ns, params, session)?;
     // The binder records a variable read as a `$`-prefixed dependency (no
     // extension function name can start with `$`); split them off before the
     // volatility guard sees the function names.
@@ -7357,14 +7830,6 @@ pub(crate) fn bind_tracked_with(
              value, or read it in a query",
             name.trim_start_matches('$')
         )));
-    }
-    if crate::plan::writes_tables(&plan) && dynamic.iter().any(|d| d == VOLATILE_UUID_DEP) {
-        return Err(PinkDbError::Execution(
-            "uuid() is volatile (nondeterministic) and cannot be called in a statement the \
-             engine WAL-logs: replaying it would produce different values. Use it in a \
-             read-only statement"
-                .to_string(),
-        ));
     }
     if crate::plan::writes_tables(&plan)
         && let Some(function) = db.first_volatile_dynamic_function(&dynamic)
@@ -7382,25 +7847,25 @@ pub(crate) fn bind_tracked_with(
 fn bind_tracked_plan(
     db: &PinkDb,
     stmt: &Statement,
-    default_db: &str,
+    default_ns: &SchemaPath,
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     // Every binder this statement creates (RETURNING, ON CONFLICT, …) reads
     // one clock.
-    let _clock = ClockScope::enter();
+    let _clock = StatementScope::enter();
     let empty = |plan| Ok((plan, Vec::new()));
     match stmt {
         Statement::CreateTable {
-            db: qdb,
+            qual: qdb,
             name,
             items,
             if_not_exists,
             or_replace,
         } => bind_create_table(
             db,
-            default_db,
-            qdb.as_deref(),
+            default_ns,
+            qdb,
             name,
             items,
             *if_not_exists,
@@ -7409,14 +7874,14 @@ fn bind_tracked_plan(
             session,
         ),
         Statement::CreateTableAs {
-            db: qdb,
+            qual: qdb,
             name,
             query,
             if_not_exists,
             or_replace,
         } => bind_create_table_as(
             db,
-            default_db,
+            default_ns,
             qdb,
             name,
             query,
@@ -7426,7 +7891,7 @@ fn bind_tracked_plan(
             session,
         ),
         Statement::Insert {
-            db: qdb,
+            qual: qdb,
             table,
             columns,
             source,
@@ -7435,11 +7900,25 @@ fn bind_tracked_plan(
         } => match source {
             InsertSource::Values(rows) => bind_insert(
                 db,
-                default_db,
+                default_ns,
                 qdb,
                 table,
                 columns,
                 rows,
+                false,
+                on_conflict.as_ref(),
+                returning.as_deref(),
+                params.clone(),
+                session,
+            ),
+            InsertSource::DefaultValues => bind_insert(
+                db,
+                default_ns,
+                qdb,
+                table,
+                columns,
+                &[],
+                true,
                 on_conflict.as_ref(),
                 returning.as_deref(),
                 params.clone(),
@@ -7447,7 +7926,7 @@ fn bind_tracked_plan(
             ),
             InsertSource::Select(query) => bind_insert_select(
                 db,
-                default_db,
+                default_ns,
                 qdb,
                 table,
                 columns,
@@ -7459,7 +7938,7 @@ fn bind_tracked_plan(
             ),
         },
         Statement::Update {
-            db: qdb,
+            qual: qdb,
             table,
             sets,
             from,
@@ -7467,7 +7946,7 @@ fn bind_tracked_plan(
             returning,
         } => bind_update(
             db,
-            default_db,
+            default_ns,
             qdb,
             table,
             sets,
@@ -7478,7 +7957,7 @@ fn bind_tracked_plan(
             session,
         ),
         Statement::Delete {
-            db: qdb,
+            qual: qdb,
             table,
             alias,
             using,
@@ -7486,7 +7965,7 @@ fn bind_tracked_plan(
             returning,
         } => bind_delete(
             db,
-            default_db,
+            default_ns,
             qdb,
             table,
             alias.as_deref(),
@@ -7497,7 +7976,7 @@ fn bind_tracked_plan(
             session,
         ),
         Statement::Merge {
-            db: qdb,
+            qual: qdb,
             table,
             alias,
             using,
@@ -7506,7 +7985,7 @@ fn bind_tracked_plan(
             returning,
         } => bind_merge(
             db,
-            default_db,
+            default_ns,
             qdb,
             table,
             alias.as_deref(),
@@ -7518,38 +7997,47 @@ fn bind_tracked_plan(
             session,
         ),
         Statement::CopyTo {
-            db: qdb,
+            qual: qdb,
             table,
             path,
             format,
-        } => bind_copy_to(db, default_db, qdb, table, path, format.as_deref(), session),
+        } => bind_copy_to(db, default_ns, qdb, table, path, format.as_deref(), session),
         Statement::Begin => empty(LogicalPlan::Begin),
         Statement::Commit => empty(LogicalPlan::Commit),
         Statement::Rollback => empty(LogicalPlan::Rollback),
         Statement::CreateView {
-            db: qdb,
+            qual: qdb,
             name,
             cols,
             query,
             or_replace,
-        } => bind_create_view(db, default_db, qdb, name, cols, query, *or_replace, session),
+        } => bind_create_view(db, default_ns, qdb, name, cols, query, *or_replace, session),
         Statement::CreateMaterializedView {
-            db: qdb,
+            qual: qdb,
             name,
             query,
             if_not_exists,
             policy,
         } => {
-            let target = Binder::new(db, default_db).resolve_db(qdb)?;
-            // Bind the inner query.
-            let mut binder = Binder::new(db, default_db)
+            let target = Binder::new(db, default_ns)
+                .with_session(session.clone())
+                .resolve_ns(qdb)?;
+            if target.temp_id().is_some() {
+                return Err(PinkDbError::Catalog(
+                    "temporary materialized views are not supported; create a regular view"
+                        .to_string(),
+                ));
+            }
+            // Bind the inner query against the view's own schema.
+            let mut binder = Binder::new(db, &target)
                 .with_session(session.clone())
                 .with_params(params.clone());
             let plan = bind_select_in(db, &mut binder, query)?;
+            reject_temp_dependency(db, &target, &binder.temp_tables_used())?;
             let dynamic = binder.dynamic_functions_used();
             Ok((
                 LogicalPlan::CreateMaterializedView {
-                    db: Some(target),
+                    ns: Some(target),
                     name: name.clone(),
                     query: Box::new(plan),
                     if_not_exists: *if_not_exists,
@@ -7561,38 +8049,42 @@ fn bind_tracked_plan(
                 dynamic,
             ))
         }
-        Statement::RefreshMaterializedView { db: qdb, name } => {
+        Statement::RefreshMaterializedView { qual: qdb, name } => {
             empty(LogicalPlan::RefreshMaterializedView {
-                db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+                ns: Some(Binder::new(db, default_ns).resolve_ns(qdb)?),
                 name: name.clone(),
             })
         }
         Statement::RefreshMaterializedViews => empty(LogicalPlan::RefreshMaterializedViews {
-            db: Some(Binder::new(db, default_db).resolve_db(&None)?),
+            ns: Some(Binder::new(db, default_ns).resolve_ns(&Qualifier::none())?),
         }),
         Statement::ShowMaterializedViews => empty(LogicalPlan::ShowMaterializedViews {
-            db: Some(default_db.to_ascii_lowercase()),
+            ns: Some(default_ns.clone()),
         }),
         Statement::DropMaterializedView {
-            db: qdb,
+            qual: qdb,
             name,
             if_exists,
         } => empty(LogicalPlan::DropMaterializedView {
-            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+            ns: Some(Binder::new(db, default_ns).resolve_ns(qdb)?),
             name: name.clone(),
             if_exists: *if_exists,
         }),
         Statement::DropTable {
-            db: qdb,
+            qual: qdb,
             name,
             if_exists,
         } => empty(LogicalPlan::DropTable {
-            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+            ns: Some(
+                Binder::new(db, default_ns)
+                    .with_session(session.clone())
+                    .resolve_table_ns(qdb, name)?,
+            ),
             name: name.clone(),
             if_exists: *if_exists,
         }),
         Statement::CreateIndex {
-            db: qdb,
+            qual: qdb,
             name,
             table,
             column,
@@ -7601,7 +8093,9 @@ fn bind_tracked_plan(
             options,
         } => {
             // Validate table + column exist.
-            let target_db = Binder::new(db, default_db).resolve_db(qdb)?;
+            let target_db = Binder::new(db, default_ns)
+                .with_session(session.clone())
+                .resolve_table_ns(qdb, table)?;
             let col_idx = if let Ok(t) = db.table_in(&target_db, table) {
                 t.columns
                     .iter()
@@ -7654,7 +8148,7 @@ fn bind_tracked_plan(
                 .collect();
             Ok((
                 LogicalPlan::CreateIndex {
-                    db: Some(target_db),
+                    ns: Some(target_db),
                     name: name.clone(),
                     table: table.clone(),
                     column: col_idx,
@@ -7667,62 +8161,168 @@ fn bind_tracked_plan(
             ))
         }
         Statement::DropIndex {
-            db: qdb,
+            qual: qdb,
             name,
             if_exists,
         } => {
-            let target_db = Binder::new(db, default_db).resolve_db(qdb)?;
-            // Resolve the owning table now: the executed plan's written table
-            // is what the WAL frame touches and what a durable replay rebuilds
-            // (`.pink` has no index section). A missing index stays `None`
-            // (`IF EXISTS` no-op), and the statement still logs.
-            let table = db.list_tables_in(&target_db).into_iter().find(|tbl| {
-                db.table_in(&target_db, tbl).is_ok_and(|t| {
-                    t.indexes.iter().any(|i| i.name == *name)
-                        || t.vector_indexes
-                            .iter()
-                            .any(|i| i.name.eq_ignore_ascii_case(name))
-                })
+            let binder = Binder::new(db, default_ns).with_session(session.clone());
+            let resolved = binder.resolve_ns(qdb)?;
+            // An index lives on its table, so an unqualified name searches the
+            // session's `temp.main` first like every other table lookup.
+            let mut candidates = Vec::new();
+            if qdb.is_empty() {
+                candidates.push(binder.temp_ns());
+            }
+            candidates.push(resolved.clone());
+            let found = candidates.iter().find_map(|ns| {
+                db.list_tables_in(ns.clone())
+                    .into_iter()
+                    .find(|tbl| {
+                        db.table_in(ns.clone(), tbl).is_ok_and(|t| {
+                            t.indexes.iter().any(|i| i.name == *name)
+                                || t.vector_indexes
+                                    .iter()
+                                    .any(|i| i.name.eq_ignore_ascii_case(name))
+                        })
+                    })
+                    .map(|tbl| (ns.clone(), tbl))
             });
+            let (target_db, table) = match found {
+                Some((ns, tbl)) => (ns, Some(tbl)),
+                None => (resolved, None),
+            };
             empty(LogicalPlan::DropIndex {
-                db: Some(target_db),
+                ns: Some(target_db),
                 name: name.clone(),
                 table,
                 if_exists: *if_exists,
             })
         }
-        Statement::AlterTable { db: qdb, name, op } => bind_alter_table(
-            db,
-            default_db,
-            qdb.as_deref(),
+        Statement::AlterTable {
+            qual: qdb,
             name,
             op,
-            params.clone(),
-            session,
-        ),
-        Statement::DropView { db: qdb, name } => empty(LogicalPlan::DropView {
-            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+        } => bind_alter_table(db, default_ns, qdb, name, op, params.clone(), session),
+        Statement::DropView { qual: qdb, name } => empty(LogicalPlan::DropView {
+            ns: Some(Binder::new(db, default_ns).resolve_ns(qdb)?),
             name: name.clone(),
         }),
+        Statement::CreateSchema {
+            qual,
+            name,
+            if_not_exists,
+        } => {
+            let dbname = qual.catalog.as_deref().unwrap_or(default_ns.db());
+            let ns = SchemaPath::new(dbname, name);
+            // `information_schema` and `pg_catalog` are reserved for the
+            // catalog views (wave 131c), so they cannot be user schemas.
+            if ns.schema() == "information_schema" || ns.schema() == "pg_catalog" {
+                return Err(PinkDbError::Catalog(format!(
+                    "schema name \"{}\" is reserved",
+                    ns.schema()
+                )));
+            }
+            if !db.database_exists(ns.db()) {
+                return Err(PinkDbError::Catalog(format!(
+                    "database \"{}\" not found",
+                    ns.db()
+                )));
+            }
+            empty(LogicalPlan::CreateSchema {
+                ns,
+                name: name.clone(),
+                if_not_exists: *if_not_exists,
+            })
+        }
+        Statement::DropSchema {
+            qual,
+            name,
+            if_exists,
+            cascade,
+        } => {
+            let dbname = qual.catalog.as_deref().unwrap_or(default_ns.db());
+            empty(LogicalPlan::DropSchema {
+                ns: SchemaPath::new(dbname, name),
+                if_exists: *if_exists,
+                cascade: *cascade,
+            })
+        }
         Statement::CreateDatabase {
             name,
             if_not_exists,
             options,
-        } => empty(LogicalPlan::CreateDatabase {
-            name: name.clone(),
-            if_not_exists: *if_not_exists,
-            lake: bind_create_database_options(options.as_ref())?,
-        }),
+        } => {
+            if name.eq_ignore_ascii_case("system") {
+                return Err(PinkDbError::Catalog(
+                    "database name \"system\" is reserved".to_string(),
+                ));
+            }
+            empty(LogicalPlan::CreateDatabase {
+                name: name.clone(),
+                if_not_exists: *if_not_exists,
+                lake: bind_create_database_options(options.as_ref())?,
+            })
+        }
         Statement::Attach {
             location,
             name,
             options,
-        } => empty(LogicalPlan::Attach {
-            name: name.clone(),
-            spec: bind_attach_options(location, options)?,
-        }),
+        } => {
+            if name.eq_ignore_ascii_case("system") {
+                return Err(PinkDbError::Catalog(
+                    "Attached database name \"system\" cannot be used because it is a reserved name"
+                        .to_string(),
+                ));
+            }
+            if name.eq_ignore_ascii_case("temp") {
+                return Err(PinkDbError::Catalog(
+                    "Attached database name \"temp\" cannot be used because it is reserved for \
+                     each session's temporary tables"
+                        .to_string(),
+                ));
+            }
+            let (spec, secret) = bind_attach_options(name, location, options)?;
+            empty(LogicalPlan::Attach {
+                name: name.clone(),
+                spec,
+                secret,
+            })
+        }
         Statement::Detach { name, if_exists } => empty(LogicalPlan::Detach {
             name: name.clone(),
+            if_exists: *if_exists,
+        }),
+        // Wave 132b: the binder validates the type and every option name; the
+        // values only live in the plan and the secret stores, never in SQL
+        // text that is logged.
+        Statement::CreateSecret {
+            name,
+            secret_type,
+            fields,
+            persistent,
+            or_replace,
+            if_not_exists,
+        } => {
+            let Some(type_) = crate::secret::SecretType::parse(secret_type) else {
+                return Err(PinkDbError::Catalog(format!(
+                    "unknown secret type \"{secret_type}\" (supported: s3, r2, gcs, postgres)"
+                )));
+            };
+            let secret = crate::secret::Secret::new(name.clone(), type_, fields.clone())?;
+            empty(LogicalPlan::CreateSecret {
+                secret,
+                persistent: *persistent,
+                or_replace: *or_replace,
+                if_not_exists: *if_not_exists,
+            })
+        }
+        Statement::DropSecret {
+            name,
+            persistent,
+            if_exists,
+        } => empty(LogicalPlan::DropSecret {
+            name: name.clone(),
+            persistent: *persistent,
             if_exists: *if_exists,
         }),
         Statement::DropDatabase { name, if_exists } => empty(LogicalPlan::DropDatabase {
@@ -7730,11 +8330,15 @@ fn bind_tracked_plan(
             if_exists: *if_exists,
         }),
         Statement::ShowTables => empty(LogicalPlan::ShowTables {
-            db: default_db.to_ascii_lowercase(),
+            ns: default_ns.clone(),
         }),
+        Statement::ShowAllTables => {
+            let binder = Binder::new(db, default_ns).with_session(session.clone());
+            empty(bind_show_all_tables(db, &binder)?)
+        }
         Statement::ShowDatabases => empty(LogicalPlan::ShowDatabases),
-        Statement::Describe { db: qdb, name } => {
-            bind_describe(db, default_db, qdb.as_deref(), name)
+        Statement::Describe { qual: qdb, name } => {
+            bind_describe(db, default_ns, qdb, name, session)
         }
         Statement::Explain(inner) => {
             // EXPLAIN never executes its inner statement, so a DML plan is
@@ -7757,7 +8361,7 @@ fn bind_tracked_plan(
             // Bind the inner statement fully (errors surface here) and wrap
             // it — EXPLAIN never executes it.
             let (plan, dynamic) =
-                bind_tracked_plan(db, inner, default_db, params.clone(), session)?;
+                bind_tracked_plan(db, inner, default_ns, params.clone(), session)?;
             Ok((
                 LogicalPlan::Explain {
                     plan: Box::new(plan),
@@ -7765,20 +8369,41 @@ fn bind_tracked_plan(
                 dynamic,
             ))
         }
-        Statement::Use { name } => {
-            // Validate at bind: USE must fail clearly before touching the
-            // session (and before any later statement in the same string).
-            if !db.database_exists(name) {
-                return Err(PinkDbError::Catalog(format!(
-                    "database \"{name}\" not found"
-                )));
-            }
-            empty(LogicalPlan::Use { name: name.clone() })
+        Statement::Use { qual } => {
+            // Validate at bind, before the session changes: one part is a
+            // database first (its `main`), else a schema of the current
+            // database; two parts name a database and a schema outright.
+            let target = match (&qual.catalog, &qual.schema) {
+                (Some(dbname), Some(schema)) => {
+                    let ns = SchemaPath::new(dbname, schema);
+                    if !db.schema_exists(&ns) {
+                        return Err(schema_error(db, &ns));
+                    }
+                    ns
+                }
+                (None, Some(x)) => {
+                    if db.database_exists(x) {
+                        SchemaPath::main(x)
+                    } else {
+                        let ns = SchemaPath::new(default_ns.db(), x);
+                        if !db.schema_exists(&ns) {
+                            // Either reading could have been meant (DuckDB:
+                            // "No catalog + schema named …").
+                            return Err(PinkDbError::Catalog(format!(
+                                "database or schema \"{x}\" not found"
+                            )));
+                        }
+                        ns
+                    }
+                }
+                _ => return Err(PinkDbError::Parse("USE needs a name".to_string())),
+            };
+            empty(LogicalPlan::Use { ns: target })
         }
         Statement::SetVariable { name, value } => {
             // A statement binds with no FROM scope, so the value can only be a
             // constant expression (a scalar subquery included).
-            let mut binder = Binder::new(db, default_db).with_session(session.clone());
+            let mut binder = Binder::new(db, default_ns).with_session(session.clone());
             let mut aggs = Vec::new();
             let bound = binder.bind_expr(value, &mut aggs, false)?;
             if !aggs.is_empty() {
@@ -7811,27 +8436,29 @@ fn bind_tracked_plan(
             empty(LogicalPlan::LoadInstalledExtension { name: name.clone() })
         }
         Statement::Checkpoint => empty(LogicalPlan::Checkpoint),
-        Statement::Analyze { db: qdb, table } => {
-            let target = match qdb {
-                Some(d) => d.to_ascii_lowercase(),
-                None => default_db.to_ascii_lowercase(),
+        Statement::Analyze { qual: qdb, table } => {
+            let binder = Binder::new(db, default_ns).with_session(session.clone());
+            let target = match table {
+                Some(name) => binder.resolve_table_ns(qdb, name)?,
+                None => binder.resolve_ns(qdb)?,
             };
             // Resolve the target now: ANALYZE of a missing table must fail
             // before a single table is touched (bare ANALYZE covers all).
             if let Some(name) = table {
                 db.table_in(&target, name)?;
-            } else if !db.database_exists(&target) {
+            } else if !db.database_exists(target.db()) {
                 return Err(PinkDbError::Catalog(format!(
-                    "database \"{target}\" not found"
+                    "database \"{}\" not found",
+                    target.db()
                 )));
             }
             empty(LogicalPlan::Analyze {
-                db: target,
+                ns: target,
                 table: table.as_ref().map(|t| t.to_ascii_lowercase()),
             })
         }
         Statement::CreateProcedure {
-            db: qdb,
+            qual: qdb,
             name,
             params: sig,
             language,
@@ -7839,8 +8466,8 @@ fn bind_tracked_plan(
             or_replace,
         } => bind_create_procedure(
             db,
-            default_db,
-            qdb.as_deref(),
+            default_ns,
+            qdb,
             CreateProcedureArgs {
                 name,
                 sig,
@@ -7850,68 +8477,74 @@ fn bind_tracked_plan(
             },
         ),
         Statement::DropProcedure {
-            db: qdb,
+            qual: qdb,
             name,
             if_exists,
         } => empty(LogicalPlan::DropProcedure {
-            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+            ns: Some(Binder::new(db, default_ns).resolve_ns(qdb)?),
             name: name.clone(),
             if_exists: *if_exists,
         }),
         Statement::CreateTrigger {
-            db: qdb,
+            qual: qdb,
+            table,
             or_replace,
             ..
         } => {
-            let target = Binder::new(db, default_db).resolve_db(qdb)?;
+            let target = Binder::new(db, default_ns)
+                .with_session(session.clone())
+                .resolve_table_ns(qdb, table)?;
             // The plan carries the definition, not the statement, so execution,
             // the `.pink` footer and the WAL all see one shape.
             let def = crate::trigger::def_from_statement(&target, stmt)?;
             empty(LogicalPlan::CreateTrigger {
-                db: Some(target),
+                ns: Some(target),
                 def: Box::new(def),
                 or_replace: *or_replace,
             })
         }
         Statement::DropTrigger {
-            db: qdb,
+            qual: qdb,
             name,
             table,
             if_exists,
-        } => empty(LogicalPlan::DropTrigger {
-            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
-            name: name.clone(),
-            table: table.clone(),
-            if_exists: *if_exists,
-        }),
-        Statement::ShowTriggers { db: qdb, table } => {
-            let target = Binder::new(db, default_db).resolve_db(qdb)?;
+        } => {
+            let binder = Binder::new(db, default_ns).with_session(session.clone());
+            let target = match table {
+                Some(name) => binder.resolve_table_ns(qdb, name)?,
+                None => binder.resolve_ns(qdb)?,
+            };
+            empty(LogicalPlan::DropTrigger {
+                ns: Some(target),
+                name: name.clone(),
+                table: table.clone(),
+                if_exists: *if_exists,
+            })
+        }
+        Statement::ShowTriggers { qual: qdb, table } => {
+            let binder = Binder::new(db, default_ns).with_session(session.clone());
+            let target = match table {
+                Some(name) => binder.resolve_table_ns(qdb, name)?,
+                None => binder.resolve_ns(qdb)?,
+            };
             empty(LogicalPlan::ShowTriggers {
-                db: Some(target),
+                ns: Some(target),
                 table: table.clone(),
             })
         }
         Statement::Call {
-            db: qdb,
+            qual: qdb,
             name,
             args,
-        } => bind_call(
-            db,
-            default_db,
-            qdb.as_deref(),
-            name,
-            args,
-            params.clone(),
-            session,
-        ),
+        } => bind_call(db, default_ns, qdb, name, args, params.clone(), session),
         // Wave 83: an anonymous block binds to a `Call` carrying its parsed
         // definition — the same execution, atomicity, logging and RBAC path
         // (running one requires ADMIN in an authenticated session, like CALL).
         Statement::Do { body } => {
-            let target = Binder::new(db, default_db).resolve_db(&None)?;
+            let target = Binder::new(db, default_ns).resolve_ns(&Qualifier::none())?;
             let parsed = crate::procedure::parse_body("DO", &[], body)?;
             empty(LogicalPlan::Call {
-                db: Some(target),
+                ns: Some(target),
                 name: "DO".to_string(),
                 args: Vec::new(),
                 inline: Some(Box::new(crate::procedure::ProcedureDef {
@@ -7921,10 +8554,11 @@ fn bind_tracked_plan(
                     source: body.clone(),
                     body: Some(parsed),
                 })),
+                lake: None,
             })
         }
         Statement::CreateMacro {
-            db: qdb,
+            qual: qdb,
             name,
             params: macro_params,
             body,
@@ -7932,8 +8566,8 @@ fn bind_tracked_plan(
             if_not_exists,
         } => bind_create_macro(
             db,
-            default_db,
-            qdb.as_deref(),
+            default_ns,
+            qdb,
             CreateMacroArgs {
                 name,
                 params: macro_params,
@@ -7944,22 +8578,22 @@ fn bind_tracked_plan(
             session,
         ),
         Statement::DropMacro {
-            db: qdb,
+            qual: qdb,
             name,
             if_exists,
         } => empty(LogicalPlan::DropMacro {
-            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+            ns: Some(Binder::new(db, default_ns).resolve_ns(qdb)?),
             name: name.clone(),
             if_exists: *if_exists,
         }),
         Statement::ShowMacros => empty(LogicalPlan::ShowMacros {
-            db: default_db.to_ascii_lowercase(),
+            ns: default_ns.clone(),
         }),
-        Statement::DescribeMacro { db: qdb, name } => {
-            let target = Binder::new(db, default_db).resolve_db(qdb)?;
+        Statement::DescribeMacro { qual: qdb, name } => {
+            let target = Binder::new(db, default_ns).resolve_ns(qdb)?;
             db.macro_in(&target, name)?;
             empty(LogicalPlan::DescribeMacro {
-                db: target,
+                ns: target,
                 name: name.clone(),
             })
         }
@@ -7975,10 +8609,36 @@ fn bind_tracked_plan(
             if_not_exists,
         } => bind_create_role(db, name, *if_not_exists),
         Statement::DropRole { name, if_exists } => bind_drop_role(db, name, *if_exists),
-        Statement::Grant { target } => bind_grant(db, default_db, target, false),
-        Statement::Revoke { target } => bind_grant(db, default_db, target, true),
-        Statement::Select(sel) => bind_select(db, default_db, sel, params.clone(), session),
+        Statement::Grant { target } => bind_grant(db, default_ns, target, false, session),
+        Statement::Revoke { target } => bind_grant(db, default_ns, target, true, session),
+        Statement::Select(sel) => bind_select(db, default_ns, sel, params.clone(), session),
     }
+}
+
+/// The error for a missing namespace part: a typo in the database and a typo
+/// in the schema are different messages (wave 131b).
+/// Does a non-empty column/table prefix name `ns`? (`s` matches any database's
+/// schema `s`; `c.s` pins both.)
+fn qualifier_matches(qual: &Qualifier, ns: &SchemaPath) -> bool {
+    qual.schema
+        .as_deref()
+        .is_some_and(|s| ns.schema().eq_ignore_ascii_case(s))
+        && qual
+            .catalog
+            .as_deref()
+            .is_none_or(|c| ns.db().eq_ignore_ascii_case(c))
+}
+
+fn schema_error_text(db: &PinkDb, ns: &SchemaPath) -> String {
+    if !db.database_exists(ns.db()) {
+        format!("database \"{}\" not found", ns.db())
+    } else {
+        format!("schema \"{}\" not found", ns.schema())
+    }
+}
+
+fn schema_error(db: &PinkDb, ns: &SchemaPath) -> PinkDbError {
+    PinkDbError::Catalog(schema_error_text(db, ns))
 }
 
 /// The parsed `CREATE [OR REPLACE] PROCEDURE` header the binder validates (a
@@ -8003,8 +8663,8 @@ struct CreateProcedureArgs<'a> {
 /// store-level statements a body may not contain).
 fn bind_create_procedure(
     db: &PinkDb,
-    default_db: &str,
-    qdb: Option<&str>,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
     args: CreateProcedureArgs<'_>,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let CreateProcedureArgs {
@@ -8014,7 +8674,12 @@ fn bind_create_procedure(
         body,
         or_replace,
     } = args;
-    let target = Binder::new(db, default_db).resolve_db(&qdb.map(str::to_string))?;
+    let target = Binder::new(db, default_ns).resolve_ns(qdb)?;
+    if names_temp(qdb) {
+        return Err(PinkDbError::Catalog(
+            "procedures cannot be temporary; create a regular procedure".to_string(),
+        ));
+    }
     crate::procedure::check_language_available(language)?;
     // A duplicate parameter name would make the scope ambiguous.
     for (i, (n, _)) in sig.iter().enumerate() {
@@ -8039,7 +8704,7 @@ fn bind_create_procedure(
     };
     Ok((
         LogicalPlan::CreateProcedure {
-            db: Some(target),
+            ns: Some(target),
             name: name.to_string(),
             def: crate::procedure::ProcedureDef {
                 name: name.to_string(),
@@ -8077,8 +8742,8 @@ struct CreateMacroArgs<'a> {
 /// of this wave).
 fn bind_create_macro(
     db: &PinkDb,
-    default_db: &str,
-    qdb: Option<&str>,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
     args: CreateMacroArgs<'_>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
@@ -8089,7 +8754,14 @@ fn bind_create_macro(
         or_replace,
         if_not_exists,
     } = args;
-    let target = Binder::new(db, default_db).resolve_db(&qdb.map(str::to_string))?;
+    let target = Binder::new(db, default_ns)
+        .with_session(session.clone())
+        .resolve_ns(qdb)?;
+    if target.temp_id().is_some() {
+        return Err(PinkDbError::Catalog(
+            "macros cannot be temporary; create a regular macro".to_string(),
+        ));
+    }
     let key = name.to_ascii_lowercase();
     let mut defs: Vec<crate::macros::MacroParamDef> = Vec::with_capacity(params.len());
     let mut seen_default = false;
@@ -8147,7 +8819,7 @@ fn bind_create_macro(
     }
     Ok((
         LogicalPlan::CreateMacro {
-            db: Some(target),
+            ns: Some(target),
             name: name.to_string(),
             def: crate::macros::MacroDef {
                 name: name.to_string(),
@@ -8178,7 +8850,7 @@ fn recursive_macro(name: &str) -> PinkDbError {
 fn validate_macro_default(
     db: &PinkDb,
     session: &Session,
-    target_db: &str,
+    target_db: &SchemaPath,
     macro_name: &str,
     param: &str,
     default: &Expr,
@@ -8250,9 +8922,195 @@ fn expr_has_subquery(expr: &Expr) -> bool {
         Expr::Literal(_)
         | Expr::Parameter(_)
         | Expr::Star
+        | Expr::Default
         | Expr::QualifiedStar { .. }
         | Expr::Column { .. } => false,
     }
+}
+
+/// Whether a `DEFAULT` expression contains a column reference or a window
+/// function. Subqueries are checked separately so the refusals keep DuckDB's
+/// precedence (subquery, then column, then window, then aggregate).
+fn default_expr_uses_column_or_window(expr: &Expr, column: &mut bool, window: &mut bool) {
+    match expr {
+        Expr::Column { .. } => *column = true,
+        Expr::Window {
+            args, over, filter, ..
+        } => {
+            *window = true;
+            for arg in args {
+                default_expr_uses_column_or_window(arg, column, window);
+            }
+            if let Some(filter) = filter {
+                default_expr_uses_column_or_window(filter, column, window);
+            }
+            for e in over.partition() {
+                default_expr_uses_column_or_window(e, column, window);
+            }
+            for item in over.order() {
+                default_expr_uses_column_or_window(&item.expr, column, window);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            default_expr_uses_column_or_window(left, column, window);
+            default_expr_uses_column_or_window(right, column, window);
+        }
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::TryCast { expr, .. }
+        | Expr::NamedArg { expr, .. } => default_expr_uses_column_or_window(expr, column, window),
+        Expr::Subscript { base, index } => {
+            default_expr_uses_column_or_window(base, column, window);
+            default_expr_uses_column_or_window(index, column, window);
+        }
+        Expr::ArrayLiteral(items) | Expr::Coalesce(items) => {
+            for item in items {
+                default_expr_uses_column_or_window(item, column, window);
+            }
+        }
+        Expr::Slice { base, from, to } => {
+            default_expr_uses_column_or_window(base, column, window);
+            if let Some(from) = from {
+                default_expr_uses_column_or_window(from, column, window);
+            }
+            if let Some(to) = to {
+                default_expr_uses_column_or_window(to, column, window);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            default_expr_uses_column_or_window(expr, column, window);
+            default_expr_uses_column_or_window(low, column, window);
+            default_expr_uses_column_or_window(high, column, window);
+        }
+        Expr::Function { args, filter, .. } => {
+            for arg in args {
+                default_expr_uses_column_or_window(arg, column, window);
+            }
+            if let Some(filter) = filter {
+                default_expr_uses_column_or_window(filter, column, window);
+            }
+        }
+        Expr::Case { branches, else_ } => {
+            for (when, then) in branches {
+                default_expr_uses_column_or_window(when, column, window);
+                default_expr_uses_column_or_window(then, column, window);
+            }
+            if let Some(else_) = else_ {
+                default_expr_uses_column_or_window(else_, column, window);
+            }
+        }
+        // A subquery is refused first, so its contents cannot change the
+        // message. `DEFAULT` itself is only a whole VALUES/SET item.
+        Expr::ScalarSubquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::Exists { .. }
+        | Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::Star
+        | Expr::Default
+        | Expr::QualifiedStar { .. } => {}
+    }
+}
+
+/// Bind one column `DEFAULT` in an empty scope and check DuckDB's refusals.
+/// Cast and conversion errors are deferred: binding only types the
+/// expression, so `DEFAULT 'now()'` on TIMESTAMP is accepted here and fails
+/// when a row takes it.
+#[allow(clippy::too_many_arguments)]
+fn bind_column_default(
+    db: &PinkDb,
+    ns: &SchemaPath,
+    text: &str,
+    expr: &Expr,
+    dtype: DataType,
+    params: Option<ParamSlots>,
+    session: &Session,
+    dynamic: &mut Vec<String>,
+) -> Result<ColumnDefault> {
+    if expr_has_subquery(expr) {
+        return Err(PinkDbError::Type(
+            "DEFAULT value cannot contain subqueries".to_string(),
+        ));
+    }
+    let (mut column, mut window) = (false, false);
+    default_expr_uses_column_or_window(expr, &mut column, &mut window);
+    if column {
+        return Err(PinkDbError::Type(
+            "DEFAULT value cannot contain column names".to_string(),
+        ));
+    }
+    if window {
+        return Err(PinkDbError::Type(
+            "DEFAULT value cannot contain window functions!".to_string(),
+        ));
+    }
+    let mut binder = Binder::new(db, ns)
+        .with_session(session.clone())
+        .with_params(params);
+    binder.allow_win = false;
+    binder.pin_parameter(expr, dtype)?;
+    let mut aggs = Vec::new();
+    let mut bound = binder.bind_expr(expr, &mut aggs, true)?;
+    if !aggs.is_empty() {
+        return Err(PinkDbError::Type(
+            "DEFAULT value cannot contain aggregates!".to_string(),
+        ));
+    }
+    if bound.dtype() != dtype {
+        bound = BoundExpr::Cast {
+            expr: Box::new(bound),
+            dtype,
+        };
+    }
+    let used = binder.dynamic_functions_used();
+    // Only a statement-independent default can be recorded as a constant for
+    // lake schema evolution. A clock or volatile default is rebound per
+    // statement instead.
+    let constant = if used.is_empty() {
+        const_value(&bound).and_then(|v| crate::exec::expr::cast_value(v.clone(), dtype).ok())
+    } else {
+        None
+    };
+    for name in used {
+        if !dynamic.iter().any(|n| n == &name) {
+            dynamic.push(name);
+        }
+    }
+    // A prepared DDL default holds a bound literal but its text is `?`, which
+    // could never be rebound from the footer: store the literal instead.
+    // shortcut: `DEFAULT ? + 1` has no folded constant and keeps its `?` text,
+    // so saving such a table fails to reload; upgrade when prepared DDL
+    // defaults matter.
+    let text = if crate::sql::peg_parser::expr_contains_parameter(expr) {
+        match &constant {
+            Some(v) => crate::prepared::value_literal(v)?,
+            None => text.to_string(),
+        }
+    } else {
+        text.to_string()
+    };
+    Ok(ColumnDefault {
+        text,
+        expr: bound,
+        constant,
+    })
+}
+
+/// Rebind a default persisted as SQL text (footer v5). The statement clock is
+/// read fresh; `now()` defaults therefore take the loading statement's instant
+/// only until the next INSERT rebinds them.
+pub(crate) fn bind_stored_default(
+    db: &PinkDb,
+    ns: &SchemaPath,
+    text: &str,
+    dtype: DataType,
+) -> Result<ColumnDefault> {
+    let expr = crate::sql::parse_expr(text)?;
+    let mut dynamic = Vec::new();
+    bind_column_default(db, ns, text, &expr, dtype, None, &db.session, &mut dynamic)
 }
 
 /// Bind `CALL name(args...)`: resolve the procedure, check arity, and bind
@@ -8262,22 +9120,91 @@ fn expr_has_subquery(expr: &Expr) -> bool {
 /// body.
 fn bind_call(
     db: &PinkDb,
-    default_db: &str,
-    qdb: Option<&str>,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
     name: &str,
     args: &[Expr],
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let target = Binder::new(db, default_db)
+    let target = Binder::new(db, default_ns)
         .with_session(session.clone())
-        .resolve_db(&qdb.map(str::to_string))?;
+        .resolve_ns(qdb)?;
+    // A DuckLake function is a lake method, not a stored procedure. The
+    // unqualified `ducklake_<fn>(…)` form names its lake in argument 1; the
+    // catalog-scoped `CALL <lake>.<fn>(…)` form implies it.
+    let lake_name = name.to_ascii_lowercase();
+    let lake_scoped = !qdb.is_empty()
+        && matches!(
+            db.database_storage(target.db()),
+            Some(crate::lake_db::DbStorage::Lake(_))
+        );
+    if lake_name.starts_with("ducklake_") || lake_scoped {
+        let canonical = if lake_name.starts_with("ducklake_") {
+            lake_name.clone()
+        } else {
+            format!("ducklake_{lake_name}")
+        };
+        let mut positional = Vec::new();
+        let mut named = Vec::new();
+        if lake_scoped {
+            positional.push(Value::Varchar(target.db().to_string()));
+        }
+        for (i, arg) in args.iter().enumerate() {
+            let (name, expr) = match arg {
+                Expr::NamedArg { name, expr } => (Some(name.to_ascii_lowercase()), expr.as_ref()),
+                other => (None, other),
+            };
+            let value = match literal_arg_value(expr) {
+                Some(value) => value,
+                None => {
+                    let bound = bind_constant_expr(db, &target, expr, params.clone())?;
+                    refuse_opaque_call_arg(i + 1, &bound)?;
+                    match bound {
+                        BoundExpr::Literal(value) => value,
+                        _ => {
+                            return Err(PinkDbError::Type(format!(
+                                "{canonical}: argument {} must be a literal",
+                                i + 1
+                            )));
+                        }
+                    }
+                }
+            };
+            match name {
+                Some(name) => named.push((name, value)),
+                None => positional.push(value),
+            }
+        }
+        let call = crate::lake_db::LakeFunctionCall {
+            name: canonical.clone(),
+            positional,
+            named,
+        };
+        if db.lake_function_schema(&call)?.is_some() {
+            return Ok((
+                LogicalPlan::Call {
+                    ns: None,
+                    name: canonical,
+                    args: Vec::new(),
+                    inline: None,
+                    lake: Some(call),
+                },
+                Vec::new(),
+            ));
+        }
+        if qdb.is_empty() {
+            return Err(PinkDbError::Catalog(format!(
+                "unknown table function \"{name}\""
+            )));
+        }
+    }
     let procedure = db.procedure_in(&target, name);
     // A package's host statement (wave 108a) answers the name when no stored
     // procedure does: user DDL always wins, and an unqualified call is the
     // only form (`db.name(...)` stays a procedure lookup).
     if procedure.is_err()
-        && qdb.is_none()
+        && qdb.is_empty()
         && let Some(host) = db.host_statement(name).cloned()
     {
         let mut bound = Vec::new();
@@ -8311,10 +9238,11 @@ fn bind_call(
             // `db: None` marks a host statement: the executor takes the
             // package path instead of a procedure lookup.
             LogicalPlan::Call {
-                db: None,
+                ns: None,
                 name: host.name().to_string(),
                 args: bound,
                 inline: None,
+                lake: None,
             },
             vec![host.name().to_ascii_lowercase()],
         ));
@@ -8336,10 +9264,11 @@ fn bind_call(
     }
     Ok((
         LogicalPlan::Call {
-            db: Some(target),
+            ns: Some(target),
             name: def.name.clone(),
             args: bound,
             inline: None,
+            lake: None,
         },
         Vec::new(),
     ))
@@ -8495,9 +9424,10 @@ fn bind_drop_role(db: &PinkDb, name: &str, if_exists: bool) -> Result<(LogicalPl
 /// the multi-writer paths.
 fn bind_grant(
     db: &PinkDb,
-    default_db: &str,
+    default_ns: &SchemaPath,
     target: &crate::rbac::GrantTarget,
     revoke: bool,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     use crate::rbac::{GrantObject, GrantSpec, GrantTarget};
     let rbac = db.rbac();
@@ -8558,31 +9488,69 @@ fn bind_grant(
         }
         GrantTarget::Table {
             privs,
-            db: qdb,
+            qual: qdb,
             table,
             principal,
         } => {
-            let target_db = Binder::new(db, default_db).resolve_db(qdb)?;
+            let target = Binder::new(db, default_ns)
+                .with_session(session.clone())
+                .resolve_table_ns(qdb, table)?;
+            if target.temp_id().is_some() {
+                return Err(PinkDbError::Catalog(
+                    "grants on temporary tables are not supported: a session's temporary \
+                     tables are private to it"
+                        .to_string(),
+                ));
+            }
             let table_key = table.to_ascii_lowercase();
             let table_display = db
-                .table_in(&target_db, table)
+                .table_in(&target, table)
                 .map(|t| t.name.clone())
                 .map_err(|_| {
                     PinkDbError::Catalog(format!(
-                        "table \"{table}\" not found in database \"{target_db}\""
+                        "table \"{table}\" not found in schema \"{target}\""
                     ))
                 })?;
             let expanded = expand_table_privs(privs)?;
             let principal = resolve(principal)?;
-            let db_display = db.database_display_name(&target_db);
             GrantSpec {
                 privs: expanded.clone(),
                 object: GrantObject::Table {
-                    db: target_db,
+                    db: target.db().to_string(),
+                    schema: target.schema().to_string(),
                     table: table_key,
                 },
                 description: format!(
-                    "{} ON TABLE {db_display}.{table_display} TO {}",
+                    "{} ON TABLE {target}.{table_display} TO {}",
+                    crate::rbac::Privilege::list(&expanded),
+                    rbac.display_of(&principal)
+                ),
+                principal,
+            }
+        }
+        GrantTarget::Schema {
+            privs,
+            qual: qdb,
+            name,
+            principal,
+        } => {
+            let target = Binder::new(db, default_ns)
+                .with_session(session.clone())
+                .resolve_ns(qdb)?;
+            let ns = SchemaPath::new(target.db(), name);
+            if !db.schema_exists(&ns) {
+                return Err(schema_error(db, &ns));
+            }
+            let expanded = expand_schema_privs(privs)?;
+            let principal = resolve(principal)?;
+            GrantSpec {
+                privs: expanded.clone(),
+                object: GrantObject::Schema {
+                    db: ns.db().to_string(),
+                    schema: ns.schema().to_string(),
+                },
+                description: format!(
+                    "{} ON SCHEMA {ns} TO {}",
                     crate::rbac::Privilege::list(&expanded),
                     rbac.display_of(&principal)
                 ),
@@ -8591,17 +9559,24 @@ fn bind_grant(
         }
         GrantTarget::Database {
             privs,
-            db: qdb,
+            db: dbname,
             principal,
         } => {
-            let target_db = Binder::new(db, default_db).resolve_db(&Some(qdb.clone()))?;
+            // A database grant names a database, never a schema (unlike a
+            // table's two-part name, which the session disambiguates).
+            if !db.database_exists(dbname) {
+                return Err(PinkDbError::Catalog(format!(
+                    "database \"{dbname}\" not found"
+                )));
+            }
+            let target_db = SchemaPath::main(dbname);
             let expanded = expand_database_privs(privs)?;
             let principal = resolve(principal)?;
-            let db_display = db.database_display_name(&target_db);
+            let db_display = db.database_display_name(target_db.db());
             GrantSpec {
                 privs: expanded.clone(),
                 object: GrantObject::Database {
-                    db: target_db.clone(),
+                    db: target_db.db().to_string(),
                 },
                 description: format!(
                     "{} ON DATABASE {db_display} TO {}",
@@ -8658,6 +9633,25 @@ fn expand_database_privs(privs: &crate::rbac::GrantPrivs) -> Result<Vec<crate::r
     Ok(expanded)
 }
 
+/// Expand and validate a `GRANT … ON SCHEMA` privilege list: `ALL` means
+/// `CREATE`, and a table privilege is refused with the statement form that
+/// accepts it.
+fn expand_schema_privs(privs: &crate::rbac::GrantPrivs) -> Result<Vec<crate::rbac::Privilege>> {
+    use crate::rbac::Privilege;
+    let expanded = privs.expand_schema();
+    if let Some(p) = expanded.iter().find(|p| !Privilege::SCHEMA.contains(p)) {
+        return Err(PinkDbError::Catalog(format!(
+            "{} is a table privilege: GRANT {} ON TABLE <table> TO <principal>",
+            p.keyword(),
+            p.keyword()
+        )));
+    }
+    let mut expanded = expanded;
+    expanded.sort();
+    expanded.dedup();
+    Ok(expanded)
+}
+
 /// Bind one expression as a constant (an empty table scope) with optional
 /// `?` slots / procedure variables visible — the shared path for `CALL`
 /// arguments, `ALTER TABLE … DEFAULT`, and every expression a procedure body
@@ -8665,11 +9659,11 @@ fn expand_database_privs(privs: &crate::rbac::GrantPrivs) -> Result<Vec<crate::r
 /// `RAISE`, `DECLARE … DEFAULT`).
 pub(crate) fn bind_constant_expr(
     db: &PinkDb,
-    default_db: &str,
+    default_ns: &SchemaPath,
     expr: &Expr,
     params: Option<ParamSlots>,
 ) -> Result<BoundExpr> {
-    Ok(bind_constant_expr_tracked(db, default_db, expr, params)?.0)
+    Ok(bind_constant_expr_tracked(db, default_ns, expr, params)?.0)
 }
 
 /// [`bind_constant_expr`] plus the dynamic-function names (lowercased
@@ -8681,11 +9675,11 @@ pub(crate) fn bind_constant_expr(
 /// applies the volatility guard to expressions bound outside any statement.
 pub(crate) fn bind_constant_expr_tracked(
     db: &PinkDb,
-    default_db: &str,
+    default_ns: &SchemaPath,
     expr: &Expr,
     params: Option<ParamSlots>,
 ) -> Result<(BoundExpr, Vec<String>)> {
-    let mut binder = Binder::new(db, default_db).with_params(params);
+    let mut binder = Binder::new(db, default_ns).with_params(params);
     binder.allow_win = false;
     binder.allow_alias = false;
     let mut aggs = Vec::new();
@@ -8704,17 +9698,22 @@ pub(crate) fn bind_constant_expr_tracked(
 #[allow(clippy::too_many_arguments)]
 fn bind_create_view(
     db: &PinkDb,
-    default_db: &str,
-    qdb: &Option<String>,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
     name: &str,
     cols: &Option<Vec<String>>,
     query: &Select,
     or_replace: bool,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let view_db = Binder::new(db, default_db)
+    let view_db = Binder::new(db, default_ns)
         .with_session(session.clone())
-        .resolve_db(qdb)?;
+        .resolve_ns(qdb)?;
+    if view_db.temp_id().is_some() {
+        return Err(PinkDbError::Catalog(
+            "temporary views are not supported; create a regular view".to_string(),
+        ));
+    }
     let mut binder = Binder::new(db, &view_db).with_session(session.clone());
     let bound = bind_select_in(db, &mut binder, query)?;
     let schema = plan_schema(db, &view_db, &binder.ctes, &bound)?;
@@ -8730,7 +9729,7 @@ fn bind_create_view(
     let dynamic_functions = binder.dynamic_functions_used();
     Ok((
         LogicalPlan::CreateView {
-            db: Some(view_db),
+            ns: Some(view_db),
             name: name.to_string(),
             cols: cols.clone(),
             query: Box::new(query.clone()),
@@ -8747,8 +9746,8 @@ fn bind_create_view(
 #[allow(clippy::too_many_arguments)]
 fn bind_update(
     db: &PinkDb,
-    default_db: &str,
-    qdb: &Option<String>,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
     table: &str,
     sets: &[(SetTarget, Expr)],
     from: Option<&FromClause>,
@@ -8757,9 +9756,9 @@ fn bind_update(
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_db)
+    let table_db = Binder::new(db, default_ns)
         .with_session(session.clone())
-        .resolve_db(qdb)?;
+        .resolve_table_ns(qdb, table)?;
     if let Some(err) = db.attached_read_only(&table_db, table) {
         return Err(err);
     }
@@ -8773,12 +9772,12 @@ fn bind_update(
     // table (and database); any other qualifier is an error naming both.
     let own_ref = format!("{table_db}.{}", t.name);
     for (target, _) in sets {
-        if let Some(qdb) = &target.db
-            && !qdb.eq_ignore_ascii_case(&table_db)
-        {
+        let qdb = &target.qual;
+        if !qual_matches_ns(qdb, &table_db) {
             return Err(PinkDbError::Catalog(format!(
-                "UPDATE SET target \"{qdb}.{}.{}\" does not match the statement's target \
+                "UPDATE SET target \"{}{}.{}\" does not match the statement's target \
                  table \"{own_ref}\"",
+                qual_text(qdb),
                 target.table.as_deref().unwrap_or_default(),
                 target.column
             )));
@@ -8786,10 +9785,7 @@ fn bind_update(
         if let Some(qtable) = &target.table
             && !qtable.eq_ignore_ascii_case(&t.name)
         {
-            let written = match &target.db {
-                Some(qdb) => format!("{qdb}.{qtable}.{}", target.column),
-                None => format!("{qtable}.{}", target.column),
-            };
+            let written = format!("{}{qtable}.{}", qual_text(&target.qual), target.column);
             return Err(PinkDbError::Catalog(format!(
                 "UPDATE SET target \"{written}\" does not match the statement's target table \
                  \"{own_ref}\""
@@ -8819,27 +9815,49 @@ fn bind_update(
     binder.tables.push(ScopeTable {
         name: t.name.to_ascii_lowercase(),
         original: Some(t.name.to_ascii_lowercase()),
-        db: Some(table_db.clone()),
+        ns: Some(table_db.clone()),
         is_alias: false,
         qualified_only: false,
         columns: t.schema(),
     });
     let mut bound_sets = Vec::with_capacity(sets.len());
+    let mut default_dynamic = Vec::new();
     for (set_target, expr) in sets {
         let col = &set_target.column;
         let idx = t
             .column_index(col)
             .map_err(|_| PinkDbError::Catalog(format!("no column \"{col}\"")))?;
         let (_, target) = t.schema()[idx].clone();
-        // `UPDATE t SET col = ?`: the parameter takes the column's type.
-        binder.pin_parameter(expr, target)?;
-        let mut aggs = Vec::new();
-        let bound = binder.bind_expr(expr, &mut aggs, false)?;
-        if !aggs.is_empty() {
-            return Err(PinkDbError::Execution(
-                "aggregates are not allowed in UPDATE SET".to_string(),
-            ));
-        }
+        let bound = if matches!(expr, Expr::Default) {
+            match &t.columns[idx].default {
+                Some(default) => {
+                    let ast = crate::sql::parse_expr(&default.text)?;
+                    bind_column_default(
+                        db,
+                        &table_db,
+                        &default.text,
+                        &ast,
+                        target,
+                        params.clone(),
+                        session,
+                        &mut default_dynamic,
+                    )?
+                    .expr
+                }
+                None => BoundExpr::Literal(Value::Null),
+            }
+        } else {
+            // `UPDATE t SET col = ?`: the parameter takes the column's type.
+            binder.pin_parameter(expr, target)?;
+            let mut aggs = Vec::new();
+            let bound = binder.bind_expr(expr, &mut aggs, false)?;
+            if !aggs.is_empty() {
+                return Err(PinkDbError::Execution(
+                    "aggregates are not allowed in UPDATE SET".to_string(),
+                ));
+            }
+            bound
+        };
         // Subqueries are fine (uncorrelated; evaluated pre-mutation).
         if !can_assign(bound.dtype(), target) && !matches!(bound, BoundExpr::Literal(Value::Null)) {
             return Err(PinkDbError::Type(format!(
@@ -8863,7 +9881,13 @@ fn bind_update(
         ));
     }
     reject_view_dependency(db, &binder.views_used())?;
+    reject_temp_dependency(db, &table_db, &binder.temp_tables_used())?;
     let mut dynamic_functions = binder.dynamic_functions_used();
+    for name in default_dynamic {
+        if !dynamic_functions.iter().any(|n| n == &name) {
+            dynamic_functions.push(name);
+        }
+    }
     // A RETURNING expression may itself call an extension function.
     let (returning, returning_dynamic) =
         bind_returning(db, session, &table_db, t, returning, params)?;
@@ -8874,7 +9898,7 @@ fn bind_update(
     }
     Ok((
         LogicalPlan::Update {
-            db: Some(table_db),
+            ns: Some(table_db),
             table: t.name.clone(),
             sets: bound_sets,
             predicate,
@@ -8889,8 +9913,8 @@ fn bind_update(
 #[allow(clippy::too_many_arguments)]
 fn bind_delete(
     db: &PinkDb,
-    default_db: &str,
-    qdb: &Option<String>,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
     table: &str,
     alias: Option<&str>,
     using: Option<&FromClause>,
@@ -8899,9 +9923,9 @@ fn bind_delete(
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_db)
+    let table_db = Binder::new(db, default_ns)
         .with_session(session.clone())
-        .resolve_db(qdb)?;
+        .resolve_table_ns(qdb, table)?;
     if let Some(err) = db.attached_read_only(&table_db, table) {
         return Err(err);
     }
@@ -8919,7 +9943,7 @@ fn bind_delete(
     binder.tables.push(ScopeTable {
         name: alias.unwrap_or(&t.name).to_ascii_lowercase(),
         original: Some(t.name.to_ascii_lowercase()),
-        db: Some(table_db.clone()),
+        ns: Some(table_db.clone()),
         is_alias: alias.is_some(),
         qualified_only: false,
         columns: t.schema(),
@@ -8937,6 +9961,7 @@ fn bind_delete(
         ));
     }
     reject_view_dependency(db, &binder.views_used())?;
+    reject_temp_dependency(db, &table_db, &binder.temp_tables_used())?;
     let mut dynamic_functions = binder.dynamic_functions_used();
     let (returning, returning_dynamic) =
         bind_returning(db, session, &table_db, t, returning, params)?;
@@ -8947,7 +9972,7 @@ fn bind_delete(
     }
     Ok((
         LogicalPlan::Delete {
-            db: Some(table_db),
+            ns: Some(table_db),
             table: t.name.clone(),
             predicate,
             using: using_plan,
@@ -8967,16 +9992,16 @@ fn bind_delete(
 /// message saying what to do instead.
 fn bind_copy_to(
     db: &PinkDb,
-    default_db: &str,
-    qdb: &Option<String>,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
     table: &str,
     path: &str,
     format: Option<&str>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_db)
+    let table_db = Binder::new(db, default_ns)
         .with_session(session.clone())
-        .resolve_db(qdb)?;
+        .resolve_table_ns(qdb, table)?;
     let t = db.table_in(&table_db, table).map_err(|_| {
         PinkDbError::Catalog(format!(
             "COPY source table \"{table}\" does not exist in database \"{table_db}\" \
@@ -9004,7 +10029,7 @@ fn bind_copy_to(
         .map(|p| p.to_ascii_lowercase());
     Ok((
         LogicalPlan::CopyTo {
-            db: Some(table_db),
+            ns: Some(table_db),
             table: t.name.clone(),
             format: fmt.name().to_string(),
             path: path.to_string(),
@@ -9020,7 +10045,7 @@ fn bind_copy_to(
 fn bind_returning(
     db: &PinkDb,
     session: &Session,
-    table_db: &str,
+    table_db: &SchemaPath,
     t: &DataTable,
     projections: Option<&[Projection]>,
     params: Option<ParamSlots>,
@@ -9036,7 +10061,7 @@ fn bind_returning(
     binder.tables.push(ScopeTable {
         name: t.name.to_ascii_lowercase(),
         original: Some(t.name.to_ascii_lowercase()),
-        db: Some(table_db.to_string()),
+        ns: Some(table_db.clone()),
         is_alias: false,
         qualified_only: false,
         columns: t.schema(),
@@ -9060,12 +10085,17 @@ fn bind_returning(
                 }
                 check_star_excludes(exclude, &used)?;
             }
-            Projection::QualifiedStar { db, table, exclude } => {
-                if db
-                    .as_deref()
-                    .is_some_and(|d| !d.eq_ignore_ascii_case(table_db))
-                    || !table.eq_ignore_ascii_case(&t.name)
-                {
+            Projection::QualifiedStar {
+                qual,
+                table,
+                exclude,
+            } => {
+                let same_table = if qual.is_empty() {
+                    table.eq_ignore_ascii_case(&t.name)
+                } else {
+                    t.name.eq_ignore_ascii_case(table) && qualifier_matches(qual, table_db)
+                };
+                if !same_table {
                     return Err(PinkDbError::Catalog(format!(
                         "RETURNING `{table}.*` does not match the statement's target table \
                          \"{}\"",
@@ -9121,6 +10151,7 @@ fn can_assign(from: DataType, to: DataType) -> bool {
                 | DataType::Date
                 | DataType::Timestamp
                 | DataType::Interval
+                | DataType::Uuid
         )
     };
     let numeric = |t: DataType| {
@@ -9182,6 +10213,7 @@ fn expand_pivot(db: &PinkDb, binder: &Binder, sel: &Select) -> Result<Option<Sel
     if using.is_empty() {
         using.push((
             Expr::Function {
+                qual: Box::new(Qualifier::none()),
                 name: "count".to_string(),
                 args: vec![Expr::Star],
                 distinct: false,
@@ -9250,7 +10282,7 @@ fn expand_pivot(db: &PinkDb, binder: &Binder, sel: &Select) -> Result<Option<Sel
         }]);
         let mut child = binder.child();
         let plan = bind_select_in(db, &mut child, &probe)?;
-        let schema = plan_schema(db, &child.default_db, &child.ctes, &plan)?;
+        let schema = plan_schema(db, &child.default_ns, &child.ctes, &plan)?;
         let mut used = Vec::new();
         expr_column_names(&on, &mut used);
         for (agg, _) in &using {
@@ -9260,7 +10292,7 @@ fn expand_pivot(db: &PinkDb, binder: &Binder, sel: &Select) -> Result<Option<Sel
             .into_iter()
             .filter(|(name, _)| !used.iter().any(|u| u.eq_ignore_ascii_case(name)))
             .map(|(name, _)| Expr::Column {
-                db: None,
+                qual: Qualifier::none(),
                 table: None,
                 name,
             })
@@ -9306,6 +10338,7 @@ fn expand_pivot(db: &PinkDb, binder: &Binder, sel: &Select) -> Result<Option<Sel
             };
             projections.push(Projection::Expr {
                 expr: Expr::Function {
+                    qual: Box::new(Qualifier::none()),
                     name: name.clone(),
                     args: args.clone(),
                     distinct: *distinct,
@@ -9425,18 +10458,18 @@ fn conflict_target(t: &DataTable, columns: &[String]) -> Result<Vec<usize>> {
 fn bind_sets(
     binder: &mut Binder,
     t: &DataTable,
-    own_db: &str,
+    own_ns: &SchemaPath,
     sets: &[(SetTarget, Expr)],
     label: &str,
 ) -> Result<Vec<(usize, BoundExpr)>> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(sets.len());
     for (target, expr) in sets {
-        if let Some(qdb) = &target.db
-            && !qdb.eq_ignore_ascii_case(own_db)
-        {
+        let qdb = &target.qual;
+        if !qual_matches_ns(qdb, own_ns) {
             return Err(PinkDbError::Catalog(format!(
-                "{label} SET target \"{qdb}.{}.{}\" does not match the statement's target table",
+                "{label} SET target \"{}.{}.{}\" does not match the statement's target table",
+                qual_text(qdb),
                 target.table.as_deref().unwrap_or_default(),
                 target.column
             )));
@@ -9486,7 +10519,7 @@ fn bind_sets(
 fn bind_conflict(
     db: &PinkDb,
     session: &Session,
-    table_db: &str,
+    table_db: &SchemaPath,
     t: &DataTable,
     on_conflict: Option<&OnConflict>,
     order: &[usize],
@@ -9507,7 +10540,7 @@ fn bind_conflict(
     binder.tables.push(ScopeTable {
         name: t.name.to_ascii_lowercase(),
         original: Some(t.name.to_ascii_lowercase()),
-        db: Some(table_db.to_string()),
+        ns: Some(table_db.clone()),
         is_alias: false,
         qualified_only: false,
         columns: t.schema(),
@@ -9518,7 +10551,7 @@ fn bind_conflict(
     binder.tables.push(ScopeTable {
         name: "excluded".to_string(),
         original: None,
-        db: None,
+        ns: None,
         is_alias: true,
         qualified_only: true,
         columns: t.schema(),
@@ -9567,8 +10600,8 @@ fn bind_conflict(
 #[allow(clippy::too_many_arguments)]
 fn bind_merge(
     db: &PinkDb,
-    default_db: &str,
-    qdb: &Option<String>,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
     table: &str,
     alias: Option<&str>,
     using: &FromClause,
@@ -9578,9 +10611,9 @@ fn bind_merge(
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_db)
+    let table_db = Binder::new(db, default_ns)
         .with_session(session.clone())
-        .resolve_db(qdb)?;
+        .resolve_table_ns(qdb, table)?;
     if let Some(err) = db.attached_read_only(&table_db, table) {
         return Err(err);
     }
@@ -9602,7 +10635,7 @@ fn bind_merge(
     binder.tables.push(ScopeTable {
         name: target_name,
         original: Some(t.name.to_ascii_lowercase()),
-        db: Some(table_db.clone()),
+        ns: Some(table_db.clone()),
         is_alias: alias.is_some(),
         qualified_only: false,
         columns: t.schema(),
@@ -9615,6 +10648,7 @@ fn bind_merge(
         ));
     }
     let mut bound_clauses = Vec::with_capacity(clauses.len());
+    let mut merge_default_dynamic = Vec::new();
     for clause in clauses {
         let condition = clause
             .condition
@@ -9634,7 +10668,7 @@ fn bind_merge(
             },
             MergeAction::Delete => crate::plan::MergeActionPlan::Delete,
             MergeAction::Insert { columns, values } => {
-                let cols: Vec<usize> = match columns {
+                let written: Vec<usize> = match columns {
                     Some(cols) => {
                         let mut seen = std::collections::HashSet::new();
                         cols.iter()
@@ -9651,15 +10685,24 @@ fn bind_merge(
                     }
                     None => (0..t.schema().len()).collect(),
                 };
-                if values.len() != cols.len() {
+                if values.len() != written.len() {
                     return Err(PinkDbError::Execution(format!(
                         "MERGE INSERT has {} values for {} columns",
                         values.len(),
-                        cols.len()
+                        written.len()
                     )));
                 }
-                let mut bound = Vec::with_capacity(values.len());
-                for (expr, &col) in values.iter().zip(cols.iter()) {
+                // A written column whose value is DEFAULT, and every column
+                // the list omits, takes its DEFAULT for each inserted row.
+                let mut takes_default: Vec<bool> = (0..t.schema().len())
+                    .map(|col| !written.contains(&col))
+                    .collect();
+                let mut bound: Vec<(usize, BoundExpr)> = Vec::with_capacity(written.len());
+                for (expr, &col) in values.iter().zip(written.iter()) {
+                    if matches!(expr, Expr::Default) {
+                        takes_default[col] = true;
+                        continue;
+                    }
                     let (_, want) = t.schema()[col].clone();
                     binder.pin_parameter(expr, want)?;
                     let mut aggs = Vec::new();
@@ -9678,11 +10721,36 @@ fn bind_merge(
                             t.schema()[col].0
                         )));
                     }
-                    bound.push(e);
+                    bound.push((col, e));
                 }
+                for (col, take) in takes_default.iter().enumerate() {
+                    if !take {
+                        continue;
+                    }
+                    let (_, want) = t.schema()[col].clone();
+                    let e = match &t.columns[col].default {
+                        Some(default) => {
+                            let ast = crate::sql::parse_expr(&default.text)?;
+                            bind_column_default(
+                                db,
+                                &table_db,
+                                &default.text,
+                                &ast,
+                                want,
+                                params.clone(),
+                                session,
+                                &mut merge_default_dynamic,
+                            )?
+                            .expr
+                        }
+                        None => BoundExpr::Literal(Value::Null),
+                    };
+                    bound.push((col, e));
+                }
+                let (cols, values) = bound.into_iter().unzip();
                 crate::plan::MergeActionPlan::Insert {
                     columns: cols,
-                    values: bound,
+                    values,
                 }
             }
         };
@@ -9693,7 +10761,13 @@ fn bind_merge(
         });
     }
     reject_view_dependency(db, &binder.views_used())?;
+    reject_temp_dependency(db, &table_db, &binder.temp_tables_used())?;
     let mut dynamic_functions = binder.dynamic_functions_used();
+    for name in merge_default_dynamic {
+        if !dynamic_functions.iter().any(|n| n == &name) {
+            dynamic_functions.push(name);
+        }
+    }
     let (returning, returning_dynamic) =
         bind_returning(db, session, &table_db, t, returning, params)?;
     for name in returning_dynamic {
@@ -9703,7 +10777,7 @@ fn bind_merge(
     }
     Ok((
         LogicalPlan::Merge {
-            db: Some(table_db),
+            ns: Some(table_db),
             table: t.name.clone(),
             source: Box::new(source),
             on,
@@ -9717,25 +10791,26 @@ fn bind_merge(
 #[allow(clippy::too_many_arguments)]
 fn bind_insert(
     db: &PinkDb,
-    default_db: &str,
-    qdb: &Option<String>,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
     table: &str,
     columns: &Option<Vec<String>>,
     rows: &[Vec<Expr>],
+    default_values: bool,
     on_conflict: Option<&OnConflict>,
     returning: Option<&[Projection]>,
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_db)
+    let table_db = Binder::new(db, default_ns)
         .with_session(session.clone())
-        .resolve_db(qdb)?;
+        .resolve_table_ns(qdb, table)?;
     if let Some(err) = db.attached_read_only(&table_db, table) {
         return Err(err);
     }
     let t = db.table_in(&table_db, table)?;
     let schema = t.schema();
-    let order: Vec<usize> = match columns {
+    let mut order: Vec<usize> = match columns {
         Some(cols) => cols
             .iter()
             .map(|c| {
@@ -9744,6 +10819,15 @@ fn bind_insert(
             })
             .collect::<Result<_>>()?,
         None => (0..schema.len()).collect(),
+    };
+    // `DEFAULT VALUES` is one row with the DEFAULT keyword in every cell.
+    let default_values_row;
+    let rows: &[Vec<Expr>] = if default_values {
+        order = (0..schema.len()).collect();
+        default_values_row = vec![vec![Expr::Default; schema.len()]];
+        &default_values_row
+    } else {
+        rows
     };
     if let Some(cols) = columns {
         let mut seen = std::collections::HashSet::new();
@@ -9757,9 +10841,46 @@ fn bind_insert(
     }
     // Cells bind in an empty scope: only constants (literals, constant scalar
     // expressions) are accepted; column refs and aggregates fail here.
+    //
+    // A column takes its DEFAULT when the column list omits it or its cell is
+    // the DEFAULT keyword. Bind each such default once for this statement
+    // (the clock is spliced at bind time), then clone it per row.
+    let mut provided = vec![false; schema.len()];
+    for &i in &order {
+        provided[i] = true;
+    }
+    for row in rows {
+        for (pos, cell) in row.iter().enumerate() {
+            if matches!(cell, Expr::Default) {
+                provided[order[pos]] = false;
+            }
+        }
+    }
+    let mut default_exprs: Vec<Option<BoundExpr>> = vec![None; schema.len()];
+    let mut dynamic_functions: Vec<String> = Vec::new();
+    for (i, slot) in default_exprs.iter_mut().enumerate() {
+        if provided[i] {
+            continue;
+        }
+        let Some(default) = &t.columns[i].default else {
+            continue;
+        };
+        let expr = crate::sql::parse_expr(&default.text)?;
+        let rebound = bind_column_default(
+            db,
+            &table_db,
+            &default.text,
+            &expr,
+            schema[i].1,
+            params.clone(),
+            session,
+            &mut dynamic_functions,
+        )?;
+        *slot = Some(rebound.expr);
+    }
     let mut bound_rows = Vec::with_capacity(rows.len());
     let mut views_used: Vec<String> = Vec::new();
-    let mut dynamic_functions: Vec<String> = Vec::new();
+    let mut temp_used: Vec<String> = Vec::new();
     for row in rows {
         if row.len() != order.len() {
             return Err(PinkDbError::Execution(format!(
@@ -9768,18 +10889,14 @@ fn bind_insert(
                 order.len()
             )));
         }
-        let mut bound = vec![BoundExpr::Literal(Value::Null); schema.len()];
-        // Fill unspecified columns with NULL — or the column's DEFAULT when it
-        // has one (`ALTER TABLE … ADD COLUMN … DEFAULT`, wave 65); only when a
-        // column list is given.
-        for (i, cell) in bound.iter_mut().enumerate() {
-            if !order.contains(&i)
-                && let Some(d) = &t.columns[i].default
-            {
-                *cell = BoundExpr::Literal(d.clone());
-            }
-        }
+        let mut bound: Vec<BoundExpr> = default_exprs
+            .iter()
+            .map(|e| e.clone().unwrap_or(BoundExpr::Literal(Value::Null)))
+            .collect();
         for (pos, cell) in row.iter().enumerate() {
+            if matches!(cell, Expr::Default) {
+                continue;
+            }
             let mut binder = Binder::new(db, &table_db)
                 .with_session(session.clone())
                 .with_params(params.clone());
@@ -9794,6 +10911,11 @@ fn bind_insert(
                     views_used.push(v);
                 }
             }
+            for v in binder.temp_tables_used() {
+                if !temp_used.iter().any(|n| n.eq_ignore_ascii_case(&v)) {
+                    temp_used.push(v);
+                }
+            }
             for f in binder.dynamic_functions_used() {
                 if !dynamic_functions.iter().any(|n| n == &f) {
                     dynamic_functions.push(f);
@@ -9804,6 +10926,7 @@ fn bind_insert(
         bound_rows.push(bound);
     }
     reject_view_dependency(db, &views_used)?;
+    reject_temp_dependency(db, &table_db, &temp_used)?;
     let (conflict, conflict_dynamic) = bind_conflict(
         db,
         session,
@@ -9822,7 +10945,7 @@ fn bind_insert(
     }
     Ok((
         LogicalPlan::Insert {
-            db: Some(table_db),
+            ns: Some(table_db),
             table: t.name.clone(),
             rows: bound_rows,
             conflict,
@@ -9838,8 +10961,8 @@ fn bind_insert(
 #[allow(clippy::too_many_arguments)]
 fn bind_insert_select(
     db: &PinkDb,
-    default_db: &str,
-    qdb: &Option<String>,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
     table: &str,
     columns: &Option<Vec<String>>,
     query: &Select,
@@ -9848,9 +10971,9 @@ fn bind_insert_select(
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_db)
+    let table_db = Binder::new(db, default_ns)
         .with_session(session.clone())
-        .resolve_db(qdb)?;
+        .resolve_table_ns(qdb, table)?;
     if let Some(err) = db.attached_read_only(&table_db, table) {
         return Err(err);
     }
@@ -9876,11 +10999,11 @@ fn bind_insert_select(
             }
         }
     }
-    let mut binder = Binder::new(db, default_db)
+    let mut binder = Binder::new(db, default_ns)
         .with_session(session.clone())
         .with_params(params.clone());
     let query_plan = bind_select_in(db, &mut binder, query)?;
-    let source = plan_schema(db, &binder.default_db, &binder.ctes, &query_plan)?;
+    let source = plan_schema(db, &binder.default_ns, &binder.ctes, &query_plan)?;
     if source.len() != order.len() {
         return Err(PinkDbError::Execution(format!(
             "INSERT has {} values for {} columns",
@@ -9897,7 +11020,31 @@ fn bind_insert_select(
         }
     }
     reject_view_dependency(db, &binder.views_used())?;
+    reject_temp_dependency(db, &table_db, &binder.temp_tables_used())?;
     let mut dynamic = binder.dynamic_functions_used();
+    // Omitted target columns take their DEFAULT per source row, rebound for
+    // this statement so a clock default uses its instant.
+    let mut defaults: Vec<Option<BoundExpr>> = vec![None; schema.len()];
+    for (i, slot) in defaults.iter_mut().enumerate() {
+        if order.contains(&i) {
+            continue;
+        }
+        let Some(default) = &t.columns[i].default else {
+            continue;
+        };
+        let expr = crate::sql::parse_expr(&default.text)?;
+        let rebound = bind_column_default(
+            db,
+            &table_db,
+            &default.text,
+            &expr,
+            schema[i].1,
+            params.clone(),
+            session,
+            &mut dynamic,
+        )?;
+        *slot = Some(rebound.expr);
+    }
     let (conflict, conflict_dynamic) = bind_conflict(
         db,
         session,
@@ -9916,9 +11063,10 @@ fn bind_insert_select(
     }
     Ok((
         LogicalPlan::InsertSelect {
-            db: Some(table_db),
+            ns: Some(table_db),
             table: t.name.clone(),
             columns: Some(order),
+            defaults,
             query: Box::new(query_plan),
             conflict,
             returning,
@@ -9940,8 +11088,8 @@ fn bind_insert_select(
 #[allow(clippy::too_many_arguments)]
 fn bind_create_table(
     db: &PinkDb,
-    default_db: &str,
-    qdb: Option<&str>,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
     name: &str,
     items: &[TableItem],
     if_not_exists: bool,
@@ -9949,12 +11097,12 @@ fn bind_create_table(
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let target = Binder::new(db, default_db)
+    let target = Binder::new(db, default_ns)
         .with_session(session.clone())
-        .resolve_db(&qdb.map(str::to_string))?;
+        .resolve_ns(qdb)?;
     let mut schema: Vec<(String, DataType)> = Vec::new();
-    let mut defaults: Vec<Option<BoundExpr>> = Vec::new();
-    let mut dynamic: Vec<String> = Vec::new();
+    let mut defaults: Vec<Option<ColumnDefault>> = Vec::new();
+    let dynamic: Vec<String> = Vec::new();
     let mut constraints = TableConstraints::default();
     // Named constraints are echoes of the DDL; only the declaration matters.
     for item in items {
@@ -9974,40 +11122,24 @@ fn bind_create_table(
                 for c in &col.constraints {
                     bind_column_constraint(db, &target, name, &schema, idx, c, &mut constraints)?;
                 }
-                // A DEFAULT binds in an empty scope (constants only), like
-                // `ALTER TABLE … ADD COLUMN … DEFAULT`, and is evaluated once
-                // when the table is created.
+                // A DEFAULT binds in an empty scope and is never evaluated
+                // here: a statement-time or conversion failure surfaces when
+                // a row takes it. Its dependencies are therefore not the
+                // statement's (a `uuid()` default is refused by the INSERT
+                // that evaluates it, not by CREATE).
+                let mut unused_dynamic = Vec::new();
                 defaults.push(match &col.default {
                     None => None,
-                    Some(expr) => {
-                        let mut binder = Binder::new(db, &target)
-                            .with_session(session.clone())
-                            .with_params(params.clone());
-                        binder.allow_win = false;
-                        binder.pin_parameter(expr, col.dtype)?;
-                        let mut aggs = Vec::new();
-                        let bound = binder.bind_expr(expr, &mut aggs, false)?;
-                        if !aggs.is_empty() {
-                            return Err(PinkDbError::Execution(
-                                "an aggregate is not allowed in a column DEFAULT".to_string(),
-                            ));
-                        }
-                        let used = binder.dynamic_functions_used();
-                        if used.iter().any(|d| clock_reading(d).is_some()) {
-                            return Err(PinkDbError::Execution(format!(
-                                "the DEFAULT of column \"{}\" reads the clock: pinkdb stores a \
-                                 constant default (evaluated once at CREATE TABLE), so a \
-                                 per-row now()/CURRENT_TIMESTAMP default is not supported yet",
-                                col.name
-                            )));
-                        }
-                        for d in used {
-                            if !dynamic.contains(&d) {
-                                dynamic.push(d);
-                            }
-                        }
-                        Some(bound)
-                    }
+                    Some(default) => Some(bind_column_default(
+                        db,
+                        &target,
+                        &default.text,
+                        &default.expr,
+                        col.dtype,
+                        params.clone(),
+                        session,
+                        &mut unused_dynamic,
+                    )?),
                 });
             }
             TableItem::Constraint(tc) => {
@@ -10022,7 +11154,7 @@ fn bind_create_table(
     }
     Ok((
         LogicalPlan::CreateTable {
-            db: Some(target),
+            ns: Some(target),
             name: name.to_string(),
             schema,
             constraints,
@@ -10044,22 +11176,23 @@ fn bind_create_table(
 /// with name …`, `Could not rename …`).
 fn bind_alter_table(
     db: &PinkDb,
-    default_db: &str,
-    qdb: Option<&str>,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
     name: &str,
     op: &AlterTableOp,
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let target = Binder::new(db, default_db)
+    let target = Binder::new(db, default_ns)
         .with_session(session.clone())
-        .resolve_db(&qdb.map(str::to_string))?;
+        .resolve_table_ns(qdb, name)?;
     if let Some(err) = db.attached_read_only(&target, name) {
         return Err(err);
     }
     let t = db.table_in(&target, name)?;
     let schema: Vec<(String, DataType)> = t.schema();
     let table_display = t.name.clone();
+    let mut dynamic = Vec::new();
     let plan_op = match op {
         AlterTableOp::AddColumn {
             column,
@@ -10098,18 +11231,20 @@ fn bind_alter_table(
                     }
                 }
             }
-            // A default expression binds in an empty scope (constants only).
+            // Bound for this statement: every existing row evaluates it, so
+            // a clock default reads this statement's instant.
             let bound_default = match default {
                 None => None,
-                Some(expr) => {
-                    let mut binder = Binder::new(db, &target)
-                        .with_session(session.clone())
-                        .with_params(params.clone());
-                    binder.allow_win = false;
-                    binder.pin_parameter(expr, column.dtype)?;
-                    let mut aggs = Vec::new();
-                    Some(binder.bind_expr(expr, &mut aggs, false)?)
-                }
+                Some(default) => Some(bind_column_default(
+                    db,
+                    &target,
+                    &default.text,
+                    &default.expr,
+                    column.dtype,
+                    params.clone(),
+                    session,
+                    &mut dynamic,
+                )?),
             };
             AlterTablePlan::AddColumn {
                 column: column.name.clone(),
@@ -10128,7 +11263,7 @@ fn bind_alter_table(
                     // A no-op plan the executor recognizes by index `None`.
                     return Ok((
                         LogicalPlan::AlterTable {
-                            db: Some(target),
+                            ns: Some(target),
                             name: table_display,
                             op: AlterTablePlan::DropColumn {
                                 column: col.clone(),
@@ -10195,7 +11330,7 @@ fn bind_alter_table(
             if to.eq_ignore_ascii_case(&table_display) {
                 return Ok((
                     LogicalPlan::AlterTable {
-                        db: Some(target),
+                        ns: Some(target),
                         name: table_display,
                         op: AlterTablePlan::RenameTable { to: to.clone() },
                     },
@@ -10218,11 +11353,11 @@ fn bind_alter_table(
     };
     Ok((
         LogicalPlan::AlterTable {
-            db: Some(target),
+            ns: Some(target),
             name: table_display,
             op: plan_op,
         },
-        Vec::new(),
+        dynamic,
     ))
 }
 
@@ -10258,7 +11393,7 @@ fn resolve_constraint_columns(
 
 fn bind_column_constraint(
     db: &PinkDb,
-    target: &str,
+    target: &SchemaPath,
     table: &str,
     schema: &[(String, DataType)],
     idx: usize,
@@ -10294,7 +11429,7 @@ fn bind_column_constraint(
 
 fn bind_table_constraint(
     db: &PinkDb,
-    target: &str,
+    target: &SchemaPath,
     table: &str,
     schema: &[(String, DataType)],
     tc: &TableConstraint,
@@ -10358,7 +11493,7 @@ fn push_key(
 #[allow(clippy::too_many_arguments)]
 fn bind_foreign_key(
     db: &PinkDb,
-    target: &str,
+    target: &SchemaPath,
     schema: &[(String, DataType)],
     name: Option<String>,
     columns: &[usize],
@@ -10366,16 +11501,27 @@ fn bind_foreign_key(
     ref_columns: Option<&[String]>,
     out: &mut TableConstraints,
 ) -> Result<()> {
-    let ref_db = match &ref_table.db {
-        Some(q) => {
-            if !db.database_exists(q) {
-                return Err(PinkDbError::Catalog(format!("database \"{q}\" not found")));
+    let ref_ns = match (&ref_table.qual.catalog, &ref_table.qual.schema) {
+        (None, None) => target.clone(),
+        (None, Some(x)) => {
+            let as_schema = SchemaPath::new(target.db(), x);
+            if db.schema_exists(&as_schema) || !db.database_exists(x) {
+                as_schema
+            } else {
+                SchemaPath::main(x)
             }
-            q.to_ascii_lowercase()
         }
-        None => target.to_string(),
+        (Some(c), Some(s)) => SchemaPath::new(c, s),
+        (Some(_), None) => unreachable!("a catalog part implies a schema part"),
     };
-    let ref_t = db.table_in(&ref_db, &ref_table.name).map_err(|_| {
+    if ref_ns != *target {
+        return Err(PinkDbError::Catalog(format!(
+            "Creating foreign keys across different schemas or catalogs is not supported \
+             (referenced table \"{}\")",
+            ref_table.name
+        )));
+    }
+    let ref_t = db.table_in(&ref_ns, &ref_table.name).map_err(|_| {
         PinkDbError::Catalog(format!(
             "failed to create foreign key: table \"{}\" does not exist",
             ref_table.name
@@ -10449,7 +11595,7 @@ fn bind_foreign_key(
     out.foreign_keys.push(ForeignKeyConstraint {
         name,
         columns: columns.to_vec(),
-        ref_db,
+        ref_db: target.db().to_string(),
         ref_table: ref_table.name.to_ascii_lowercase(),
         ref_columns: ref_cols,
     });
@@ -10461,8 +11607,8 @@ fn bind_foreign_key(
 #[allow(clippy::too_many_arguments)]
 fn bind_create_table_as(
     db: &PinkDb,
-    default_db: &str,
-    qdb: &Option<String>,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
     name: &str,
     query: &Select,
     if_not_exists: bool,
@@ -10470,10 +11616,17 @@ fn bind_create_table_as(
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_db)
+    let table_db = Binder::new(db, default_ns)
         .with_session(session.clone())
-        .resolve_db(qdb)?;
-    let mut binder = Binder::new(db, default_db)
+        .resolve_ns(qdb)?;
+    // The query keeps the session's search path: `CREATE TEMP TABLE s AS
+    // SELECT … FROM p` reads `p` from the current schema, not from temp.
+    let query_ns: &SchemaPath = if table_db.temp_id().is_some() {
+        default_ns
+    } else {
+        &table_db
+    };
+    let mut binder = Binder::new(db, query_ns)
         .with_session(session.clone())
         .with_params(params);
     let query_plan = bind_select_in(db, &mut binder, query)?;
@@ -10481,10 +11634,11 @@ fn bind_create_table_as(
     // (names from the final Project, types from its expressions) — binding
     // here already validated the query in full.
     reject_view_dependency(db, &binder.views_used())?;
+    reject_temp_dependency(db, &table_db, &binder.temp_tables_used())?;
     let dynamic = binder.dynamic_functions_used();
     Ok((
         LogicalPlan::CreateTableAs {
-            db: Some(table_db),
+            ns: Some(table_db),
             name: name.to_string(),
             query: Box::new(query_plan),
             if_not_exists,
@@ -10499,19 +11653,38 @@ fn bind_create_table_as(
 /// schema into the plan; the executor formats the DuckDB-shaped rows.
 fn bind_describe(
     db: &PinkDb,
-    default_db: &str,
-    qdb: Option<&str>,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
     name: &str,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let lookup = match qdb {
-        Some(q) => {
-            if !db.database_exists(q) {
-                return Err(PinkDbError::Catalog(format!("database \"{q}\" not found")));
-            }
-            q.to_ascii_lowercase()
-        }
-        None => default_db.to_ascii_lowercase(),
-    };
+    if let Some(schema) = qdb
+        .schema
+        .as_deref()
+        .filter(|schema| is_builtin_schema(schema))
+    {
+        let dbname = qdb
+            .catalog
+            .clone()
+            .unwrap_or_else(|| default_ns.db().to_string());
+        let binder = Binder::new(db, default_ns);
+        let (scope, _) = bind_builtin_view(db, &binder, &dbname, schema, name, &None)?;
+        let columns = scope
+            .columns
+            .into_iter()
+            .map(|(name, dtype)| crate::plan::DescribeColumn {
+                name,
+                dtype,
+                not_null: false,
+                key: None,
+                default: None,
+            })
+            .collect();
+        return Ok((LogicalPlan::Describe { columns }, Vec::new()));
+    }
+    let lookup = Binder::new(db, default_ns)
+        .with_session(session.clone())
+        .resolve_table_ns(qdb, name)?;
     if let Ok(t) = db.table_in(&lookup, name) {
         let mut columns = Vec::with_capacity(t.columns.len());
         for (i, c) in t.columns.iter().enumerate() {
@@ -10520,11 +11693,7 @@ fn bind_describe(
                 dtype: c.dtype,
                 not_null: t.constraints.is_not_null(i),
                 key: t.constraints.column_key_kind(i),
-                default: c
-                    .default
-                    .as_ref()
-                    .map(crate::prepared::value_literal)
-                    .transpose()?,
+                default: c.default.as_ref().map(|d| d.text.clone()),
             });
         }
         return Ok((LogicalPlan::Describe { columns }, Vec::new()));
@@ -10535,7 +11704,7 @@ fn bind_describe(
         // The view body is self-contained (same rule as FROM resolution).
         child.ctes.clear();
         let sub = bind_select_in(db, &mut child, &view.query)?;
-        let mut schema = plan_schema(db, &child.default_db, &child.ctes, &sub)?;
+        let mut schema = plan_schema(db, &child.default_ns, &child.ctes, &sub)?;
         if let Some(cols) = &view.cols {
             for (s, c) in schema.iter_mut().zip(cols.iter()) {
                 s.0 = c.clone();
@@ -10554,7 +11723,14 @@ fn bind_describe(
         return Ok((LogicalPlan::Describe { columns }, Vec::new()));
     }
     // Attached lake tables are visible to queries (they are not in the store).
-    let schema = db.visible_table_schema(&lookup, name)?;
+    let schema = db
+        .visible_table_schema(&lookup, name)
+        .map_err(|e| match e {
+            PinkDbError::Catalog(m) if m.starts_with("table ") => {
+                PinkDbError::Catalog(format!("{m} because {}", schema_error_text(db, &lookup)))
+            }
+            other => other,
+        })?;
     let columns = schema
         .into_iter()
         .map(|(name, dtype)| crate::plan::DescribeColumn {
@@ -10583,15 +11759,43 @@ fn reject_view_dependency(db: &PinkDb, views: &[String]) -> Result<()> {
     )))
 }
 
+/// True when a qualifier names the reserved session-local `temp` catalog.
+fn names_temp(qual: &Qualifier) -> bool {
+    let named_temp = |part: &str| part.eq_ignore_ascii_case("temp");
+    qual.catalog.as_deref().is_some_and(named_temp)
+        || (qual.catalog.is_none() && qual.schema.as_deref().is_some_and(named_temp))
+}
+
+/// A temporary table is never persisted either: a logged statement that reads
+/// one could not be rebuilt during replay. Writing a lake database is fine
+/// (the lake commit is the record), and so is a write that lands in `temp`
+/// itself (it is not logged at all).
+fn reject_temp_dependency(db: &PinkDb, target: &SchemaPath, temp: &[String]) -> Result<()> {
+    if temp.is_empty() || target.temp_id().is_some() || !db.is_durable() {
+        return Ok(());
+    }
+    if matches!(
+        db.storage_key(target.db()),
+        crate::lake_db::StorageKey::Lake(_)
+    ) {
+        return Ok(());
+    }
+    Err(PinkDbError::Execution(format!(
+        "statement reads session-local temporary table \"{}\", which is never persisted; a \
+         durable database cannot replay it — write the rows to a real table first",
+        temp[0]
+    )))
+}
+
 /// Bind a top-level SELECT with a fresh binder.
 fn bind_select(
     db: &PinkDb,
-    default_db: &str,
+    default_ns: &SchemaPath,
     sel: &Select,
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let mut binder = Binder::new(db, default_db)
+    let mut binder = Binder::new(db, default_ns)
         .with_session(session.clone())
         .with_params(params);
     let plan = bind_select_in(db, &mut binder, sel)?;
@@ -10719,7 +11923,7 @@ fn bind_union_chain(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         if is_intersect(*op) {
             // Fold into the previous unit (INTERSECT binds tighter).
             let (prev_op, prev) = units.pop().expect("at least the head");
-            let combined = bind_pair_types(db, &binder.default_db, &binder.ctes, *op, prev, right)?;
+            let combined = bind_pair_types(db, &binder.default_ns, &binder.ctes, *op, prev, right)?;
             units.push((prev_op, combined));
         } else {
             units.push((Some(*op), right));
@@ -10730,7 +11934,7 @@ fn bind_union_chain(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     let (_, mut plan) = iter.next().expect("head unit");
     for (op, right) in iter {
         let op = op.expect("non-head units carry their operator");
-        plan = bind_pair_types(db, &binder.default_db, &binder.ctes, op, plan, right)?;
+        plan = bind_pair_types(db, &binder.default_ns, &binder.ctes, op, plan, right)?;
     }
     Ok(plan)
 }
@@ -10743,14 +11947,14 @@ fn is_intersect(op: SetOp) -> bool {
 /// types (numeric tower; else identical).
 fn bind_pair_types(
     db: &PinkDb,
-    default_db: &str,
+    default_ns: &SchemaPath,
     ctes: &[(String, Vec<(String, DataType)>)],
     op: SetOp,
     left: LogicalPlan,
     right: LogicalPlan,
 ) -> Result<LogicalPlan> {
-    let left_schema = plan_schema(db, default_db, ctes, &left)?;
-    let right_schema = plan_schema(db, default_db, ctes, &right)?;
+    let left_schema = plan_schema(db, default_ns, ctes, &left)?;
+    let right_schema = plan_schema(db, default_ns, ctes, &right)?;
     if left_schema.len() != right_schema.len() {
         return Err(PinkDbError::Execution(format!(
             "set-operation branches have {} and {} columns",
@@ -10834,28 +12038,28 @@ fn cast_null_columns(
 /// definition.
 pub(crate) fn bind_mv_query(
     db: &PinkDb,
-    default_db: &str,
+    default_ns: &SchemaPath,
     query: &crate::sql::ast::Select,
     session: &Session,
 ) -> Result<LogicalPlan> {
-    let mut binder = Binder::new(db, default_db).with_session(session.clone());
+    let mut binder = Binder::new(db, default_ns).with_session(session.clone());
     bind_select_in(db, &mut binder, query)
 }
 
 /// Output schema of a bound plan: (column name, type) per output column.
 /// Used for CTE/derived-table scoping and subquery arity checks. `ctes`
 /// carries the CTEs visible at this point (CTEs shadow catalog tables);
-/// `default_db` resolves a `Scan` that names a CTE only indirectly. The
+/// `default_ns` resolves a `Scan` that names a CTE only indirectly. The
 /// executor uses it too (LIMIT 0 returns an empty result whose header must
 /// still match, and the LIMIT stream needs a scan's shape without decoding).
 pub(crate) fn plan_schema(
     db: &PinkDb,
-    default_db: &str,
+    default_ns: &SchemaPath,
     ctes: &[(String, Vec<(String, DataType)>)],
     plan: &LogicalPlan,
 ) -> Result<Vec<(String, DataType)>> {
     match plan {
-        LogicalPlan::Scan { db: qdb, table, at } => {
+        LogicalPlan::Scan { ns: qdb, table, at } => {
             if qdb.is_none()
                 && let Some((_, schema)) = ctes
                     .iter()
@@ -10864,14 +12068,20 @@ pub(crate) fn plan_schema(
                 {
                     return Ok(schema.clone());
                 }
-            let lookup = qdb.as_deref().unwrap_or(default_db);
+            let lookup = qdb.as_ref().unwrap_or(default_ns);
             // Attached lake tables are visible to queries (they are not in
             // the store themselves); an `AT` target resolves the schema from
             // the target version's own descriptor.
-            match at {
+            let r = match at {
                 None => db.visible_table_schema(lookup, table),
                 Some(at) => db.visible_table_schema_at(lookup, table, *at),
-            }
+            };
+            r.map_err(|e| match e {
+                PinkDbError::Catalog(m) if m.starts_with("table ") => {
+                    PinkDbError::Catalog(format!("{m} because {}", schema_error_text(db, lookup)))
+                }
+                other => other,
+            })
         }
         // Statements that produce no relation (or, for ANALYZE, its
         // DuckDB-shaped one-row Success result at execution time).
@@ -10889,7 +12099,7 @@ pub(crate) fn plan_schema(
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Offset { input, .. }
-        | LogicalPlan::Sample { input, .. } => plan_schema(db, default_db, ctes, input),
+        | LogicalPlan::Sample { input, .. } => plan_schema(db, default_ns, ctes, input),
         // A DML statement is a query scope only through `RETURNING` (a
         // data-modifying CTE); without one it produces no rows.
         LogicalPlan::Insert { returning, .. }
@@ -10921,6 +12131,8 @@ pub(crate) fn plan_schema(
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
+        | LogicalPlan::CreateSecret { .. }
+        | LogicalPlan::DropSecret { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::InstallExtension { .. }
         | LogicalPlan::LoadInstalledExtension { .. }
@@ -10957,11 +12169,18 @@ pub(crate) fn plan_schema(
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::DropRole { .. }
         | LogicalPlan::Grant { .. }
-        | LogicalPlan::Revoke { .. } => Ok(Vec::new()),
-        LogicalPlan::IndexScan { db: qdb, table, .. }
-        | LogicalPlan::VectorTopK { db: qdb, table, .. } => {
-            let lookup = qdb.as_deref().unwrap_or(default_db);
-            db.visible_table_schema(lookup, table)
+        | LogicalPlan::Revoke { .. }
+        | LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. } => Ok(Vec::new()),
+        LogicalPlan::IndexScan { ns: qdb, table, .. }
+        | LogicalPlan::VectorTopK { ns: qdb, table, .. } => {
+            let lookup = qdb.as_ref().unwrap_or(default_ns);
+            db.visible_table_schema(lookup, table).map_err(|e| match e {
+                PinkDbError::Catalog(m) if m.starts_with("table ") => {
+                    PinkDbError::Catalog(format!("{m} because {}", schema_error_text(db, lookup)))
+                }
+                other => other,
+            })
         }
         // DESCRIBE/EXPLAIN produce fixed shapes (their schema is built by the
         // executor); they never appear as a query scope.
@@ -10978,7 +12197,7 @@ pub(crate) fn plan_schema(
         }
         LogicalPlan::Join { kind, left, right, .. }
         | LogicalPlan::NestedLoopJoin { kind, left, right, .. } => {
-            let mut out = plan_schema(db, default_db, ctes, left)?;
+            let mut out = plan_schema(db, default_ns, ctes, left)?;
             // Semi/anti join output is the left side; a mark join appends its
             // marker column (wave 120).
             match kind {
@@ -10986,13 +12205,13 @@ pub(crate) fn plan_schema(
                 JoinKind::Mark => {
                     out.push((crate::exec::MARK_NAME.to_string(), DataType::Boolean));
                 }
-                _ => out.extend(plan_schema(db, default_db, ctes, right)?),
+                _ => out.extend(plan_schema(db, default_ns, ctes, right)?),
             }
             Ok(out)
         }
         LogicalPlan::SetOp { left, types, .. } => {
             // Output names come from the left branch.
-            let left_schema = plan_schema(db, default_db, ctes, left)?;
+            let left_schema = plan_schema(db, default_ns, ctes, left)?;
             Ok(left_schema
                 .into_iter()
                 .zip(types.iter().copied())
@@ -11006,11 +12225,11 @@ pub(crate) fn plan_schema(
             ..
         } => {
             let mut inner: Vec<(String, Vec<(String, DataType)>)> = ctes.to_vec();
-            inner.push((name.clone(), plan_schema(db, default_db, ctes, query)?));
-            plan_schema(db, default_db, &inner, body)
+            inner.push((name.clone(), plan_schema(db, default_ns, ctes, query)?));
+            plan_schema(db, default_ns, &inner, body)
         }
         LogicalPlan::Window { input, windows, .. } => {
-            let mut out = plan_schema(db, default_db, ctes, input)?;
+            let mut out = plan_schema(db, default_ns, ctes, input)?;
             let (names, types) = crate::plan::win_output_schema(windows);
             out.extend(names.into_iter().zip(types));
             Ok(out)
@@ -11054,6 +12273,15 @@ fn literal_arg_value(expr: &Expr) -> Option<Value> {
         Expr::Cast { expr, dtype } => {
             crate::exec::expr::cast_value(literal_arg_value(expr)?, *dtype).ok()
         }
+        // `versions := [2, 3]`: a literal array is still a literal.
+        Expr::ArrayLiteral(items) => {
+            let items: Vec<Value> = items
+                .iter()
+                .map(literal_arg_value)
+                .collect::<Option<Vec<_>>>()?;
+            let (_, array) = crate::array::ArrayValue::infer(&items).ok()?;
+            Some(Value::Array(std::sync::Arc::new(array)))
+        }
         Expr::Unary {
             op: crate::sql::ast::UnaryOp::Negate,
             expr,
@@ -11061,7 +12289,9 @@ fn literal_arg_value(expr: &Expr) -> Option<Value> {
             Value::Integer(n) => Some(Value::Integer(-n)),
             Value::Bigint(n) => Some(Value::Bigint(-n)),
             Value::Double(d) => Some(Value::Double(-d)),
-            Value::Decimal(v, s) => Some(Value::Decimal(-v, s)),
+            Value::Decimal {
+                value: v, scale: s, ..
+            } => Some(Value::decimal(-v, s)),
             _ => None,
         },
         _ => None,
@@ -11088,23 +12318,74 @@ fn bind_table_function(
     if name.eq_ignore_ascii_case("pinkdb_catalog") {
         return bind_catalog(db, binder, args, alias);
     }
+    let lower = name.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "duckdb_databases" | "duckdb_schemas" | "duckdb_tables" | "duckdb_views" | "duckdb_columns"
+    ) {
+        return bind_duckdb_meta(db, binder, &lower, args, alias);
+    }
     if name.eq_ignore_ascii_case("pinkdb_users") || name.eq_ignore_ascii_case("pinkdb_grants") {
         return bind_access(db, binder, &name.to_ascii_lowercase(), args, alias);
+    }
+    if name.eq_ignore_ascii_case("duckdb_secrets") {
+        return bind_duckdb_secrets(db, binder, args, alias);
+    }
+    if name.eq_ignore_ascii_case("which_secret") {
+        return bind_which_secret(db, binder, args, alias);
+    }
+    if lower.starts_with("ducklake_") {
+        let lake = crate::lake_db::LakeFunctionCall::from_table_call(&lower, args);
+        let Some(schema) = db.lake_function_schema(&lake)? else {
+            return Err(PinkDbError::Catalog(format!(
+                "unknown table function \"{name}\""
+            )));
+        };
+        if db.lake_function_mutates(&lake) {
+            return Err(PinkDbError::Execution(format!(
+                "{name} writes the lake and must be called as CALL"
+            )));
+        }
+        let call = TableFunctionCall::Function {
+            name: name.to_string(),
+            args: args.to_vec(),
+        };
+        let eff = alias.clone().unwrap_or_else(|| name.to_string());
+        return Ok((
+            ScopeTable {
+                name: eff.to_ascii_lowercase(),
+                original: None,
+                ns: None,
+                is_alias: alias.is_some(),
+                qualified_only: false,
+                columns: schema.clone(),
+            },
+            LogicalPlan::TableFunction {
+                source: "ducklake".to_string(),
+                call,
+                schema,
+            },
+        ));
     }
     let call = TableFunctionCall::Function {
         name: name.to_string(),
         args: args.to_vec(),
     };
     let builtin = crate::table_source::builtin_table_source(crate::table_source::RANGE_SOURCE);
+    let secrets: Vec<_> = db
+        .visible_secrets(&binder.session)
+        .into_iter()
+        .map(|entry| entry.secret)
+        .collect();
     for source in builtin.into_iter().chain(db.table_sources()) {
-        if let Some(schema) = source.bind(&call)? {
+        if let Some(schema) = source.bind_with(&call, &secrets)? {
             binder.note_extension_package(db.package_of_table_source(source.name()));
             let eff = alias.clone().unwrap_or_else(|| name.to_string());
             return Ok((
                 ScopeTable {
                     name: eff.to_ascii_lowercase(),
                     original: None,
-                    db: None,
+                    ns: None,
                     is_alias: alias.is_some(),
                     qualified_only: false,
                     columns: schema.clone(),
@@ -11123,21 +12404,164 @@ fn bind_table_function(
     )))
 }
 
+/// `duckdb_secrets([redact := true])`: the secrets this session can use
+/// (wave 132b). DuckDB's column set, with `scope` rendered as text (pinkdb
+/// has no LIST type) and every credential field already `redacted` inside
+/// `secret_string`; `redact := false` is refused because unredacted output
+/// would put a password into a result stream, the session history and any
+/// `COPY` of it.
+fn bind_duckdb_secrets(
+    db: &PinkDb,
+    binder: &Binder<'_>,
+    args: &[TableFunctionArg],
+    alias: &Option<String>,
+) -> Result<(ScopeTable, LogicalPlan)> {
+    for arg in args {
+        match arg.name.as_deref() {
+            Some(name) if name.eq_ignore_ascii_case("redact") => {
+                if matches!(arg.value, Value::Boolean(false)) {
+                    return Err(PinkDbError::Execution(
+                        "Displaying unredacted secrets is disabled".to_string(),
+                    ));
+                }
+            }
+            Some(other) => {
+                return Err(PinkDbError::Catalog(format!(
+                    "duckdb_secrets() has no argument \"{other}\""
+                )));
+            }
+            None => {
+                return Err(PinkDbError::Type(
+                    "duckdb_secrets() takes no positional arguments; use redact := true"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    let names: Vec<String> = [
+        "name",
+        "type",
+        "provider",
+        "persistent",
+        "storage",
+        "scope",
+        "secret_string",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let types = vec![
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Boolean,
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Varchar,
+    ];
+    let mut rows = Vec::new();
+    for entry in db.visible_secrets(&binder.session) {
+        rows.push(vec![
+            BoundExpr::Literal(Value::Varchar(entry.secret.name().to_string())),
+            BoundExpr::Literal(Value::Varchar(entry.secret.type_().as_str().to_string())),
+            BoundExpr::Literal(Value::Varchar("config".to_string())),
+            BoundExpr::Literal(Value::Boolean(entry.persistent)),
+            BoundExpr::Literal(Value::Varchar(entry.storage().to_string())),
+            BoundExpr::Literal(Value::Varchar(entry.secret.scope_text())),
+            BoundExpr::Literal(Value::Varchar(entry.secret.secret_string())),
+        ]);
+    }
+    Ok(values_scope(alias, "duckdb_secrets", names, types, rows))
+}
+
+/// `which_secret(path, type)`: the name and persistence of the secret a URL
+/// would use, or no row (wave 132b).
+fn bind_which_secret(
+    db: &PinkDb,
+    binder: &Binder<'_>,
+    args: &[TableFunctionArg],
+    alias: &Option<String>,
+) -> Result<(ScopeTable, LogicalPlan)> {
+    if args.len() != 2 || args.iter().any(|arg| arg.name.is_some()) {
+        return Err(PinkDbError::Type(
+            "which_secret() takes a path and a type".to_string(),
+        ));
+    }
+    let Value::Varchar(path) = &args[0].value else {
+        return Err(PinkDbError::Type(
+            "which_secret() takes a VARCHAR path".to_string(),
+        ));
+    };
+    let Value::Varchar(type_name) = &args[1].value else {
+        return Err(PinkDbError::Type(
+            "which_secret() takes a VARCHAR type".to_string(),
+        ));
+    };
+    let Some(type_) = crate::secret::SecretType::parse(type_name) else {
+        return Err(PinkDbError::Catalog(format!(
+            "unknown secret type \"{type_name}\" (supported: s3, r2, gcs, postgres)"
+        )));
+    };
+    let names = vec!["name".to_string(), "persistent".to_string()];
+    let types = vec![DataType::Varchar, DataType::Varchar];
+    let mut rows = Vec::new();
+    if let Some(entry) = db.secret_for(path, type_, &binder.session) {
+        rows.push(vec![
+            BoundExpr::Literal(Value::Varchar(entry.secret.name().to_string())),
+            BoundExpr::Literal(Value::Varchar(entry.persistence().to_string())),
+        ]);
+    }
+    Ok(values_scope(alias, "which_secret", names, types, rows))
+}
+
+/// Wrap literal rows in a `Values` plan with a table-function scope.
+fn values_scope(
+    alias: &Option<String>,
+    default_name: &str,
+    names: Vec<String>,
+    types: Vec<DataType>,
+    rows: Vec<Vec<BoundExpr>>,
+) -> (ScopeTable, LogicalPlan) {
+    let scope = ScopeTable {
+        name: alias
+            .clone()
+            .unwrap_or_else(|| default_name.to_string())
+            .to_ascii_lowercase(),
+        original: None,
+        ns: None,
+        is_alias: alias.is_some(),
+        qualified_only: false,
+        columns: names.iter().cloned().zip(types.iter().copied()).collect(),
+    };
+    (
+        scope,
+        LogicalPlan::Values {
+            rows,
+            names,
+            types,
+            sources: Vec::new(),
+        },
+    )
+}
+
 /// `pinkdb_catalog()`: one row per catalog object of the store (wave 121) —
-/// tables, views, materialized views, hash and vector indexes, triggers,
-/// macros, procedures and attached lake tables — for a catalog browser. DuckDB splits
-/// this over `duckdb_tables()`, `duckdb_views()` and `duckdb_indexes()`; one
-/// relation keeps the console to one statement.
+/// databases, schemas, tables, views, materialized views, hash and vector
+/// indexes, triggers, macros, procedures and attached lake tables — for a
+/// catalog browser. DuckDB splits this over `duckdb_tables()`,
+/// `duckdb_views()` and `duckdb_indexes()`; one relation keeps the console to
+/// one statement.
 ///
-/// Columns: `database`, `name`, `kind` (`DATABASE`, `TABLE`, `VIEW`,
-/// `MATERIALIZED VIEW`, `INDEX`, `TRIGGER`, `MACRO`, `PROCEDURE`, `LAKE
-/// TABLE`), `table_name` (the table an index or trigger belongs to), `detail`
-/// (index column and method, trigger timing, macro parameters, procedure
-/// parameters and language, lake location), and — on `DATABASE` rows only
-/// (wave 124) — `storage` (`local`/`lake`), `location` (redacted),
-/// `read_only`, `version` and `status` (`ok` or `unavailable: …`). A logged-in session sees only the relations it may `SELECT`,
-/// only those relations' indexes and triggers, and procedures only when it
-/// is an administrator (the one who may `CALL` them).
+/// Columns: `database`, `schema`, `name`, `kind` (`DATABASE`, `SCHEMA`,
+/// `TABLE`, `VIEW`, `MATERIALIZED VIEW`, `INDEX`, `TRIGGER`, `MACRO`,
+/// `PROCEDURE`, `LAKE TABLE`), `table_name` (the table an index or trigger
+/// belongs to), `detail` (index column and method, trigger timing, macro
+/// parameters, procedure parameters and language, lake location), and — on
+/// `DATABASE` rows only (wave 124) — `storage` (`local`/`lake`), `location`
+/// (redacted), `read_only`, `version` and `status` (`ok` or
+/// `unavailable: …`). `schema` is NULL on `DATABASE` rows. A logged-in
+/// session sees only the relations it may `SELECT`, only those relations'
+/// indexes and triggers, and procedures only when it is an administrator
+/// (the one who may `CALL` them).
 fn bind_catalog(
     db: &PinkDb,
     binder: &Binder<'_>,
@@ -11151,6 +12575,7 @@ fn bind_catalog(
     }
     let names: Vec<String> = [
         "database",
+        "schema",
         "name",
         "kind",
         "table_name",
@@ -11164,15 +12589,16 @@ fn bind_catalog(
     .into_iter()
     .map(str::to_string)
     .collect();
-    let mut types = vec![DataType::Varchar; 7];
+    let mut types = vec![DataType::Varchar; 8];
     types.extend([DataType::Boolean, DataType::Bigint, DataType::Varchar]);
     let principal = binder.session.principal();
-    let readable = |dbname: &str, table: &str| match &principal {
+    let readable = |dbname: &str, schema: &str, table: &str| match &principal {
         None => true,
         Some(principal) => db.rbac().allowed(
             principal,
             &crate::rbac::GrantObject::Table {
                 db: dbname.to_string(),
+                schema: schema.to_string(),
                 table: table.to_string(),
             },
             crate::rbac::Privilege::Select,
@@ -11185,10 +12611,12 @@ fn bind_catalog(
     let null = || BoundExpr::Literal(Value::Null);
     let mut rows: Vec<Vec<BoundExpr>> = Vec::new();
     // Wave 124: one DATABASE row per database carries its storage facts
-    // (the other rows leave those columns NULL).
+    // (the other rows leave those columns NULL). Wave 131c adds one SCHEMA
+    // row per schema, and object rows now name their schema.
     for info in db.database_infos() {
         rows.push(vec![
             text(&info.name),
+            null(),
             text(&info.name),
             text("DATABASE"),
             null(),
@@ -11205,113 +12633,147 @@ fn bind_catalog(
     let mut databases = db.list_databases();
     databases.sort();
     for dbname in databases {
-        let mvs: Vec<String> = db
-            .materialized_view_status_in(&dbname, crate::mv::now_ms())
-            .into_iter()
-            .map(|status| status.name)
-            .collect();
-        let mut tables = db.list_tables_in(&dbname);
-        tables.sort();
-        for tname in &tables {
-            if !readable(&dbname, tname) {
+        let mut schemas = db.list_schemas(&dbname);
+        schemas.sort();
+        for schema in schemas {
+            let ns = SchemaPath::new(&dbname, &schema);
+            let mvs: Vec<String> = db
+                .materialized_view_status_in(ns.clone(), crate::mv::now_ms())
+                .into_iter()
+                .map(|status| status.name)
+                .collect();
+            let mut tables = db.list_tables_in(ns.clone());
+            tables.sort();
+            let mut views = db.list_views_in(ns.clone());
+            views.sort();
+            let visible = principal.is_none()
+                || may_call
+                || tables.iter().any(|t| readable(&dbname, &schema, t))
+                || views.iter().any(|v| readable(&dbname, &schema, v));
+            if !visible {
                 continue;
             }
-            let kind = if mvs.iter().any(|mv| mv.eq_ignore_ascii_case(tname)) {
-                "MATERIALIZED VIEW"
-            } else {
-                "TABLE"
-            };
-            rows.push(vec![text(&dbname), text(tname), text(kind), null(), null()]);
-            let t = db.table_in(&dbname, tname)?;
-            let schema = t.schema();
-            let column = |i: usize| schema.get(i).map(|(c, _)| c.as_str()).unwrap_or("?");
-            for index in &t.indexes {
-                rows.push(vec![
-                    text(&dbname),
-                    text(&index.name),
-                    text("INDEX"),
-                    text(tname),
-                    text(&format!("{} (hash)", column(index.column))),
-                ]);
-            }
-            for index in &t.vector_indexes {
-                rows.push(vec![
-                    text(&dbname),
-                    text(&index.name),
-                    text("INDEX"),
-                    text(tname),
-                    text(&format!("{} ({})", column(index.column), index.provider)),
-                ]);
-            }
-        }
-        let mut views = db.list_views_in(&dbname);
-        views.sort();
-        for view in views {
-            if readable(&dbname, &view) {
-                rows.push(vec![
-                    text(&dbname),
-                    text(&view),
-                    text("VIEW"),
-                    null(),
-                    null(),
-                ]);
-            }
-        }
-        for trigger in db.triggers_in(&dbname) {
-            if readable(&dbname, &trigger.table) {
-                rows.push(vec![
-                    text(&dbname),
-                    text(&trigger.name),
-                    text("TRIGGER"),
-                    text(&trigger.table),
-                    text(&format!(
-                        "{} {}",
-                        trigger.timing.as_str(),
-                        trigger
-                            .events
-                            .iter()
-                            .map(|e| e.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" OR ")
-                    )),
-                ]);
-            }
-        }
-        for (_, def) in db.macros_in(&dbname) {
             rows.push(vec![
                 text(&dbname),
-                text(&def.name),
-                text("MACRO"),
+                text(&schema),
+                text(&schema),
+                text("SCHEMA"),
                 null(),
-                text(&def.parameter_names()),
+                null(),
             ]);
-        }
-        // Only a session that may `CALL` a procedure (an administrator) sees
-        // it: its body reaches anything the definer can.
-        if may_call {
-            for (_, def) in db.procedures_in(&dbname) {
-                let params: Vec<String> =
-                    def.params.iter().map(|(n, t)| format!("{n} {t}")).collect();
-                let detail = if params.is_empty() {
-                    def.language.name().to_string()
+            for tname in &tables {
+                if !readable(&dbname, &schema, tname) {
+                    continue;
+                }
+                let kind = if mvs.iter().any(|mv| mv.eq_ignore_ascii_case(tname)) {
+                    "MATERIALIZED VIEW"
                 } else {
-                    format!("{} · {}", params.join(", "), def.language.name())
+                    "TABLE"
                 };
                 rows.push(vec![
                     text(&dbname),
-                    text(&def.name),
-                    text("PROCEDURE"),
+                    text(&schema),
+                    text(tname),
+                    text(kind),
                     null(),
-                    text(&detail),
+                    null(),
                 ]);
+                let t = db.table_in(ns.clone(), tname)?;
+                let table_schema = t.schema();
+                let column = |i: usize| table_schema.get(i).map(|(c, _)| c.as_str()).unwrap_or("?");
+                for index in &t.indexes {
+                    rows.push(vec![
+                        text(&dbname),
+                        text(&schema),
+                        text(&index.name),
+                        text("INDEX"),
+                        text(tname),
+                        text(&format!("{} (hash)", column(index.column))),
+                    ]);
+                }
+                for index in &t.vector_indexes {
+                    rows.push(vec![
+                        text(&dbname),
+                        text(&schema),
+                        text(&index.name),
+                        text("INDEX"),
+                        text(tname),
+                        text(&format!("{} ({})", column(index.column), index.provider)),
+                    ]);
+                }
+            }
+            for view in views {
+                if readable(&dbname, &schema, &view) {
+                    rows.push(vec![
+                        text(&dbname),
+                        text(&schema),
+                        text(&view),
+                        text("VIEW"),
+                        null(),
+                        null(),
+                    ]);
+                }
+            }
+            for trigger in db.triggers_in(ns.clone()) {
+                if readable(&dbname, &schema, &trigger.table) {
+                    rows.push(vec![
+                        text(&dbname),
+                        text(&schema),
+                        text(&trigger.name),
+                        text("TRIGGER"),
+                        text(&trigger.table),
+                        text(&format!(
+                            "{} {}",
+                            trigger.timing.as_str(),
+                            trigger
+                                .events
+                                .iter()
+                                .map(|e| e.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" OR ")
+                        )),
+                    ]);
+                }
+            }
+            for (_, def) in db.macros_in(ns.clone()) {
+                rows.push(vec![
+                    text(&dbname),
+                    text(&schema),
+                    text(&def.name),
+                    text("MACRO"),
+                    null(),
+                    text(&def.parameter_names()),
+                ]);
+            }
+            // Only a session that may `CALL` a procedure (an administrator)
+            // sees it: its body reaches anything the definer can.
+            if may_call {
+                for (_, def) in db.procedures_in(ns.clone()) {
+                    let params: Vec<String> =
+                        def.params.iter().map(|(n, t)| format!("{n} {t}")).collect();
+                    let detail = if params.is_empty() {
+                        def.language.name().to_string()
+                    } else {
+                        format!("{} · {}", params.join(", "), def.language.name())
+                    };
+                    rows.push(vec![
+                        text(&dbname),
+                        text(&schema),
+                        text(&def.name),
+                        text("PROCEDURE"),
+                        null(),
+                        text(&detail),
+                    ]);
+                }
             }
         }
     }
     for (location, tables) in db.attached_lakes() {
         for table in tables {
-            if readable(&table.db, &table.table) {
+            if readable(&table.db, &table.schema_name, &table.table) {
                 rows.push(vec![
                     text(&table.db),
+                    text(&table.schema_name),
                     text(&table.table),
                     text("LAKE TABLE"),
                     null(),
@@ -11331,7 +12793,7 @@ fn bind_catalog(
             .unwrap_or_else(|| "pinkdb_catalog".to_string())
             .to_ascii_lowercase(),
         original: None,
-        db: None,
+        ns: None,
         is_alias: alias.is_some(),
         qualified_only: false,
         columns: names.iter().cloned().zip(types.iter().copied()).collect(),
@@ -11345,6 +12807,1063 @@ fn bind_catalog(
             sources: Vec::new(),
         },
     ))
+}
+
+// ---------- DuckDB-compatible catalog metadata (wave 131c) ----------
+
+#[derive(Clone)]
+struct CatalogDatabase {
+    name: String,
+    oid: i64,
+    info: crate::lake_db::DatabaseInfo,
+    path: Option<String>,
+    encrypted: bool,
+    internal: bool,
+}
+
+struct CatalogSchema {
+    db: String,
+    name: String,
+    oid: i64,
+    /// The session whose `temp` catalog this is; `None` for every persistent
+    /// schema.
+    temp: Option<u64>,
+    /// `information_schema` / `pg_catalog`: built-in views, never
+    /// enumerated as tables of their own.
+    builtin: bool,
+    /// What `duckdb_schemas().internal` reports: the built-in schemas and
+    /// every database's `main`, as DuckDB marks them.
+    internal: bool,
+}
+
+struct CatalogColumn {
+    name: String,
+    dtype: DataType,
+    default: Option<String>,
+    not_null: bool,
+}
+
+struct CatalogTable {
+    db: String,
+    schema: String,
+    schema_oid: i64,
+    name: String,
+    oid: i64,
+    sql: Option<String>,
+    columns: Vec<CatalogColumn>,
+    row_count: i64,
+    index_count: i64,
+    has_primary_key: bool,
+    /// A table of the statement's session-local `temp.main`.
+    temporary: bool,
+}
+
+struct CatalogView {
+    db: String,
+    schema: String,
+    schema_oid: i64,
+    name: String,
+    oid: i64,
+    sql: Option<String>,
+    columns: Option<Vec<CatalogColumn>>,
+}
+
+struct CatalogSnapshot {
+    databases: Vec<CatalogDatabase>,
+    schemas: Vec<CatalogSchema>,
+    tables: Vec<CatalogTable>,
+    views: Vec<CatalogView>,
+}
+
+/// The catalog as one statement sees it. OIDs are assigned in sorted
+/// enumeration order (databases, then schemas, then tables and views) so the
+/// functions join with each other; they are not stable across DDL.
+///
+/// DuckDB keeps `information_schema` and `pg_catalog` under a separate
+/// `system` database; pinkdb exposes the same virtual database (it is not in
+/// the store and cannot be created or attached).
+fn catalog_snapshot(db: &PinkDb, binder: &Binder<'_>) -> Result<CatalogSnapshot> {
+    let principal = binder.session.principal();
+    let restricted = principal
+        .as_deref()
+        .is_some_and(|p| !db.rbac().is_admin_resolved(p));
+    let readable = |dbname: &str, schema: &str, table: &str| match &principal {
+        None => true,
+        Some(principal) => db.rbac().allowed(
+            principal,
+            &crate::rbac::GrantObject::Table {
+                db: dbname.to_string(),
+                schema: schema.to_string(),
+                table: table.to_string(),
+            },
+            crate::rbac::Privilege::Select,
+        ),
+    };
+    let mut databases = Vec::new();
+    for (i, info) in db.database_infos().into_iter().enumerate() {
+        let path = if info.storage == "local" {
+            db.store_path()
+        } else {
+            info.location.clone()
+        };
+        let encrypted = info.storage == "local" && db.encryption_key().is_some();
+        let name = info.name.clone();
+        databases.push(CatalogDatabase {
+            name,
+            oid: (i + 1) as i64,
+            info,
+            path,
+            encrypted,
+            internal: false,
+        });
+    }
+    databases.push(CatalogDatabase {
+        name: "system".to_string(),
+        oid: (databases.len() + 1) as i64,
+        info: crate::lake_db::DatabaseInfo {
+            name: "system".to_string(),
+            storage: "local".to_string(),
+            location: None,
+            read_only: false,
+            version: None,
+            status: "ok".to_string(),
+        },
+        path: None,
+        encrypted: false,
+        internal: true,
+    });
+    // DuckDB always lists the session-local `temp` catalog, whether or not the
+    // session has created a temporary table yet.
+    databases.push(CatalogDatabase {
+        name: "temp".to_string(),
+        oid: (databases.len() + 1) as i64,
+        info: crate::lake_db::DatabaseInfo {
+            name: "temp".to_string(),
+            storage: "local".to_string(),
+            location: None,
+            read_only: false,
+            version: None,
+            status: "ok".to_string(),
+        },
+        path: None,
+        encrypted: false,
+        internal: true,
+    });
+    let mut schemas = Vec::new();
+    // The session's temp catalog first, like DuckDB's search path. Its tables
+    // are private to the session, so RBAC never hides them.
+    schemas.push(CatalogSchema {
+        db: "temp".to_string(),
+        name: "main".to_string(),
+        oid: 0,
+        temp: Some(binder.session.id()),
+        builtin: false,
+        internal: true,
+    });
+    for database in &databases {
+        let mut names = db.list_schemas(&database.name);
+        names.sort();
+        for name in names {
+            let builtin = false;
+            let internal = name.eq_ignore_ascii_case("main");
+            if !builtin && restricted {
+                let ns = SchemaPath::new(&database.name, &name);
+                let has_table = db
+                    .list_tables_in(ns.clone())
+                    .iter()
+                    .any(|t| readable(&database.name, &name, t));
+                let has_view = db
+                    .list_views_in(ns)
+                    .iter()
+                    .any(|v| readable(&database.name, &name, v));
+                if !has_table && !has_view {
+                    continue;
+                }
+            }
+            schemas.push(CatalogSchema {
+                db: database.name.clone(),
+                name,
+                oid: 0,
+                temp: None,
+                builtin,
+                internal,
+            });
+        }
+    }
+    let mut system_schemas = vec![
+        ("information_schema".to_string(), true),
+        ("main".to_string(), false),
+        ("pg_catalog".to_string(), true),
+    ];
+    system_schemas.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, builtin) in system_schemas {
+        schemas.push(CatalogSchema {
+            db: "system".to_string(),
+            name,
+            oid: 0,
+            temp: None,
+            builtin,
+            internal: true,
+        });
+    }
+    for (i, schema) in schemas.iter_mut().enumerate() {
+        schema.oid = (i + 1) as i64;
+    }
+    let mut tables = Vec::new();
+    let mut views = Vec::new();
+    let mut next_oid = 1i64;
+    for schema in &schemas {
+        if schema.builtin {
+            continue;
+        }
+        let ns = match schema.temp {
+            Some(id) => SchemaPath::temp(id),
+            None => SchemaPath::new(&schema.db, &schema.name),
+        };
+        let mvs: Vec<String> = db
+            .materialized_view_status_in(ns.clone(), crate::mv::now_ms())
+            .into_iter()
+            .map(|status| status.name)
+            .collect();
+        for name in db.list_tables_in(ns.clone()) {
+            if schema.temp.is_none() && !readable(&schema.db, &schema.name, &name) {
+                continue;
+            }
+            let table = db.table_in(ns.clone(), &name)?;
+            let sql = if mvs.iter().any(|mv| mv.eq_ignore_ascii_case(&name)) {
+                Some(
+                    db.materialized_view_in(ns.clone(), &name)?
+                        .query_sql
+                        .clone(),
+                )
+            } else {
+                Some(catalog_table_sql(db, &ns, table)?)
+            };
+            let columns = table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, column)| CatalogColumn {
+                    name: column.name.clone(),
+                    dtype: column.dtype,
+                    default: column.default.as_ref().map(|d| d.text.clone()),
+                    not_null: table.constraints.is_not_null(i),
+                })
+                .collect();
+            tables.push(CatalogTable {
+                db: schema.db.clone(),
+                schema: schema.name.clone(),
+                schema_oid: schema.oid,
+                name,
+                oid: next_oid,
+                sql,
+                columns,
+                row_count: table.num_rows as i64,
+                index_count: (table.indexes.len() + table.vector_indexes.len()) as i64,
+                has_primary_key: table.constraints.primary_key().is_some(),
+                temporary: ns.temp_id().is_some(),
+            });
+            next_oid += 1;
+        }
+        // A read-only lake database keeps its tables in the lake, not in the
+        // engine catalog: list them from the attached reader.
+        for attached in db.attached_tables() {
+            if !attached.db.eq_ignore_ascii_case(&schema.db)
+                || !attached.schema_name.eq_ignore_ascii_case(&schema.name)
+                || db.table_in(ns.clone(), &attached.table).is_ok()
+                || !readable(&schema.db, &schema.name, &attached.table)
+            {
+                continue;
+            }
+            let columns = attached
+                .schema
+                .iter()
+                .map(|(name, dtype)| CatalogColumn {
+                    name: name.clone(),
+                    dtype: *dtype,
+                    default: None,
+                    not_null: true,
+                })
+                .collect();
+            tables.push(CatalogTable {
+                db: schema.db.clone(),
+                schema: schema.name.clone(),
+                schema_oid: schema.oid,
+                name: attached.table.clone(),
+                oid: next_oid,
+                sql: None,
+                columns,
+                row_count: attached.rows as i64,
+                index_count: 0,
+                has_primary_key: false,
+                temporary: false,
+            });
+            next_oid += 1;
+        }
+        for name in db.list_views_in(ns.clone()) {
+            if !readable(&schema.db, &schema.name, &name) {
+                continue;
+            }
+            let view = db.view_in(ns.clone(), &name)?;
+            let sql = (!view.sql.is_empty()).then(|| view.sql.clone());
+            let columns = catalog_view_columns(db, binder, &ns, view);
+            views.push(CatalogView {
+                db: schema.db.clone(),
+                schema: schema.name.clone(),
+                schema_oid: schema.oid,
+                name,
+                oid: next_oid,
+                sql,
+                columns,
+            });
+            next_oid += 1;
+        }
+    }
+    Ok(CatalogSnapshot {
+        databases,
+        schemas,
+        tables,
+        views,
+    })
+}
+
+fn catalog_table_sql(db: &PinkDb, ns: &SchemaPath, table: &DataTable) -> Result<String> {
+    let mut items = Vec::new();
+    let mut names = Vec::new();
+    for (i, column) in table.columns.iter().enumerate() {
+        let name = crate::rbac::quote_ident(&column.name);
+        names.push(name.clone());
+        let mut item = format!("{name} {}", column.dtype.name());
+        if let Some(default) = &column.default {
+            // DuckDB normalizes its own rendering (`(1+2)` becomes
+            // `(1 + 2)`); we print the written text, so simple defaults match.
+            item.push_str(&format!(" DEFAULT({})", default.text));
+        }
+        // DuckDB repeats only explicitly written NOT NULL; a PRIMARY KEY
+        // column is implicitly NOT NULL and stays bare in `sql`.
+        if table.constraints.not_null.contains(&i) {
+            item.push_str(" NOT NULL");
+        }
+        items.push(item);
+    }
+    for key in &table.constraints.keys {
+        let keyword = match key.kind {
+            KeyKind::Primary => "PRIMARY KEY",
+            KeyKind::Unique => "UNIQUE",
+        };
+        let columns: Vec<String> = key
+            .columns
+            .iter()
+            .map(|&i| names.get(i).cloned().unwrap_or_else(|| "?".to_string()))
+            .collect();
+        items.push(format!("{keyword}({})", columns.join(", ")));
+    }
+    for foreign_key in &table.constraints.foreign_keys {
+        let columns: Vec<String> = foreign_key
+            .columns
+            .iter()
+            .map(|&i| names.get(i).cloned().unwrap_or_else(|| "?".to_string()))
+            .collect();
+        let referenced = db.table_in(ns.clone(), &foreign_key.ref_table)?;
+        let referenced_columns: Vec<String> = foreign_key
+            .ref_columns
+            .iter()
+            .map(|&i| {
+                referenced
+                    .columns
+                    .get(i)
+                    .map(|column| crate::rbac::quote_ident(&column.name))
+                    .unwrap_or_else(|| "?".to_string())
+            })
+            .collect();
+        items.push(format!(
+            "FOREIGN KEY ({}) REFERENCES {}({})",
+            columns.join(", "),
+            crate::rbac::quote_ident(&referenced.name),
+            referenced_columns.join(", ")
+        ));
+    }
+    // DuckDB's generated SQL names the schema only when it is not the
+    // default one; the database never appears. A temporary table keeps its
+    // `TEMP` marker instead.
+    let table_name = if ns.schema().eq_ignore_ascii_case("main") {
+        crate::rbac::quote_ident(&table.name)
+    } else {
+        format!(
+            "{}.{}",
+            crate::rbac::quote_ident(ns.schema()),
+            crate::rbac::quote_ident(&table.name)
+        )
+    };
+    let create = if ns.temp_id().is_some() {
+        "CREATE TEMP TABLE"
+    } else {
+        "CREATE TABLE"
+    };
+    Ok(format!("{create} {table_name}({});", items.join(", ")))
+}
+
+fn catalog_view_columns(
+    db: &PinkDb,
+    binder: &Binder<'_>,
+    ns: &SchemaPath,
+    view: &crate::storage::ViewDef,
+) -> Option<Vec<CatalogColumn>> {
+    let view = view.clone();
+    let key = format!("{ns}.{}", view.name).to_ascii_lowercase();
+    if binder.views_expanding.borrow().contains(&key) {
+        return None;
+    }
+    binder.views_expanding.borrow_mut().push(key);
+    let result = (|| -> Result<Vec<CatalogColumn>> {
+        let mut child = binder.child();
+        child.default_ns = ns.clone();
+        child.ctes.clear();
+        let sub = bind_select_in(db, &mut child, &view.query)?;
+        let mut schema = plan_schema(db, &child.default_ns, &child.ctes, &sub)?;
+        if let Some(cols) = &view.cols {
+            for (s, c) in schema.iter_mut().zip(cols.iter()) {
+                s.0 = c.clone();
+            }
+        }
+        Ok(schema
+            .into_iter()
+            .map(|(name, dtype)| CatalogColumn {
+                name,
+                dtype,
+                default: None,
+                not_null: false,
+            })
+            .collect())
+    })();
+    binder.views_expanding.borrow_mut().pop();
+    result.ok()
+}
+
+fn duckdb_data_type_id(dtype: DataType) -> i64 {
+    match dtype {
+        DataType::Boolean => 10,
+        DataType::Integer => 13,
+        DataType::Bigint => 14,
+        DataType::Date => 15,
+        DataType::Timestamp => 19,
+        DataType::Decimal { .. } => 21,
+        DataType::Double => 23,
+        DataType::Varchar => 25,
+        DataType::Interval => 27,
+        // Pinkdb arrays always carry a length, so they are DuckDB's fixed
+        // ARRAY type (id 108), not a variable LIST (101).
+        DataType::Array { .. } => 108,
+        // DuckDB's LogicalTypeId::UUID.
+        DataType::Uuid => 54,
+        DataType::Variant => 109,
+    }
+}
+
+fn duckdb_numeric_meta(dtype: DataType) -> (Option<i32>, Option<i32>, Option<i32>) {
+    match dtype {
+        DataType::Integer => (Some(32), Some(2), Some(0)),
+        DataType::Bigint => (Some(64), Some(2), Some(0)),
+        DataType::Double => (Some(53), Some(2), Some(0)),
+        DataType::Decimal { precision, scale } => {
+            (Some(precision as i32), Some(10), Some(scale as i32))
+        }
+        _ => (None, None, None),
+    }
+}
+
+fn duckdb_list_text(items: impl IntoIterator<Item = String>) -> String {
+    let mut out = String::from("[");
+    for (i, item) in items.into_iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        if item.is_empty()
+            || item.starts_with(char::is_whitespace)
+            || item.ends_with(char::is_whitespace)
+            || item.contains([',', '\'', '"', '(', ')', '[', ']', '{', '}', ':', '='])
+        {
+            out.push('\'');
+            out.push_str(&item.replace('\'', "\\'"));
+            out.push('\'');
+        } else {
+            out.push_str(&item);
+        }
+    }
+    out.push(']');
+    out
+}
+
+fn bind_duckdb_meta(
+    db: &PinkDb,
+    binder: &Binder<'_>,
+    which: &str,
+    args: &[TableFunctionArg],
+    alias: &Option<String>,
+) -> Result<(ScopeTable, LogicalPlan)> {
+    if !args.is_empty() {
+        return Err(PinkDbError::Type(format!("{which}() takes no arguments")));
+    }
+    let snapshot = catalog_snapshot(db, binder)?;
+    let text = |v: &str| BoundExpr::Literal(Value::Varchar(v.to_string()));
+    let text_opt = |v: Option<&str>| {
+        v.map(|v| BoundExpr::Literal(Value::Varchar(v.to_string())))
+            .unwrap_or(BoundExpr::Literal(Value::Null))
+    };
+    let bigint = |v: i64| BoundExpr::Literal(Value::Bigint(v));
+    let integer = |v: i32| BoundExpr::Literal(Value::Integer(v));
+    let boolean = |v: bool| BoundExpr::Literal(Value::Boolean(v));
+    let null = || BoundExpr::Literal(Value::Null);
+    let make = |names: &[&str], types: Vec<DataType>, rows: Vec<Vec<BoundExpr>>| {
+        let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        let scope = ScopeTable {
+            name: alias
+                .clone()
+                .unwrap_or_else(|| which.to_string())
+                .to_ascii_lowercase(),
+            original: None,
+            ns: None,
+            is_alias: alias.is_some(),
+            qualified_only: false,
+            columns: names.iter().cloned().zip(types.iter().copied()).collect(),
+        };
+        (
+            scope,
+            LogicalPlan::Values {
+                rows,
+                names,
+                types,
+                sources: Vec::new(),
+            },
+        )
+    };
+    match which {
+        "duckdb_databases" => {
+            let mut rows = Vec::new();
+            for database in &snapshot.databases {
+                rows.push(vec![
+                    text(&database.name),
+                    bigint(database.oid),
+                    text_opt(database.path.as_deref()),
+                    null(),
+                    boolean(database.internal),
+                    text(if database.info.storage == "local" {
+                        "pinkdb"
+                    } else {
+                        "ducklake"
+                    }),
+                    boolean(database.info.read_only),
+                    boolean(database.encrypted),
+                    null(),
+                ]);
+            }
+            Ok(make(
+                &[
+                    "database_name",
+                    "database_oid",
+                    "path",
+                    "comment",
+                    "internal",
+                    "type",
+                    "readonly",
+                    "encrypted",
+                    "cipher",
+                ],
+                vec![
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Boolean,
+                    DataType::Varchar,
+                ],
+                rows,
+            ))
+        }
+        "duckdb_schemas" => {
+            let mut rows = Vec::new();
+            for schema in &snapshot.schemas {
+                let database = snapshot
+                    .databases
+                    .iter()
+                    .find(|database| database.name.eq_ignore_ascii_case(&schema.db))
+                    .expect("snapshot schema belongs to a database");
+                rows.push(vec![
+                    bigint(schema.oid),
+                    text(&schema.db),
+                    bigint(database.oid),
+                    text(&schema.name),
+                    null(),
+                    boolean(schema.internal),
+                    null(),
+                    null(),
+                    null(),
+                ]);
+            }
+            Ok(make(
+                &[
+                    "oid",
+                    "database_name",
+                    "database_oid",
+                    "schema_name",
+                    "comment",
+                    "internal",
+                    "sql",
+                    "parent_schema",
+                    "parent_schema_oid",
+                ],
+                vec![
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                ],
+                rows,
+            ))
+        }
+        "duckdb_tables" => {
+            let mut rows = Vec::new();
+            for table in &snapshot.tables {
+                let database = snapshot
+                    .databases
+                    .iter()
+                    .find(|database| database.name.eq_ignore_ascii_case(&table.db))
+                    .expect("snapshot table belongs to a database");
+                rows.push(vec![
+                    text(&table.db),
+                    bigint(database.oid),
+                    text(&table.schema),
+                    bigint(table.schema_oid),
+                    text(&table.name),
+                    bigint(table.oid),
+                    null(),
+                    boolean(false),
+                    boolean(table.temporary),
+                    boolean(table.has_primary_key),
+                    bigint(table.row_count),
+                    bigint(table.columns.len() as i64),
+                    bigint(table.index_count),
+                    bigint(0),
+                    text_opt(table.sql.as_deref()),
+                ]);
+            }
+            Ok(make(
+                &[
+                    "database_name",
+                    "database_oid",
+                    "schema_name",
+                    "schema_oid",
+                    "table_name",
+                    "table_oid",
+                    "comment",
+                    "internal",
+                    "temporary",
+                    "has_primary_key",
+                    "estimated_size",
+                    "column_count",
+                    "index_count",
+                    "check_constraint_count",
+                    "sql",
+                ],
+                vec![
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Boolean,
+                    DataType::Boolean,
+                    DataType::Bigint,
+                    DataType::Bigint,
+                    DataType::Bigint,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                ],
+                rows,
+            ))
+        }
+        "duckdb_views" => {
+            let mut rows = Vec::new();
+            for view in &snapshot.views {
+                let database = snapshot
+                    .databases
+                    .iter()
+                    .find(|database| database.name.eq_ignore_ascii_case(&view.db))
+                    .expect("snapshot view belongs to a database");
+                rows.push(vec![
+                    text(&view.db),
+                    bigint(database.oid),
+                    text(&view.schema),
+                    bigint(view.schema_oid),
+                    text(&view.name),
+                    bigint(view.oid),
+                    null(),
+                    boolean(false),
+                    boolean(false),
+                    bigint(view.columns.as_ref().map_or(0, |columns| columns.len()) as i64),
+                    text_opt(view.sql.as_deref()),
+                    boolean(view.columns.is_some()),
+                ]);
+            }
+            Ok(make(
+                &[
+                    "database_name",
+                    "database_oid",
+                    "schema_name",
+                    "schema_oid",
+                    "view_name",
+                    "view_oid",
+                    "comment",
+                    "internal",
+                    "temporary",
+                    "column_count",
+                    "sql",
+                    "is_bound",
+                ],
+                vec![
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Boolean,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                ],
+                rows,
+            ))
+        }
+        "duckdb_columns" => {
+            let mut rows = Vec::new();
+            for table in &snapshot.tables {
+                let database = snapshot
+                    .databases
+                    .iter()
+                    .find(|database| database.name.eq_ignore_ascii_case(&table.db))
+                    .expect("snapshot table belongs to a database");
+                for (i, column) in table.columns.iter().enumerate() {
+                    let (precision, radix, scale) = duckdb_numeric_meta(column.dtype);
+                    let default = column.default.clone();
+                    rows.push(vec![
+                        text(&table.db),
+                        bigint(database.oid),
+                        text(&table.schema),
+                        bigint(table.schema_oid),
+                        text(&table.name),
+                        bigint(table.oid),
+                        text(&column.name),
+                        integer((i + 1) as i32),
+                        null(),
+                        boolean(false),
+                        text_opt(default.as_deref()),
+                        boolean(!column.not_null),
+                        text(&column.dtype.name()),
+                        bigint(duckdb_data_type_id(column.dtype)),
+                        null(),
+                        precision.map(integer).unwrap_or_else(null),
+                        radix.map(integer).unwrap_or_else(null),
+                        scale.map(integer).unwrap_or_else(null),
+                        boolean(false),
+                        null(),
+                    ]);
+                }
+            }
+            for view in &snapshot.views {
+                let database = snapshot
+                    .databases
+                    .iter()
+                    .find(|database| database.name.eq_ignore_ascii_case(&view.db))
+                    .expect("snapshot view belongs to a database");
+                if let Some(columns) = &view.columns {
+                    for (i, column) in columns.iter().enumerate() {
+                        let (precision, radix, scale) = duckdb_numeric_meta(column.dtype);
+                        rows.push(vec![
+                            text(&view.db),
+                            bigint(database.oid),
+                            text(&view.schema),
+                            bigint(view.schema_oid),
+                            text(&view.name),
+                            bigint(view.oid),
+                            text(&column.name),
+                            integer((i + 1) as i32),
+                            null(),
+                            boolean(false),
+                            null(),
+                            boolean(true),
+                            text(&column.dtype.name()),
+                            bigint(duckdb_data_type_id(column.dtype)),
+                            null(),
+                            precision.map(integer).unwrap_or_else(null),
+                            radix.map(integer).unwrap_or_else(null),
+                            scale.map(integer).unwrap_or_else(null),
+                            boolean(false),
+                            null(),
+                        ]);
+                    }
+                }
+            }
+            Ok(make(
+                &[
+                    "database_name",
+                    "database_oid",
+                    "schema_name",
+                    "schema_oid",
+                    "table_name",
+                    "table_oid",
+                    "column_name",
+                    "column_index",
+                    "comment",
+                    "internal",
+                    "column_default",
+                    "is_nullable",
+                    "data_type",
+                    "data_type_id",
+                    "character_maximum_length",
+                    "numeric_precision",
+                    "numeric_precision_radix",
+                    "numeric_scale",
+                    "is_generated",
+                    "generation_expression",
+                ],
+                vec![
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Integer,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Integer,
+                    DataType::Integer,
+                    DataType::Integer,
+                    DataType::Integer,
+                    DataType::Boolean,
+                    DataType::Varchar,
+                ],
+                rows,
+            ))
+        }
+        _ => unreachable!("bind_duckdb_meta called for {which}"),
+    }
+}
+
+/// DuckDB's `information_schema` views, kept as SQL over the catalog
+/// functions above (design and definitions adapted from DuckDB's
+/// `default_views.cpp`, used under the MIT licence).
+const INFORMATION_SCHEMA_VIEWS: &[(&str, &str)] = &[
+    (
+        "schemata",
+        r#"SELECT database_name AS catalog_name, schema_name, 'duckdb' AS schema_owner, CAST(NULL AS VARCHAR) AS default_character_set_catalog, CAST(NULL AS VARCHAR) AS default_character_set_schema, CAST(NULL AS VARCHAR) AS default_character_set_name, "sql" AS sql_path FROM duckdb_schemas();"#,
+    ),
+    (
+        "tables",
+        r#"SELECT database_name AS table_catalog, schema_name AS table_schema, table_name, CASE WHEN ("temporary") THEN ('LOCAL TEMPORARY') ELSE 'BASE TABLE' END AS table_type, CAST(NULL AS VARCHAR) AS self_referencing_column_name, CAST(NULL AS VARCHAR) AS reference_generation, CAST(NULL AS VARCHAR) AS user_defined_type_catalog, CAST(NULL AS VARCHAR) AS user_defined_type_schema, CAST(NULL AS VARCHAR) AS user_defined_type_name, 'YES' AS is_insertable_into, 'NO' AS is_typed, CASE WHEN ("temporary") THEN ('PRESERVE') ELSE CAST(NULL AS VARCHAR) END AS commit_action, "comment" AS TABLE_COMMENT FROM duckdb_tables() UNION ALL SELECT database_name AS table_catalog, schema_name AS table_schema, view_name AS table_name, 'VIEW' AS table_type, CAST(NULL AS VARCHAR) AS self_referencing_column_name, CAST(NULL AS VARCHAR) AS reference_generation, CAST(NULL AS VARCHAR) AS user_defined_type_catalog, CAST(NULL AS VARCHAR) AS user_defined_type_schema, CAST(NULL AS VARCHAR) AS user_defined_type_name, 'NO' AS is_insertable_into, 'NO' AS is_typed, CAST(NULL AS VARCHAR) AS commit_action, "comment" AS TABLE_COMMENT FROM duckdb_views();"#,
+    ),
+    (
+        "columns",
+        r#"SELECT database_name AS table_catalog, schema_name AS table_schema, table_name, column_name, column_index AS ordinal_position, column_default, CASE WHEN (is_nullable) THEN ('YES') ELSE 'NO' END AS is_nullable, data_type, character_maximum_length, CAST(NULL AS INTEGER) AS character_octet_length, numeric_precision, numeric_precision_radix, numeric_scale, CAST(NULL AS INTEGER) AS datetime_precision, CAST(NULL AS VARCHAR) AS interval_type, CAST(NULL AS INTEGER) AS interval_precision, CAST(NULL AS VARCHAR) AS character_set_catalog, CAST(NULL AS VARCHAR) AS character_set_schema, CAST(NULL AS VARCHAR) AS character_set_name, CAST(NULL AS VARCHAR) AS collation_catalog, CAST(NULL AS VARCHAR) AS collation_schema, CAST(NULL AS VARCHAR) AS collation_name, CAST(NULL AS VARCHAR) AS domain_catalog, CAST(NULL AS VARCHAR) AS domain_schema, CAST(NULL AS VARCHAR) AS domain_name, CAST(NULL AS VARCHAR) AS udt_catalog, CAST(NULL AS VARCHAR) AS udt_schema, CAST(NULL AS VARCHAR) AS udt_name, CAST(NULL AS VARCHAR) AS scope_catalog, CAST(NULL AS VARCHAR) AS scope_schema, CAST(NULL AS VARCHAR) AS scope_name, CAST(NULL AS BIGINT) AS maximum_cardinality, CAST(NULL AS VARCHAR) AS dtd_identifier, CAST(NULL AS BOOL) AS is_self_referencing, CAST(NULL AS BOOL) AS is_identity, CAST(NULL AS VARCHAR) AS identity_generation, CAST(NULL AS VARCHAR) AS identity_start, CAST(NULL AS VARCHAR) AS identity_increment, CAST(NULL AS VARCHAR) AS identity_maximum, CAST(NULL AS VARCHAR) AS identity_minimum, CAST(NULL AS BOOL) AS identity_cycle, CASE WHEN (is_generated) THEN ('ALWAYS') ELSE 'NEVER' END AS is_generated, generation_expression, CAST(NULL AS BOOL) AS is_updatable, "comment" AS COLUMN_COMMENT FROM duckdb_columns();"#,
+    ),
+    (
+        "views",
+        r#"SELECT database_name AS table_catalog, schema_name AS table_schema, view_name AS table_name, "sql" AS view_definition, 'NONE' AS check_option, 'NO' AS is_updatable, 'NO' AS is_insertable_into, 'NO' AS is_trigger_updatable, 'NO' AS is_trigger_deletable, 'NO' AS is_trigger_insertable_into FROM duckdb_views();"#,
+    ),
+];
+
+/// The `pg_catalog` subset DuckDB defines in one short view over the same
+/// functions. Everything else in `pg_catalog` needs constructors pinkdb has
+/// no equivalent for yet.
+const PG_CATALOG_VIEWS: &[(&str, &str)] = &[
+    (
+        "pg_namespace",
+        r#"SELECT oid, schema_name AS nspname, 0 AS nspowner, CAST(NULL AS VARCHAR) AS nspacl FROM duckdb_schemas() WHERE database_name = current_database();"#,
+    ),
+    (
+        "pg_tables",
+        r#"SELECT schema_name AS schemaname, table_name AS tablename, 'duckdb' AS tableowner, CAST(NULL AS VARCHAR) AS "tablespace", (index_count > 0) AS hasindexes, false AS hasrules, false AS hastriggers FROM duckdb_tables();"#,
+    ),
+    (
+        "pg_views",
+        r#"SELECT schema_name AS schemaname, view_name AS viewname, 'duckdb' AS viewowner, "sql" AS definition FROM duckdb_views();"#,
+    ),
+];
+
+fn is_builtin_schema(schema: &str) -> bool {
+    schema.eq_ignore_ascii_case("information_schema") || schema.eq_ignore_ascii_case("pg_catalog")
+}
+
+fn builtin_view_sql(schema: &str, name: &str) -> Option<&'static str> {
+    let views = if schema.eq_ignore_ascii_case("information_schema") {
+        INFORMATION_SCHEMA_VIEWS
+    } else if schema.eq_ignore_ascii_case("pg_catalog") {
+        PG_CATALOG_VIEWS
+    } else {
+        return None;
+    };
+    views
+        .iter()
+        .find(|(view, _)| view.eq_ignore_ascii_case(name))
+        .map(|(_, sql)| *sql)
+}
+
+/// Bind a built-in view as a derived table. The view's SQL is parsed and
+/// bound in its own database, like a stored view body.
+fn bind_builtin_view(
+    db: &PinkDb,
+    binder: &Binder<'_>,
+    dbname: &str,
+    schema: &str,
+    name: &str,
+    alias: &Option<String>,
+) -> Result<(ScopeTable, LogicalPlan)> {
+    if !dbname.eq_ignore_ascii_case("system")
+        && !db
+            .list_databases()
+            .iter()
+            .any(|database| database.eq_ignore_ascii_case(dbname))
+    {
+        return Err(PinkDbError::Catalog(format!(
+            "database \"{dbname}\" not found"
+        )));
+    }
+    let sql = builtin_view_sql(schema, name)
+        .ok_or_else(|| PinkDbError::Catalog(format!("table \"{name}\" not found")))?;
+    let statement = super::parse_statements(sql)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| PinkDbError::Catalog(format!("table \"{name}\" not found")))?;
+    let Statement::Select(select) = statement else {
+        return Err(PinkDbError::Catalog(format!(
+            "built-in view \"{name}\" is not a SELECT"
+        )));
+    };
+    let ns = SchemaPath::new(dbname, schema);
+    let key = format!("{ns}.{name}").to_ascii_lowercase();
+    if binder.views_expanding.borrow().contains(&key) {
+        return Err(PinkDbError::Catalog(format!(
+            "view \"{name}\" is recursive: its definition reads itself through a macro or another view"
+        )));
+    }
+    binder.views_expanding.borrow_mut().push(key);
+    let result = (|| -> Result<(ScopeTable, LogicalPlan)> {
+        let mut child = binder.child();
+        child.default_ns = ns.clone();
+        child.ctes.clear();
+        let plan = bind_select_in(db, &mut child, &select)?;
+        let columns = plan_schema(db, &child.default_ns, &child.ctes, &plan)?;
+        let effective = alias.clone().unwrap_or_else(|| name.to_string());
+        Ok((
+            ScopeTable {
+                name: effective.to_ascii_lowercase(),
+                original: Some(name.to_ascii_lowercase()),
+                ns: Some(ns.clone()),
+                is_alias: alias.is_some(),
+                qualified_only: false,
+                columns,
+            },
+            plan,
+        ))
+    })();
+    binder.views_expanding.borrow_mut().pop();
+    result
+}
+
+struct ShowTableRow {
+    database: String,
+    schema: String,
+    name: String,
+    columns: Vec<String>,
+    types: Vec<String>,
+    temporary: bool,
+}
+
+fn bind_show_all_tables(db: &PinkDb, binder: &Binder<'_>) -> Result<LogicalPlan> {
+    let snapshot = catalog_snapshot(db, binder)?;
+    let mut objects = Vec::new();
+    for table in &snapshot.tables {
+        objects.push(ShowTableRow {
+            database: table.db.clone(),
+            schema: table.schema.clone(),
+            name: table.name.clone(),
+            columns: table.columns.iter().map(|c| c.name.clone()).collect(),
+            types: table.columns.iter().map(|c| c.dtype.name()).collect(),
+            temporary: table.temporary,
+        });
+    }
+    for view in &snapshot.views {
+        let columns = view.columns.as_deref().unwrap_or(&[]);
+        objects.push(ShowTableRow {
+            database: view.db.clone(),
+            schema: view.schema.clone(),
+            name: view.name.clone(),
+            columns: columns.iter().map(|c| c.name.clone()).collect(),
+            types: columns.iter().map(|c| c.dtype.name()).collect(),
+            temporary: false,
+        });
+    }
+    objects.sort_by(|a, b| {
+        a.database
+            .cmp(&b.database)
+            .then_with(|| a.schema.cmp(&b.schema))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let text = |v: &str| BoundExpr::Literal(Value::Varchar(v.to_string()));
+    let names = [
+        "database",
+        "schema",
+        "name",
+        "column_names",
+        "column_types",
+        "temporary",
+    ];
+    let types = [
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Boolean,
+    ];
+    let rows = objects
+        .into_iter()
+        .map(|row| {
+            vec![
+                text(&row.database),
+                text(&row.schema),
+                text(&row.name),
+                text(&duckdb_list_text(row.columns)),
+                text(&duckdb_list_text(row.types)),
+                BoundExpr::Literal(Value::Boolean(row.temporary)),
+            ]
+        })
+        .collect();
+    Ok(LogicalPlan::Values {
+        rows,
+        names: names.iter().map(|name| name.to_string()).collect(),
+        types: types.to_vec(),
+        sources: Vec::new(),
+    })
 }
 
 /// `pinkdb_users()` and `pinkdb_grants()` (wave 121b): the store's users and
@@ -11433,17 +13952,25 @@ fn bind_access(
             }
         }
     } else {
-        names = ["principal", "privilege", "object_type", "database", "name"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        types = vec![DataType::Varchar; 5];
+        names = [
+            "principal",
+            "privilege",
+            "object_type",
+            "database",
+            "schema",
+            "name",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        types = vec![DataType::Varchar; 6];
         for key in &rbac.admins {
             if shown(key) {
                 rows.push(vec![
                     text(&rbac.display_of(key)),
                     text("ADMIN"),
                     text("GLOBAL"),
+                    null(),
                     null(),
                     null(),
                 ]);
@@ -11456,6 +13983,7 @@ fn bind_access(
                         text(&rbac.display_of(member)),
                         text("MEMBER"),
                         text("ROLE"),
+                        null(),
                         null(),
                         text(&rbac.display_of(role)),
                     ]);
@@ -11472,12 +14000,29 @@ fn bind_access(
                             text("DATABASE"),
                             text(dbname),
                             null(),
+                            null(),
                         ]);
                     }
                 }
             }
         }
-        for ((dbname, table), grants) in &rbac.table_grants {
+        for ((dbname, schema), grants) in &rbac.schema_grants {
+            for (principal, privileges) in grants {
+                if shown(principal) {
+                    for privilege in privileges {
+                        rows.push(vec![
+                            text(&rbac.display_of(principal)),
+                            text(privilege.keyword()),
+                            text("SCHEMA"),
+                            text(dbname),
+                            text(schema),
+                            null(),
+                        ]);
+                    }
+                }
+            }
+        }
+        for ((dbname, schema, table), grants) in &rbac.table_grants {
             for (principal, privileges) in grants {
                 if shown(principal) {
                     for privilege in privileges {
@@ -11486,6 +14031,7 @@ fn bind_access(
                             text(privilege.keyword()),
                             text("TABLE"),
                             text(dbname),
+                            text(schema),
                             text(table),
                         ]);
                     }
@@ -11499,7 +14045,7 @@ fn bind_access(
             .unwrap_or_else(|| which.to_string())
             .to_ascii_lowercase(),
         original: None,
-        db: None,
+        ns: None,
         is_alias: alias.is_some(),
         qualified_only: false,
         columns: names.iter().cloned().zip(types.iter().copied()).collect(),
@@ -11596,6 +14142,7 @@ fn bind_column_stats(
             if let Some(principal) = &principal {
                 let object = crate::rbac::GrantObject::Table {
                     db: dbname.clone(),
+                    schema: "main".to_string(),
                     table: tname.clone(),
                 };
                 if !db
@@ -11661,7 +14208,7 @@ fn bind_column_stats(
             .unwrap_or_else(|| "pinkdb_column_stats".to_string())
             .to_ascii_lowercase(),
         original: None,
-        db: None,
+        ns: None,
         is_alias: alias.is_some(),
         qualified_only: false,
         columns: names.iter().cloned().zip(types.iter().copied()).collect(),
@@ -11834,7 +14381,7 @@ fn bind_source_raw(
                     .unwrap_or_else(|| "values".to_string())
                     .to_ascii_lowercase(),
                 original: None,
-                db: None,
+                ns: None,
                 is_alias: alias.is_some(),
                 qualified_only: false,
                 columns: names.iter().cloned().zip(types.iter().copied()).collect(),
@@ -11849,9 +14396,25 @@ fn bind_source_raw(
                 },
             ))
         }
-        FromSource::Table { db: qdb, name } => {
+        FromSource::Table { qual: qdb, name } => {
+            if let Some(schema) = qdb
+                .schema
+                .as_deref()
+                .filter(|schema| is_builtin_schema(schema))
+            {
+                if at.is_some() {
+                    return Err(PinkDbError::Catalog(format!(
+                        "time travel is not available on the built-in view \"{name}\""
+                    )));
+                }
+                let dbname = qdb
+                    .catalog
+                    .clone()
+                    .unwrap_or_else(|| binder.default_ns.db().to_string());
+                return bind_builtin_view(db, binder, &dbname, schema, name, alias);
+            }
             // CTEs shadow everything — but only unqualified names.
-            if qdb.is_none()
+            if qdb.is_empty()
                 && let Some((_, schema)) = binder
                     .ctes
                     .iter()
@@ -11872,19 +14435,19 @@ fn bind_source_raw(
                     ScopeTable {
                         name: eff.to_ascii_lowercase(),
                         original: None,
-                        db: None,
+                        ns: None,
                         is_alias: alias.is_some(),
                         qualified_only: false,
                         columns: schema.clone(),
                     },
                     LogicalPlan::Scan {
-                        db: None,
+                        ns: None,
                         table: name.clone(),
                         at: None,
                     },
                 ));
             }
-            let lookup_db = binder.resolve_db(qdb)?;
+            let lookup_db = binder.resolve_table_ns(qdb, name)?;
             if let Ok(view) = db.view_in(&lookup_db, name) {
                 if binder
                     .params
@@ -11915,7 +14478,7 @@ fn bind_source_raw(
                 }
                 let view = view.clone();
                 let mut child = binder.child();
-                child.default_db = lookup_db.clone();
+                child.default_ns = lookup_db.clone();
                 // A view body is self-contained: the caller's CTEs must not
                 // leak in (a caller CTE named like a table in the body would
                 // silently shadow it; DuckDB resolves the table). The body's
@@ -11932,7 +14495,7 @@ fn bind_source_raw(
                 let sub = bind_select_in(child.db, &mut child, &view.query);
                 binder.views_expanding.borrow_mut().pop();
                 let sub = sub?;
-                let mut schema = plan_schema(child.db, &child.default_db, &child.ctes, &sub)?;
+                let mut schema = plan_schema(child.db, &child.default_ns, &child.ctes, &sub)?;
                 if let Some(cols) = &view.cols {
                     for (s, c) in schema.iter_mut().zip(cols.iter()) {
                         s.0 = c.clone();
@@ -11943,7 +14506,7 @@ fn bind_source_raw(
                     ScopeTable {
                         name: eff.to_ascii_lowercase(),
                         original: Some(name.to_ascii_lowercase()),
-                        db: Some(lookup_db.clone()),
+                        ns: Some(lookup_db.clone()),
                         is_alias: alias.is_some(),
                         qualified_only: false,
                         columns: schema,
@@ -11963,19 +14526,19 @@ fn bind_source_raw(
                 ScopeTable {
                     name: eff.to_ascii_lowercase(),
                     original: Some(name.to_ascii_lowercase()),
-                    db: Some(lookup_db.clone()),
+                    ns: Some(lookup_db.clone()),
                     is_alias: alias.is_some(),
                     qualified_only: false,
                     columns,
                 },
                 LogicalPlan::Scan {
-                    db: Some(lookup_db),
+                    ns: Some(lookup_db),
                     table: name.clone(),
                     at,
                 },
             ))
         }
-        FromSource::Function { name, args } => {
+        FromSource::Function { qual, name, args } => {
             if let Some(at) = at {
                 // The parser refuses `AT` after a function source; a
                 // hand-built AST gets the same clean error.
@@ -11987,9 +14550,21 @@ fn bind_source_raw(
             // Wave 77: a stored table macro expands into the FROM clause.
             // Its body is a self-contained SELECT: the caller's CTEs do not
             // leak in (like a view body), and the substituted arguments see
-            // the current database's catalog.
-            if let Ok(def) = binder.db.macro_in(&binder.default_db, name) {
-                let def = def.clone();
+            // the current database's catalog. Wave 131b: a qualified name
+            // selects the macro's schema, but the body itself stays in the
+            // caller's scope (DuckDB splices macros at the call site).
+            let macro_ns = binder.resolve_ns(qual)?;
+            let macro_def = match binder.db.macro_in(&macro_ns, name) {
+                Ok(def) => Some(def.clone()),
+                Err(_) if qual.is_empty() => None,
+                Err(_) => {
+                    return Err(PinkDbError::Catalog(format!(
+                        "function \"{}{name}\" not found",
+                        qual_text(qual)
+                    )));
+                }
+            };
+            if let Some(def) = macro_def {
                 if !def.is_table() {
                     return Err(PinkDbError::Catalog(format!(
                         "macro \"{name}\" is a scalar macro; call it in an expression"
@@ -12018,13 +14593,13 @@ fn bind_source_raw(
                 let sub = bind_select_in(db, &mut child, &expanded);
                 binder.macro_depth.set(depth - 1);
                 let sub = sub?;
-                let schema = plan_schema(db, &child.default_db, &child.ctes, &sub)?;
+                let schema = plan_schema(db, &child.default_ns, &child.ctes, &sub)?;
                 let eff = alias.clone().unwrap_or_else(|| def.name.clone());
                 return Ok((
                     ScopeTable {
                         name: eff.to_ascii_lowercase(),
                         original: None,
-                        db: None,
+                        ns: None,
                         is_alias: alias.is_some(),
                         qualified_only: false,
                         columns: schema,
@@ -12045,15 +14620,20 @@ fn bind_source_raw(
             // DuckDB's replacement scan: the first registered source that
             // claims the path owns it.
             let call = TableFunctionCall::Path(path.clone());
+            let secrets: Vec<_> = db
+                .visible_secrets(&binder.session)
+                .into_iter()
+                .map(|entry| entry.secret)
+                .collect();
             for source in db.table_sources() {
-                if let Some(schema) = source.bind(&call)? {
+                if let Some(schema) = source.bind_with(&call, &secrets)? {
                     binder.note_extension_package(db.package_of_table_source(source.name()));
                     let eff = alias.clone().unwrap_or_else(|| replacement_scan_name(path));
                     return Ok((
                         ScopeTable {
                             name: eff.to_ascii_lowercase(),
                             original: None,
-                            db: None,
+                            ns: None,
                             is_alias: alias.is_some(),
                             qualified_only: false,
                             columns: schema.clone(),
@@ -12089,12 +14669,12 @@ fn bind_source_raw(
                 Ok(sub) => sub,
                 Err(err) => return Err(lateral_column_error(db, binder, q, err, lateral)),
             };
-            let schema = plan_schema(db, &child.default_db, &binder.ctes, &sub)?;
+            let schema = plan_schema(db, &child.default_ns, &binder.ctes, &sub)?;
             Ok((
                 ScopeTable {
                     name: alias.to_ascii_lowercase(),
                     original: None,
-                    db: None,
+                    ns: None,
                     is_alias: true,
                     qualified_only: false,
                     columns: schema,
@@ -12160,7 +14740,7 @@ fn bind_ctes(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Vec<CtePl
             let (plan, dynamic) = bind_tracked_plan(
                 db,
                 inner,
-                &binder.default_db,
+                &binder.default_ns,
                 binder.params.clone(),
                 &binder.session,
             )?;
@@ -12217,7 +14797,7 @@ fn bind_ctes(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Vec<CtePl
             let step = bind_select_with(db, &mut child, &step_sel)?;
             // The step must produce the anchor's columns: cast each one onto
             // the anchor's type so the growing result keeps one schema.
-            let step_schema = plan_schema(db, &child.default_db, &child.ctes, &step)?;
+            let step_schema = plan_schema(db, &child.default_ns, &child.ctes, &step)?;
             if step_schema.len() != schema.len() {
                 return Err(PinkDbError::Execution(format!(
                     "recursive CTE \"{}\" step has {} columns, its anchor has {}",
@@ -12275,7 +14855,7 @@ fn cte_schema(
     cte: &CteDef,
     query: &LogicalPlan,
 ) -> Result<Vec<(String, DataType)>> {
-    let mut schema = plan_schema(db, &child.default_db, &binder.ctes, query)?;
+    let mut schema = plan_schema(db, &child.default_ns, &binder.ctes, query)?;
     if let Some(cols) = &cte.cols {
         if cols.len() != schema.len() {
             return Err(PinkDbError::Execution(format!(
@@ -12362,7 +14942,7 @@ fn bind_from_scope(db: &PinkDb, binder: &mut Binder, from: &FromClause) -> Resul
         // disambiguates. Every other duplicate keeps the old error.
         let duplicate = binder.tables.iter().any(|t| {
             t.name == right.name
-                && match (&t.db, &right.db) {
+                && match (&t.ns, &right.ns) {
                     (Some(a), Some(b)) => a == b,
                     _ => true,
                 }
@@ -12485,9 +15065,11 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                     // name, because another database may hold the same table
                     // name (`db1.t JOIN db2.t`, wave 94); an alias or a
                     // database-less scope has a unique effective name.
-                    let (db, q) = match (&t.db, t.is_alias) {
-                        (Some(d), false) => (Some(d.clone()), t.name.clone()),
-                        _ => (None, t.name.clone()),
+                    let (qual, q) = match &t.ns {
+                        Some(ns) if !t.is_alias => {
+                            (Qualifier::both(ns.db(), ns.schema()), t.name.clone())
+                        }
+                        _ => (Qualifier::none(), t.name.clone()),
                     };
                     for (name, _) in &t.columns.clone() {
                         if star_excludes(exclude, &mut used, Some(&t.name), name) {
@@ -12495,7 +15077,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                         }
                         pending.push((
                             Expr::Column {
-                                db: db.clone(),
+                                qual: qual.clone(),
                                 table: Some(q.clone()),
                                 name: name.clone(),
                             },
@@ -12505,71 +15087,59 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                 }
                 check_star_excludes(exclude, &used)?;
             }
-            Projection::QualifiedStar { db, table, exclude } => {
-                let star = match db {
-                    Some(d) => format!("{d}.{table}.*"),
-                    None => format!("{table}.*"),
-                };
-                let cols = if let Some(qdb) = db {
-                    // Wave 94: `db.table.*` names an unaliased base table or
-                    // view of `qdb`, exactly like a three-part column.
-                    if !binder.db.database_exists(qdb) {
-                        return Err(PinkDbError::Catalog(format!(
-                            "database \"{qdb}\" not found"
-                        )));
-                    }
+            Projection::QualifiedStar {
+                qual,
+                table,
+                exclude,
+            } => {
+                let star = format!("{}{table}.*", qual_text(qual));
+                let cols = if !qual.is_empty() {
+                    // Wave 131: an unaliased base table whose path ends with
+                    // the prefix (`s.t.*`, `c.s.t.*`); an alias hides it.
                     let mut unaliased = None;
                     let mut aliased_as = None;
                     for t in &binder.tables {
-                        let same_table =
-                            t.db.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(qdb))
-                                && t.original
-                                    .as_deref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(table));
-                        if !same_table {
-                            continue;
-                        }
-                        if t.is_alias {
-                            aliased_as.get_or_insert(t.name.clone());
-                        } else {
-                            unaliased = Some(t.columns.clone());
+                        if let Some(n) = &t.original
+                            && n.eq_ignore_ascii_case(table)
+                            && t.path_matches(qual, table)
+                        {
+                            if t.is_alias {
+                                aliased_as.get_or_insert(t.name.clone());
+                            } else {
+                                unaliased = Some(t);
+                            }
+                            break;
                         }
                     }
-                    if let Some(cols) = unaliased {
-                        cols
+                    if let Some(t) = unaliased {
+                        t.columns.clone()
                     } else if let Some(alias) = aliased_as {
                         return Err(PinkDbError::Catalog(format!(
-                            "table \"{qdb}.{table}\" is aliased as \"{alias}\" in this query; \
+                            "table \"{star}\" is aliased as \"{alias}\" in this query; \
                              refer to its columns as {alias}.*"
                         )));
                     } else {
                         return Err(PinkDbError::Catalog(format!(
-                            "no table \"{qdb}.{table}\" in this query's FROM clause"
+                            "table \"{star}\" is not in the FROM clause"
                         )));
                     }
                 } else {
-                    let matches: Vec<&ScopeTable> = binder
-                        .tables
-                        .iter()
-                        .filter(|t| t.name.eq_ignore_ascii_case(table))
-                        .collect();
-                    match matches.as_slice() {
-                        [] => {
-                            return Err(PinkDbError::Catalog(format!(
-                                "no table \"{table}\" for `{star}`"
-                            )));
-                        }
-                        [t] => t.columns.clone(),
-                        many => {
-                            let names: Vec<String> =
-                                many.iter().map(|t| t.qualified_name()).collect();
-                            return Err(PinkDbError::Catalog(format!(
-                                "table reference \"{star}\" is ambiguous: table name \"{table}\" \
-                                 matches {}; use db.{table}.* or an alias",
-                                names.join(" and ")
-                            )));
+                    let mut found: Option<&ScopeTable> = None;
+                    for t in &binder.tables {
+                        if t.name.eq_ignore_ascii_case(table) {
+                            if found.is_some() {
+                                return Err(PinkDbError::Catalog(format!(
+                                    "column reference \"{star}\" is ambiguous: table name \
+                                     \"{table}\" matches more than one FROM item; use the \
+                                     three-part form db.{table}.* or an alias"
+                                )));
+                            }
+                            found = Some(t);
                         }
                     }
+                    found.map(|t| t.columns.clone()).ok_or_else(|| {
+                        PinkDbError::Catalog(format!("table \"{table}\" is not in the FROM clause"))
+                    })?
                 };
                 let mut used = vec![false; exclude.len()];
                 for (name, _) in &cols {
@@ -12578,7 +15148,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                     }
                     pending.push((
                         Expr::Column {
-                            db: db.clone(),
+                            qual: qual.clone(),
                             table: Some(table.clone()),
                             name: name.clone(),
                         },
@@ -12893,10 +15463,11 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         }
         // Select alias → reuse that output (no hidden column).
         if let Expr::Column {
-            db: None,
+            qual,
             table: None,
             name,
         } = &item.expr
+            && qual.is_empty()
             && let Some(pos) = proj_names[..visible]
                 .iter()
                 .position(|n| n.eq_ignore_ascii_case(name))
@@ -13068,6 +15639,12 @@ fn bind_create_database_options(
             "READ_ONLY and VERSION apply to ATTACH, not to CREATE DATABASE".to_string(),
         ));
     }
+    if options.create_if_not_exists {
+        return Err(PinkDbError::Catalog(
+            "CREATE_IF_NOT_EXISTS applies to ATTACH, not to CREATE DATABASE".to_string(),
+        ));
+    }
+    refuse_unsupported_lake_options(options)?;
     if options.data.is_some() && options.catalog.is_none() {
         return Err(PinkDbError::Catalog(
             "DATA needs a CATALOG: a managed lake keeps its data under the store's lake \
@@ -13080,25 +15657,106 @@ fn bind_create_database_options(
         data: options.data.clone(),
         read_only: false,
         version: None,
+        data_inlining_row_limit: options.data_inlining_row_limit,
+        create_if_not_exists: false,
+        data_file_format: None,
     }))
 }
 
-/// `ATTACH`'s location and options (wave 124): a lake, named with the
-/// `lake:` prefix or `TYPE LAKE`.
+/// DuckLake options pinkdb parses but does not implement. Refused by name, so
+/// a caller never thinks an option took effect.
+fn refuse_unsupported_lake_options(options: &crate::sql::ast::DatabaseOptions) -> Result<()> {
+    if let Some(time) = &options.snapshot_time {
+        return Err(PinkDbError::Catalog(format!(
+            "SNAPSHOT_TIME '{time}' is not supported: pin the attachment with SNAPSHOT_VERSION n \
+             (the lake's version is what pinkdb can select)"
+        )));
+    }
+    if options.metadata_schema.is_some() {
+        return Err(PinkDbError::Catalog(
+            "METADATA_SCHEMA is not supported: pink-lake keeps the DuckLake metadata tables in \
+             the catalog's own (default) schema"
+                .to_string(),
+        ));
+    }
+    if options.encrypted {
+        return Err(PinkDbError::Catalog(
+            "ENCRYPTED is not supported per attachment (encrypted DuckLakes are a follow-up): \
+             pinkdb encrypts a lake's files with the store key (PINKDB_KEY) when the lake catalog \
+             is encrypted"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The catalog inside a `ducklake:` location: a SQLite file, a Postgres
+/// catalog (URI or libpq conninfo), or a refusal naming the DuckDB database
+/// file pinkdb cannot open.
+fn ducklake_catalog(rest: &str) -> Result<String> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Err(PinkDbError::Catalog(
+            "ATTACH 'ducklake:' needs a catalog: sqlite:<path> or postgres:<conninfo>".to_string(),
+        ));
+    }
+    if let Some(path) = rest.strip_prefix("sqlite:") {
+        if path.is_empty() {
+            return Err(PinkDbError::Catalog(
+                "ATTACH 'ducklake:sqlite:' needs a path".to_string(),
+            ));
+        }
+        return Ok(format!("sqlite:{path}"));
+    }
+    if let Some(conn) = rest.strip_prefix("postgres:") {
+        if conn.is_empty() {
+            return Err(PinkDbError::Catalog(
+                "ATTACH 'ducklake:postgres:' needs a libpq conninfo or a postgres:// URI"
+                    .to_string(),
+            ));
+        }
+        // libpq takes both spellings: a URI passes through unchanged, a
+        // conninfo keeps the `postgres:` prefix so pink-lake reads it as a
+        // remote catalog, not as a local path.
+        if conn.starts_with("postgres://") || conn.starts_with("postgresql://") {
+            return Ok(conn.to_string());
+        }
+        return Ok(format!("postgres:{conn}"));
+    }
+    Err(PinkDbError::Catalog(format!(
+        "ATTACH 'ducklake:…' needs a sqlite: or postgres: catalog; '{}' names a DuckDB \
+         database file, which pinkdb cannot open",
+        crate::lake_db::redact_location(rest)
+    )))
+}
+
+/// `ATTACH`'s location and options (wave 124, DuckLake form in wave 132b): a
+/// lake, named with the `lake:` / `ducklake:` prefix or `TYPE LAKE`.
+///
+/// A password in a Postgres catalog location (URI userinfo or conninfo
+/// `password=`) is moved into a persistent `postgres` secret scoped to the
+/// redacted location: the spec that reaches the footer and the WAL never
+/// carries it. The returned secret is installed by the executor before the
+/// attach.
 fn bind_attach_options(
+    database: &str,
     location: &str,
     options: &crate::sql::ast::DatabaseOptions,
-) -> Result<crate::lake_db::LakeSpec> {
-    let catalog = match location.strip_prefix("lake:") {
-        Some(rest) => rest,
-        None if options.lake => location,
-        None => {
-            return Err(PinkDbError::Catalog(format!(
-                "ATTACH '{}' is not a lake: name a lake with the lake: prefix or TYPE LAKE \
-                 (attaching a .pink file is not supported yet)",
-                crate::lake_db::redact_location(location)
-            )));
-        }
+) -> Result<(crate::lake_db::LakeSpec, Option<crate::secret::Secret>)> {
+    let ducklake = location.strip_prefix("ducklake:");
+    let catalog = match ducklake {
+        Some(rest) => ducklake_catalog(rest)?,
+        None => match location.strip_prefix("lake:") {
+            Some(rest) => rest.to_string(),
+            None if options.lake => location.to_string(),
+            None => {
+                return Err(PinkDbError::Catalog(format!(
+                    "ATTACH '{}' is not a lake: name a lake with the lake: or ducklake: prefix \
+                     or TYPE LAKE (attaching a .pink file is not supported yet)",
+                    crate::lake_db::redact_location(location)
+                )));
+            }
+        },
     };
     if catalog.trim().is_empty() {
         return Err(PinkDbError::Catalog(
@@ -13115,12 +15773,51 @@ fn bind_attach_options(
             "VERSION pins a read-only attachment: add READ_ONLY".to_string(),
         ));
     }
-    Ok(crate::lake_db::LakeSpec {
-        catalog: Some(catalog.to_string()),
-        data: options.data.clone(),
-        read_only: options.read_only,
-        version: options.version,
-    })
+    if options.create_if_not_exists && options.read_only {
+        return Err(PinkDbError::Catalog(
+            "CREATE_IF_NOT_EXISTS cannot create a READ_ONLY attachment".to_string(),
+        ));
+    }
+    refuse_unsupported_lake_options(options)?;
+    let (catalog, password) = if ducklake.is_some() {
+        crate::lake_db::split_catalog_password(&catalog)
+    } else {
+        (catalog, None)
+    };
+    // Defensive: no location that still carries a password may reach the
+    // footer or a WAL statement.
+    if crate::lake_db::location_has_password(&catalog) {
+        return Err(PinkDbError::Catalog(format!(
+            "lake location {} carries a password: give credentials through a secret \
+             (CREATE SECRET … TYPE postgres) or the environment (PGPASSWORD)",
+            crate::lake_db::redact_location(&catalog)
+        )));
+    }
+    let secret = match password {
+        Some(password) => Some(crate::secret::Secret::new(
+            Some(format!("__attach_{}", database.to_ascii_lowercase())),
+            crate::secret::SecretType::Postgres,
+            vec![
+                ("PASSWORD".to_string(), password),
+                ("SCOPE".to_string(), catalog.clone()),
+            ],
+        )?),
+        None => None,
+    };
+    Ok((
+        crate::lake_db::LakeSpec {
+            catalog: Some(catalog),
+            data: options.data.clone(),
+            read_only: options.read_only,
+            version: options.version,
+            data_inlining_row_limit: options.data_inlining_row_limit,
+            // DuckLake's ATTACH creates the catalog when the database is
+            // empty; pinkdb's own `lake:` scheme keeps the explicit option.
+            create_if_not_exists: ducklake.is_some() || options.create_if_not_exists,
+            data_file_format: ducklake.map(|_| "parquet".to_string()),
+        },
+        secret,
+    ))
 }
 
 /// `pinkdb_lake_decodes()` (wave 124): the data-file decode counters of every
@@ -13173,7 +15870,7 @@ fn bind_lake_decodes(
             .unwrap_or_else(|| "pinkdb_lake_decodes".to_string())
             .to_ascii_lowercase(),
         original: None,
-        db: None,
+        ns: None,
         is_alias: alias.is_some(),
         qualified_only: false,
         columns: names.iter().cloned().zip(types.iter().copied()).collect(),
@@ -13210,12 +15907,13 @@ mod tests {
 
     fn bind_one(db: &PinkDb, sql: &str) -> Result<LogicalPlan> {
         let stmts = parse_statements(sql).unwrap();
-        bind(db, &stmts[0], "main")
+        bind(db, &stmts[0], &SchemaPath::main("main"))
     }
 
-    fn bind_in(db: &PinkDb, sql: &str, default_db: &str) -> Result<LogicalPlan> {
+    fn bind_in(db: &PinkDb, sql: &str, default_ns: impl Into<SchemaPath>) -> Result<LogicalPlan> {
+        let default_ns = default_ns.into();
         let stmts = parse_statements(sql).unwrap();
-        bind(db, &stmts[0], default_db)
+        bind(db, &stmts[0], &default_ns)
     }
 
     /// The database of the first `Scan` under the top projection.
@@ -13223,7 +15921,7 @@ mod tests {
         match plan {
             LogicalPlan::Project { input, .. } => scan_db(input),
             LogicalPlan::Cte { body, .. } => scan_db(body),
-            LogicalPlan::Scan { db, .. } => db.clone(),
+            LogicalPlan::Scan { ns, .. } => ns.as_ref().map(|n| n.db().to_string()),
             other => panic!("no scan in plan: {other:?}"),
         }
     }
@@ -13332,7 +16030,7 @@ mod tests {
         let Statement::Select(sel) = &stmts[0] else {
             panic!("expected SELECT")
         };
-        let mut binder = Binder::new(&db, "main");
+        let mut binder = Binder::new(&db, &SchemaPath::main("main"));
         let err = bind_select_with(&db, &mut binder, sel).unwrap_err();
         assert!(matches!(err, PinkDbError::Execution(_)), "{err:?}");
         assert!(err.to_string().contains("bind_select_in"), "{err}");
@@ -13362,10 +16060,20 @@ mod tests {
         // `main.t` has one column; `db1.t` has two.
         let main_plan = bind_in(&db, "SELECT * FROM t;", "main").unwrap();
         assert_eq!(scan_db(&main_plan).as_deref(), Some("main"));
-        assert_eq!(plan_schema(&db, "main", &[], &main_plan).unwrap().len(), 1);
+        assert_eq!(
+            plan_schema(&db, &SchemaPath::main("main"), &[], &main_plan)
+                .unwrap()
+                .len(),
+            1
+        );
         let db1_plan = bind_in(&db, "SELECT * FROM t;", "db1").unwrap();
         assert_eq!(scan_db(&db1_plan).as_deref(), Some("db1"));
-        assert_eq!(plan_schema(&db, "db1", &[], &db1_plan).unwrap().len(), 2);
+        assert_eq!(
+            plan_schema(&db, &SchemaPath::main("db1"), &[], &db1_plan)
+                .unwrap()
+                .len(),
+            2
+        );
         // A column that only exists in db1.t fails when bound on main.
         assert!(bind_in(&db, "SELECT b FROM t;", "main").is_err());
         assert!(bind_in(&db, "SELECT b FROM t;", "db1").is_ok());
@@ -13378,12 +16086,16 @@ mod tests {
             let plan = bind_in(&db, "SELECT a FROM db1.t;", session).unwrap();
             assert_eq!(scan_db(&plan).as_deref(), Some("db1"));
         }
-        let plan = bind_in(&db, "SELECT a FROM main.t;", "db1").unwrap();
+        // `main` is both a database and `main.t`'s schema reading from db1:
+        // decision 4 refuses that ambiguity rather than guessing.
+        let err = bind_in(&db, "SELECT a FROM main.t;", "db1").unwrap_err();
+        assert!(err.to_string().contains("ambiguous reference"), "{err}");
+        let plan = bind_in(&db, "SELECT a FROM main.main.t;", "db1").unwrap();
         assert_eq!(scan_db(&plan).as_deref(), Some("main"));
         // Unknown database / table errors are clear.
         let err = bind_in(&db, "SELECT * FROM nope.t;", "main").unwrap_err();
         assert!(
-            err.to_string().contains("database \"nope\" not found"),
+            err.to_string().contains("schema \"nope\" not found"),
             "{err}"
         );
         let err = bind_in(&db, "SELECT * FROM db1.missing;", "main").unwrap_err();
@@ -13420,7 +16132,7 @@ mod tests {
         let db = multi_db();
         assert!(matches!(
             bind_one(&db, "USE db1;").unwrap(),
-            LogicalPlan::Use { name } if name == "db1"
+            LogicalPlan::Use { ns } if ns == SchemaPath::main("db1")
         ));
         assert!(matches!(
             bind_one(&db, "USE MAIN;").unwrap(),
@@ -13428,7 +16140,8 @@ mod tests {
         ));
         let err = bind_one(&db, "USE nope;").unwrap_err();
         assert!(
-            err.to_string().contains("database \"nope\" not found"),
+            err.to_string()
+                .contains("database or schema \"nope\" not found"),
             "{err}"
         );
         assert!(matches!(
@@ -13446,32 +16159,32 @@ mod tests {
         let db = multi_db();
         assert!(matches!(
             bind_one(&db, "CREATE TABLE db1.u (x BIGINT);").unwrap(),
-            LogicalPlan::CreateTable { db: Some(d), name, .. } if d == "db1" && name == "u"
+            LogicalPlan::CreateTable { ns: Some(d), name, .. } if d.db() == "db1" && name == "u"
         ));
         assert!(matches!(
             bind_one(&db, "INSERT INTO db1.t VALUES (1, 'x');").unwrap(),
-            LogicalPlan::Insert { db: Some(d), .. } if d == "db1"
+            LogicalPlan::Insert { ns: Some(d), .. } if d.db() == "db1"
         ));
         assert!(matches!(
             bind_one(&db, "UPDATE db1.t SET a = 2;").unwrap(),
-            LogicalPlan::Update { db: Some(d), .. } if d == "db1"
+            LogicalPlan::Update { ns: Some(d), .. } if d.db() == "db1"
         ));
         assert!(matches!(
             bind_one(&db, "DELETE FROM db1.t;").unwrap(),
-            LogicalPlan::Delete { db: Some(d), .. } if d == "db1"
+            LogicalPlan::Delete { ns: Some(d), .. } if d.db() == "db1"
         ));
         assert!(matches!(
             bind_one(&db, "DROP TABLE db1.t;").unwrap(),
-            LogicalPlan::DropTable { db: Some(d), .. } if d == "db1"
+            LogicalPlan::DropTable { ns: Some(d), .. } if d.db() == "db1"
         ));
         // Unqualified DDL/DML resolves to the session database.
         assert!(matches!(
             bind_in(&db, "INSERT INTO t VALUES (1, 'x');", "db1").unwrap(),
-            LogicalPlan::Insert { db: Some(d), .. } if d == "db1"
+            LogicalPlan::Insert { ns: Some(d), .. } if d.db() == "db1"
         ));
         // A DML statement against a missing database is a clean error.
         let err = bind_one(&db, "INSERT INTO nope.t VALUES (1);").unwrap_err();
-        assert!(err.to_string().contains("database \"nope\""), "{err}");
+        assert!(err.to_string().contains("schema \"nope\""), "{err}");
     }
 
     #[test]
@@ -13499,5 +16212,40 @@ mod tests {
         // `v` is not visible from main, and `src` does not exist there.
         let err = bind_in(&db, "SELECT * FROM v;", "main").unwrap_err();
         assert!(err.to_string().contains("table \"v\" not found"), "{err}");
+    }
+
+    #[test]
+    fn attach_password_moves_into_a_scoped_secret() {
+        use crate::secret::SecretType;
+
+        let (spec, secret) = bind_attach_options(
+            "warehouse",
+            "ducklake:postgres:postgres://user:hunter2@127.0.0.1:55433/lake?sslmode=require",
+            &crate::sql::ast::DatabaseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            spec.catalog.as_deref(),
+            Some("postgres://user@127.0.0.1:55433/lake?sslmode=require")
+        );
+        let secret = secret.expect("a URI password mints a secret");
+        assert_eq!(secret.name(), "__attach_warehouse");
+        assert_eq!(secret.type_(), SecretType::Postgres);
+        assert_eq!(secret.field("PASSWORD"), Some("hunter2"));
+        assert_eq!(secret.scopes(), vec![spec.catalog.clone().unwrap()]);
+        assert!(!format!("{spec:?}").contains("hunter2"));
+
+        let (spec, secret) = bind_attach_options(
+            "w",
+            "ducklake:postgres:postgres:host=h user=u password='p w' dbname=d",
+            &crate::sql::ast::DatabaseOptions::default(),
+        )
+        .unwrap();
+        let catalog = spec.catalog.unwrap();
+        assert!(
+            !catalog.contains("password") && !catalog.contains("p w"),
+            "{catalog}"
+        );
+        assert_eq!(secret.unwrap().field("PASSWORD"), Some("p w"));
     }
 }

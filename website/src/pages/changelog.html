@@ -17,6 +17,18 @@ progress log</a>.</p>
 <li><strong><code>COALESCE</code></strong> is evaluated a vector at a time.</li>
 <li><strong>GROUP BY with millions of groups</strong> merges per-chunk partial tables without copying their keys and without a final sort: 17–21 % faster on QuackLab's 1.9M-group fact roll-up, 250 MB less memory.</li>
 </ul>
+<h3>Wave 132 — DuckLake interop ✅</h3>
+<p>pinkdb opens the DuckLakes stock DuckDB writes and writes ones DuckDB reads, with QuackLab's own attach sequence.</p>
+<ul>
+<li><strong><code>ATTACH 'ducklake:…'</code></strong> with <code>sqlite:</code>, <code>postgres:&lt;conninfo&gt;</code> and <code>postgres:postgresql://…</code> catalogs and DuckLake's options (<code>DATA_PATH</code>, <code>READ_ONLY</code>, <code>SNAPSHOT_VERSION</code>, <code>CREATE_IF_NOT_EXISTS</code>, <code>DATA_INLINING_ROW_LIMIT</code>); options pinkdb lacks are refused by name.</li>
+<li><strong>Secrets:</strong> <code>CREATE [OR REPLACE] [PERSISTENT | TEMPORARY] SECRET</code> for <code>s3</code>, <code>r2</code>, <code>gcs</code> and <code>postgres</code>, <code>DROP SECRET</code>, <code>duckdb_secrets()</code>, <code>which_secret()</code>. Lake data, <code>read_csv</code>/<code>read_parquet</code> over <code>s3://</code> and Postgres catalogs use the matching secret. A password in an <code>ATTACH</code> string is kept as a secret; no secret value reaches the WAL, statement history, <code>SHOW</code> or errors.</li>
+<li><strong>Reading DuckDB's lakes:</strong> catalog versions <code>1.1-dev1</code> to <code>1.3</code>, DuckLake's path rules (including absolute paths), Parquet delete files and inlined deletes.</li>
+<li><strong>Writing for DuckDB:</strong> the catalog tables have DuckDB's exact columns and types, and <code>ducklake:</code> lakes write Parquet data and delete files (server feature <code>parquetlake</code>).</li>
+<li><strong>DuckLake's functions in SQL:</strong> <code>ducklake_snapshots</code>, <code>table_info</code>, <code>list_files</code>, <code>table_changes</code> / <code>insertions</code> / <code>deletions</code>, <code>options</code>, <code>settings</code>, <code>current_snapshot</code>, <code>last_committed_snapshot</code>, and <code>CALL</code>s for flushing inlined data, expiring snapshots, compaction, cleanup, <code>set_option</code> (including <code>CALL db.set_option(…)</code>) and commit messages. The CLI's matching <code>.lake</code> dot-commands are gone.</li>
+<li><strong>Formats:</strong> <code>.pink</code> footer version 6 and WAL version 6; files from earlier builds are refused.</li>
+</ul>
+<h3>Wave 126a — decimal literals typed like DuckDB ✅</h3>
+<p><code>1.5</code> is now <code>DECIMAL(2,1)</code>, as in DuckDB, instead of <code>DOUBLE</code>, so arithmetic with decimal columns keeps DuckDB's types and exact values: <code>x - 1.5</code> over a <code>DECIMAL(15,2)</code> column is <code>DECIMAL(16,2)</code>, <code>0.1 + 0.2</code> is <code>0.3</code>, and unaliased column names keep the literal as written (<code>(10 / 4.0)</code>). Literals with an exponent (<code>1e3</code>) or more than 38 digits stay <code>DOUBLE</code>; array literals keep <code>DOUBLE</code> elements. Filters against a column convert the literal once, so queries run as fast as before.</p>
 <h3>Wave 140 — QuackLab's ETL hot spots ✅</h3>
 <p>QuackLab's ETL on its NYC-taxi benchmark (local storage) went from 68 s to 1.8 s for the 1.87M-row initial batch (DuckDB: 2.2 s on the same machine), from 43 s to 1.5 s for the next batch and from 15 s to 1.4 s for a one-row correction. Results are unchanged.</p>
 <ul>
@@ -24,6 +36,37 @@ progress log</a>.</p>
 <li><strong><code>MERGE</code></strong> matches with a hash table, evaluates <code>ON</code>, the clause conditions and the <code>SET</code> / <code>INSERT</code> values a chunk at a time, skips target chunks that cannot match, and writes in bulk. One source row into 1.92M rows: 6.6 s → 0.09 s; 960k matched rows: 45 s → 0.7 s; 1.92M inserts into an empty table: 0.24 s. <code>UPDATE … FROM</code> and <code>DELETE … USING</code> probe the same way.</li>
 <li><strong><code>CREATE TABLE … AS SELECT</code> and <code>INSERT … SELECT</code></strong> append whole column vectors instead of one row at a time (1.92M × 18 columns: 1.5 s → 0.06 s).</li>
 <li><strong>Fixed:</strong> <code>RETURNING</code>, a data-modifying CTE and a <code>REFERENCING</code> transition table failed with "vector overflow" past 2048 rows.</li>
+</ul>
+<h3>Wave 139 — QuackLab leftovers: defaults, uuid(), TEMP tables ✅</h3>
+<p>QuackLab's golden fixtures now run with their column defaults as written (117 of 117, no workaround left in the harness).</p>
+<ul>
+<li><strong>Column defaults are expressions</strong>, evaluated for every row that takes them: <code>DEFAULT now()</code>, <code>DEFAULT uuid()</code>, <code>DEFAULT 'now()'</code> (which, as in DuckDB, creates fine and fails at insert), the <code>DEFAULT</code> keyword in <code>VALUES</code> and <code>UPDATE … SET</code>, <code>INSERT … DEFAULT VALUES</code>, and <code>ADD COLUMN … DEFAULT</code> per existing row. <code>information_schema.columns</code> shows the written expression.</li>
+<li><strong><code>uuid()</code>, <code>gen_random_uuid()</code> and <code>random()</code> in writes</strong>, replayed exactly after a crash: each statement's values come from a seed recorded in the WAL.</li>
+<li><strong>A <code>UUID</code> type</strong>, with DuckDB's text forms, ordering, Parquet encoding and DuckLake type name.</li>
+<li><strong><code>CREATE TEMP TABLE</code></strong>: per-session, never persisted, found before persistent tables of the same name, as in DuckDB. A durable local write that reads one is refused; loading a lake from one is allowed.</li>
+<li><strong>Fixed:</strong> <code>now()</code> inside a procedure body, <code>DO</code> block or trigger action did not replay with its original instant; <code>x IS NOT NULL</code> and similar expressions are now named as in DuckDB.</li>
+<li><strong>Formats:</strong> <code>.pink</code> footer version 5, wire protocol 15.</li>
+<li>LIST and STRUCT are scoped in <code>docs/nested-types-plan.md</code>, not built: QuackLab's SQL uses neither.</li>
+</ul>
+<h2>2026-10-31</h2>
+<h3>Wave 131 — schemas and three-part names ✅</h3>
+<p>Every database now holds schemas, as in DuckDB: <code>catalog.schema.table</code> works everywhere a table is named, and QuackLab's SQL runs as written — <code>r2_cat."master"."FACT"</code>, a <code>CREATE SCHEMA</code> per model — with no workaround (117 of 117 golden statements and setups DuckDB runs).</p>
+<ul>
+<li><strong>SQL:</strong> <code>CREATE SCHEMA [IF NOT EXISTS]</code>, <code>DROP SCHEMA [IF EXISTS] … [CASCADE | RESTRICT]</code>, <code>USE db.schema</code> / <code>USE schema</code>, <code>current_database()</code>, <code>current_schema()</code>, <code>current_schemas()</code>. Names take up to three parts and column references up to four; <code>x.t</code> is database <code>x</code> or schema <code>x</code> by DuckDB's rule, and an ambiguous <code>x</code> is an error naming both readings. Macros can be called as <code>s.m()</code> and expand in the caller's schema, as in DuckDB; views, materialized views, procedures and triggers bind in their own. Cross-schema foreign keys are refused.</li>
+<li><strong>Catalog functions:</strong> <code>duckdb_databases()</code>, <code>duckdb_schemas()</code>, <code>duckdb_tables()</code>, <code>duckdb_views()</code>, <code>duckdb_columns()</code>, <code>information_schema.{schemata,tables,columns,views}</code>, a few <code>pg_catalog</code> views and <code>SHOW ALL TABLES</code>, with DuckDB's columns; <code>pinkdb_catalog()</code> gains a <code>schema</code> column.</li>
+<li><strong>Access control:</strong> <code>GRANT … ON SCHEMA s</code> covers every table of the schema, including later ones; table grants name their schema.</li>
+<li><strong>Lakes:</strong> a lake database shows every DuckLake schema of its lake, and <code>CREATE SCHEMA</code> / <code>DROP SCHEMA</code> reach the lake's catalog.</li>
+<li><strong>Console:</strong> a schema selector beside the database, schemas (empty ones too) in the explorer, three-part names in generated SQL, schema grants.</li>
+<li><strong>Formats:</strong> <code>.pink</code> footer version 4, WAL frame sets format 2, lake image format 2 and wire protocol 14; files from earlier builds are refused.</li>
+<li><strong>Fixed:</strong> an uncorrelated subquery in a join condition re-ran on every probe chunk instead of once per join.</li>
+<li><strong>Fixed:</strong> the console's Preview of a table never finished (the new tab lost its state when the explorer refreshed).</li>
+</ul>
+<h3>Wave 130 — the QuackLab benchmark ✅</h3>
+<p><code>bench/quacklab/run.py</code> measures QuackLab's own workload on pinkdb and DuckDB on the same machine: the NYC-taxi model compiled by QuackLab's compiler, its ETL plan per batch, a full refresh of its 55 materialized views, and 12 dashboard widgets at 1, 4 and 16 concurrent clients, plus cold start and peak memory, on local storage and on a lake (Postgres catalog, S3 data).</p>
+<ul>
+<li>pinkdb runs QuackLab's statements as emitted first and records what blocks them (schemas: wave 131; DuckLake <code>ATTACH</code>: wave 132), then a labelled workaround. Dialect gaps it works around are probed and listed with pinkdb's error, and stop being shimmed once pinkdb accepts them.</li>
+<li>Results agree between the engines (table counts, widget rows).</li>
+<li><code>crates/pinkdb-server/examples/chart_load.rs</code>: a concurrent chart-query load client for pinkdb-server.</li>
 </ul>
 <h2>2026-10-30</h2>
 <h3>Wave 129 — QuackLab's DuckDB dialect ✅</h3>

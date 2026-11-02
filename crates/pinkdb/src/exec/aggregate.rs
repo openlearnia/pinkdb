@@ -50,6 +50,10 @@ pub(crate) fn encode_value(buf: &mut Vec<u8>, v: &Value) {
             buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
         }
+        Value::Uuid(bits) => {
+            buf.push(15);
+            buf.extend_from_slice(&bits.to_le_bytes());
+        }
         // Dates encode as their raw payloads under distinct tags so same-type
         // equality (GROUP BY / DISTINCT / JOIN) never mixes them with ints.
         Value::Date(d) => {
@@ -61,7 +65,9 @@ pub(crate) fn encode_value(buf: &mut Vec<u8>, v: &Value) {
             buf.extend_from_slice(&us.to_le_bytes());
         }
         // DECIMAL keys carry their scale (same encoding as the vector path).
-        Value::Decimal(v, scale) => {
+        Value::Decimal {
+            value: v, scale, ..
+        } => {
             buf.push(8);
             buf.push(*scale);
             buf.extend_from_slice(&v.to_le_bytes());
@@ -727,7 +733,10 @@ impl Acc {
                 _ => {}
             },
             Acc::SumDecimal { .. } => {
-                if let Some(Value::Decimal(x, scale)) = arg {
+                if let Some(Value::Decimal {
+                    value: x, scale, ..
+                }) = arg
+                {
                     self.add_decimal(*x, *scale);
                 }
             }
@@ -735,7 +744,9 @@ impl Acc {
                 Some(Value::Integer(i)) => avg.add_int(*i as i128),
                 Some(Value::Bigint(i)) => avg.add_int(*i as i128),
                 Some(Value::Double(x)) => avg.add_f64(*x),
-                Some(Value::Decimal(x, scale)) => avg.add_decimal(*x, *scale),
+                Some(Value::Decimal {
+                    value: x, scale, ..
+                }) => avg.add_decimal(*x, *scale),
                 _ => {}
             },
             Acc::MinMax { cur, is_min } => {
@@ -833,7 +844,7 @@ impl Acc {
             Acc::Collect(_) => {
                 unreachable!("COUNT(DISTINCT) and ordered-set aggregates use update_vec")
             }
-            other => other.update(Some(&Value::Decimal(x, scale))),
+            other => other.update(Some(&Value::decimal(x, scale))),
         }
     }
 
@@ -1099,7 +1110,7 @@ impl Acc {
                             .to_string(),
                     ));
                 } else {
-                    Value::Decimal(*sum, *scale)
+                    Value::decimal(*sum, *scale)
                 }
             }
             Acc::Avg(avg) => avg.finalize(),
@@ -1164,7 +1175,7 @@ fn ordered_set_result(vals: &[Value], kind: OrderedSet, dtype: DataType) -> Resu
                                 "Overflow in percentile_cont: {x} does not fit in {dtype}"
                             ))
                         })?;
-                    Value::Decimal(mantissa, scale)
+                    Value::decimal(mantissa, scale)
                 }
                 _ => Value::Double(x),
             }
@@ -1178,7 +1189,9 @@ fn as_f64(v: &Value) -> f64 {
         Value::Integer(i) => f64::from(*i),
         Value::Bigint(i) => *i as f64,
         Value::Double(x) => *x,
-        Value::Decimal(m, s) => crate::types::decimal_to_f64(*m, *s),
+        Value::Decimal {
+            value: m, scale: s, ..
+        } => crate::types::decimal_to_f64(*m, *s),
         Value::Date(d) => f64::from(*d),
         Value::Timestamp(t) => *t as f64,
         _ => f64::NAN,
@@ -1198,9 +1211,14 @@ fn compare_cell(data: &VectorData, i: usize, c: &Value) -> std::cmp::Ordering {
         (VectorData::VarChar(d), Value::Varchar(y)) => d[i].cmp(y.as_str()),
         (VectorData::Date32(d), Value::Date(y)) => d[i].cmp(y),
         (VectorData::TimestampMicros(d), Value::Timestamp(y)) => d[i].cmp(y),
-        (VectorData::Decimal { values, scale, .. }, Value::Decimal(y, ys)) => {
-            crate::types::decimal_cmp(values[i], *scale, *y, *ys)
-        }
+        (
+            VectorData::Decimal { values, scale, .. },
+            Value::Decimal {
+                value: y,
+                scale: ys,
+                ..
+            },
+        ) => crate::types::decimal_cmp(values[i], *scale, *y, *ys),
         (VectorData::Interval(d), Value::Interval { .. }) => {
             let y = match c {
                 Value::Interval {
@@ -1230,13 +1248,14 @@ fn cell_value(data: &VectorData, i: usize) -> Value {
         VectorData::VarChar(d) => Value::Varchar(d[i].to_string()),
         VectorData::Date32(d) => Value::Date(d[i]),
         VectorData::TimestampMicros(d) => Value::Timestamp(d[i]),
-        VectorData::Decimal { values, scale, .. } => Value::Decimal(values[i], *scale),
+        VectorData::Decimal { values, scale, .. } => Value::decimal(values[i], *scale),
         VectorData::Interval(d) => Value::Interval {
             months: d[i].months,
             days: d[i].days,
             micros: d[i].micros,
         },
         VectorData::Variant(d) => Value::Variant(std::sync::Arc::clone(&d[i])),
+        VectorData::Uuid(d) => Value::Uuid(d[i]),
         VectorData::Array {
             elem,
             len,
@@ -2657,7 +2676,7 @@ mod tests {
             } else {
                 -mag
             };
-            d.push_valid(Value::Decimal(value, 2)).unwrap();
+            d.push_valid(Value::decimal(value, 2)).unwrap();
             b.push_valid(Value::Bigint((next_rand(state) % 2001) as i64 - 1000))
                 .unwrap();
             x.push_valid(Value::Double((next_rand(state) % 2001) as f64 / 8.0 - 12.5))

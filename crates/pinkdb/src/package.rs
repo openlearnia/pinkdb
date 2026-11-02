@@ -729,12 +729,16 @@ impl HostScalar {
 /// re-runs the same work deterministically.
 pub struct HostCtx<'a> {
     db: &'a mut PinkDb,
-    db_name: String,
+    db_name: crate::storage::SchemaPath,
     statement: String,
 }
 
 impl<'a> HostCtx<'a> {
-    pub(crate) fn new(db: &'a mut PinkDb, db_name: String, statement: String) -> Self {
+    pub(crate) fn new(
+        db: &'a mut PinkDb,
+        db_name: crate::storage::SchemaPath,
+        statement: String,
+    ) -> Self {
         Self {
             db,
             db_name,
@@ -757,7 +761,7 @@ impl<'a> HostCtx<'a> {
 
     /// The session database the `CALL` ran in.
     pub fn db_name(&self) -> &str {
-        &self.db_name
+        self.db_name.db()
     }
 
     /// Run one SQL statement against the store, without a WAL record of its
@@ -788,9 +792,14 @@ impl<'a> HostCtx<'a> {
     /// Append `rows` to `db.table` through the ordinary insert funnel, so
     /// keys, constraints, triggers and the table version behave exactly like
     /// `INSERT`.
-    pub fn insert_rows(&mut self, db: &str, table: &str, rows: Vec<Vec<Value>>) -> Result<()> {
+    pub fn insert_rows(
+        &mut self,
+        db: impl Into<crate::storage::SchemaPath>,
+        table: &str,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<()> {
         let budget = Arc::new(crate::exec::ExecBudget::unbounded());
-        crate::trigger::insert_rows(self.db, db, table, rows, &budget)
+        crate::trigger::insert_rows(self.db, &db.into(), table, rows, &budget)
     }
 }
 

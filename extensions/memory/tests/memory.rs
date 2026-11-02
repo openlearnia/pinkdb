@@ -336,7 +336,7 @@ fn the_tables_are_not_readable_outside_the_extension() {
     assert_ne!(code, 0, "{refused}");
     assert!(refused.contains("permission denied"), "{refused}");
     assert!(
-        refused.contains("GRANT SELECT ON TABLE pinkdb_memory.atoms"),
+        refused.contains("GRANT SELECT ON TABLE pinkdb_memory.main.atoms"),
         "{refused}"
     );
 

@@ -81,10 +81,53 @@ pub(crate) struct CatalogChange {
     pub(crate) lake_id: Option<String>,
     pub(crate) author: Option<String>,
     pub(crate) commit_message: Option<String>,
+    /// `ducklake_snapshot_changes.commit_extra_info`: free-form text riding
+    /// the same row as the author and message (`ducklake_set_commit_message`'s
+    /// optional fourth argument).
+    pub(crate) commit_extra_info: Option<String>,
     /// The engine catalog image to publish with this version (wave 96b). The
     /// engine's metadata and its table data must become visible together, so
     /// the image rides the commit's transaction instead of a second one.
     pub(crate) engine_catalog: Option<std::sync::Arc<Vec<u8>>>,
+    /// The database's schemas when the engine published it: a writable lake
+    /// database keeps one `ducklake_schema` row per engine schema, empty ones
+    /// included, so schema rows are created and ended to match (the
+    /// incremental commit path applies the list). `None` leaves the catalog's
+    /// schemas alone (maintenance and saves).
+    pub(crate) schemas: Option<Vec<String>>,
+}
+
+/// One snapshot's DuckLake change row: the raw `changes_made` text and the
+/// commit metadata, exactly as the committing writer stored them. The
+/// function layer parses `changes_made` (DuckLake's own grammar) to render
+/// `ducklake_snapshots`' `changes` map, which [`Catalog::changes`]' engine-
+/// facing summary deliberately does not carry.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SnapshotChanges {
+    /// `ducklake_snapshot.snapshot_time`, the catalog's own text for the time.
+    pub(crate) snapshot_time: Option<String>,
+    pub(crate) changes_made: Option<String>,
+    pub(crate) author: Option<String>,
+    pub(crate) commit_message: Option<String>,
+    pub(crate) commit_extra_info: Option<String>,
+}
+
+/// A table's catalog identities: the flat `schema.table` key, the schema id,
+/// the table id and the DuckLake UUID in the catalog's dashed spelling.
+pub(crate) struct TableIdentity {
+    pub(crate) key: String,
+    pub(crate) schema_id: i64,
+    pub(crate) table_id: i64,
+    pub(crate) uuid: Option<String>,
+}
+
+/// One `ducklake_metadata` row: its key, its value, the scope it applies to
+/// (`None` = global) and the catalog id that scope names.
+pub(crate) struct MetadataOptionRow {
+    pub(crate) key: String,
+    pub(crate) value: String,
+    pub(crate) scope: Option<String>,
+    pub(crate) scope_id: Option<i64>,
 }
 
 /// The typed metadata surface every catalog database implements.
@@ -172,6 +215,9 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
     /// deletion. One transaction.
     fn expire_snapshots(&self, versions: &[u64]) -> Result<()>;
 
+    /// Every live schema name at `version` (`None` = head), ordered by id.
+    fn schemas(&self, version: Option<u64>) -> Result<Vec<String>>;
+
     /// Files in `ducklake_files_scheduled_for_deletion`, as
     /// `(id, catalog-relative path)`.
     fn scheduled_files(&self) -> Result<Vec<(i64, String)>>;
@@ -221,8 +267,55 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
     /// sealed (DuckLake's own flag).
     fn is_encrypted(&self) -> Result<bool>;
 
+    /// The DuckLake metadata backend this catalog lives in, named the way
+    /// `ducklake_settings`'s `catalog_type` reports it: `sqlite`, `postgres`
+    /// or `duckdb`. pinkdb's own `.pink` catalog is not one of DuckLake's
+    /// backends, so it reports `pinkdb`.
+    /// The Parquet footer size of every file the catalog records one for, as
+    /// `(file name, footer size)`. Names are DuckLake's UUID file names, which
+    /// are unique within a lake, so they key the manifest's files without
+    /// re-deriving paths.
+    fn data_file_footers(&self) -> Result<Vec<(String, u64)>>;
+
+    /// Live delete files per table at the head snapshot, as
+    /// `(table_id, file count, total size)`.
+    fn table_delete_files(&self) -> Result<Vec<(i64, u64, Option<u64>)>>;
+
+    fn catalog_type(&self) -> &'static str;
+
+    /// One snapshot's change row ([`SnapshotChanges`]), if the catalog has
+    /// one. Missing for a snapshot with no row (an expired version) and for
+    /// a backend that keeps no change text.
+    fn snapshot_changes(&self, version: u64) -> Result<Option<SnapshotChanges>>;
+
+    /// The live tables' DuckLake catalog identities at the head snapshot:
+    /// `(flat table key, schema_id, table_id, table_uuid hex)`. These are the
+    /// numeric ids `ducklake_table_info` reports and the `changes` map's id
+    /// values name; pinkdb's own manifest keeps only the key and the uuid.
+    fn catalog_table_ids(&self) -> Result<Vec<TableIdentity>>;
+
+    /// The live schemas' DuckLake catalog ids as `(name, schema_id)`: the
+    /// numeric id a schema-scoped option names.
+    fn catalog_schema_ids(&self) -> Result<Vec<(String, i64)>>;
+
+    /// Every `ducklake_metadata` row as `(key, value, scope, scope_id)`: the
+    /// option set `ducklake_options` reports. A `NULL` scope is a global
+    /// option, `schema` and `table` are the two scoped forms DuckLake stores
+    /// in the same table.
+    fn metadata_options(&self) -> Result<Vec<MetadataOptionRow>>;
+
     /// Set `ducklake_metadata.encrypted`.
     fn set_encrypted(&self, encrypted: bool) -> Result<()>;
+
+    /// Store one `ducklake_metadata` option row (`scope`/`scope_id` name a
+    /// schema or table; `None` is global).
+    fn set_option(
+        &self,
+        key: &str,
+        value: &str,
+        scope: Option<&str>,
+        scope_id: Option<i64>,
+    ) -> Result<()>;
 
     /// Publish `change` on top of `base_version` in one transaction.
     ///
@@ -231,9 +324,20 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
     /// version.
     fn commit(&self, base_version: u64, change: CatalogChange) -> Result<u64>;
 
-    /// The stored commit-delta manifest's logical content, if the store keeps
-    /// one. Used by change-data reads.
-    fn commit_manifest(&self, version: u64) -> Result<Option<Vec<u8>>>;
+    /// The catalog facts DuckLake's change queries read for one table over the
+    /// inclusive version range `[start, end]`: files whose rows begin in it,
+    /// files dropped whole in it, the delete files listed at `end`, and the
+    /// inlined insertions, deletions and positional deletes dated in it.
+    /// `None` when the table does not exist at `end`.
+    ///
+    /// The facts are catalog state, not pinkdb's commit history, so a lake any
+    /// DuckLake writer produced answers them (see [`crate::cdc`]).
+    fn change_facts(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<crate::cdc::ChangeFacts>>;
 
     /// Store/read an opaque catalog-side object (replication state, the
     /// engine lease, …). The catalog's own tables are the source of truth;

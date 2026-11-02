@@ -987,6 +987,13 @@ fn main() -> ExitCode {
     // before the store opens: the checkpoint names lake databases and the
     // WAL may replay an ATTACH.
     pink_lake::database::register();
+    // Wave 132b: a DuckLake catalog is Parquet (stock DuckDB writes Parquet
+    // into one), so a server that writes into a lake needs the lake's Parquet
+    // format registered before any handle resolves it.
+    #[cfg(feature = "parquetlake")]
+    if let Err(e) = pink_lake_parquet::register() {
+        eprintln!("warning: the parquet lake format could not be registered: {e}");
+    }
 
     // The data directory: created on first start, unless --in-memory.
     let data_dir = if args.in_memory {

@@ -275,15 +275,44 @@ impl CsvSource {
         }
     }
 
-    fn open(&self, path: &str) -> Result<Box<dyn Fetcher>> {
+    /// [`CsvSource::open`] with a secret's S3 credentials (`None` keeps the
+    /// environment path).
+    fn open_with_secret(
+        &self,
+        path: &str,
+        s3: Option<&pinkdb::secret::S3Secret>,
+    ) -> Result<Box<dyn Fetcher>> {
+        #[cfg(feature = "s3")]
+        if let Some(credential) = s3 {
+            let bucket = path
+                .strip_prefix("s3://")
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or_default();
+            let config = crate::s3::config_from_secret(bucket, credential);
+            return crate::fetch::open_s3_with(path, config)
+                .map_err(|e| PinkDbError::Execution(format!("cannot open \"{path}\": {e}")));
+        }
+        let _ = s3;
         open_with(path, &self.config)
             .map_err(|e| PinkDbError::Execution(format!("cannot open \"{path}\": {e}")))
+    }
+
+    /// The S3 config a matching secret gives this call, if any.
+    fn secret_s3(
+        call: &Call,
+        secrets: &[pinkdb::secret::Secret],
+    ) -> Option<pinkdb::secret::S3Secret> {
+        pinkdb::secret::s3_secret_for_url(secrets, &call.path)
     }
 
     /// The schema, plus the file's beginning: the whole file when one probe
     /// returned it, else the probe's bytes for the streaming scan. A local
     /// file is always read whole (there is no window to bound).
-    fn load(&self, call: &Call) -> Result<(Body, CsvSchema)> {
+    fn load(
+        &self,
+        call: &Call,
+        s3: Option<&pinkdb::secret::S3Secret>,
+    ) -> Result<(Body, CsvSchema)> {
         if !is_remote(&call.path) {
             let mut bytes = std::fs::read(&call.path).map_err(|e| {
                 PinkDbError::Execution(format!("cannot read CSV \"{}\": {e}", call.path))
@@ -296,15 +325,18 @@ impl CsvSource {
         }
         // A compressed object has no byte ranges to stream: fetch it whole.
         if call.gzip {
-            let raw = self.open(&call.path)?.fetch().map_err(|e| {
-                PinkDbError::Execution(format!("cannot read \"{}\": {e}", call.path))
-            })?;
+            let raw = self
+                .open_with_secret(&call.path, s3)?
+                .fetch()
+                .map_err(|e| {
+                    PinkDbError::Execution(format!("cannot read \"{}\": {e}", call.path))
+                })?;
             let bytes = gunzip(&call.path, &raw)?;
             let schema = sniff_csv(&bytes, &call.options)?;
             return Ok((Body::Whole(bytes), schema));
         }
         let head = self
-            .open(&call.path)?
+            .open_with_secret(&call.path, s3)?
             .fetch_range(0, SNIFF_BYTES)
             .map_err(|e| PinkDbError::Execution(format!("cannot read \"{}\": {e}", call.path)))?;
         let schema = sniff_csv(&head, &call.options)?;
@@ -346,6 +378,7 @@ impl CsvSource {
         call: &Call,
         projection: Option<&[usize]>,
         sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+        s3: Option<&pinkdb::secret::S3Secret>,
     ) -> Result<(u64, u64)> {
         let cached = {
             let mut cache = self
@@ -359,7 +392,7 @@ impl CsvSource {
         };
         let (body, schema) = match cached {
             Some(entry) => (entry.body, entry.schema),
-            None => self.load(call)?,
+            None => self.load(call, s3)?,
         };
         let types = &schema.types;
         let selected: Vec<bool> = match projection {
@@ -379,12 +412,86 @@ impl CsvSource {
                 }
             }
             Body::Stream(head) => {
-                let reader =
-                    crate::prefetch::Prefetch::open_after_head(self.open(&call.path)?, head);
+                let reader = crate::prefetch::Prefetch::open_after_head(
+                    self.open_with_secret(&call.path, s3)?,
+                    head,
+                );
                 stream_csv_chunks(reader, &schema, &mut emit)?;
             }
         }
         Ok((rows, decoded))
+    }
+
+    /// [`CsvSource::bind`] for an already-parsed call.
+    fn bind_call(
+        &self,
+        call: &Call,
+        s3: Option<&pinkdb::secret::S3Secret>,
+    ) -> Result<Option<Vec<(String, DataType)>>> {
+        let (body, schema) = self.load(call, s3)?;
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *cache = Some(Cached {
+            key: call.cache_key(),
+            body,
+            schema: schema.clone(),
+        });
+        Ok(Some(
+            schema
+                .names
+                .iter()
+                .cloned()
+                .zip(schema.types.iter().copied())
+                .collect(),
+        ))
+    }
+
+    /// [`CsvSource::scan`] for an already-parsed call.
+    fn scan_call_output(
+        &self,
+        call: &Call,
+        projection: Option<&[usize]>,
+        s3: Option<&pinkdb::secret::S3Secret>,
+    ) -> Result<TableScanOutput> {
+        let mut chunks = Vec::new();
+        let (rows, decoded) = self.scan_call(
+            call,
+            projection,
+            &mut |chunk| {
+                chunks.push(chunk);
+                Ok(())
+            },
+            s3,
+        )?;
+        self.count(rows, decoded);
+        Ok(TableScanOutput {
+            chunks,
+            files: 1,
+            row_groups: 0,
+            row_groups_pruned: 0,
+            columns_decoded: decoded,
+        })
+    }
+
+    /// [`CsvSource::scan_stream`] for an already-parsed call.
+    fn scan_stream_output(
+        &self,
+        call: &Call,
+        projection: Option<&[usize]>,
+        s3: Option<&pinkdb::secret::S3Secret>,
+        sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<TableScanOutput> {
+        let (rows, decoded) = self.scan_call(call, projection, sink, s3)?;
+        self.count(rows, decoded);
+        Ok(TableScanOutput {
+            chunks: Vec::new(),
+            files: 1,
+            row_groups: 0,
+            row_groups_pruned: 0,
+            columns_decoded: decoded,
+        })
     }
 
     fn count(&self, rows: u64, decoded: u64) {
@@ -410,24 +517,19 @@ impl TableSource for CsvSource {
         let Some(call) = parse_call(call)? else {
             return Ok(None);
         };
-        let (body, schema) = self.load(&call)?;
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *cache = Some(Cached {
-            key: call.cache_key(),
-            body,
-            schema: schema.clone(),
-        });
-        Ok(Some(
-            schema
-                .names
-                .iter()
-                .cloned()
-                .zip(schema.types.iter().copied())
-                .collect(),
-        ))
+        self.bind_call(&call, None)
+    }
+
+    fn bind_with(
+        &self,
+        call: &TableFunctionCall,
+        secrets: &[pinkdb::secret::Secret],
+    ) -> Result<Option<Vec<(String, DataType)>>> {
+        let Some(call) = parse_call(call)? else {
+            return Ok(None);
+        };
+        let s3 = Self::secret_s3(&call, secrets);
+        self.bind_call(&call, s3.as_ref())
     }
 
     fn scan(
@@ -441,19 +543,23 @@ impl TableSource for CsvSource {
                 "the httpfs CSV source does not serve {call:?}"
             )));
         };
-        let mut chunks = Vec::new();
-        let (rows, decoded) = self.scan_call(&call, projection, &mut |chunk| {
-            chunks.push(chunk);
-            Ok(())
-        })?;
-        self.count(rows, decoded);
-        Ok(TableScanOutput {
-            chunks,
-            files: 1,
-            row_groups: 0,
-            row_groups_pruned: 0,
-            columns_decoded: decoded,
-        })
+        self.scan_call_output(&call, projection, None)
+    }
+
+    fn scan_with(
+        &self,
+        call: &TableFunctionCall,
+        projection: Option<&[usize]>,
+        _filters: &[PrunePredicate],
+        secrets: &[pinkdb::secret::Secret],
+    ) -> Result<TableScanOutput> {
+        let Some(call) = parse_call(call)? else {
+            return Err(PinkDbError::Execution(format!(
+                "the httpfs CSV source does not serve {call:?}"
+            )));
+        };
+        let s3 = Self::secret_s3(&call, secrets);
+        self.scan_call_output(&call, projection, s3.as_ref())
     }
 
     fn scan_stream(
@@ -468,15 +574,24 @@ impl TableSource for CsvSource {
                 "the httpfs CSV source does not serve {call:?}"
             )));
         };
-        let (rows, decoded) = self.scan_call(&call, projection, sink)?;
-        self.count(rows, decoded);
-        Ok(TableScanOutput {
-            chunks: Vec::new(),
-            files: 1,
-            row_groups: 0,
-            row_groups_pruned: 0,
-            columns_decoded: decoded,
-        })
+        self.scan_stream_output(&call, projection, None, sink)
+    }
+
+    fn scan_stream_with(
+        &self,
+        call: &TableFunctionCall,
+        projection: Option<&[usize]>,
+        _filters: &[PrunePredicate],
+        secrets: &[pinkdb::secret::Secret],
+        sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<TableScanOutput> {
+        let Some(call) = parse_call(call)? else {
+            return Err(PinkDbError::Execution(format!(
+                "the httpfs CSV source does not serve {call:?}"
+            )));
+        };
+        let s3 = Self::secret_s3(&call, secrets);
+        self.scan_stream_output(&call, projection, s3.as_ref(), sink)
     }
 
     /// Streams exactly when bind did not keep the file whole: a local file (or
@@ -1120,6 +1235,55 @@ mod tests {
             mock.requests().iter().any(|r| r == "GET /bucket/data.csv"),
             "{:?}",
             mock.requests()
+        );
+    }
+
+    /// A `CREATE SECRET` of type S3 supplies the endpoint and credentials for
+    /// an `s3://` scan with no `AWS_*` environment at all; a secret whose
+    /// scope does not cover the URL is not used, and the missing-credentials
+    /// error names the fallback.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_remote_s3_scan_uses_a_scoped_secret_instead_of_the_environment() {
+        let _guard = global_test_lock();
+        let mock = crate::mock_s3::MockS3::start();
+        mock.put_object("secret/data.csv", b"a,b\n1,x\n2,y\n");
+        mock.put_object("other/data.csv", b"a,b\n1,x\n");
+        // SAFETY: every environment-mutating test holds GLOBAL_TEST_LOCK.
+        let _env = MockEnv;
+        unsafe {
+            std::env::remove_var("AWS_ACCESS_KEY_ID");
+            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_ENDPOINT_URL_S3");
+            std::env::remove_var("PINKDB_S3_ALLOW_HTTP");
+        }
+
+        let mut db = PinkDb::new();
+        db.register_table_source(source_with(HttpfsConfig::default()));
+        db.execute(&format!(
+            "CREATE SECRET csv_s3 (TYPE S3, KEY_ID '{}', SECRET 'mock-secret', \
+             ENDPOINT '{}', URL_STYLE 'path', REGION 'auto', USE_SSL false, \
+             SCOPE 's3://bucket/secret/');",
+            mock.access_key_id(),
+            mock.endpoint()
+        ))
+        .expect("create secret");
+
+        let got = rows(
+            &mut db,
+            "SELECT SUM(a) FROM read_csv('s3://bucket/secret/data.csv');",
+        );
+        assert_eq!(got, vec![vec![Value::Bigint(3)]]);
+        assert!(mock.verified_requests() >= 1, "signed with the secret");
+
+        let error = db
+            .execute("SELECT * FROM read_csv('s3://bucket/other/data.csv');")
+            .expect_err("the secret's scope does not cover this URL")
+            .to_string();
+        assert!(
+            error.contains("no S3 credentials") || error.contains("credentials"),
+            "{error}"
         );
     }
 

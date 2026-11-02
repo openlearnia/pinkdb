@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use pinkdb_ext_loader::{ExtFunction, ExtHandle};
 
 use crate::crypto::EncryptionKey;
+use crate::plan::ColumnDefault;
 use crate::sql::ast::Select;
 use crate::stats::{ColStats, Hll, TableStats, Zone};
 use crate::types::{DataType, PinkDbError, Result, Value};
@@ -45,13 +46,12 @@ pub(crate) fn reset_index_rebuild_count() {
 pub struct Column {
     pub name: String,
     pub dtype: DataType,
-    /// The column's DEFAULT (wave 65): the value a later `INSERT` that omits
-    /// the column writes, and the value `ALTER TABLE … ADD COLUMN … DEFAULT`
-    /// materialized into the rows that existed before it. `None` = no default
-    /// (an omitted `INSERT` column writes NULL). Persisted in `.pink` v5 under
-    /// the defaults flag; lake v5 manifests carry it in the table entry's
-    /// `columns` record.
-    pub default: Option<Value>,
+    /// The column's DEFAULT (wave 65): the expression a later `INSERT` that
+    /// omits the column evaluates, and the expression `ALTER TABLE … ADD
+    /// COLUMN … DEFAULT` evaluated for every existing row. `None` = no
+    /// default (an omitted `INSERT` column writes NULL). The `.pink` footer
+    /// stores its text under the defaults flag and rebinds it at load.
+    pub default: Option<ColumnDefault>,
     /// Reference-counted chunks: scans share storage instead of cloning
     /// megabytes per query. Mutations use copy-on-write (`Arc::make_mut`),
     /// which never actually clones — the executor never holds chunks
@@ -633,16 +633,17 @@ impl DataTable {
     }
 
     /// `ALTER TABLE … ADD COLUMN` (wave 65): append a column at the end,
-    /// filled with `default` for every existing row. The value is
-    /// materialized into the chunks (the engine's in-memory style; the lake's
-    /// schema record is what keeps the operation metadata-only for old *data
-    /// files*). `default` stays recorded on the [`Column`] so later `INSERT`s
-    /// that omit the column write it too.
+    /// filled with the per-row `values` evaluated from `default`. The values
+    /// are materialized into the chunks (the engine's in-memory style; the
+    /// lake's schema record is what keeps the operation metadata-only for old
+    /// *data files*). `default` stays recorded on the [`Column`] so later
+    /// `INSERT`s that omit the column evaluate it too.
     pub(crate) fn add_column(
         &mut self,
         name: String,
         dtype: DataType,
-        default: Option<Value>,
+        default: Option<ColumnDefault>,
+        values: &[Value],
     ) -> Result<()> {
         if self
             .columns
@@ -664,10 +665,12 @@ impl DataTable {
             .first()
             .map(|c| c.chunks.iter().map(|v| v.len()).collect())
             .unwrap_or_default();
+        debug_assert_eq!(values.len(), lens.iter().sum::<usize>());
+        let mut values = values.iter();
         for len in lens {
             let mut v = Vector::with_capacity(dtype, len);
             for _ in 0..len {
-                match &default {
+                match values.next() {
                     Some(d) if !d.is_null() => v.push_valid(d.clone())?,
                     _ => v.push_null()?,
                 }
@@ -933,20 +936,25 @@ impl DataTable {
             // DECIMAL/INTERVAL columns accept numeric values and string cells
             // (parsed like an implicit cast), mirroring DuckDB's INSERT/CSV
             // behavior.
-            (Value::Decimal(x, from), DataType::Decimal { precision, scale }) => {
-                crate::types::rescale_decimal(x, from, scale)
-                    .filter(|y| crate::types::decimal_fits(*y, precision))
-                    .map(|y| Value::Decimal(y, scale))
-                    .ok_or_else(|| {
-                        PinkDbError::Type(format!(
-                            "cannot coerce {} to DECIMAL({precision},{scale}): value out of range",
-                            crate::types::format_decimal(x, from)
-                        ))
-                    })
-            }
+            (
+                Value::Decimal {
+                    value: x,
+                    scale: from,
+                    ..
+                },
+                DataType::Decimal { precision, scale },
+            ) => crate::types::rescale_decimal(x, from, scale)
+                .filter(|y| crate::types::decimal_fits(*y, precision))
+                .map(|y| Value::decimal(y, scale))
+                .ok_or_else(|| {
+                    PinkDbError::Type(format!(
+                        "cannot coerce {} to DECIMAL({precision},{scale}): value out of range",
+                        crate::types::format_decimal(x, from)
+                    ))
+                }),
             (Value::Integer(i), DataType::Decimal { precision, scale }) => {
                 crate::types::int_to_decimal(i as i128, precision, scale)
-                    .map(|x| Value::Decimal(x, scale))
+                    .map(|x| Value::decimal(x, scale))
                     .ok_or_else(|| {
                         PinkDbError::Type(format!(
                             "cannot coerce {i} to DECIMAL({precision},{scale}): value out of range"
@@ -955,7 +963,7 @@ impl DataTable {
             }
             (Value::Bigint(i), DataType::Decimal { precision, scale }) => {
                 crate::types::int_to_decimal(i as i128, precision, scale)
-                    .map(|x| Value::Decimal(x, scale))
+                    .map(|x| Value::decimal(x, scale))
                     .ok_or_else(|| {
                         PinkDbError::Type(format!(
                             "cannot coerce {i} to DECIMAL({precision},{scale}): value out of range"
@@ -964,7 +972,7 @@ impl DataTable {
             }
             (Value::Double(x), DataType::Decimal { precision, scale }) => {
                 crate::types::f64_to_decimal(x, precision, scale)
-                    .map(|v| Value::Decimal(v, scale))
+                    .map(|v| Value::decimal(v, scale))
                     .ok_or_else(|| {
                         PinkDbError::Type(format!(
                             "cannot coerce {x} to DECIMAL({precision},{scale}): value out of range"
@@ -973,7 +981,7 @@ impl DataTable {
             }
             (Value::Varchar(s), DataType::Decimal { precision, scale }) => {
                 crate::types::parse_decimal_str(&s, precision, scale)
-                    .map(|x| Value::Decimal(x, scale))
+                    .map(|x| Value::decimal(x, scale))
                     .map_err(PinkDbError::Type)
             }
             (
@@ -998,6 +1006,12 @@ impl DataTable {
                     "cannot parse \"{s}\" as INTERVAL"
                 ))),
             },
+            // UUID columns take the value as it is, and a string cell is
+            // parsed the way the CAST matrix parses it.
+            (Value::Uuid(bits), DataType::Uuid) => Ok(Value::Uuid(bits)),
+            (Value::Varchar(s), DataType::Uuid) => crate::uuid::parse(&s)
+                .map(Value::Uuid)
+                .ok_or_else(|| PinkDbError::Type(format!("cannot parse \"{s}\" as UUID"))),
             // ARRAY columns follow the CAST matrix: same length, any element
             // tower, and the text/JSON spellings an INSERT or CSV gives.
             (v @ Value::Array(_), t @ DataType::Array { .. })
@@ -1015,7 +1029,7 @@ impl DataTable {
                 | Value::Integer(_)
                 | Value::Bigint(_)
                 | Value::Double(_)
-                | Value::Decimal(..)),
+                | Value::Decimal { .. }),
                 t @ (DataType::Boolean
                 | DataType::Integer
                 | DataType::Bigint
@@ -1035,10 +1049,11 @@ impl DataTable {
                 | Value::Integer(_)
                 | Value::Bigint(_)
                 | Value::Double(_)
-                | Value::Decimal(..)
+                | Value::Decimal { .. }
                 | Value::Date(_)
                 | Value::Timestamp(_)
-                | Value::Interval { .. }),
+                | Value::Interval { .. }
+                | Value::Uuid(_)),
                 DataType::Varchar,
             ) => crate::exec::expr::cast_value(v, DataType::Varchar),
             (v, t) => Err(PinkDbError::Type(format!("cannot coerce {v} to {t}"))),
@@ -1479,7 +1494,12 @@ impl DataTable {
             return None;
         }
         let cols = self.columns.iter().map(|c| c.chunks[idx].clone()).collect();
-        DataChunk::from_arcs(cols)
+        let mut chunk = DataChunk::from_arcs(cols)?;
+        // Volatile expressions read the ordinal: a chunk read straight from
+        // storage (an UPDATE, a trigger) is still the idx-th chunk in scan
+        // order, which is what a plan-driven scan would stamp.
+        chunk.ordinal = idx;
+        Some(chunk)
     }
 
     /// Value at (row, col).
@@ -1545,11 +1565,16 @@ pub struct MaterializedViewDef {
     pub last_error: Option<String>,
 }
 
-/// One database's catalog: its tables, its session-local views, and (wave 44)
-/// its stored procedures.
+/// One schema's catalog: the tables, views and other objects it holds.
+///
+/// Wave 131 added the level DuckDB calls a schema (`catalog.schema.object`):
+/// two schemas of one database may each hold a table of the same name. The
+/// design follows DuckDB's `SchemaCatalogEntry`
+/// (`src/catalog/catalog_entry/duck_schema_entry.cpp`).
 #[derive(Debug, Default, Clone)]
-pub struct DbCatalog {
-    /// Display name as created (the map key is the lowercased name).
+pub struct SchemaCatalog {
+    /// Display name as created (the owning `DbCatalog::schemas` key is the
+    /// lowercased name).
     pub(crate) name: String,
     pub(crate) tables: HashMap<String, DataTable>,
     pub(crate) views: HashMap<String, ViewDef>,
@@ -1562,22 +1587,15 @@ pub struct DbCatalog {
     pub(crate) macros: HashMap<String, crate::macros::MacroDef>,
     /// Triggers (wave 100) in **creation order**: that order is the firing
     /// order, so it must survive a save/open round trip and a WAL replay.
+    /// The order is per schema, like every other object.
     pub(crate) triggers: Vec<crate::trigger::TriggerDef>,
-    /// Where the database's rows live (wave 124): the store, or a lake.
-    /// Persisted in the checkpoint footer.
-    pub(crate) storage: crate::lake_db::DbStorage,
-    /// A lake database's version as this catalog reflects it (the pinned or
-    /// last published lake version); 0 for a local database. Process-local:
-    /// a reopen reads the lake's own.
-    pub(crate) lake_version: u64,
 }
 
-impl DbCatalog {
-    /// An empty database catalog.
-    pub(crate) fn empty(name: &str, storage: crate::lake_db::DbStorage) -> Self {
+impl SchemaCatalog {
+    /// An empty schema catalog.
+    pub(crate) fn empty(name: &str) -> Self {
         Self {
             name: name.to_string(),
-            storage,
             ..Self::default()
         }
     }
@@ -1588,6 +1606,164 @@ impl DbCatalog {
         self.triggers
             .iter()
             .position(|t| t.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Does the schema hold any object at all? (`DROP SCHEMA` without
+    /// `CASCADE` refuses a non-empty schema.)
+    fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+            && self.views.is_empty()
+            && self.materialized_views.is_empty()
+            && self.procedures.is_empty()
+            && self.macros.is_empty()
+            && self.triggers.is_empty()
+    }
+}
+
+/// A namespace's fully qualified name: `database.schema`, the first two of
+/// DuckDB's three name parts (wave 131).
+///
+/// Both parts are stored lowercased: catalog names are case-insensitive and
+/// the store's keys are lowercased. A bare database name means that database's
+/// `main` schema, which is where every object of a version-3 store lives.
+///
+/// The struct is `Ord`/`Hash` so it can key maps and order checkpoints. Use
+/// its `Display` for a message: identifiers are quoted only when they would
+/// not re-parse as written (the `rbac::quote_ident` rule).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SchemaPath {
+    db: String,
+    schema: String,
+    /// The session that owns this `temp` catalog. `None` for every persistent
+    /// database: `temp` never lives in [`PinkDb::databases`], so the owner is
+    /// part of the name (two sessions' `temp.main` are different namespaces).
+    temp: Option<u64>,
+}
+
+impl SchemaPath {
+    /// The namespace `db.schema` (both parts lowercased).
+    pub fn new(db: &str, schema: &str) -> Self {
+        Self {
+            db: db.to_ascii_lowercase(),
+            schema: schema.to_ascii_lowercase(),
+            temp: None,
+        }
+    }
+
+    /// The database's default schema, `db.main`.
+    pub fn main(db: &str) -> Self {
+        Self::new(db, "main")
+    }
+
+    /// The session's temporary catalog, `temp.main`. Only the binder creates
+    /// these; the session id keeps two sessions' temp namespaces apart.
+    pub(crate) fn temp(session: u64) -> Self {
+        Self {
+            db: "temp".to_string(),
+            schema: "main".to_string(),
+            temp: Some(session),
+        }
+    }
+
+    /// The session that owns this temp namespace, if it is one.
+    pub(crate) fn temp_id(&self) -> Option<u64> {
+        self.temp
+    }
+
+    /// The lowercased database name.
+    pub fn db(&self) -> &str {
+        &self.db
+    }
+
+    /// The lowercased schema name.
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+}
+
+impl std::fmt::Display for SchemaPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}.{}",
+            crate::rbac::quote_ident(&self.db),
+            crate::rbac::quote_ident(&self.schema)
+        )
+    }
+}
+
+impl From<&str> for SchemaPath {
+    fn from(db: &str) -> Self {
+        Self::main(db)
+    }
+}
+
+impl From<&String> for SchemaPath {
+    fn from(db: &String) -> Self {
+        Self::main(db)
+    }
+}
+
+impl From<String> for SchemaPath {
+    fn from(db: String) -> Self {
+        Self::main(&db)
+    }
+}
+
+impl From<&SchemaPath> for SchemaPath {
+    fn from(ns: &SchemaPath) -> Self {
+        ns.clone()
+    }
+}
+
+/// A table or view addressed by its namespace and its lowercased name: the
+/// form the plan's read/write sets, the materialized-view dirty set and the
+/// in-process commit check carry.
+pub(crate) type TableRef = (SchemaPath, String);
+
+/// One database's catalog: its schemas, and where its rows live.
+#[derive(Debug, Clone)]
+pub struct DbCatalog {
+    /// Display name as created (the map key is the lowercased name).
+    pub(crate) name: String,
+    /// The database's schemas, keyed by lowercased name. A database always
+    /// holds `main`: [`DbCatalog::empty`] creates it and `drop_schema`
+    /// refuses to remove it.
+    pub(crate) schemas: BTreeMap<String, SchemaCatalog>,
+    /// Where the database's rows live (wave 124): the store, or a lake.
+    /// Persisted in the checkpoint footer.
+    pub(crate) storage: crate::lake_db::DbStorage,
+    /// A lake database's version as this catalog reflects it (the pinned or
+    /// last published lake version); 0 for a local database. Process-local:
+    /// a reopen reads the lake's own.
+    pub(crate) lake_version: u64,
+}
+
+/// A database always holds schema `main`, so even the `..Default::default()`
+/// construction paths (`create_database`, a reload into an existing store)
+/// establish it.
+impl Default for DbCatalog {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            schemas: BTreeMap::from([("main".to_string(), SchemaCatalog::empty("main"))]),
+            storage: crate::lake_db::DbStorage::Local,
+            lake_version: 0,
+        }
+    }
+}
+
+impl DbCatalog {
+    /// An empty database catalog: no objects, one schema `main`.
+    pub(crate) fn empty(name: &str, storage: crate::lake_db::DbStorage) -> Self {
+        let mut schemas = BTreeMap::new();
+        schemas.insert("main".to_string(), SchemaCatalog::empty("main"));
+        Self {
+            name: name.to_string(),
+            schemas,
+            storage,
+            lake_version: 0,
+        }
     }
 }
 
@@ -1611,8 +1787,12 @@ impl DbCatalog {
 /// to the WAL. A statement the engine logs may not *read* one (see
 /// `sql::bind_tracked_with`): replay re-binds the logged text against a fresh
 /// session, so a reference there could not reproduce its value.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Session {
+    /// Session identity, unique for the life of the process. Keys the
+    /// session's `temp` catalog, so two connections never see each other's
+    /// temporary tables (a transaction snapshot shares its session's).
+    id: u64,
     /// Lowercased name -> value.
     vars: Arc<Mutex<BTreeMap<String, Value>>>,
     /// The authenticated user of this session (wave 48's login), lowercased:
@@ -1625,6 +1805,13 @@ pub struct Session {
     /// its connection carries the caller's roles from the warehouse instead
     /// of resolving them in its own (empty) user catalog.
     roles: Arc<Mutex<Option<Vec<String>>>>,
+    /// The session's temporary secrets, shadowing a persistent secret of
+    /// the same name. Values are credentials: `Debug` shows only the count.
+    secrets: Arc<Mutex<BTreeMap<String, crate::secret::Secret>>>,
+    /// Lowercased lake database -> the last DuckLake snapshot id this session
+    /// committed there (`ducklake_last_committed_snapshot`). Per connection:
+    /// another session's commits are not this session's last commit.
+    last_lake_commits: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -1634,15 +1821,35 @@ impl std::fmt::Debug for Session {
         // a secret and is what a `current_user()` bug report needs.
         f.debug_struct("Session")
             .field("variables", &self.len())
+            .field("secrets", &self.secrets().len())
             .field("principal", &self.principal())
             .finish()
+    }
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl Session {
     /// A session with no variables set.
     pub fn new() -> Self {
-        Self::default()
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            vars: Arc::default(),
+            secrets: Arc::default(),
+            principal: Arc::default(),
+            roles: Arc::default(),
+            last_lake_commits: Arc::default(),
+        }
+    }
+
+    /// This session's identity: what keys its `temp` catalog.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// Adopt `principal` as this session's user (`None` = trusted embedded).
@@ -1689,9 +1896,163 @@ impl Session {
         self.lock().is_empty()
     }
 
+    /// Record the DuckLake snapshot id this session last committed to `lake`.
+    pub(crate) fn set_last_lake_commit(&self, lake: &str, snapshot_id: u64) {
+        self.last_lake_commits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(lake.to_ascii_lowercase(), snapshot_id);
+    }
+
+    /// The DuckLake snapshot id this session last committed to `lake`.
+    pub(crate) fn last_lake_commit(&self, lake: &str) -> Option<u64> {
+        self.last_lake_commits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&lake.to_ascii_lowercase())
+            .copied()
+    }
+
+    /// The session's temporary secrets, name order.
+    pub(crate) fn secrets(&self) -> std::collections::BTreeMap<String, crate::secret::Secret> {
+        self.secrets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Install a temporary secret, replacing one of the same name.
+    pub(crate) fn put_secret(&self, secret: crate::secret::Secret) {
+        self.secrets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(secret.name().to_string(), secret);
+    }
+
+    /// Remove a temporary secret; `true` when it existed.
+    pub(crate) fn remove_secret(&self, name: &str) -> bool {
+        self.secrets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name)
+            .is_some()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Value>> {
         // A panic elsewhere must not turn every later statement into a panic.
         self.vars.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The volatile-function state of the WAL record being filled.
+///
+/// A record — an autocommit statement, a transaction, a procedure segment, a
+/// trigger's refire, a view refresh — records one seed per statement that drew
+/// a volatile value, in the order the statements ran. That order is the whole
+/// key: a replay runs the record's statements in the same order (a procedure
+/// body and a trigger action re-execute exactly as they did) and takes the
+/// seeds back in it, so two identical statements of one record still draw
+/// different values and nothing about statement positions has to survive the
+/// WAL.
+///
+/// A mutex, not atomics, because the slots form a sequence and a bind only has
+/// `&PinkDb`: the state needs interior mutability, and this is never on a hot
+/// path.
+#[derive(Debug, Default)]
+pub(crate) struct RecordSeed {
+    state: std::sync::Mutex<RecordState>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RecordState {
+    /// One slot per statement that could draw a volatile value, in execution
+    /// order. It stays empty until the statement's first seeded call, so a
+    /// statement that calls none consumes no recorded seed.
+    slots: Vec<Option<u128>>,
+    /// While replaying, the record's seeds in the order it recorded them; each
+    /// logged statement takes the next one, so no statement position has to be
+    /// carried across the WAL.
+    replay: std::collections::VecDeque<u128>,
+}
+
+impl Clone for RecordSeed {
+    fn clone(&self) -> Self {
+        Self {
+            state: std::sync::Mutex::new(self.lock().clone()),
+        }
+    }
+}
+
+impl RecordSeed {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RecordState> {
+        // A panic elsewhere must not turn every later statement into a panic.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Start a new record: no statement, no seeds to replay.
+    pub(crate) fn clear(&self) {
+        *self.lock() = RecordState::default();
+    }
+
+    /// Load the seeds a record being replayed recorded, in order.
+    fn set_replay(&self, seeds: impl IntoIterator<Item = u128>) {
+        let mut state = self.lock();
+        state.slots.clear();
+        state.replay = seeds.into_iter().collect();
+    }
+
+    /// Open the slot of the statement about to execute.
+    fn open_slot(&self) {
+        self.lock().slots.push(None);
+    }
+
+    /// The seed for the value being evaluated: this statement's seed if it
+    /// already drew one, else a fresh one — or, while replaying, the next seed
+    /// its record recorded.
+    fn seed(&self, replay: bool) -> Result<u128> {
+        let mut state = self.lock();
+        if state.slots.is_empty() {
+            // A read-only statement has no record to replay: its values only
+            // need to differ from each other.
+            return crate::sql::binder::fresh_seed();
+        }
+        if let Some(seed) = state.slots.last().copied().flatten() {
+            return Ok(seed);
+        }
+        let seed = if replay {
+            match state.replay.pop_front() {
+                Some(seed) => seed,
+                // Fail closed: the store, its clients and any lake may hold
+                // the values that seed produced, so a fresh draw would make
+                // the replayed tables disagree with what was committed.
+                None => {
+                    return Err(PinkDbError::Execution(
+                        "WAL replay failed: the record does not carry a seed for a statement that \
+                         draws volatile values"
+                            .to_string(),
+                    ));
+                }
+            }
+        } else {
+            crate::sql::binder::fresh_seed()?
+        };
+        if let Some(slot) = state.slots.last_mut() {
+            *slot = Some(seed);
+        }
+        Ok(seed)
+    }
+
+    /// Take the memo entries for the record that is being appended: one per
+    /// statement that used a seeded function, in execution order. Replay reads
+    /// them back in the same order, so the position is informational.
+    pub(crate) fn take_memos(&self) -> Vec<crate::wal::ExtCall> {
+        let slots = std::mem::take(&mut self.lock().slots);
+        slots
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(position, seed)| crate::sql::binder::seed_memo(position, seed))
+            .collect()
     }
 }
 
@@ -1709,6 +2070,12 @@ impl Session {
 pub struct PinkDb {
     /// Key = lowercased database name.
     pub(crate) databases: HashMap<String, DbCatalog>,
+    /// Each session's `temp` catalog, keyed by [`Session::id`]. Never
+    /// persisted, never in the WAL, and deliberately not in `databases`: a
+    /// temporary table exists only for the session that created it, and the
+    /// catalog is created on its first temp table and dropped with the
+    /// session.
+    pub(crate) temp: HashMap<u64, DbCatalog>,
     /// Loadable-extension scalar functions (ABI v1 `dlopen`, wave 29A; linked
     /// registry, wave 49), keyed by lowercased name. Registered by
     /// [`PinkDb::load_extension`] / [`PinkDb::load_linked_extension`]; shared
@@ -1724,6 +2091,9 @@ pub struct PinkDb {
     pub(crate) loaded_extensions: HashMap<String, ExtHandle>,
     /// Lowercased name of the embedded session's current database.
     pub(crate) current_db: String,
+    /// The embedded session's current schema (wave 131b). `current_db` above
+    /// is kept as the database part so the pre-schema call sites stay cheap.
+    pub(crate) current_ns: SchemaPath,
     /// The embedded handle's session (see [`Session`]): `SET VARIABLE` state
     /// for this client only. A network [`crate::Connection`] overrides it with
     /// its own session for every statement it runs.
@@ -1751,7 +2121,7 @@ pub struct PinkDb {
     wal_txn: Vec<String>,
     /// Session database before the first statement of the open transaction's
     /// WAL record (the record replays in that session).
-    wal_txn_db: Option<String>,
+    wal_txn_db: Option<SchemaPath>,
     /// Extension paths touched by the buffered statements (dynamic functions
     /// they call), deduped, in first-use order. A record whose replay needs an
     /// extension the current WAL generation has not loaded is prefixed with
@@ -1796,6 +2166,11 @@ pub struct PinkDb {
     /// exact path match is a no-op instead of the user-facing "already
     /// loaded" error. Normal SQL keeps the strict duplicate-load refusal.
     pub(crate) replaying: bool,
+    /// The position of the record statement being replayed. A statement's
+    /// volatile seed is keyed by it in the record's memo.
+    /// The seed and statement slots of the WAL record being filled (see
+    /// [`RecordSeed`]).
+    pub(crate) volatile: RecordSeed,
     /// Recorded results of the `external_io` host scalars of the WAL record
     /// being replayed (wave 107c), keyed by (function, arguments) inside the
     /// record. `None` outside a replay: a live statement records instead.
@@ -1831,11 +2206,11 @@ pub struct PinkDb {
     /// statements and COMMITs) since the last statement-boundary refresh pass
     /// (wave 80): the ON COMMIT trigger's dirty set. Process-local, never
     /// persisted, cleared by the pass — see `crate::mv`.
-    pub(crate) mv_pending: std::collections::HashSet<(String, String)>,
+    pub(crate) mv_pending: std::collections::HashSet<TableRef>,
     /// `(database, table)` pairs written by the open embedded transaction:
     /// moved into `mv_pending` at COMMIT, discarded at ROLLBACK (a rolled-back
     /// write must not trigger an ON COMMIT refresh).
-    pub(crate) txn_writes: std::collections::HashSet<(String, String)>,
+    pub(crate) txn_writes: std::collections::HashSet<TableRef>,
     /// The `CALL` nesting depth of the statement currently executing (wave
     /// 44): 0 outside a call. Bounds recursion ([`crate::procedure::
     /// MAX_CALL_DEPTH`]) and decides where a call's statement-scoped frame
@@ -1857,6 +2232,10 @@ pub struct PinkDb {
     /// RBAC section + replayed from the WAL; an empty catalog is the
     /// documented "no users: every connection is trusted" state.
     pub(crate) rbac: crate::rbac::RbacCatalog,
+    /// Wave 132b: the store's persistent secrets. Values are credentials, so
+    /// nothing renders this map (`Secret`'s Debug redacts them) and only
+    /// `persist`/`wal` carry it to disk, in their own sections.
+    pub(crate) secrets: BTreeMap<String, crate::secret::Secret>,
     /// The row images and transition tables a trigger body sees (wave 100),
     /// installed by [`crate::trigger`] while the body runs and read back by
     /// the binder (as `NEW`/`OLD` variables and `FROM <alias>`). Never
@@ -1975,9 +2354,11 @@ impl Clone for PinkDb {
     fn clone(&self) -> Self {
         Self {
             databases: self.databases.clone(),
+            temp: self.temp.clone(),
             dynamic_functions: self.dynamic_functions.clone(),
             loaded_extensions: self.loaded_extensions.clone(),
             current_db: self.current_db.clone(),
+            current_ns: self.current_ns.clone(),
             // Clones share the session: a transaction's private snapshot runs
             // in the session that opened it.
             session: self.session.clone(),
@@ -1996,6 +2377,7 @@ impl Clone for PinkDb {
             allow_extension_replay: self.allow_extension_replay,
             extension_root: self.extension_root.clone(),
             replaying: false,
+            volatile: self.volatile.clone(),
             // A clone is a snapshot, never the record being replayed, and
             // the memo of an open transaction belongs to the store that
             // opened it (the committing clone flushes it).
@@ -2029,6 +2411,7 @@ impl Clone for PinkDb {
             txn_storages: self.txn_storages.clone(),
             trigger_invoker: self.trigger_invoker.clone(),
             rbac: self.rbac.clone(),
+            secrets: self.secrets.clone(),
             file_formats: self.file_formats.clone(),
             loaded_packages: self.loaded_packages.clone(),
             package_table_sources: self.package_table_sources.clone(),
@@ -2080,9 +2463,11 @@ impl PinkDb {
         }
         Self {
             databases,
+            temp: HashMap::new(),
             dynamic_functions: HashMap::new(),
             loaded_extensions: HashMap::new(),
             current_db: "main".to_string(),
+            current_ns: SchemaPath::main("main"),
             session: Session::default(),
             txn_snapshot: None,
             wal: None,
@@ -2099,6 +2484,7 @@ impl PinkDb {
             allow_extension_replay: false,
             extension_root: None,
             replaying: false,
+            volatile: RecordSeed::default(),
             ext_replay: None,
             wal_txn_memo: Vec::new(),
             external_services: true,
@@ -2123,6 +2509,7 @@ impl PinkDb {
             txn_storages: std::collections::BTreeSet::new(),
             trigger_invoker: None,
             rbac: crate::rbac::RbacCatalog::default(),
+            secrets: BTreeMap::new(),
             // Process-global sinks (`filefmt::register_global_file_format`)
             // seed every store constructed after the registration.
             file_formats: crate::filefmt::seeded_global_formats(),
@@ -2221,7 +2608,12 @@ impl PinkDb {
 
     /// The embedded session's current database (lowercased).
     pub fn current_db(&self) -> &str {
-        &self.current_db
+        self.current_ns.db()
+    }
+
+    /// The embedded session's current schema (database and schema).
+    pub fn current_ns(&self) -> &SchemaPath {
+        &self.current_ns
     }
 
     /// Set the embedded session's current database without validation
@@ -2229,6 +2621,14 @@ impl PinkDb {
     /// the session layer after `USE`/`DROP DATABASE`).
     pub(crate) fn set_current_db(&mut self, name: &str) {
         self.current_db = name.to_string();
+        self.current_ns = SchemaPath::main(name);
+    }
+
+    /// Set the embedded session's current schema without validation (the
+    /// session layer has already checked it, or a dropped schema fell back).
+    pub(crate) fn set_current_ns(&mut self, ns: SchemaPath) {
+        self.current_db = ns.db().to_string();
+        self.current_ns = ns;
     }
 
     /// Sorted display names of every database.
@@ -2239,7 +2639,7 @@ impl PinkDb {
     }
 
     pub fn database_exists(&self, name: &str) -> bool {
-        self.databases.contains_key(&Self::db_key(name))
+        name.eq_ignore_ascii_case("temp") || self.databases.contains_key(&Self::db_key(name))
     }
 
     /// The as-created spelling of a database (for diagnostics), else the key
@@ -2254,6 +2654,11 @@ impl PinkDb {
     /// Create a new, empty database. Case-insensitive; errors if it exists.
     pub fn create_database(&mut self, name: &str) -> Result<()> {
         let key = Self::db_key(name);
+        if key == "temp" {
+            return Err(PinkDbError::Catalog(
+                "database \"temp\" is reserved for each session's temporary tables".to_string(),
+            ));
+        }
         if self.databases.contains_key(&key) {
             return Err(PinkDbError::Catalog(format!(
                 "database \"{name}\" already exists"
@@ -2274,6 +2679,11 @@ impl PinkDb {
     /// database is the caller's job (see [`PinkDb::fallback_db`]).
     pub fn drop_database(&mut self, name: &str) -> Result<()> {
         let key = Self::db_key(name);
+        if key == "temp" {
+            return Err(PinkDbError::Catalog(
+                "database \"temp\" is session-local and disappears with its session".to_string(),
+            ));
+        }
         if !self.databases.contains_key(&key) {
             return Err(PinkDbError::Catalog(format!(
                 "database \"{name}\" not found"
@@ -2310,13 +2720,52 @@ impl PinkDb {
 
     /// Switch the embedded session to `name` (validated).
     pub fn use_database(&mut self, name: &str) -> Result<()> {
+        if name.eq_ignore_ascii_case("temp") {
+            return Err(PinkDbError::Catalog(
+                "cannot USE the internal database \"temp\"".to_string(),
+            ));
+        }
         if !self.database_exists(name) {
             return Err(PinkDbError::Catalog(format!(
                 "database \"{name}\" not found"
             )));
         }
         self.current_db = Self::db_key(name);
+        self.current_ns = SchemaPath::main(&self.current_db);
         Ok(())
+    }
+
+    /// Switch the embedded session to `ns` (validated; wave 131b).
+    pub fn use_schema(&mut self, ns: &SchemaPath) -> Result<()> {
+        if ns.temp_id().is_some() || ns.db().eq_ignore_ascii_case("temp") {
+            return Err(PinkDbError::Catalog(
+                "cannot USE the internal schema \"temp\"".to_string(),
+            ));
+        }
+        if !self.database_exists(ns.db()) {
+            return Err(PinkDbError::Catalog(format!(
+                "database \"{}\" not found",
+                ns.db()
+            )));
+        }
+        if !self.schema_exists(ns) {
+            return Err(PinkDbError::Catalog(format!(
+                "schema \"{}\" not found",
+                ns.schema()
+            )));
+        }
+        self.set_current_ns(ns.clone());
+        Ok(())
+    }
+
+    /// The schema a session should fall back to after dropping its current
+    /// schema: `main` of the current database (or the fallback database when
+    /// that one is gone too).
+    pub fn fallback_ns(&self) -> SchemaPath {
+        if self.database_exists(self.current_ns.db()) {
+            return SchemaPath::main(self.current_ns.db());
+        }
+        SchemaPath::main(&self.fallback_db())
     }
 
     /// The database a session should fall back to after dropping its current
@@ -2338,15 +2787,206 @@ impl PinkDb {
     }
 
     fn catalog(&self, db: &str) -> Result<&DbCatalog> {
+        if db.eq_ignore_ascii_case("temp") {
+            return Err(PinkDbError::Catalog(
+                "database \"temp\" is session-local; a namespace carries the session that owns it"
+                    .to_string(),
+            ));
+        }
         self.databases
             .get(&Self::db_key(db))
             .ok_or_else(|| PinkDbError::Catalog(format!("database \"{db}\" not found")))
     }
 
     fn catalog_mut(&mut self, db: &str) -> Result<&mut DbCatalog> {
+        if db.eq_ignore_ascii_case("temp") {
+            return Err(PinkDbError::Catalog(
+                "database \"temp\" is session-local; a namespace carries the session that owns it"
+                    .to_string(),
+            ));
+        }
         self.databases
             .get_mut(&Self::db_key(db))
             .ok_or_else(|| PinkDbError::Catalog(format!("database \"{db}\" not found")))
+    }
+
+    /// The `temp` catalog of session `id`, if it has created one.
+    pub(crate) fn temp_catalog(&self, id: u64) -> Option<&DbCatalog> {
+        self.temp.get(&id)
+    }
+
+    /// The `temp` catalog of session `id`, created on first use: a session
+    /// pays for the catalog only once it creates a temp table.
+    pub(crate) fn temp_catalog_mut(&mut self, id: u64) -> &mut DbCatalog {
+        self.temp.entry(id).or_insert_with(|| DbCatalog {
+            name: "temp".to_string(),
+            ..DbCatalog::default()
+        })
+    }
+
+    /// Does session `id` hold a temp catalog (has it created a temporary
+    /// table)?
+    pub(crate) fn has_session_temp(&self, id: u64) -> bool {
+        self.temp.contains_key(&id)
+    }
+
+    /// Drop a session's temp catalog when the session ends.
+    pub(crate) fn drop_session_temp(&mut self, id: u64) {
+        self.temp.remove(&id);
+    }
+
+    /// The schema `ns` names. A missing database and a missing schema are
+    /// different errors: `ns` may be fully qualified, so a typo in either part
+    /// has to be reported as the part that is wrong.
+    pub(crate) fn schema(&self, ns: &SchemaPath) -> Result<&SchemaCatalog> {
+        if let Some(id) = ns.temp_id() {
+            return self
+                .temp_catalog(id)
+                .and_then(|c| c.schemas.get(ns.schema()))
+                .ok_or_else(|| {
+                    PinkDbError::Catalog(format!("schema \"{}\" not found", ns.schema()))
+                });
+        }
+        self.catalog(ns.db())?
+            .schemas
+            .get(ns.schema())
+            .ok_or_else(|| PinkDbError::Catalog(format!("schema \"{}\" not found", ns.schema())))
+    }
+
+    pub(crate) fn schema_mut(&mut self, ns: &SchemaPath) -> Result<&mut SchemaCatalog> {
+        if let Some(id) = ns.temp_id() {
+            return self
+                .temp_catalog_mut(id)
+                .schemas
+                .get_mut(ns.schema())
+                .ok_or_else(|| {
+                    PinkDbError::Catalog(format!("schema \"{}\" not found", ns.schema()))
+                });
+        }
+        self.catalog_mut(ns.db())?
+            .schemas
+            .get_mut(ns.schema())
+            .ok_or_else(|| PinkDbError::Catalog(format!("schema \"{}\" not found", ns.schema())))
+    }
+
+    /// Does `ns` name an existing schema?
+    pub fn schema_exists(&self, ns: &SchemaPath) -> bool {
+        if let Some(id) = ns.temp_id() {
+            return self
+                .temp_catalog(id)
+                .is_some_and(|c| c.schemas.contains_key(ns.schema()));
+        }
+        self.databases
+            .get(ns.db())
+            .is_some_and(|c| c.schemas.contains_key(ns.schema()))
+    }
+
+    /// The display names of `db`'s schemas, sorted. Empty for an unknown
+    /// database (like the other `list_*_in` helpers).
+    pub fn list_schemas(&self, db: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .databases
+            .get(&Self::db_key(db))
+            .map(|c| c.schemas.values().map(|s| s.name.clone()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Every table of `db`, in schema-key then table-key order, as
+    /// `(namespace, lowercased key, table)`: the shape the optimistic base and
+    /// the "every table of every database" walks (statistics, index rebuilds,
+    /// vector hydration, checkpointing) need.
+    pub(crate) fn all_tables_of(&self, db: &str) -> Vec<(SchemaPath, String, &DataTable)> {
+        let Some(cat) = self.databases.get(&Self::db_key(db)) else {
+            return Vec::new();
+        };
+        cat.schemas
+            .iter()
+            .flat_map(|(schema, s)| {
+                s.tables
+                    .iter()
+                    .map(move |(name, t)| (SchemaPath::new(db, schema), name.clone(), t))
+            })
+            .collect()
+    }
+
+    /// Every view of `db`, in schema-key then view-key order (see
+    /// [`PinkDb::all_tables_of`]).
+    pub(crate) fn all_views_of(&self, db: &str) -> Vec<(SchemaPath, String, &ViewDef)> {
+        let Some(cat) = self.databases.get(&Self::db_key(db)) else {
+            return Vec::new();
+        };
+        cat.schemas
+            .iter()
+            .flat_map(|(schema, s)| {
+                s.views
+                    .iter()
+                    .map(move |(name, v)| (SchemaPath::new(db, schema), name.clone(), v))
+            })
+            .collect()
+    }
+
+    /// Create schema `ns.schema`. `if_not_exists` makes an existing schema a
+    /// no-op instead of an error (SQL `CREATE SCHEMA IF NOT EXISTS`).
+    pub fn create_schema(&mut self, ns: &SchemaPath, if_not_exists: bool) -> Result<()> {
+        let cat = self.catalog_mut(ns.db())?;
+        if cat.schemas.contains_key(ns.schema()) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(PinkDbError::Catalog(format!(
+                "schema \"{}\" already exists",
+                ns.schema()
+            )));
+        }
+        // The SQL layer sets the written spelling after this call; the
+        // catalog key and this fallback display name are lowercased.
+        cat.schemas
+            .insert(ns.schema().to_string(), SchemaCatalog::empty(ns.schema()));
+        Ok(())
+    }
+
+    /// Set a schema's display name (the checkpoint restores the spelling it
+    /// recorded; the catalog key stays the lowercased name).
+    pub(crate) fn set_schema_display(&mut self, ns: &SchemaPath, name: &str) -> Result<()> {
+        self.schema_mut(ns)?.name = name.to_string();
+        Ok(())
+    }
+
+    /// Drop schema `ns.schema`. `main` can never be dropped (every database
+    /// has it), and without `cascade` a non-empty schema is refused with
+    /// DuckDB's wording. With `cascade` every object in the schema goes.
+    pub fn drop_schema(&mut self, ns: &SchemaPath, if_exists: bool, cascade: bool) -> Result<()> {
+        let cat = self.catalog_mut(ns.db())?;
+        if !cat.schemas.contains_key(ns.schema()) {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(PinkDbError::Catalog(format!(
+                "schema \"{}\" not found",
+                ns.schema()
+            )));
+        }
+        if ns.schema() == "main" {
+            return Err(PinkDbError::Catalog(
+                "cannot drop schema \"main\": it is the database's default schema".to_string(),
+            ));
+        }
+        if !cascade && cat.schemas.get(ns.schema()).is_some_and(|s| !s.is_empty()) {
+            return Err(PinkDbError::Catalog(format!(
+                "schema \"{}\" is not empty: use DROP SCHEMA ... CASCADE",
+                ns.schema()
+            )));
+        }
+        cat.schemas.remove(ns.schema());
+        // Every grant on the schema and its tables goes with it, cascade or
+        // not: a later schema of the same name must not inherit them. Inside
+        // a transaction this edits the transaction's catalog copy, so a
+        // rollback restores the grants exactly as it restores a dropped table
+        // (see `sync_table_grants` in db.rs for the commit merge).
+        self.rbac_mut().remove_schema(ns.db(), ns.schema());
+        Ok(())
     }
 
     /// Current version of one table (for conflict detection).
@@ -2362,99 +3002,113 @@ impl PinkDb {
         self.store_id
     }
 
-    pub fn table_version_in(&self, db: &str, name: &str) -> Result<u64> {
-        Ok(self.table_in(db, name)?.version)
+    pub fn table_version_in(&self, ns: impl Into<SchemaPath>, name: &str) -> Result<u64> {
+        Ok(self.table_in(ns, name)?.version)
     }
 
-    pub(crate) fn tables_remove_in(&mut self, db: &str, key: &str) -> Option<DataTable> {
-        self.databases
-            .get_mut(&Self::db_key(db))?
-            .tables
-            .remove(key)
+    pub(crate) fn tables_remove_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        key: &str,
+    ) -> Option<DataTable> {
+        self.schema_mut(&ns.into()).ok()?.tables.remove(key)
     }
 
     pub(crate) fn tables_insert_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         key: String,
         table: DataTable,
     ) -> Result<()> {
-        self.catalog_mut(db)?.tables.insert(key, table);
+        self.schema_mut(&ns.into())?.tables.insert(key, table);
         Ok(())
     }
 
-    pub(crate) fn views_remove_in(&mut self, db: &str, key: &str) -> Option<ViewDef> {
-        self.databases.get_mut(&Self::db_key(db))?.views.remove(key)
+    pub(crate) fn views_remove_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        key: &str,
+    ) -> Option<ViewDef> {
+        self.schema_mut(&ns.into()).ok()?.views.remove(key)
     }
 
-    pub(crate) fn views_insert_in(&mut self, db: &str, key: String, view: ViewDef) -> Result<()> {
-        self.catalog_mut(db)?.views.insert(key, view);
+    pub(crate) fn views_insert_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        key: String,
+        view: ViewDef,
+    ) -> Result<()> {
+        self.schema_mut(&ns.into())?.views.insert(key, view);
         Ok(())
     }
 
     pub(crate) fn materialized_views_remove_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         key: &str,
     ) -> Option<MaterializedViewDef> {
-        self.databases
-            .get_mut(&Self::db_key(db))?
+        self.schema_mut(&ns.into())
+            .ok()?
             .materialized_views
             .remove(key)
     }
 
     pub(crate) fn materialized_views_insert_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         key: String,
         view: MaterializedViewDef,
     ) -> Result<()> {
-        self.catalog_mut(db)?.materialized_views.insert(key, view);
+        self.schema_mut(&ns.into())
+            .map(|s| s.materialized_views.insert(key, view))?;
         Ok(())
     }
 
-    /// A stored procedure of `db` by name (case-insensitive).
-    pub fn procedure_in(&self, db: &str, name: &str) -> Result<&crate::procedure::ProcedureDef> {
-        self.catalog(db)?
+    /// A stored procedure of `ns` by name (case-insensitive).
+    pub fn procedure_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+        name: &str,
+    ) -> Result<&crate::procedure::ProcedureDef> {
+        let ns = ns.into();
+        self.schema(&ns)?
             .procedures
             .get(&name.to_ascii_lowercase())
             .ok_or_else(|| {
-                PinkDbError::Catalog(format!(
-                    "procedure \"{name}\" not found in database \"{db}\""
-                ))
+                PinkDbError::Catalog(format!("procedure \"{name}\" not found in schema {ns}"))
             })
     }
 
     /// Install (or replace) one procedure definition.
     pub(crate) fn procedures_insert_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         key: String,
         def: crate::procedure::ProcedureDef,
     ) -> Result<()> {
-        self.catalog_mut(db)?.procedures.insert(key, def);
+        self.schema_mut(&ns.into())?.procedures.insert(key, def);
         Ok(())
     }
 
     /// Remove one procedure (the caller checks existence for `IF EXISTS`).
     pub(crate) fn procedures_remove_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         key: &str,
     ) -> Option<crate::procedure::ProcedureDef> {
-        self.databases
-            .get_mut(&Self::db_key(db))?
-            .procedures
-            .remove(key)
+        self.schema_mut(&ns.into()).ok()?.procedures.remove(key)
     }
 
-    /// Every procedure of `db`, as `(lowercased key, definition)` pairs
+    /// Every procedure of `ns`, as `(lowercased key, definition)` pairs
     /// sorted by key — the deterministic order `.pink` writes them in.
-    pub(crate) fn procedures_in(&self, db: &str) -> Vec<(String, crate::procedure::ProcedureDef)> {
-        let Some(cat) = self.databases.get(&Self::db_key(db)) else {
+    pub(crate) fn procedures_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+    ) -> Vec<(String, crate::procedure::ProcedureDef)> {
+        let Ok(schema) = self.schema(&ns.into()) else {
             return Vec::new();
         };
-        let mut out: Vec<(String, crate::procedure::ProcedureDef)> = cat
+        let mut out: Vec<(String, crate::procedure::ProcedureDef)> = schema
             .procedures
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -2463,30 +3117,37 @@ impl PinkDb {
         out
     }
 
-    /// Does any database hold a procedure? (Cheap gate for the `.pink`
-    /// flags word.)
+    /// Does any schema of any database hold a procedure? (Cheap gate for the
+    /// `.pink` flags word.)
     pub(crate) fn has_procedures(&self) -> bool {
-        self.databases.values().any(|c| !c.procedures.is_empty())
+        self.databases
+            .values()
+            .any(|c| c.schemas.values().any(|s| !s.procedures.is_empty()))
     }
 
-    /// Every trigger of `db`, in creation order. A borrowed slice so the
+    /// Every trigger of `ns`, in creation order. A borrowed slice so the
     /// trigger-free write path pays no allocation at all.
-    pub(crate) fn triggers_in(&self, db: &str) -> &[crate::trigger::TriggerDef] {
+    pub(crate) fn triggers_in(&self, ns: impl Into<SchemaPath>) -> &[crate::trigger::TriggerDef] {
         static EMPTY: &[crate::trigger::TriggerDef] = &[];
-        match self.databases.get(&Self::db_key(db)) {
-            Some(cat) => &cat.triggers,
-            None => EMPTY,
+        match self.schema(&ns.into()) {
+            Ok(schema) => &schema.triggers,
+            Err(_) => EMPTY,
         }
     }
 
-    /// A stored trigger of `db` by name (case-insensitive).
-    pub(crate) fn trigger_in(&self, db: &str, name: &str) -> Result<&crate::trigger::TriggerDef> {
-        self.catalog(db)?
+    /// A stored trigger of `ns` by name (case-insensitive).
+    pub(crate) fn trigger_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+        name: &str,
+    ) -> Result<&crate::trigger::TriggerDef> {
+        let ns = ns.into();
+        self.schema(&ns)?
             .triggers
             .iter()
             .find(|t| t.name.eq_ignore_ascii_case(name))
             .ok_or_else(|| {
-                PinkDbError::Catalog(format!("trigger \"{name}\" not found in database \"{db}\""))
+                PinkDbError::Catalog(format!("trigger \"{name}\" not found in schema {ns}"))
             })
     }
 
@@ -2494,13 +3155,13 @@ impl PinkDb {
     /// overwrites in place, so a replaced trigger keeps its firing position.
     pub(crate) fn triggers_insert_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         def: crate::trigger::TriggerDef,
     ) -> Result<()> {
-        let cat = self.catalog_mut(db)?;
-        match cat.trigger_index(&def.name) {
-            Some(i) => cat.triggers[i] = def,
-            None => cat.triggers.push(def),
+        let schema = self.schema_mut(&ns.into())?;
+        match schema.trigger_index(&def.name) {
+            Some(i) => schema.triggers[i] = def,
+            None => schema.triggers.push(def),
         }
         Ok(())
     }
@@ -2508,60 +3169,67 @@ impl PinkDb {
     /// Remove one trigger (the caller checks existence for `IF EXISTS`).
     pub(crate) fn triggers_remove_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         name: &str,
     ) -> Option<crate::trigger::TriggerDef> {
-        let cat = self.databases.get_mut(&Self::db_key(db))?;
-        let i = cat.trigger_index(name)?;
-        Some(cat.triggers.remove(i))
+        let schema = self.schema_mut(&ns.into()).ok()?;
+        let i = schema.trigger_index(name)?;
+        Some(schema.triggers.remove(i))
     }
 
-    /// Does any database hold a trigger? (Cheap gate for the `.pink` flags
-    /// word.)
+    /// Does any schema of any database hold a trigger? (Cheap gate for the
+    /// `.pink` flags word.)
     pub(crate) fn has_triggers(&self) -> bool {
-        self.databases.values().any(|c| !c.triggers.is_empty())
+        self.databases
+            .values()
+            .any(|c| c.schemas.values().any(|s| !s.triggers.is_empty()))
     }
 
-    /// A stored macro of `db` by name (case-insensitive).
-    pub fn macro_in(&self, db: &str, name: &str) -> Result<&crate::macros::MacroDef> {
-        self.catalog(db)?
+    /// A stored macro of `ns` by name (case-insensitive).
+    pub fn macro_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+        name: &str,
+    ) -> Result<&crate::macros::MacroDef> {
+        let ns = ns.into();
+        self.schema(&ns)?
             .macros
             .get(&name.to_ascii_lowercase())
             .ok_or_else(|| {
-                PinkDbError::Catalog(format!("macro \"{name}\" not found in database \"{db}\""))
+                PinkDbError::Catalog(format!("macro \"{name}\" not found in schema {ns}"))
             })
     }
 
     /// Install (or replace) one macro definition.
     pub(crate) fn macros_insert_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         key: String,
         def: crate::macros::MacroDef,
     ) -> Result<()> {
-        self.catalog_mut(db)?.macros.insert(key, def);
+        self.schema_mut(&ns.into())?.macros.insert(key, def);
         Ok(())
     }
 
     /// Remove one macro (the caller checks existence for `IF EXISTS`).
     pub(crate) fn macros_remove_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         key: &str,
     ) -> Option<crate::macros::MacroDef> {
-        self.databases
-            .get_mut(&Self::db_key(db))?
-            .macros
-            .remove(key)
+        self.schema_mut(&ns.into()).ok()?.macros.remove(key)
     }
 
-    /// Every macro of `db`, as `(lowercased key, definition)` pairs sorted by
+    /// Every macro of `ns`, as `(lowercased key, definition)` pairs sorted by
     /// key — the deterministic order `.pink` writes them in.
-    pub(crate) fn macros_in(&self, db: &str) -> Vec<(String, crate::macros::MacroDef)> {
-        let Some(cat) = self.databases.get(&Self::db_key(db)) else {
+    pub(crate) fn macros_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+    ) -> Vec<(String, crate::macros::MacroDef)> {
+        let Ok(schema) = self.schema(&ns.into()) else {
             return Vec::new();
         };
-        let mut out: Vec<(String, crate::macros::MacroDef)> = cat
+        let mut out: Vec<(String, crate::macros::MacroDef)> = schema
             .macros
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -2570,10 +3238,12 @@ impl PinkDb {
         out
     }
 
-    /// Does any database hold a macro? (Cheap gate for the `.pink` flags
-    /// word.)
+    /// Does any schema of any database hold a macro? (Cheap gate for the
+    /// `.pink` flags word.)
     pub(crate) fn has_macros(&self) -> bool {
-        self.databases.values().any(|c| !c.macros.is_empty())
+        self.databases
+            .values()
+            .any(|c| c.schemas.values().any(|s| !s.macros.is_empty()))
     }
 
     /// Does the store hold any RBAC data (a user, a role, a membership, a
@@ -2583,6 +3253,7 @@ impl PinkDb {
             || !self.rbac.roles.is_empty()
             || !self.rbac.memberships.is_empty()
             || !self.rbac.table_grants.is_empty()
+            || !self.rbac.schema_grants.is_empty()
             || !self.rbac.database_grants.is_empty()
             || !self.rbac.admins.is_empty()
     }
@@ -2593,8 +3264,13 @@ impl PinkDb {
         self.proc_frame.clear();
     }
 
-    pub fn materialized_view_in(&self, db: &str, name: &str) -> Result<&MaterializedViewDef> {
-        self.catalog(db)?
+    pub fn materialized_view_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+        name: &str,
+    ) -> Result<&MaterializedViewDef> {
+        let ns = ns.into();
+        self.schema(&ns)?
             .materialized_views
             .get(&name.to_ascii_lowercase())
             .ok_or_else(|| PinkDbError::Catalog(format!("materialized view \"{name}\" not found")))
@@ -2603,24 +3279,28 @@ impl PinkDb {
     /// Mutable access to one materialized view's definition.
     pub(crate) fn materialized_view_mut_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         name: &str,
     ) -> Result<&mut MaterializedViewDef> {
+        let ns = ns.into();
         let key = name.to_ascii_lowercase();
-        self.catalog_mut(db)?
+        self.schema_mut(&ns)?
             .materialized_views
             .get_mut(&key)
             .ok_or_else(|| PinkDbError::Catalog(format!("materialized view \"{name}\" not found")))
     }
 
-    /// Every materialized view of `db`, as `(lowercased key, definition)`
+    /// Every materialized view of `ns`, as `(lowercased key, definition)`
     /// pairs sorted by key (deterministic order for `SHOW MATERIALIZED VIEWS`,
     /// `REFRESH MATERIALIZED VIEWS`, and the boundary refresh pass).
-    pub(crate) fn materialized_views_in(&self, db: &str) -> Vec<(String, MaterializedViewDef)> {
-        let Some(cat) = self.databases.get(&Self::db_key(db)) else {
+    pub(crate) fn materialized_views_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+    ) -> Vec<(String, MaterializedViewDef)> {
+        let Ok(schema) = self.schema(&ns.into()) else {
             return Vec::new();
         };
-        let mut out: Vec<(String, MaterializedViewDef)> = cat
+        let mut out: Vec<(String, MaterializedViewDef)> = schema
             .materialized_views
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -2629,13 +3309,12 @@ impl PinkDb {
         out
     }
 
-    /// Names of every materialized view of `db`, sorted (display names).
-    pub(crate) fn materialized_view_names_in(&self, db: &str) -> Vec<String> {
+    /// Names of every materialized view of `ns`, sorted (display names).
+    pub(crate) fn materialized_view_names_in(&self, ns: impl Into<SchemaPath>) -> Vec<String> {
         let mut out: Vec<String> = self
-            .databases
-            .get(&Self::db_key(db))
-            .map(|c| {
-                c.materialized_views
+            .schema(&ns.into())
+            .map(|s| {
+                s.materialized_views
                     .values()
                     .map(|v| v.name.clone())
                     .collect()
@@ -2645,16 +3324,21 @@ impl PinkDb {
         out
     }
 
-    /// The `(lowercased db, lowercased table)` pairs the refresh of the MV
-    /// `(db, name)` reads: its defining query's base tables. Empty for an
-    /// unknown view or one whose query could not be rebound.
-    pub(crate) fn materialized_view_deps(&self, db: &str, name: &str) -> HashSet<(String, String)> {
+    /// The base tables the refresh of the MV `(ns, name)` reads, as
+    /// namespace-plus-name references. Empty for an unknown view or one whose
+    /// query could not be rebound.
+    pub(crate) fn materialized_view_deps(
+        &self,
+        ns: impl Into<SchemaPath>,
+        name: &str,
+    ) -> HashSet<TableRef> {
+        let ns = ns.into();
         let mut out = HashSet::new();
-        let Ok(mv) = self.materialized_view_in(db, name) else {
+        let Ok(mv) = self.materialized_view_in(&ns, name) else {
             return out;
         };
         if let Some(q) = &mv.query {
-            crate::plan::collect_tables_read(q, db, &mut out);
+            crate::plan::collect_tables_read(q, &ns, &mut out);
         }
         out
     }
@@ -2667,9 +3351,11 @@ impl PinkDb {
     /// session's current database is live, like `rollback`'s.
     pub(crate) fn proc_snapshot_restore(&mut self, snap: Box<PinkDb>) {
         let current = self.current_db.clone();
+        let current_ns = self.current_ns.clone();
         let base = self.txn_base.take();
         *self = *snap;
         self.current_db = current;
+        self.current_ns = current_ns;
         self.txn_base = base;
     }
 
@@ -2711,6 +3397,15 @@ impl PinkDb {
         self.wal.is_some()
     }
 
+    /// The checkpoint file behind a durable store, or `None` in memory.
+    /// `duckdb_databases().path` reports it for local databases.
+    pub fn store_path(&self) -> Option<String> {
+        self.wal.as_ref().map(|wal| {
+            let wal = wal.lock().unwrap_or_else(|e| e.into_inner());
+            wal.checkpoint_path().display().to_string()
+        })
+    }
+
     /// Install (or clear) the replay memo of the WAL record being replayed,
     /// returning the previous one so the caller can restore it. While set,
     /// every `external_io` host scalar must be served from it.
@@ -2724,6 +3419,92 @@ impl PinkDb {
     /// The record being replayed, if any: `(function, args) -> result`.
     pub(crate) fn ext_replay(&self) -> Option<&crate::wal::ReplayMemo> {
         self.ext_replay.as_deref()
+    }
+
+    /// Start the record state for a statement that is about to execute.
+    ///
+    /// A record is one WAL unit: an autocommit statement, a transaction, a
+    /// procedure segment, the statements two triggers fire. Its seed is drawn
+    /// once, at the first statement that writes, and travels in the record's
+    /// memo (see [`crate::sql::binder::seed_memo`]). Every statement of the
+    /// record then advances an ordinal, so two identical statements in one
+    /// record draw different values while a replay, which executes the same
+    /// statements in the same order after `clear`, draws the same ones.
+    ///
+    /// Nested statements (a `CALL` body, a trigger action, a materialized-view
+    /// refresh) belong to the unit being built, so they do not start a new one.
+    /// Read-only statements never seed: they have no record to replay.
+    pub(crate) fn begin_volatile_statement(&self, plan: &crate::plan::LogicalPlan) -> Result<()> {
+        let in_replay = self.replaying || self.ext_replay.is_some();
+        if !in_replay && !self.in_transaction() && self.proc_depth == 0 && self.trigger_depth == 0 {
+            self.volatile.clear();
+        }
+        if self.logged_statement(plan) {
+            self.begin_volatile_write();
+        }
+        Ok(())
+    }
+
+    /// Whether this statement needs a seed of its own in the record it logs.
+    ///
+    /// Every statement that can be logged gets one, and so does every nested
+    /// statement that can draw a value: a trigger action, a `DO` block body
+    /// and a `CALL` body all execute inside the statement that carries the
+    /// record, so their seeds ride in that record. The rule must not depend on
+    /// how a `CALL` happens to be logged (its text, or its body's statements
+    /// one segment at a time), because a replay takes the seeds in order.
+    fn logged_statement(&self, plan: &crate::plan::LogicalPlan) -> bool {
+        matches!(plan, crate::plan::LogicalPlan::Call { .. })
+            || self.proc_depth > 0
+            || self.trigger_depth > 0
+            || crate::plan::writes_tables(plan)
+    }
+
+    /// Open the statement's slot in the record being built.
+    pub(crate) fn begin_volatile_write(&self) {
+        self.volatile.open_slot();
+    }
+
+    /// Load the seeds a record being replayed recorded, in order.
+    pub(crate) fn set_replay_seeds(&self, seeds: impl IntoIterator<Item = u128>) {
+        self.volatile.set_replay(seeds);
+    }
+
+    /// The seed and nesting depth the statement being evaluated draws from.
+    ///
+    /// The statement's slot was opened when it started executing, so a
+    /// statement that never calls a seeded function leaves no memo entry. A
+    /// read-only statement has no slot and draws a fresh seed per evaluation:
+    /// a read has no record to replay, so its values only need to differ from
+    /// each other.
+    pub(crate) fn volatile_evaluation(&self) -> Result<(u128, u64)> {
+        // Depth keeps a trigger's action apart from the statement that fired
+        // it, even where both draw from seeds of the same record.
+        let nest = u64::from((self.proc_depth + self.trigger_depth) as u32) << 32;
+        let replay = self.replaying || self.ext_replay.is_some();
+        Ok((self.volatile.seed(replay)?, nest))
+    }
+
+    /// The clock reading a statement's record pins: from the statement's own
+    /// dependencies, or from the statements a `CALL`/`DO` body or a trigger
+    /// action ran (a `now()` inside a body is part of the same record).
+    pub(crate) fn statement_clock_memo(
+        &self,
+        dependencies: &[String],
+    ) -> Option<crate::wal::ExtCall> {
+        let mut deps = dependencies.to_vec();
+        deps.extend(self.proc_frame.memo_deps().iter().cloned());
+        crate::sql::binder::clock_memo(&deps)
+    }
+
+    /// The memo entries a record needs for the volatile functions it used: the
+    /// clock reading and the seed of every statement of the record that drew
+    /// one.
+    pub(crate) fn statement_memo(&self, dependencies: &[String]) -> Vec<crate::wal::ExtCall> {
+        self.statement_clock_memo(dependencies)
+            .into_iter()
+            .chain(self.volatile.take_memos())
+            .collect()
     }
 
     /// The result an earlier statement of the open transaction recorded for
@@ -2793,11 +3574,15 @@ impl PinkDb {
         // Session-local views survive the swap; a replayed object colliding
         // with one is then a hard replay error (hazard H4), exactly like a
         // reopen.
-        let local_views: Vec<(String, HashMap<String, ViewDef>)> = self
+        let local_views: Vec<(SchemaPath, HashMap<String, ViewDef>)> = self
             .databases
             .iter()
-            .filter(|(_, cat)| !cat.views.is_empty())
-            .map(|(key, cat)| (key.clone(), cat.views.clone()))
+            .flat_map(|(db, cat)| {
+                cat.schemas
+                    .iter()
+                    .map(move |(schema, s)| (SchemaPath::new(db, schema), s.views.clone()))
+            })
+            .filter(|(_, views)| !views.is_empty())
             .collect();
         self.databases = other.databases;
         // The RBAC catalog is store-global metadata outside `databases`: a
@@ -2805,10 +3590,10 @@ impl PinkDb {
         // exactly like it is for tables, so the swap carries users, roles and
         // grants too.
         self.rbac = other.rbac;
-        for (key, views) in local_views {
-            if let Some(cat) = self.databases.get_mut(&key) {
+        for (ns, views) in local_views {
+            if let Ok(schema) = self.schema_mut(&ns) {
                 for (name, view) in views {
-                    cat.views.entry(name).or_insert(view);
+                    schema.views.entry(name).or_insert(view);
                 }
             }
         }
@@ -2837,6 +3622,7 @@ impl PinkDb {
                 });
         }
         self.current_db = other.current_db;
+        self.current_ns = other.current_ns;
         // Wave 124: the reloaded checkpoint names its lake databases but holds
         // none of their content; this process's open lakes provide it.
         self.reinstall_lake_databases();
@@ -2876,15 +3662,19 @@ impl PinkDb {
         // per-statement source text unconditional, which took the old
         // `is_durable()` shield away. Buffering here would append the frame's
         // own statements to this transaction's record and replay them twice.
-        if self.replaying || !crate::plan::writes_tables(plan) {
+        if self.replaying || !crate::plan::writes_persistent_tables(plan, &self.current_ns.clone())
+        {
             return Ok(());
         }
-        // A statement that read the clock (`now()`) carries the reading in
-        // its replay memo, so replay binds the same instant.
+        // A statement that read the clock (`now()`) carries the reading in its
+        // replay memo, so replay binds the same instant. The seeds ride with
+        // the record itself: one per logged statement that drew a volatile
+        // value, added where the record is appended (a transaction drains them
+        // at commit, `PinkDb::commit`).
         let with_clock;
-        let memo = match crate::sql::binder::clock_memo(dynamic_functions_used) {
-            Some(call) => {
-                with_clock = memo.iter().cloned().chain([call]).collect::<Vec<_>>();
+        let memo = match self.statement_clock_memo(dynamic_functions_used) {
+            Some(clock) => {
+                with_clock = memo.iter().cloned().chain([clock]).collect::<Vec<_>>();
                 &with_clock[..]
             }
             None => memo,
@@ -2900,24 +3690,46 @@ impl PinkDb {
                 return Ok(());
             }
             let sets = self.proc_frame.touched();
-            return self.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets), memo);
+            let memo: Vec<_> = memo
+                .iter()
+                .cloned()
+                .chain(self.volatile.take_memos())
+                .collect();
+            return self.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets), None, &memo);
         }
         // Wave 48: a `CREATE/ALTER USER` is logged in its `PASSWORD_HASH`
         // form — the plaintext of the statement text must never reach the
         // WAL (and the hash is exactly the one the catalog stored).
         let logged = crate::rbac::wal_statement_text(plan, sql);
         let sql: &str = &logged;
+        // A statement that changes the stored secrets carries the whole
+        // (persistent) secret set in its record, so replay can install the
+        // password an `ATTACH` needs before it replays the attach itself.
+        // Values never ride in the statement text (see `wal_statement_text`).
+        let secret_snapshot = if matches!(
+            plan,
+            crate::plan::LogicalPlan::Attach { .. }
+                | crate::plan::LogicalPlan::CreateSecret { .. }
+                | crate::plan::LogicalPlan::DropSecret { .. }
+        ) {
+            Some(self.persistent_secrets())
+        } else {
+            None
+        };
         let touched = self.dynamic_function_paths(dynamic_functions_used);
         let loaded = loaded_extension_path(plan);
         // The frame's touched set (wave 45o), recorded in the payload so
         // other writers can validate optimistic commits against this frame.
         let sets = match sets {
             Some(s) => s.clone(),
-            None => self.plan_sets_store(plan, &self.current_db.clone()),
+            None => {
+                let ns = self.current_ns().clone();
+                self.plan_sets_store(plan, &ns)
+            }
         };
         if self.in_transaction() {
             if self.wal_txn_db.is_none() {
-                self.wal_txn_db = Some(self.current_db.clone());
+                self.wal_txn_db = Some(self.current_ns().clone());
             }
             self.wal_txn.push(sql.to_string());
             self.wal_txn_sets.extend(&sets);
@@ -2936,25 +3748,31 @@ impl PinkDb {
         }
         // `USE` is self-contained: replaying it lands in the target session
         // from anywhere, so no prefix is needed (and none would help).
-        if let crate::plan::LogicalPlan::Use { name } = plan {
+        if let crate::plan::LogicalPlan::Use { ns } = plan {
             if let Some(wal) = self.durable_handle() {
                 let mut guard = wal.lock().map_err(|_| {
                     PinkDbError::Execution("internal lock error (poisoned)".to_string())
                 })?;
-                guard.append(&[sql.to_string()], Some(&sets), memo)?;
-                guard.set_session_db(&name.to_ascii_lowercase());
+                guard.append(&[sql.to_string()], Some(&sets), None, memo)?;
+                guard.set_session_db(ns);
             }
             return Ok(());
         }
-        let db = self.current_db.clone();
+        let ns = self.current_ns().clone();
+        let memo: Vec<_> = memo
+            .iter()
+            .cloned()
+            .chain(self.volatile.take_memos())
+            .collect();
         self.wal_append_session(
-            &db,
-            &db,
+            &ns,
+            &ns,
             &[sql.to_string()],
             &touched,
             &loaded,
             Some(&sets),
-            memo,
+            secret_snapshot.as_deref(),
+            &memo,
         )
     }
 
@@ -2984,12 +3802,13 @@ impl PinkDb {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn wal_append_session(
         &mut self,
-        db_before: &str,
-        db_after: &str,
+        db_before: &SchemaPath,
+        db_after: &SchemaPath,
         stmts: &[String],
         touched_extensions: &[String],
         loaded_extensions: &[String],
         sets: Option<&crate::wal::FrameSets>,
+        secrets: Option<&[crate::secret::Secret]>,
         memo: &[crate::wal::ExtCall],
     ) -> Result<()> {
         // Wave 124: a unit that changed lake databases commits there, and the
@@ -3005,6 +3824,7 @@ impl PinkDb {
             touched_extensions,
             loaded_extensions,
             sets,
+            secrets,
             memo,
         )
     }
@@ -3017,12 +3837,13 @@ impl PinkDb {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn wal_append_local(
         &self,
-        db_before: &str,
-        db_after: &str,
+        db_before: &SchemaPath,
+        db_after: &SchemaPath,
         stmts: &[String],
         touched_extensions: &[String],
         loaded_extensions: &[String],
         sets: Option<&crate::wal::FrameSets>,
+        secrets: Option<&[crate::secret::Secret]>,
         memo: &[crate::wal::ExtCall],
     ) -> Result<()> {
         if let Some(wal) = self.durable_handle() {
@@ -3037,7 +3858,7 @@ impl PinkDb {
             let mut guard = wal.lock().map_err(|_| {
                 PinkDbError::Execution("internal lock error (poisoned)".to_string())
             })?;
-            let before = self.database_exists(db_before).then_some(db_before);
+            let before = self.schema_exists(db_before).then_some(db_before);
             guard.append_in_session(
                 before,
                 db_after,
@@ -3045,6 +3866,7 @@ impl PinkDb {
                 touched_extensions,
                 loaded_extensions,
                 sets,
+                secrets,
                 &memo,
             )?;
         }
@@ -3073,6 +3895,8 @@ impl PinkDb {
         self.wal_txn_ext_loaded.clear();
         self.wal_txn_sets = crate::wal::FrameSets::default();
         self.wal_txn_memo.clear();
+        // A transaction is a new record: it draws its own seed.
+        self.volatile.clear();
         self.txn_touched = crate::wal::FrameSets::default();
         self.txn_storages.clear();
         // A new transaction starts with no writes; ROLLBACK must not leave
@@ -3141,12 +3965,24 @@ impl PinkDb {
             let touched = std::mem::take(&mut self.wal_txn_ext_paths);
             let loaded = std::mem::take(&mut self.wal_txn_ext_loaded);
             let sets = std::mem::take(&mut self.wal_txn_sets);
-            let memo = std::mem::take(&mut self.wal_txn_memo);
+            // One seed per logged statement of the record rides with the
+            // transaction's single WAL record, exactly like an autocommit
+            // statement's.
+            let mut memo = std::mem::take(&mut self.wal_txn_memo);
+            for call in self.volatile.take_memos() {
+                // A retried COMMIT keeps the entries it already restored.
+                if !memo
+                    .iter()
+                    .any(|c| c.name == call.name && c.args == call.args)
+                {
+                    memo.push(call);
+                }
+            }
             let before = self
                 .wal_txn_db
                 .take()
-                .unwrap_or_else(|| self.current_db.clone());
-            let after = self.current_db.clone();
+                .unwrap_or_else(|| self.current_ns().clone());
+            let after = self.current_ns().clone();
             if let Err(e) = self.wal_append_local(
                 &before,
                 &after,
@@ -3154,6 +3990,7 @@ impl PinkDb {
                 &touched,
                 &loaded,
                 Some(&sets),
+                None,
                 &memo,
             ) {
                 // Keep the statements: a retried COMMIT must never publish
@@ -3190,8 +4027,10 @@ impl PinkDb {
         match self.txn_snapshot.take() {
             Some(snap) => {
                 let current = self.current_db.clone();
+                let current_ns = self.current_ns.clone();
                 *self = *snap;
                 self.current_db = current;
+                self.current_ns = current_ns;
                 self.wal_txn.clear();
                 self.wal_txn_db = None;
                 self.wal_txn_ext_paths.clear();
@@ -3220,16 +4059,16 @@ impl PinkDb {
 
     pub fn create_table(&mut self, name: &str, schema: Vec<(String, DataType)>) -> Result<()> {
         let db = self.current_db.clone();
-        self.create_table_in(&db, name, schema)
+        self.create_table_in(SchemaPath::main(&db), name, schema)
     }
 
     pub fn create_table_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         name: &str,
         schema: Vec<(String, DataType)>,
     ) -> Result<()> {
-        self.create_table_with_constraints_in(db, name, schema, TableConstraints::default())
+        self.create_table_with_constraints_in(ns, name, schema, TableConstraints::default())
     }
 
     /// [`PinkDb::create_table_in`] with declarative constraints (metadata
@@ -3237,16 +4076,17 @@ impl PinkDb {
     /// (foreign keys against the referenced table's keys).
     pub fn create_table_with_constraints_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         name: &str,
         schema: Vec<(String, DataType)>,
         constraints: TableConstraints,
     ) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, name) {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, name) {
             return Err(err);
         }
         let key = Self::key(name);
-        let cat = self.catalog_mut(db)?;
+        let cat = self.schema_mut(&ns)?;
         if cat.tables.contains_key(&key) {
             return Err(PinkDbError::Catalog(format!(
                 "table \"{name}\" already exists"
@@ -3266,14 +4106,15 @@ impl PinkDb {
 
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
         let db = self.current_db.clone();
-        self.drop_table_in(&db, name)
+        self.drop_table_in(SchemaPath::main(&db), name)
     }
 
-    pub fn drop_table_in(&mut self, db: &str, name: &str) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, name) {
+    pub fn drop_table_in(&mut self, ns: impl Into<SchemaPath>, name: &str) -> Result<()> {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, name) {
             return Err(err);
         }
-        self.catalog_mut(db)?
+        self.schema_mut(&ns)?
             .tables
             .remove(&Self::key(name))
             .map(|_| ())
@@ -3283,15 +4124,16 @@ impl PinkDb {
     /// Build a hash index on `table.column` (by index) and store it.
     pub fn create_index_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         table: &str,
         name: &str,
         column: usize,
     ) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, table) {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, table) {
             return Err(err);
         }
-        let t = self.table_mut_in(db, table)?;
+        let t = self.table_mut_in(&ns, table)?;
         let Some(col) = t.columns.get(column) else {
             return Err(PinkDbError::Catalog(format!(
                 "column {column} out of range for table \"{table}\""
@@ -3318,14 +4160,15 @@ impl PinkDb {
     /// or has a NULL element is not a vector and is skipped.
     pub fn create_vector_index_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         table: &str,
         name: &str,
         column: usize,
         provider_name: &str,
         options: &[(String, String)],
     ) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, table) {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, table) {
             return Err(err);
         }
         let provider = self
@@ -3340,7 +4183,7 @@ impl PinkDb {
                 ))
             })?;
         let dim = {
-            let t = self.table_in(db, table)?;
+            let t = self.table_in(&ns, table)?;
             if t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name))
                 || t.vector_indexes
                     .iter()
@@ -3380,7 +4223,7 @@ impl PinkDb {
         // One bulk call per chunk (wave 107d): the provider parallelises
         // the build, and chunk-sized calls bound the copied vectors.
         {
-            let t = self.table_in(db, table)?;
+            let t = self.table_in(&ns, table)?;
             let col = &t.columns[column];
             let mut offset = 0usize;
             for chunk in &col.chunks {
@@ -3398,7 +4241,7 @@ impl PinkDb {
                 offset += chunk.len();
             }
         }
-        let t = self.table_mut_in(db, table)?;
+        let t = self.table_mut_in(&ns, table)?;
         t.vector_indexes.push(VectorIndexDef {
             name: name.to_string(),
             column,
@@ -3411,11 +4254,17 @@ impl PinkDb {
     }
 
     /// Drop tombstones from a vector index (`ALTER INDEX … COMPACT`).
-    pub fn compact_vector_index_in(&mut self, db: &str, table: &str, name: &str) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, table) {
+    pub fn compact_vector_index_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        table: &str,
+        name: &str,
+    ) -> Result<()> {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, table) {
             return Err(err);
         }
-        let t = self.table_mut_in(db, table)?;
+        let t = self.table_mut_in(&ns, table)?;
         let table_name = t.name.clone();
         let def = t
             .vector_indexes
@@ -3432,11 +4281,11 @@ impl PinkDb {
     /// Live/tombstone counts of a vector index (tests and diagnostics).
     pub fn vector_index_stats_in(
         &self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         table: &str,
         name: &str,
     ) -> Result<crate::vector_index::VectorIndexStats> {
-        let t = self.table_in(db, table)?;
+        let t = self.table_in(ns, table)?;
         let def = t
             .vector_indexes
             .iter()
@@ -3478,7 +4327,8 @@ impl PinkDb {
             let pending = self
                 .databases
                 .values()
-                .flat_map(|c| c.tables.values())
+                .flat_map(|c| c.schemas.values())
+                .flat_map(|s| s.tables.values())
                 .flat_map(|t| t.vector_indexes.iter())
                 .filter(|d| d.index.is_none() && d.blob.is_some())
                 .map(|d| d.provider.clone())
@@ -3504,18 +4354,20 @@ impl PinkDb {
     ) -> Result<Vec<crate::vector_index::HydratedVectorIndex>> {
         let mut ready = Vec::new();
         for (db_key, cat) in &self.databases {
-            for (table_key, t) in &cat.tables {
-                for (i, def) in t.vector_indexes.iter().enumerate() {
-                    if def.index.is_none()
-                        && def.provider.eq_ignore_ascii_case(provider.name())
-                        && let Some(blob) = &def.blob
-                    {
-                        ready.push((
-                            db_key.clone(),
-                            table_key.clone(),
-                            i,
-                            provider.deserialize(blob)?,
-                        ));
+            for (schema_key, schema) in &cat.schemas {
+                for (table_key, t) in &schema.tables {
+                    for (i, def) in t.vector_indexes.iter().enumerate() {
+                        if def.index.is_none()
+                            && def.provider.eq_ignore_ascii_case(provider.name())
+                            && let Some(blob) = &def.blob
+                        {
+                            ready.push((
+                                SchemaPath::new(db_key, schema_key),
+                                table_key.clone(),
+                                i,
+                                provider.deserialize(blob)?,
+                            ));
+                        }
                     }
                 }
             }
@@ -3530,11 +4382,11 @@ impl PinkDb {
         &mut self,
         ready: Vec<crate::vector_index::HydratedVectorIndex>,
     ) {
-        for (db_key, table_key, slot, index) in ready {
+        for (ns, table_key, slot, index) in ready {
             let t = self
-                .databases
-                .get_mut(&db_key)
-                .and_then(|c| c.tables.get_mut(&table_key))
+                .schema_mut(&ns)
+                .ok()
+                .and_then(|s| s.tables.get_mut(&table_key))
                 .expect("table still present");
             t.vector_indexes[slot].index = Some(std::sync::Arc::from(index));
             t.vector_indexes[slot].blob = None;
@@ -3544,11 +4396,12 @@ impl PinkDb {
     /// Rebuild one table's stale hash indexes from its live chunks. The
     /// optimizer calls this lazily, just before it rewrites an equality lookup
     /// into an `IndexScan` (see [`DataTable::invalidate_indexes`]).
-    pub fn rebuild_indexes_in(&mut self, db: &str, table: &str) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, table) {
+    pub fn rebuild_indexes_in(&mut self, ns: impl Into<SchemaPath>, table: &str) -> Result<()> {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, table) {
             return Err(err);
         }
-        self.table_mut_in(db, table)?.rebuild_indexes();
+        self.table_mut_in(&ns, table)?.rebuild_indexes();
         Ok(())
     }
 
@@ -3561,19 +4414,27 @@ impl PinkDb {
     /// only costs performance.
     pub fn rebuild_stale_indexes(&mut self) {
         for catalog in self.databases.values_mut() {
-            for table in catalog.tables.values_mut() {
-                if table.indexes_stale {
-                    table.rebuild_indexes();
+            for schema in catalog.schemas.values_mut() {
+                for table in schema.tables.values_mut() {
+                    if table.indexes_stale {
+                        table.rebuild_indexes();
+                    }
                 }
             }
         }
     }
 
-    pub fn drop_index_in(&mut self, db: &str, table: &str, name: &str) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, table) {
+    pub fn drop_index_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        table: &str,
+        name: &str,
+    ) -> Result<()> {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, table) {
             return Err(err);
         }
-        let t = self.table_mut_in(db, table)?;
+        let t = self.table_mut_in(&ns, table)?;
         let before = t.indexes.len() + t.vector_indexes.len();
         t.indexes.retain(|i| !i.name.eq_ignore_ascii_case(name));
         t.vector_indexes
@@ -3592,11 +4453,17 @@ impl PinkDb {
     /// metadata only, like DuckDB. The new name must be free among the
     /// database's tables and views; a case-only rename updates the display
     /// name in place.
-    pub fn rename_table_in(&mut self, db: &str, from: &str, to: &str) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, from) {
+    pub fn rename_table_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, from) {
             return Err(err);
         }
-        let cat = self.catalog_mut(db)?;
+        let cat = self.schema_mut(&ns)?;
         let key_from = Self::key(from);
         let key_to = Self::key(to);
         if key_to == key_from {
@@ -3625,11 +4492,12 @@ impl PinkDb {
     }
 
     pub fn table(&self, name: &str) -> Result<&DataTable> {
-        self.table_in(&self.current_db, name)
+        self.table_in(SchemaPath::main(&self.current_db), name)
     }
 
-    pub fn table_in(&self, db: &str, name: &str) -> Result<&DataTable> {
-        self.catalog(db)?
+    pub fn table_in(&self, ns: impl Into<SchemaPath>, name: &str) -> Result<&DataTable> {
+        let ns = ns.into();
+        self.schema(&ns)?
             .tables
             .get(&Self::key(name))
             .ok_or_else(|| PinkDbError::Catalog(format!("table \"{name}\" not found")))
@@ -3637,14 +4505,19 @@ impl PinkDb {
 
     pub fn table_mut(&mut self, name: &str) -> Result<&mut DataTable> {
         let db = self.current_db.clone();
-        self.table_mut_in(&db, name)
+        self.table_mut_in(SchemaPath::main(&db), name)
     }
 
-    pub fn table_mut_in(&mut self, db: &str, name: &str) -> Result<&mut DataTable> {
-        if let Some(err) = self.attached_read_only(db, name) {
+    pub fn table_mut_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        name: &str,
+    ) -> Result<&mut DataTable> {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, name) {
             return Err(err);
         }
-        self.catalog_mut(db)?
+        self.schema_mut(&ns)?
             .tables
             .get_mut(&Self::key(name))
             .ok_or_else(|| PinkDbError::Catalog(format!("table \"{name}\" not found")))
@@ -3652,15 +4525,14 @@ impl PinkDb {
 
     /// Sorted table names (stable output for `.tables`).
     pub fn list_tables(&self) -> Vec<String> {
-        self.list_tables_in(&self.current_db)
+        self.list_tables_in(SchemaPath::main(&self.current_db))
     }
 
-    /// Sorted table display names in `db`.
-    pub fn list_tables_in(&self, db: &str) -> Vec<String> {
+    /// Sorted table display names in `ns`.
+    pub fn list_tables_in(&self, ns: impl Into<SchemaPath>) -> Vec<String> {
         let mut names: Vec<String> = self
-            .databases
-            .get(&Self::db_key(db))
-            .map(|c| c.tables.values().map(|t| t.name.clone()).collect())
+            .schema(&ns.into())
+            .map(|s| s.tables.values().map(|t| t.name.clone()).collect())
             .unwrap_or_default();
         names.sort();
         names
@@ -3674,18 +4546,18 @@ impl PinkDb {
         cols: Option<Vec<String>>,
     ) -> Result<()> {
         let db = self.current_db.clone();
-        self.create_view_in(&db, name, query, cols)
+        self.create_view_in(SchemaPath::main(&db), name, query, cols)
     }
 
     pub fn create_view_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         name: &str,
         query: Select,
         cols: Option<Vec<String>>,
     ) -> Result<()> {
         let key = Self::key(name);
-        let cat = self.catalog_mut(db)?;
+        let cat = self.schema_mut(&ns.into())?;
         if cat.tables.contains_key(&key) {
             return Err(PinkDbError::Catalog(format!(
                 "a table named \"{name}\" already exists"
@@ -3710,9 +4582,14 @@ impl PinkDb {
 
     /// Stamp the statement text a view was created from, so the engine catalog
     /// image can rebuild it (wave 96b).
-    pub fn set_view_source_in(&mut self, db: &str, name: &str, sql: &str) -> Result<()> {
+    pub fn set_view_source_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        name: &str,
+        sql: &str,
+    ) -> Result<()> {
         let key = Self::key(name);
-        match self.catalog_mut(db)?.views.get_mut(&key) {
+        match self.schema_mut(&ns.into())?.views.get_mut(&key) {
             Some(view) => {
                 view.sql = sql.to_string();
                 Ok(())
@@ -3723,11 +4600,11 @@ impl PinkDb {
 
     pub fn drop_view(&mut self, name: &str) -> Result<()> {
         let db = self.current_db.clone();
-        self.drop_view_in(&db, name)
+        self.drop_view_in(SchemaPath::main(&db), name)
     }
 
-    pub fn drop_view_in(&mut self, db: &str, name: &str) -> Result<()> {
-        self.catalog_mut(db)?
+    pub fn drop_view_in(&mut self, ns: impl Into<SchemaPath>, name: &str) -> Result<()> {
+        self.schema_mut(&ns.into())?
             .views
             .remove(&Self::key(name))
             .map(|_| ())
@@ -3735,11 +4612,11 @@ impl PinkDb {
     }
 
     pub fn view(&self, name: &str) -> Result<&ViewDef> {
-        self.view_in(&self.current_db, name)
+        self.view_in(SchemaPath::main(&self.current_db), name)
     }
 
-    pub fn view_in(&self, db: &str, name: &str) -> Result<&ViewDef> {
-        self.catalog(db)?
+    pub fn view_in(&self, ns: impl Into<SchemaPath>, name: &str) -> Result<&ViewDef> {
+        self.schema(&ns.into())?
             .views
             .get(&Self::key(name))
             .ok_or_else(|| PinkDbError::Catalog(format!("view \"{name}\" not found")))
@@ -3747,15 +4624,14 @@ impl PinkDb {
 
     /// Sorted view display names.
     pub fn list_views(&self) -> Vec<String> {
-        self.list_views_in(&self.current_db)
+        self.list_views_in(SchemaPath::main(&self.current_db))
     }
 
-    /// Sorted view display names in `db`.
-    pub fn list_views_in(&self, db: &str) -> Vec<String> {
+    /// Sorted view display names in `ns`.
+    pub fn list_views_in(&self, ns: impl Into<SchemaPath>) -> Vec<String> {
         let mut names: Vec<String> = self
-            .databases
-            .get(&Self::db_key(db))
-            .map(|c| c.views.values().map(|v| v.name.clone()).collect())
+            .schema(&ns.into())
+            .map(|s| s.views.values().map(|v| v.name.clone()).collect())
             .unwrap_or_default();
         names.sort();
         names
@@ -4253,5 +5129,113 @@ mod tests {
             db.rebuild_stale_indexes();
             assert_index_matches_table(&db);
         }
+    }
+
+    /// Wave 131a: every database has a `main` schema, and a created schema is
+    /// a catalog level of its own (objects never leak between schemas).
+    #[test]
+    fn schemas_are_created_listed_and_hold_their_own_objects() {
+        let mut db = PinkDb::new();
+        let main = SchemaPath::main("main");
+        assert!(db.schema_exists(&main));
+        assert_eq!(db.list_schemas("main"), vec!["main".to_string()]);
+        // Keys are lowercased; the display name is what `list_schemas` sorts.
+        let s = SchemaPath::new("main", "Sales");
+        assert_eq!(s.schema(), "sales");
+        // `Display` quotes an identifier only when it needs quoting.
+        assert_eq!(s.to_string(), "main.sales");
+        assert_eq!(SchemaPath::new("db", "we ird").to_string(), "db.\"we ird\"");
+        db.create_schema(&s, false).unwrap();
+        assert_eq!(
+            db.list_schemas("main"),
+            vec!["main".to_string(), "sales".to_string()]
+        );
+        // `IF NOT EXISTS` is a no-op; the plain form refuses a duplicate.
+        db.create_schema(&s, true).unwrap();
+        assert_eq!(
+            db.create_schema(&s, false).unwrap_err().to_string(),
+            "schema \"sales\" already exists"
+        );
+        db.create_table_in(&s, "t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        assert!(db.table_in(&s, "t").is_ok());
+        assert!(db.table_in(&main, "t").is_err());
+        assert!(db.table_in(SchemaPath::new("main", "other"), "t").is_err());
+        // A schema needs a database to live in.
+        assert_eq!(
+            db.create_schema(&SchemaPath::new("nope", "s"), false)
+                .unwrap_err()
+                .to_string(),
+            "database \"nope\" not found"
+        );
+        assert!(db.list_schemas("nope").is_empty());
+    }
+
+    /// Wave 131a: `main` cannot be dropped, a non-empty schema needs
+    /// `CASCADE`, and `CASCADE` removes the schema's objects with it.
+    #[test]
+    fn drop_schema_refuses_main_and_non_empty_schemas() {
+        let mut db = PinkDb::new();
+        let err = db
+            .drop_schema(&SchemaPath::main("main"), false, true)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "cannot drop schema \"main\": it is the database's default schema"
+        );
+        let s = SchemaPath::new("main", "s");
+        db.create_schema(&s, false).unwrap();
+        db.create_table_in(&s, "t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        assert_eq!(
+            db.drop_schema(&s, false, false).unwrap_err().to_string(),
+            "schema \"s\" is not empty: use DROP SCHEMA ... CASCADE"
+        );
+        db.drop_schema(&s, false, true).unwrap();
+        assert!(!db.schema_exists(&s));
+        assert!(db.table_in(&s, "t").is_err());
+        // A missing schema: refused, or a no-op with `IF EXISTS`.
+        assert!(db.drop_schema(&s, true, false).is_ok());
+        assert!(db.drop_schema(&s, false, false).is_err());
+    }
+
+    /// Review fix: dropping a schema drops its grants (schema and table), so
+    /// a later schema of the same name starts clean; a non-empty schema is
+    /// only dropped with `cascade`.
+    #[test]
+    fn drop_schema_removes_its_grants() {
+        use crate::rbac::{GrantObject, Privilege};
+        let mut db = PinkDb::new();
+        let s = SchemaPath::new("main", "s");
+        let schema_grant = GrantObject::Schema {
+            db: "main".to_string(),
+            schema: "s".to_string(),
+        };
+        let table_grant = GrantObject::Table {
+            db: "main".to_string(),
+            schema: "s".to_string(),
+            table: "t".to_string(),
+        };
+        db.create_schema(&s, false).unwrap();
+        db.rbac_mut()
+            .grant(&schema_grant, "alice", &[Privilege::Select]);
+        assert!(db.rbac().allowed("alice", &schema_grant, Privilege::Select));
+        // An empty schema dropped without `cascade` still drops the grant.
+        db.drop_schema(&s, false, false).unwrap();
+        assert!(!db.rbac().allowed("alice", &schema_grant, Privilege::Select));
+        db.create_schema(&s, false).unwrap();
+        assert!(
+            !db.rbac().allowed("alice", &schema_grant, Privilege::Select),
+            "a re-created schema must not inherit the old grants"
+        );
+        // A table grant goes with the schema as well.
+        db.create_table_in(&s, "t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        db.rbac_mut()
+            .grant(&table_grant, "alice", &[Privilege::Select]);
+        assert!(db.rbac().allowed("alice", &table_grant, Privilege::Select));
+        db.drop_schema(&s, false, true).unwrap();
+        assert!(!db.rbac().allowed("alice", &table_grant, Privilege::Select));
     }
 }

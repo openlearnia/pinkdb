@@ -1,0 +1,14 @@
+{
+  "kpi_totals": {"semanticId": "daily_zone_performance.by_day", "measures": ["trips", "fare_amount", "tip_amount", "total_amount"], "dimensions": []},
+  "trips_by_day": {"semanticId": "daily_zone_performance.by_day", "measures": ["trips", "total_amount"], "dimensions": [], "timeDimensions": [{"dimension": "date.day_id", "granularity": "day", "dateRange": ["2024-01-01", "2024-03-31"]}], "order": [{"member": "date.day_id", "direction": "asc"}]},
+  "revenue_by_month": {"semanticId": "daily_zone_performance.by_zone_day", "measures": ["total_amount", "avg_fare"], "dimensions": [], "timeDimensions": [{"dimension": "date.day_id", "granularity": "month"}]},
+  "top_zones": {"semanticId": "daily_zone_performance.by_zone_day", "measures": ["trips", "revenue_per_trip"], "dimensions": ["zone_name", "borough_name"], "order": [{"member": "trips", "direction": "desc"}], "limit": 10},
+  "borough_weekend_filter": {"semanticId": "daily_zone_performance.by_borough_day", "measures": ["trips", "tip_rate"], "dimensions": ["borough_name"], "filters": [{"member": "is_weekend", "operator": "equals", "values": ["true"]}], "order": [{"member": "trips", "direction": "desc"}]},
+  "payment_mix": {"semanticId": "fare_composition.by_payment_day", "measures": ["trips", "fare_amount", "tip_rate"], "dimensions": ["payment_type_name"], "timeDimensions": [{"dimension": "date.day_id", "dateRange": ["2024-02-01", "2024-02-29"]}]},
+  "hourly_profile": {"semanticId": "peak_hour_demand.by_hour_day", "measures": ["trips", "avg_fare"], "dimensions": ["hour_of_day", "daypart"], "order": [{"member": "hour_of_day", "direction": "asc"}]},
+  "hour_zone_heatmap": {"semanticId": "peak_hour_demand.by_hour_zone_day", "measures": ["trips"], "dimensions": ["hour_of_day", "zone_name"], "filters": [{"member": "service_zone", "operator": "in", "values": ["Yellow Zone", "Airports"]}], "order": [{"member": "trips", "direction": "desc"}], "limit": 200},
+  "od_pairs_rollup": {"semanticId": "daily_zone_performance.by_od_day", "measures": ["trips", "avg_fare"], "dimensions": ["zone_name", "do_zone_name"], "order": [{"member": "trips", "direction": "desc"}], "limit": 25},
+  "od_distance_filtered": {"semanticId": "daily_zone_performance.by_od_distance", "measures": ["trip_distance"], "dimensions": ["service_zone"], "filters": [{"member": "zone_name", "operator": "startsWith", "values": ["JFK"]}]},
+  "vendor_daily": {"semanticId": "fare_composition.by_vendor_day", "measures": ["trips", "airport_fee"], "dimensions": ["vendor_name"], "timeDimensions": [{"dimension": "date.day_id", "granularity": "week"}], "order": [{"member": "date.day_id", "direction": "asc"}]},
+  "rate_code_table": {"semanticId": "fare_composition.by_rate_code_day", "measures": ["trips", "fare_amount", "total_amount"], "dimensions": ["rate_code_name", "weekday_name"], "order": [{"member": "fare_amount", "direction": "desc"}], "limit": 50}
+}

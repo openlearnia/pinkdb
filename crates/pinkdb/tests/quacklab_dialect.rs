@@ -3,10 +3,10 @@
 //!
 //! The WAL stores each statement's text and replay re-executes it, so the
 //! clock (`now()`, `CURRENT_TIMESTAMP`) must replay as the instant the
-//! original statement read, a transaction must read one instant, and
-//! `uuid()` — which no replay could reproduce — is refused in a logged
-//! statement. A crash is modeled by dropping the store without a checkpoint
-//! and reopening it: the tail replays.
+//! original statement read, a transaction must read one instant, and `uuid()`
+//! reads one statement seed that the record's memo carries, so the values
+//! replay exactly. A crash is modeled by dropping the store without a
+//! checkpoint and reopening it: the tail replays.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -90,23 +90,39 @@ fn the_clock_replays_as_the_instant_the_statement_read() {
 }
 
 #[test]
-fn uuid_is_refused_in_a_logged_statement_and_fine_in_a_read() {
-    let mut db = PinkDb::new();
-    run(&mut db, "CREATE TABLE u (id VARCHAR);");
-    let err = db
-        .execute("INSERT INTO u SELECT uuid();")
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("uuid() is volatile"), "{err}");
+fn uuid_in_a_logged_statement_replays_the_same_values() {
+    let scratch = Scratch::new("uuid");
+    let before;
+    {
+        let mut db = open(&scratch);
+        run(&mut db, "CREATE TABLE u (id UUID);");
+        run(&mut db, "INSERT INTO u SELECT uuid() FROM range(100);");
+        // A UUID written into a VARCHAR column takes its text form.
+        run(&mut db, "CREATE TABLE v (id VARCHAR);");
+        run(&mut db, "INSERT INTO v SELECT uuid();");
+        before = rows(&mut db, "SELECT id FROM u ORDER BY id;");
+        assert_eq!(before.len(), 100);
+        assert_eq!(
+            rows(&mut db, "SELECT count(DISTINCT id) FROM u;"),
+            vec![vec![Value::Bigint(100)]]
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT count(*) FROM v WHERE length(id) = 36;"),
+            vec![vec![Value::Bigint(1)]]
+        );
+    }
+    // Crash: the tail replays the statement with its recorded seed.
+    let mut db = open(&scratch);
+    assert_eq!(rows(&mut db, "SELECT id FROM u ORDER BY id;"), before);
     let out = rows(
         &mut db,
-        "SELECT count(DISTINCT gen_random_uuid()), min(length(uuid())) FROM range(100);",
+        "SELECT count(DISTINCT gen_random_uuid()), min(length(uuid()::VARCHAR)) FROM range(100);",
     );
     assert_eq!(out, vec![vec![Value::Bigint(100), Value::Integer(36)]]);
 }
 
 #[test]
-fn a_column_default_is_a_constant_and_a_clock_default_is_refused() {
+fn column_defaults_are_expressions_and_a_clock_default_uses_the_statement() {
     let scratch = Scratch::new("default");
     {
         let mut db = open(&scratch);
@@ -134,11 +150,26 @@ fn a_column_default_is_a_constant_and_a_clock_default_is_refused() {
             ])
             .collect::<Vec<_>>()
     );
-    let err = db
-        .execute("CREATE TABLE e (t TIMESTAMP DEFAULT now());")
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("reads the clock"), "{err}");
+    // A clock default is an expression: CREATE succeeds, and every row that
+    // takes the default reads the INSERT statement's one clock instant.
+    run(&mut db, "CREATE TABLE e (t TIMESTAMP DEFAULT now());");
+    run(&mut db, "INSERT INTO e DEFAULT VALUES;");
+    let first = match rows(&mut db, "SELECT t FROM e;")[0][0] {
+        Value::Timestamp(v) => v,
+        ref other => panic!("expected TIMESTAMP, got {other:?}"),
+    };
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    run(&mut db, "INSERT INTO e DEFAULT VALUES;");
+    let all = rows(&mut db, "SELECT t FROM e ORDER BY t;");
+    assert_eq!(all.len(), 2);
+    let second = match all[1][0] {
+        Value::Timestamp(v) => v,
+        ref other => panic!("expected TIMESTAMP, got {other:?}"),
+    };
+    assert!(
+        second > first,
+        "clock default did not advance: {first} -> {second}"
+    );
 }
 
 #[test]
@@ -172,11 +203,20 @@ fn create_or_replace_keeps_the_last_definition_after_replay() {
 }
 
 #[test]
-fn create_temp_is_refused_with_a_reason() {
+fn create_temp_table_is_session_local() {
     let mut db = PinkDb::new();
+    db.execute("CREATE TEMP TABLE t (a INTEGER);").unwrap();
+    db.execute("INSERT INTO t VALUES (1);").unwrap();
+    assert_eq!(
+        rows(&mut db, "SELECT a FROM t;"),
+        vec![vec![Value::Integer(1)]]
+    );
     let err = db
-        .execute("CREATE TEMP TABLE t (a INTEGER);")
+        .execute("CREATE TABLE temp.t (a INTEGER);")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("CREATE TEMP is not supported"), "{err}");
+    assert!(
+        err.contains("Only TEMPORARY table names can use the \"temp\" catalog"),
+        "{err}"
+    );
 }

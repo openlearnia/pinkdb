@@ -25,6 +25,8 @@ pub(crate) fn open_metadata_store_keyed(
     location: &Location,
     create: bool,
     key: Option<&crate::EncryptionKey>,
+    #[cfg_attr(not(feature = "catalog-postgres"), allow(unused_variables))]
+    postgres_password: Option<&str>,
 ) -> Result<Option<SqlMetadataStore>> {
     match location {
         Location::Pink(path) => Ok(Some(crate::metadata::pink::open_keyed(
@@ -52,7 +54,11 @@ pub(crate) fn open_metadata_store_keyed(
         #[cfg(not(feature = "catalog-sqlite"))]
         Location::Sqlite(_) => Ok(None),
         #[cfg(feature = "catalog-postgres")]
-        Location::Postgres(_) => Ok(Some(crate::metadata::postgres::open(catalog_url, create)?)),
+        Location::Postgres(_) => Ok(Some(crate::metadata::postgres::open_with_password(
+            catalog_url,
+            create,
+            postgres_password,
+        )?)),
         #[cfg(not(feature = "catalog-postgres"))]
         Location::Postgres(_) => Ok(None),
         Location::Local(_) | Location::S3 { .. } => Err(LakeError::BadLocation {

@@ -45,6 +45,11 @@ ui = ["dep:pinkdb-server-ui"]
 # `httpfs` adds the CSV table source (local, https://, s3://) and remote
 # Parquet. Off by default: the default server reads no files.
 parquet = ["dep:pinkdb-parquet"]
+# Wave 132b: the lake's Parquet data-file format, the CLI's `parquetlake`
+# feature under the same name. A DuckLake catalog is Parquet whatever made it
+# (stock DuckDB writes Parquet), so a server that must write into one needs the
+# provider registered. Off by default, like the CLI's.
+parquetlake = ["parquet", "dep:pink-lake-parquet"]
 httpfs = ["dep:pinkdb-httpfs", "pinkdb-httpfs/s3", "pinkdb-parquet?/remote"]
 # Opt-in full-text search (wave 108a): publishes the `pinkdb-fts` package and
 # loads it into the store the server opens, so `match_bm25` works without a
@@ -86,6 +91,9 @@ pinkdb-httpfs = { path = "../pinkdb-httpfs", optional = true }
 # Lake databases (wave 124): pink-lake's opener, registered before the store
 # opens so its replay can open the lakes it names.
 pink-lake = { path = "../pink-lake" }
+# The lake's Parquet data-file format (`parquetlake` feature only): a DuckLake
+# catalog holds Parquet files, and pinkdb writes the same format into one.
+pink-lake-parquet = { path = "../pink-lake-parquet", optional = true }
 # The optional SHA-256 pin allowlist (`--extension-pin`): a workspace crate the
 # engine already links, so this adds no dependency to the binary beyond the API
 # the flag needs.

@@ -158,6 +158,11 @@ pub struct Commit {
     /// Set by [`Lake::commit_from_tables`]; a hand-built commit leaves it
     /// empty (no schema change).
     schemas: BTreeMap<String, crate::schema::TableSchema>,
+    /// The engine's schema list (wave 131d), set by
+    /// [`Lake::commit_from_tables`]: the catalog's `ducklake_schema` rows are
+    /// made to match it, so an empty schema survives a reopen and a dropped
+    /// one ends. A hand-built commit leaves the catalog's schemas alone.
+    catalog_schemas: Option<Vec<String>>,
     /// Table entries a row-level diff was computed against (`None` = the
     /// table must not exist), set by [`Lake::commit_from_tables`]. When one
     /// of these tables changed in the lake before the publish lands, the
@@ -312,6 +317,7 @@ impl Commit {
             && self.partition_changes.is_empty()
             && self.inlining_changes.is_empty()
             && self.schemas.is_empty()
+            && self.catalog_schemas.is_none()
     }
 
     /// Require `key`'s entry in the head to still equal `entry` (`None`: the
@@ -319,6 +325,17 @@ impl Commit {
     /// by [`Lake::commit_from_tables`]; see the `expect` field docs).
     pub(crate) fn expect_table(&mut self, key: &str, entry: Option<TableEntry>) {
         self.expect.insert(key.to_string(), entry);
+    }
+
+    /// Carry the engine's schema list into the next publish (crate-internal:
+    /// set by [`Lake::commit_from_tables`]).
+    pub(crate) fn set_catalog_schemas(&mut self, schemas: Vec<String>) {
+        self.catalog_schemas = Some(schemas);
+    }
+
+    /// The engine's schema list this commit carries, if any.
+    pub(crate) fn catalog_schemas(&self) -> Option<&[String]> {
+        self.catalog_schemas.as_deref()
     }
 
     /// Publish `key`'s new schema record with this commit (crate-internal:
@@ -541,7 +558,9 @@ fn mix_value(h: &mut u64, v: &Value) {
         Value::Varchar(s) => mix(h, 5, s.as_bytes()),
         Value::Date(d) => mix(h, 6, &d.to_le_bytes()),
         Value::Timestamp(t) => mix(h, 7, &t.to_le_bytes()),
-        Value::Decimal(v, scale) => {
+        Value::Decimal {
+            value: v, scale, ..
+        } => {
             let mut b = [0u8; 17];
             b[..16].copy_from_slice(&v.to_le_bytes());
             b[16] = *scale;
@@ -572,6 +591,7 @@ fn mix_value(h: &mut u64, v: &Value) {
             a.hash_key(&mut b);
             mix(h, 11, &b);
         }
+        Value::Uuid(bits) => mix(h, 12, &bits.to_le_bytes()),
     }
 }
 
@@ -1291,8 +1311,13 @@ pub(crate) fn entry_layout(
                 ),
             })?;
         let path = storage.abs(&d.path);
-        let bytes = storage.read(&d.path, &format!("reading {}", path.display()))?;
-        let positions = delete_file::read_positions(&bytes, &d.format, &d.file, &path)?;
+        let positions = match &d.positions {
+            Some(positions) => positions.clone(),
+            None => {
+                let bytes = storage.read(&d.path, &format!("reading {}", path.display()))?;
+                delete_file::read_positions(&bytes, &d.format, &d.file, &path)?
+            }
+        };
         if positions.len() as u64 != d.count {
             return Err(LakeError::Corrupt {
                 path,
@@ -1434,15 +1459,21 @@ impl Lake {
     /// row count (a mismatch is [`LakeError::Corrupt`], never a silently
     /// wrong delta). Tables in `current` but not in `base` are created;
     /// tables in `base` but not in `current` are dropped. An empty
-    /// difference publishes nothing.
+    /// difference publishes nothing. `schemas` (the engine's schema list)
+    /// makes the catalog's `ducklake_schema` rows match it, so an empty schema
+    /// and a `DROP SCHEMA` survive a reopen; `None` leaves them alone.
     pub fn commit_from_tables(
         &mut self,
         base_version: u64,
         base: &[(String, Arc<DataTable>)],
         current: &[(String, Arc<DataTable>)],
+        schemas: Option<&[String]>,
         settings: &CommitSettings,
     ) -> Result<CommitReport> {
-        let (commit, _after) = self.plan_tables_commit(base_version, base, current)?;
+        let (mut commit, _after) = self.plan_tables_commit(base_version, base, current)?;
+        if let Some(schemas) = schemas {
+            commit.set_catalog_schemas(schemas.to_vec());
+        }
         self.commit_with_settings(&commit, settings)
     }
 
@@ -1636,8 +1667,12 @@ impl Lake {
                         if start < table.num_rows() {
                             let indices: Vec<usize> = (start..table.num_rows()).collect();
                             let sub = sub_table(table, &indices)?;
-                            let _appended_inlined =
-                                self.inlines_appends(Some(&entry), false, sub.num_rows() as u64);
+                            let _appended_inlined = self.inlines_appends(
+                                key,
+                                Some(&entry),
+                                false,
+                                sub.num_rows() as u64,
+                            );
                             commit.append(key, Arc::new(sub));
                         }
                         after.insert((*key).to_string(), Arc::clone(table));
@@ -1667,6 +1702,7 @@ impl Lake {
                         // `Lake::inlines_appends`), so the rebuilt base lands
                         // the appended rows exactly where the reader will.
                         appended_inlined = self.inlines_appends(
+                            key,
                             Some(&entry),
                             delta.record.is_some(),
                             sub.num_rows() as u64,
@@ -1912,9 +1948,11 @@ impl Lake {
                     bytes_written: 0,
                 });
             }
-            let (author, commit_message) = match &self.pending_commit {
-                Some((author, message)) => (author.clone(), message.clone()),
-                None => (None, None),
+            let (author, commit_message, commit_extra_info) = match &self.pending_commit {
+                Some((author, message, extra_info)) => {
+                    (author.clone(), message.clone(), extra_info.clone())
+                }
+                None => (None, None, None),
             };
             let changes = manifest_for(&*self.store, self.catalog_path(), Some(head.version))
                 .ok()
@@ -1949,7 +1987,7 @@ impl Lake {
                 data_files,
                 bytes_written: file_bytes,
             };
-            match self.publish_catalog_version(&new_catalog, commit_manifest) {
+            match self.publish_catalog_version(&new_catalog, commit_manifest, commit_extra_info) {
                 Ok(()) => {
                     self.pending_commit = None;
                     return Ok(report);
@@ -2174,7 +2212,7 @@ impl Lake {
                         message: format!("table \"{table}\": row ids overflow u64"),
                     });
                 };
-                let saved = pinkdb::persist::table_stats(dbname, table_name, file_table);
+                let saved = pinkdb::persist::table_stats(dbname, "main", table_name, file_table);
                 let stats = crate::stats::StatsBlock::from_saved(table, rel, &saved)?;
                 let file = FileRef::Entry {
                     path: rel.to_string(),
@@ -2211,9 +2249,11 @@ impl Lake {
             tables.insert(table.to_string(), new_entry);
             let mut deltas: BTreeMap<String, TableDelta> = BTreeMap::new();
             deltas.insert(table.to_string(), delta);
-            let (author, commit_message) = match &self.pending_commit {
-                Some((author, message)) => (author.clone(), message.clone()),
-                None => (None, None),
+            let (author, commit_message, commit_extra_info) = match &self.pending_commit {
+                Some((author, message, extra_info)) => {
+                    (author.clone(), message.clone(), extra_info.clone())
+                }
+                None => (None, None, None),
             };
             let changes = manifest_for(&*self.store, self.catalog_path(), Some(head.version))
                 .ok()
@@ -2247,7 +2287,7 @@ impl Lake {
                 files: registered,
                 bytes_written: 0,
             };
-            match self.publish_catalog_version(&new_catalog, commit_manifest) {
+            match self.publish_catalog_version(&new_catalog, commit_manifest, commit_extra_info) {
                 Ok(()) => {
                     self.pending_commit = None;
                     return Ok(report);
@@ -2323,6 +2363,7 @@ impl Lake {
         for (key, rows) in &commit.appends {
             let entry = head.tables.get(key);
             if self.inlines_appends(
+                key,
                 entry,
                 commit.schemas.contains_key(key),
                 rows.num_rows() as u64,
@@ -2379,6 +2420,7 @@ impl Lake {
     /// always agrees with the reader on where the appended rows land.
     pub(crate) fn inlines_appends(
         &self,
+        table: &str,
         entry: Option<&TableEntry>,
         publishes_record: bool,
         rows: u64,
@@ -2388,6 +2430,7 @@ impl Lake {
         }
         let limit = entry
             .and_then(|e| e.inlined_limit)
+            .or_else(|| self.table_inline_limits.get(table).copied())
             .unwrap_or(self.inline_row_limit);
         // A table this commit creates mints its initial schema record together
         // with the inlined rows (the record is what decodes them); an existing
@@ -2843,18 +2886,23 @@ impl Lake {
                 // would double-drop rows (and break the row-count invariant):
                 // refuse, never publish a manifest that lies about its rows.
                 for existing in entry.deletes.iter().filter(|d| d.file == dref.file) {
-                    let epath = self.storage.abs(&existing.path);
-                    let bytes = self
-                        .storage
-                        .read(&existing.path, &format!("reading {}", epath.display()))
-                        .map_err(PublishFailure::Fatal)?;
-                    let epos = delete_file::read_positions(
-                        &bytes,
-                        &existing.format,
-                        &existing.file,
-                        &epath,
-                    )
-                    .map_err(PublishFailure::Fatal)?;
+                    let epos = match &existing.positions {
+                        Some(positions) => positions.clone(),
+                        None => {
+                            let epath = self.storage.abs(&existing.path);
+                            let bytes = self
+                                .storage
+                                .read(&existing.path, &format!("reading {}", epath.display()))
+                                .map_err(PublishFailure::Fatal)?;
+                            delete_file::read_positions(
+                                &bytes,
+                                &existing.format,
+                                &existing.file,
+                                &epath,
+                            )
+                            .map_err(PublishFailure::Fatal)?
+                        }
+                    };
                     let overlap: Vec<u64> = pos
                         .iter()
                         .copied()
@@ -2960,9 +3008,11 @@ impl Lake {
         // The per-version record, mirroring a save: the author/message kept
         // pending by `Lake::set_commit_message` and the change summary diffed
         // against the base manifest (absent when it is unavailable).
-        let (author, commit_message) = match &self.pending_commit {
-            Some((author, message)) => (author.clone(), message.clone()),
-            None => (None, None),
+        let (author, commit_message, commit_extra_info) = match &self.pending_commit {
+            Some((author, message, extra_info)) => {
+                (author.clone(), message.clone(), extra_info.clone())
+            }
+            None => (None, None, None),
         };
         let updated = crate::time::iso8601_utc(std::time::SystemTime::now());
         // SQL catalogs persist the typed tables, not the audit summary; the
@@ -3035,7 +3085,9 @@ impl Lake {
             lake_id: new_catalog.lake_id.clone(),
             author: new_catalog.author.clone(),
             commit_message: new_catalog.commit_message.clone(),
+            commit_extra_info,
             engine_catalog: self.pending_engine_catalog.clone(),
+            schemas: commit.catalog_schemas().map(|s| s.to_vec()),
         };
         self.publish_sql_commit(change)
             .map_err(|error| match error {
@@ -3078,6 +3130,7 @@ impl Lake {
         &mut self,
         catalog: &crate::catalog::Catalog,
         manifest: crate::catalog::CommitManifest,
+        commit_extra_info: Option<String>,
     ) -> Result<()> {
         let change = crate::metadata::CatalogChange {
             catalog: None,
@@ -3088,7 +3141,9 @@ impl Lake {
             lake_id: catalog.lake_id.clone(),
             author: catalog.author.clone(),
             commit_message: catalog.commit_message.clone(),
+            commit_extra_info,
             engine_catalog: None,
+            schemas: None,
         };
         self.publish_sql_commit(change)
     }
@@ -3247,18 +3302,16 @@ fn partition_specs_for(
 }
 
 /// Assign `row_id_start` ranges to the commit's new data files, continuing
-/// `next` (the table's row-id counter) in file order. A zero-row file gets no
-/// range. Backdating is not possible: the counter never moves backwards.
+/// `next` (the table's row-id counter) in file order. A zero-row file starts
+/// where the counter stands, so DuckDB can still read row ids from it.
+/// Backdating is not possible: the counter never moves backwards.
 fn stamp_file_row_ids(files: &[FileRef], next: &mut u64) -> Vec<FileRef> {
     files
         .iter()
         .map(|f| {
-            let start = f.rows().filter(|r| *r > 0).map(|rows| {
-                let start = *next;
-                *next = next.saturating_add(rows);
-                start
-            });
-            f.with_row_id_start(start)
+            let start = *next;
+            *next = next.saturating_add(f.rows().unwrap_or(0));
+            f.with_row_id_start(Some(start))
         })
         .collect()
 }

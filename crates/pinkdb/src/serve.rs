@@ -293,8 +293,13 @@ impl WriteTarget {
 pub fn write_target(stmt: &Statement, current_db: Option<&str>) -> WriteTarget {
     use Statement::*;
     /// A catalog write that names its database, or inherits the session's.
-    fn table(db: &Option<String>, current_db: Option<&str>) -> WriteTarget {
-        match db.as_deref().or(current_db) {
+    fn table(qual: &crate::sql::ast::Qualifier, current_db: Option<&str>) -> WriteTarget {
+        let db = qual
+            .catalog
+            .as_deref()
+            .or(qual.schema.as_deref())
+            .or(current_db);
+        match db {
             Some(db) => WriteTarget::Databases(vec![db.to_ascii_lowercase()]),
             None => WriteTarget::Unknown,
         }
@@ -304,11 +309,14 @@ pub fn write_target(stmt: &Statement, current_db: Option<&str>) -> WriteTarget {
         Describe { .. }
         | DescribeMacro { .. }
         | ShowTables
+        | ShowAllTables
         | ShowDatabases
         | ShowMaterializedViews
         | ShowMacros
         | ShowTriggers { .. }
         | Use { .. }
+        | CreateSchema { .. }
+        | DropSchema { .. }
         | Analyze { .. }
         // Transaction control and session variables change no table by
         // themselves; every statement inside the transaction is checked.
@@ -328,35 +336,37 @@ pub fn write_target(stmt: &Statement, current_db: Option<&str>) -> WriteTarget {
         Explain(inner) => write_target(inner, current_db),
         // A trigger writes wherever its action does each time it fires, not
         // only the database of the table it is attached to.
-        CreateTrigger { db, action, .. } => {
-            table(db, current_db).merge(write_target(action, current_db))
+        CreateTrigger { qual, action, .. } => {
+            table(qual, current_db).merge(write_target(action, current_db))
         }
-        CreateTable { db, .. }
-        | CreateTableAs { db, .. }
-        | Insert { db, .. }
-        | Update { db, .. }
-        | Delete { db, .. }
-        | Merge { db, .. }
-        | CreateView { db, .. }
-        | DropTable { db, .. }
-        | AlterTable { db, .. }
-        | DropView { db, .. }
-        | CreateMaterializedView { db, .. }
-        | RefreshMaterializedView { db, .. }
-        | DropMaterializedView { db, .. }
-        | CreateIndex { db, .. }
-        | DropIndex { db, .. }
-        | CreateProcedure { db, .. }
-        | DropProcedure { db, .. }
-        | DropTrigger { db, .. }
-        | CreateMacro { db, .. }
-        | DropMacro { db, .. } => table(db, current_db),
+        CreateTable { qual, .. }
+        | CreateTableAs { qual, .. }
+        | Insert { qual, .. }
+        | Update { qual, .. }
+        | Delete { qual, .. }
+        | Merge { qual, .. }
+        | CreateView { qual, .. }
+        | DropTable { qual, .. }
+        | AlterTable { qual, .. }
+        | DropView { qual, .. }
+        | CreateMaterializedView { qual, .. }
+        | RefreshMaterializedView { qual, .. }
+        | DropMaterializedView { qual, .. }
+        | CreateIndex { qual, .. }
+        | DropIndex { qual, .. }
+        | CreateProcedure { qual, .. }
+        | DropProcedure { qual, .. }
+        | DropTrigger { qual, .. }
+        | CreateMacro { qual, .. }
+        | DropMacro { qual, .. } => table(qual, current_db),
         // Attaching and detaching lakes change the store's database list and
         // open outside storage: a store-level write (wave 124).
         CreateDatabase { name, .. } | DropDatabase { name, .. } => {
             WriteTarget::Databases(vec![name.to_ascii_lowercase()])
         }
         Attach { .. } | Detach { .. } => WriteTarget::Global,
+        // Secrets are store state as well (wave 132b).
+        CreateSecret { .. } | DropSecret { .. } => WriteTarget::Global,
         // Everything else a policy can see here changes the store outside one
         // database, or runs SQL this function cannot inspect.
         LoadExtension { .. }
@@ -413,6 +423,7 @@ pub fn statement_allowed(stmt: &Statement, allow_writes: bool) -> bool {
         Statement::Describe { .. }
             | Statement::DescribeMacro { .. }
             | Statement::ShowTables
+            | Statement::ShowAllTables
             | Statement::ShowDatabases
             | Statement::ShowMaterializedViews
             | Statement::ShowMacros
@@ -847,8 +858,8 @@ fn statement_reason(db: &PinkDb, policy: &ServePolicy, statement: &Statement) ->
 /// own error.
 fn read_reason(db: &PinkDb, policy: &ServePolicy, statement: &Statement) -> Option<String> {
     let allowed = policy.read_databases.as_deref();
-    let session_db = db.current_db().to_string();
-    let Ok((plan, _)) = crate::sql::bind_tracked(db, statement, &session_db) else {
+    let session_ns = db.current_ns().clone();
+    let Ok((plan, _)) = crate::sql::bind_tracked(db, statement, &session_ns) else {
         // Nothing to check: the statement fails at bind time with its own
         // error. A file source whose function is not installed is the
         // exception — it must be refused for reading a file, not for an
@@ -861,7 +872,7 @@ fn read_reason(db: &PinkDb, policy: &ServePolicy, statement: &Statement) -> Opti
         return None;
     };
     let mut reads = std::collections::HashSet::new();
-    crate::plan::collect_tables_read(&plan, &session_db, &mut reads);
+    crate::plan::collect_tables_read(&plan, &session_ns, &mut reads);
     if let Some(allowed) = allowed {
         // A view over a table function binds to a scan the syntax check cannot
         // see, so the plan is asked too.
@@ -870,14 +881,14 @@ fn read_reason(db: &PinkDb, policy: &ServePolicy, statement: &Statement) -> Opti
         }
         if reads
             .iter()
-            .any(|(database, _)| !allowed.iter().any(|a| a.eq_ignore_ascii_case(database)))
+            .any(|(ns, _)| !allowed.iter().any(|a| a.eq_ignore_ascii_case(ns.db())))
         {
             return Some(confined_read_hint(allowed));
         }
     }
-    let mut denied: Vec<&String> = reads
+    let mut denied: Vec<&str> = reads
         .iter()
-        .map(|(db, _)| db)
+        .map(|(ns, _)| ns.db())
         .filter(|db| {
             policy
                 .deny_read_databases
@@ -909,8 +920,8 @@ fn external_reason(
     if policy.allow_files && policy.allow_external_services {
         return None;
     }
-    let session_db = db.current_db().to_string();
-    let Ok((plan, dynamic)) = crate::sql::bind_tracked(db, statement, &session_db) else {
+    let session_ns = db.current_ns().clone();
+    let Ok((plan, dynamic)) = crate::sql::bind_tracked(db, statement, &session_ns) else {
         // The bound plan is the sharper test; the syntax alone is all there is
         // when a source's function is not installed, and reading files is
         // still the reason to refuse it.
@@ -1059,8 +1070,16 @@ pub fn outcome_line(result: &QueryResult) -> String {
             format!("Dropped materialized view {}", name(view))
         }
         QueryResult::CreatedDatabase { name: db } => format!("Created database {}", name(db)),
+        QueryResult::CreatedSchema { name: schema } => {
+            format!("Created schema {}", name(schema))
+        }
         QueryResult::DroppedDatabase { name: db } => format!("Dropped database {}", name(db)),
-        QueryResult::Used { db } => format!("Using database {}", name(db)),
+        QueryResult::DroppedSchema { name: schema } => {
+            format!("Dropped schema {}", name(schema))
+        }
+        QueryResult::Used { db, schema } => {
+            format!("Using {}.{}", name(db), name(schema))
+        }
         QueryResult::SetVariable { name: variable } => {
             format!("Set variable {}", name(variable))
         }
@@ -1558,7 +1577,7 @@ mod tests {
     fn only_queries_pass_the_read_only_policy() {
         // One statement of every kind the parser can produce; a new kind
         // must be added here (and to the allowlist) on purpose.
-        let sql = "SELECT 1; EXPLAIN SELECT 1; DESCRIBE t; SHOW TABLES; SHOW DATABASES; \
+        let sql = "SELECT 1; EXPLAIN SELECT 1; DESCRIBE t; SHOW TABLES; SHOW ALL TABLES; SHOW DATABASES; \
                    SHOW MATERIALIZED VIEWS; SHOW MACROS; USE main; \
                    INSERT INTO t VALUES (1, 'x'); UPDATE t SET a = 1; DELETE FROM t; \
                    INSERT INTO t VALUES (1, 'x') ON CONFLICT DO NOTHING; \
@@ -1588,6 +1607,7 @@ mod tests {
             "Describe",
             "DescribeMacro",
             "ShowTables",
+            "ShowAllTables",
             "ShowDatabases",
             "ShowMaterializedViews",
             "ShowMacros",

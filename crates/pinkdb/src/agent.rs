@@ -316,17 +316,20 @@ pub fn error_json_for(err: &PinkDbError, sql: &str) -> String {
 /// prints a hint for a statement that is about to fail anyway.
 pub fn estimate_scan(db: &PinkDb, sql: &str) -> Option<ScanEstimate> {
     let stmt = crate::sql::parse_statements(sql).ok()?.into_iter().next()?;
-    let session_db = db.current_db().to_string();
-    let (plan, _) = crate::sql::bind_tracked(db, &stmt, &session_db).ok()?;
+    let session = db.current_ns().clone();
+    let (plan, _) = crate::sql::bind_tracked(db, &stmt, &session).ok()?;
     let plan = crate::optimizer::optimize(db, plan);
     let mut tables = std::collections::HashSet::new();
-    crate::plan::collect_tables_read(&plan, &session_db, &mut tables);
+    crate::plan::collect_tables_read(&plan, &session, &mut tables);
     let mut rows = 0u64;
     let mut remote = false;
-    for (database, table) in tables {
-        if let Ok(table) = db.table_in(&database, &table) {
+    for (ns, table) in tables {
+        if let Ok(table) = db.table_in(&ns, &table) {
             rows += table.num_rows() as u64;
-        } else if let Some(attached) = db.attached_table_in(&database, &table) {
+        } else if let Some(attached) = db
+            .attached_lookup(ns.db(), ns.schema(), &table)
+            .map(|(t, _)| t.clone())
+        {
             rows += attached.rows;
             remote = true;
         }

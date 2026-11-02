@@ -5,13 +5,51 @@
 
 use crate::types::{RefreshPolicy, Value};
 
+/// A name's catalog/schema prefix (`catalog.schema.name`): DuckDB's first two
+/// of four parts. A two-part name fills `schema` and leaves `catalog` empty
+/// because in SQL `x.t` may be either a catalog or a schema; the binder
+/// resolves it against the session. Wave 131.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Qualifier {
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
+}
+
+impl Qualifier {
+    /// No prefix: `t`.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// One part before `t`: `x.t`.
+    pub fn part(name: &str) -> Self {
+        Self {
+            catalog: None,
+            schema: Some(name.to_string()),
+        }
+    }
+
+    /// Two parts before `t`: `c.s.t`.
+    pub fn both(catalog: &str, schema: &str) -> Self {
+        Self {
+            catalog: Some(catalog.to_string()),
+            schema: Some(schema.to_string()),
+        }
+    }
+
+    /// No part was written.
+    pub fn is_empty(&self) -> bool {
+        self.catalog.is_none() && self.schema.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 // v1: a handful of statements alive at once; enum size is irrelevant.
 #[allow(clippy::large_enum_variant)]
 pub enum Statement {
     CreateTable {
         /// Explicit `db.` qualifier, if written (resolved at bind).
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         /// Columns and table-level constraints, in written order.
         items: Vec<TableItem>,
@@ -22,7 +60,7 @@ pub enum Statement {
     },
     /// `CREATE TABLE t AS SELECT ...` (schema inferred from the query).
     CreateTableAs {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         query: Box<Select>,
         if_not_exists: bool,
@@ -31,7 +69,7 @@ pub enum Statement {
         or_replace: bool,
     },
     Insert {
-        db: Option<String>,
+        qual: Qualifier,
         table: String,
         columns: Option<Vec<String>>,
         source: InsertSource,
@@ -40,7 +78,7 @@ pub enum Statement {
         returning: Option<Vec<Projection>>,
     },
     Update {
-        db: Option<String>,
+        qual: Qualifier,
         table: String,
         /// `(target, expression)` pairs in written order. The target may be
         /// `column`, `table.column` or `db.table.column` (wave 94); a
@@ -53,7 +91,7 @@ pub enum Statement {
         returning: Option<Vec<Projection>>,
     },
     Delete {
-        db: Option<String>,
+        qual: Qualifier,
         table: String,
         /// `DELETE FROM t [AS] alias`: the name the statement's expressions
         /// use for the target.
@@ -66,7 +104,7 @@ pub enum Statement {
     /// `MERGE INTO <target> USING <source> ON <cond> <when clauses>`
     /// (wave 95b; DuckDB 2.0's shape).
     Merge {
-        db: Option<String>,
+        qual: Qualifier,
         table: String,
         alias: Option<String>,
         using: FromClause,
@@ -79,7 +117,7 @@ pub enum Statement {
     /// format from the target path's extension (DuckDB's rule). External
     /// side effect only: no store mutation, never WAL-logged.
     CopyTo {
-        db: Option<String>,
+        qual: Qualifier,
         table: String,
         path: String,
         format: Option<String>,
@@ -88,7 +126,7 @@ pub enum Statement {
     Commit,
     Rollback,
     CreateView {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         cols: Option<Vec<String>>,
         query: Box<Select>,
@@ -96,7 +134,7 @@ pub enum Statement {
         or_replace: bool,
     },
     DropTable {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         /// `IF EXISTS`: a missing table makes the statement a no-op.
         if_exists: bool,
@@ -105,12 +143,12 @@ pub enum Statement {
     /// `DEFAULT`), drop a column, rename a column, or rename the table.
     AlterTable {
         /// Explicit `db.` qualifier, if written (resolved at bind).
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         op: AlterTableOp,
     },
     DropView {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
     },
     /// `CREATE DATABASE <name> [(TYPE LAKE [, CATALOG '…'] [, DATA '…'])]`.
@@ -138,9 +176,46 @@ pub enum Statement {
         name: String,
         if_exists: bool,
     },
-    /// `USE <name>`: switch the session's current database.
-    Use {
+    /// `CREATE [OR REPLACE] [PERSISTENT | TEMPORARY] SECRET [IF NOT EXISTS]
+    /// [<name>] (TYPE <kind>, <option> '…', …)` (wave 132b). `name = None`
+    /// picks DuckDB's `__default_<type>`. `fields` keeps the written option
+    /// names; the binder canonicalizes and validates them.
+    CreateSecret {
+        name: Option<String>,
+        secret_type: String,
+        fields: Vec<(String, String)>,
+        /// `PERSISTENT` (in the store) vs `TEMPORARY` (this session only).
+        persistent: bool,
+        or_replace: bool,
+        if_not_exists: bool,
+    },
+    /// `DROP [PERSISTENT | TEMPORARY] SECRET [IF EXISTS] <name>` (wave 132b).
+    /// `persistent = None` drops a temporary secret first, then a persistent
+    /// one with the same name.
+    DropSecret {
         name: String,
+        persistent: Option<bool>,
+        if_exists: bool,
+    },
+    /// `CREATE SCHEMA [IF NOT EXISTS] [db.]s` (wave 131). `qual.catalog`
+    /// holds the database when written; a schema never names a second schema.
+    CreateSchema {
+        qual: Qualifier,
+        name: String,
+        if_not_exists: bool,
+    },
+    /// `DROP SCHEMA [IF EXISTS] [db.]s [CASCADE | RESTRICT]`.
+    DropSchema {
+        qual: Qualifier,
+        name: String,
+        if_exists: bool,
+        cascade: bool,
+    },
+    /// `USE x` / `USE x.y`: switch the session's current schema (one part is
+    /// a database first, then a schema of the current database — DuckDB's
+    /// order, resolved at bind).
+    Use {
+        qual: Qualifier,
     },
     /// `SET VARIABLE <name> = <expr>`: bind a session variable that
     /// `getvariable('name')` and `$name` read back.
@@ -179,18 +254,20 @@ pub enum Statement {
     /// `ANALYZE [TABLE] <table>` / bare `ANALYZE` (every table of the session
     /// database): recompute catalog statistics exactly.
     Analyze {
-        db: Option<String>,
+        qual: Qualifier,
         table: Option<String>,
     },
     /// `SHOW TABLES`: the current database's tables, sorted by name.
     ShowTables,
+    /// `SHOW ALL TABLES`: every database's tables and views, one row each.
+    ShowAllTables,
     /// `SHOW DATABASES`: every database in the store, sorted by name.
     ShowDatabases,
     /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name [REFRESH <policy>] AS
     /// SELECT ...`: the query is evaluated once at creation; the view is a
     /// real table until the next refresh.
     CreateMaterializedView {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         query: Box<Select>,
         if_not_exists: bool,
@@ -200,7 +277,7 @@ pub enum Statement {
     },
     /// `REFRESH [MATERIALIZED VIEW] name`.
     RefreshMaterializedView {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
     },
     /// `REFRESH MATERIALIZED VIEWS`: recompute every materialized view of the
@@ -209,7 +286,7 @@ pub enum Statement {
     RefreshMaterializedViews,
     /// `DROP MATERIALIZED VIEW [IF EXISTS] name`.
     DropMaterializedView {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         if_exists: bool,
     },
@@ -219,7 +296,7 @@ pub enum Statement {
     /// `CREATE INDEX [IF NOT EXISTS] <name> ON <table>(<col>) [USING
     /// <provider>] [WITH (key = value, …)]`.
     CreateIndex {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         table: String,
         column: String,
@@ -229,13 +306,13 @@ pub enum Statement {
     },
     /// `DROP INDEX [IF EXISTS] <name>`.
     DropIndex {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         if_exists: bool,
     },
     /// `DESCRIBE <table>`: DuckDB-shaped column metadata.
     Describe {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
     },
     /// `EXPLAIN <select>`: print the bound (optimized) plan.
@@ -246,7 +323,7 @@ pub enum Statement {
     /// ([`crate::procedure::parse_body`]) and stores the definition in the
     /// database's catalog.
     CreateProcedure {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         /// Typed parameters, in written order.
         params: Vec<(String, crate::types::DataType)>,
@@ -259,7 +336,7 @@ pub enum Statement {
     },
     /// `DROP PROCEDURE [IF EXISTS] name`.
     DropProcedure {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         if_exists: bool,
     },
@@ -267,7 +344,7 @@ pub enum Statement {
     /// constant expressions (evaluated against an empty scope); `?`
     /// placeholders are allowed in a prepared statement.
     Call {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         args: Vec<Expr>,
     },
@@ -279,7 +356,7 @@ pub enum Statement {
     /// [`Statement::Call`], so there is no second action kind. The trigger
     /// lives in the table's database; `name` is unqualified.
     CreateTrigger {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         /// The table the trigger fires on.
         table: String,
@@ -299,14 +376,14 @@ pub enum Statement {
     },
     /// `DROP TRIGGER [IF EXISTS] name [ON table]` (wave 100).
     DropTrigger {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         table: Option<String>,
         if_exists: bool,
     },
     /// `SHOW TRIGGERS [ON table]` (wave 100).
     ShowTriggers {
-        db: Option<String>,
+        qual: Qualifier,
         table: Option<String>,
     },
     /// `DO '<body>'` (wave 83): run an anonymous SQL procedural block
@@ -324,7 +401,7 @@ pub enum Statement {
     /// splices argument ASTs into the body at every use — no SQL text is ever
     /// generated from them, and nested macro calls resolve at the same bind.
     CreateMacro {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         params: Vec<MacroParam>,
         body: MacroBody,
@@ -335,7 +412,7 @@ pub enum Statement {
     },
     /// `DROP MACRO [IF EXISTS] name`.
     DropMacro {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
         if_exists: bool,
     },
@@ -343,7 +420,7 @@ pub enum Statement {
     ShowMacros,
     /// `DESCRIBE MACRO name`: one macro's DuckDB-shaped function metadata.
     DescribeMacro {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
     },
     /// `CREATE USER [IF NOT EXISTS] name PASSWORD '<plaintext>'` (wave 48).
@@ -386,20 +463,30 @@ pub enum Statement {
     Select(Select),
 }
 
+/// A `DEFAULT` expression as written: its source text (trimmed) and AST.
+///
+/// The text is what `DESCRIBE` and the catalog print; the binder keeps the
+/// bound expression next to it so `INSERT`/`UPDATE`/`ALTER` can evaluate it
+/// for every row that takes the default.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DefaultExpr {
+    pub text: String,
+    pub expr: Box<Expr>,
+}
+
 /// One `ALTER TABLE` operation (wave 65).
 ///
 /// `ADD COLUMN` carries the column definition (type + inline constraints; the
 /// binder accepts only `NOT NULL`, which needs a non-NULL `DEFAULT` on a
 /// non-empty table — DuckDB's rule) plus the optional `DEFAULT` expression.
-/// The default is bound as a constant expression and evaluated once when the
-/// statement runs; every existing row (and every later `INSERT` that omits
-/// the column) reads that value.
+/// The default text is kept and its expression is evaluated for every existing
+/// row; later `INSERT`s that omit the column evaluate it again.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterTableOp {
     AddColumn {
         column: ColumnDef,
-        /// `DEFAULT <expr>`: bound in an empty scope (constants only).
-        default: Option<Expr>,
+        /// `DEFAULT <expr>`: bound in an empty scope (no column references).
+        default: Option<DefaultExpr>,
         /// `IF NOT EXISTS`: an existing column makes the statement a no-op.
         if_not_exists: bool,
     },
@@ -436,6 +523,8 @@ pub enum InsertSource {
     Values(Vec<Vec<Expr>>),
     /// `SELECT ...` (or WITH ... SELECT).
     Select(Box<Select>),
+    /// `DEFAULT VALUES`: one row, every column takes its default.
+    DefaultValues,
 }
 
 /// One `CREATE TABLE` item list entry: a column definition or a table-level
@@ -455,10 +544,10 @@ pub struct ColumnDef {
     pub name: String,
     pub dtype: crate::types::DataType,
     pub constraints: Vec<ColumnConstraint>,
-    /// `DEFAULT <expr>` in `CREATE TABLE` (a constant, evaluated once when
-    /// the table is created). `ALTER TABLE … ADD COLUMN` carries its default
-    /// on the operation instead.
-    pub default: Option<Box<Expr>>,
+    /// `DEFAULT <expr>` in `CREATE TABLE`: stored as written and evaluated
+    /// for every row that takes it. `ALTER TABLE … ADD COLUMN` carries its
+    /// default on the operation instead.
+    pub default: Option<DefaultExpr>,
 }
 
 /// `CONSTRAINT name <constraint>` (the name is optional).
@@ -505,7 +594,7 @@ pub enum TableConstraint {
 /// A referenced table name: `u` or `db.u`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RefTable {
-    pub db: Option<String>,
+    pub qual: Qualifier,
     pub name: String,
 }
 
@@ -574,7 +663,7 @@ pub enum Projection {
     /// `db` is `None` for the two-part form; a database qualifier is never
     /// present without a table.
     QualifiedStar {
-        db: Option<String>,
+        qual: Qualifier,
         table: String,
         exclude: Vec<ExcludeColumn>,
     },
@@ -593,7 +682,7 @@ pub struct ExcludeColumn {
 /// `db.table.column` (wave 94). `db` implies `table`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetTarget {
-    pub db: Option<String>,
+    pub qual: Qualifier,
     pub table: Option<String>,
     pub column: String,
 }
@@ -693,13 +782,15 @@ impl CteBody {
 pub enum FromSource {
     /// A possibly-qualified table reference (`db.table`).
     Table {
-        db: Option<String>,
+        qual: Qualifier,
         name: String,
     },
     Derived(Box<Select>),
     /// A table-function call in FROM position (wave 70): the binder offers
     /// it to every registered [`crate::table_source::TableSource`].
     Function {
+        /// `s.tm()` / `c.s.tm()`: only macros may be qualified.
+        qual: Qualifier,
         name: String,
         args: Vec<TableFunctionCallArg>,
     },
@@ -939,10 +1030,12 @@ pub enum Expr {
     Parameter(usize),
     /// Bare `*` (only valid as a function arg for `COUNT(*)`).
     Star,
+    /// The `DEFAULT` keyword in a `VALUES` cell or an `UPDATE SET` value.
+    Default,
     /// `column`, `table.column` or `db.table.column` (wave 94). A database
     /// qualifier implies a table qualifier.
     Column {
-        db: Option<String>,
+        qual: Qualifier,
         table: Option<String>,
         name: String,
     },
@@ -950,7 +1043,7 @@ pub enum Expr {
     /// binder outside a projection; the projection parser owns the accepted
     /// shapes).
     QualifiedStar {
-        db: Option<String>,
+        qual: Qualifier,
         table: String,
     },
     Binary {
@@ -973,6 +1066,10 @@ pub enum Expr {
         negated: bool,
     },
     Function {
+        /// `s.f` / `c.s.f`: only macros may be qualified. Boxed because every
+        /// `Expr` carries this variant and an inline qualifier grows the whole
+        /// recursive AST.
+        qual: Box<Qualifier>,
         name: String,
         args: Vec<Expr>,
         /// `f(DISTINCT x)` — only `COUNT(DISTINCT x)` is supported (checked
@@ -990,9 +1087,12 @@ pub enum Expr {
     },
     /// `f(...) OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS/RANGE ...])`.
     Window {
+        /// A qualified call is refused: built-in window functions are never
+        /// qualified and macros are not window functions.
+        qual: Box<Qualifier>,
         name: String,
         args: Vec<Expr>,
-        over: OverSpec,
+        over: Box<OverSpec>,
         /// Parsed for a clear binder error (DISTINCT windows are not
         /// supported, matching DuckDB).
         distinct: bool,
@@ -1100,4 +1200,16 @@ pub struct DatabaseOptions {
     pub read_only: bool,
     /// `VERSION n` (`ATTACH … READ_ONLY` only).
     pub version: Option<u64>,
+    /// `DATA_INLINING_ROW_LIMIT n`.
+    pub data_inlining_row_limit: Option<u64>,
+    /// `CREATE_IF_NOT_EXISTS` (`ATTACH` only).
+    pub create_if_not_exists: bool,
+    /// `SNAPSHOT_TIME '…'` (`ATTACH` only).
+    pub snapshot_time: Option<String>,
+    /// `METADATA_SCHEMA '…'`.
+    pub metadata_schema: Option<String>,
+    /// `ENCRYPTED`.
+    pub encrypted: bool,
+    /// `AUTOMATIC_MIGRATION [true|false]`.
+    pub automatic_migration: bool,
 }

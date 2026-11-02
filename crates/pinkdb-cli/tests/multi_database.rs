@@ -50,8 +50,8 @@ fn databases_dot_command_marks_the_current_one() {
          .databases\n\
          .quit\n");
     assert!(out.contains("Database analytics created."), "{out}");
-    assert!(out.contains("Using database analytics."), "{out}");
-    assert!(out.contains("Using database main."), "{out}");
+    assert!(out.contains("Using analytics.main."), "{out}");
+    assert!(out.contains("Using main.main."), "{out}");
     // The first listing has main as current; the second marks analytics.
     let first = out.find("main (current)").expect("main marked current");
     let second = out

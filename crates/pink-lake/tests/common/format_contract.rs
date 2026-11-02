@@ -136,6 +136,7 @@ fn engine_types() -> Vec<(String, DataType)> {
                 len: 2,
             },
         ),
+        ("uu", DataType::Uuid),
     ])
 }
 
@@ -223,14 +224,14 @@ fn special_values(dtype: DataType) -> Vec<Value> {
         DataType::Decimal { precision, scale } => {
             let max = 10i128.pow(u32::from(precision)) - 1;
             vec![
-                Value::Decimal(-max, scale),
-                Value::Decimal(max, scale),
+                Value::decimal(-max, scale),
+                Value::decimal(max, scale),
                 Value::Null,
-                Value::Decimal(0, scale),
-                Value::Decimal(-1, scale),
+                Value::decimal(0, scale),
+                Value::decimal(-1, scale),
                 Value::Null,
-                Value::Decimal(max / 3, scale),
-                Value::Decimal(-42, scale),
+                Value::decimal(max / 3, scale),
+                Value::decimal(-42, scale),
             ]
         }
         // Kinds a JSON-text encoding would flatten (DATE, TIMESTAMP, a
@@ -253,6 +254,16 @@ fn special_values(dtype: DataType) -> Vec<Value> {
                 v(r#""héllo 世界 🚀""#),
             ]
         }
+        DataType::Uuid => vec![
+            Value::Uuid(0),
+            Value::Uuid(u128::MAX),
+            Value::Null,
+            Value::Uuid(0x550e_8400_e29b_41d4_a716_4466_5544_0000),
+            Value::Uuid(0x8000_0000_0000_4000_8000_0000_0000_0000),
+            Value::Null,
+            Value::Uuid(1),
+            Value::Uuid(0x0000_0000_0000_4000_8000_0000_0000_0001),
+        ],
         DataType::Interval => vec![
             Value::Interval {
                 months: -12,
@@ -383,7 +394,8 @@ fn sample_value(dtype: DataType) -> Value {
         DataType::Varchar => Value::Varchar("x".to_string()),
         DataType::Date => Value::Date(1),
         DataType::Timestamp => Value::Timestamp(1),
-        DataType::Decimal { scale, .. } => Value::Decimal(1, scale),
+        DataType::Decimal { scale, .. } => Value::decimal(1, scale),
+        DataType::Uuid => Value::Uuid(1),
         DataType::Interval => Value::Interval {
             months: 1,
             days: 2,

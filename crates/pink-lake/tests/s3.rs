@@ -80,7 +80,7 @@ fn small_store() -> PinkDb {
     db.execute("INSERT INTO analytics.u VALUES (7);").unwrap();
     db.execute("CREATE TABLE analytics.\"a.b\" (z DOUBLE);")
         .unwrap();
-    db.execute("INSERT INTO analytics.\"a.b\" VALUES (1.5), (-0.0);")
+    db.execute("INSERT INTO analytics.\"a.b\" VALUES (1.5), (-0.0e0);")
         .unwrap();
     db
 }

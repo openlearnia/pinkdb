@@ -66,7 +66,7 @@ fn user_and_password_log_in_and_run_under_that_principal() {
     assert!(text.contains("│ 1       │"), "{text}");
     assert!(text.contains("permission denied"), "{text}");
     assert!(
-        text.contains("INSERT privilege on table \"main.t\""),
+        text.contains("INSERT privilege on table \"main.main.t\""),
         "{text}"
     );
 

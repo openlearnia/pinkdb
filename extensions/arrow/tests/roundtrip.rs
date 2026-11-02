@@ -120,7 +120,7 @@ fn all_types_table(name: &str) -> DataTable {
                 precision: 18,
                 scale: 4,
             },
-            &[Value::Decimal(12345, 4), Value::Null, Value::Decimal(-1, 4)],
+            &[Value::decimal(12345, 4), Value::Null, Value::decimal(-1, 4)],
         ),
         vec_of(
             DataType::Interval,
@@ -165,7 +165,7 @@ fn all_types_table(name: &str) -> DataTable {
                 precision: 18,
                 scale: 4,
             },
-            &[Value::Decimal(20_000, 4), Value::Decimal(35_000, 4)],
+            &[Value::decimal(20_000, 4), Value::decimal(35_000, 4)],
         ),
         vec_of(
             DataType::Interval,
@@ -369,8 +369,8 @@ fn reads_pyarrow_golden_types() {
     assert_eq!(get(0, "ts_us"), Value::Timestamp(1));
     // -1000 ns truncates toward zero to -1 µs.
     assert_eq!(get(2, "ts_ns"), Value::Timestamp(-1));
-    assert_eq!(get(0, "dec"), Value::Decimal(12345, 4));
-    assert_eq!(get(2, "dec"), Value::Decimal(-1, 4));
+    assert_eq!(get(0, "dec"), Value::decimal(12345, 4));
+    assert_eq!(get(2, "dec"), Value::decimal(-1, 4));
     assert_eq!(
         get(0, "iv"),
         Value::Interval {

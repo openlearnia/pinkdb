@@ -124,8 +124,13 @@ impl PreparedStatement {
     /// against the current catalog, so every bind-time error (unknown column,
     /// incompatible value, untypable `NULL`) surfaces here, before anything
     /// executes. Does not mutate `db`.
-    pub fn bind(&self, db: &PinkDb, default_db: &str, params: &[Value]) -> Result<BoundStatement> {
-        self.bind_in(db, default_db, params, &db.session)
+    pub fn bind(
+        &self,
+        db: &PinkDb,
+        default_ns: &crate::storage::SchemaPath,
+        params: &[Value],
+    ) -> Result<BoundStatement> {
+        self.bind_in(db, default_ns, params, &db.session)
     }
 
     /// Bind against an explicit session: a network connection's variables are
@@ -133,7 +138,7 @@ impl PreparedStatement {
     pub(crate) fn bind_in(
         &self,
         db: &PinkDb,
-        default_db: &str,
+        default_ns: &crate::storage::SchemaPath,
         params: &[Value],
         session: &crate::storage::Session,
     ) -> Result<BoundStatement> {
@@ -142,7 +147,7 @@ impl PreparedStatement {
         // Dry bind: inference, conversion, and every bind-time check happen
         // here; the plan itself is discarded (execution re-binds the
         // substituted text through the statement's normal path).
-        bind_tracked_with(db, &self.ast, default_db, Some(slots.clone()), session)?;
+        bind_tracked_with(db, &self.ast, default_ns, Some(slots.clone()), session)?;
         let mut values = Vec::with_capacity(params.len());
         let mut types = Vec::with_capacity(params.len());
         for i in 0..params.len() {
@@ -208,7 +213,7 @@ impl PinkDb {
         stmt: &PreparedStatement,
         params: &[Value],
     ) -> Result<QueryResult> {
-        let bound = stmt.bind(self, self.current_db(), params)?;
+        let bound = stmt.bind(self, self.current_ns(), params)?;
         self.execute_bound(&bound)
     }
 
@@ -286,6 +291,9 @@ const MAX_LITERAL_DAY: i32 = 2_932_896; // 9999-12-31
 pub(crate) fn value_literal(value: &Value) -> Result<String> {
     Ok(match value {
         Value::Null => "NULL".to_string(),
+        // CAST keeps the logged text unambiguous (a bare literal has no UUID
+        // form) while re-parsing to exactly the same 128 bits.
+        Value::Uuid(bits) => format!("CAST('{}' AS UUID)", crate::uuid::format(*bits)),
         Value::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
         // The negative extremes cannot be written as plain literals (`-2147483648`
         // parses as BIGINT negation, `-9223372036854775808` overflows the
@@ -303,16 +311,26 @@ pub(crate) fn value_literal(value: &Value) -> Result<String> {
             format!("CAST('{}' AS BIGINT)", i)
         }
         Value::Bigint(i) => i.to_string(),
-        // `{:?}` is the shortest form that round-trips an f64, with a `.0`
-        // for integral values (so the literal stays DOUBLE, never INTEGER).
-        Value::Double(x) if x.is_finite() => format!("{x:?}"),
+        // `{:?}` is the shortest form that round-trips an f64. A bare
+        // `2.5` would now parse as DECIMAL, so pin an exponent (`2.5e0`) in
+        // the text; integral values get `.0e0` so they stay DOUBLE.
+        Value::Double(x) if x.is_finite() => {
+            let text = format!("{x:?}");
+            if text.contains('e') {
+                text
+            } else {
+                text + "e0"
+            }
+        }
         Value::Double(x) if x.is_nan() => "CAST('NaN' AS DOUBLE)".to_string(),
         Value::Double(x) if x.is_sign_negative() => "CAST('-inf' AS DOUBLE)".to_string(),
         Value::Double(_) => "CAST('inf' AS DOUBLE)".to_string(),
         Value::Varchar(s) => format!("'{}'", s.replace('\'', "''")),
         // DECIMAL keeps its exact unscaled value: pin through the widest
         // precision, which every engine-produced DECIMAL(p ≤ 38) fits.
-        Value::Decimal(x, scale) => format!(
+        Value::Decimal {
+            value: x, scale, ..
+        } => format!(
             "CAST('{}' AS DECIMAL(38,{scale}))",
             crate::types::format_decimal(*x, *scale)
         ),
@@ -449,7 +467,9 @@ mod tests {
             value_literal(&Value::Bigint(0)).unwrap(),
             "CAST(0 AS BIGINT)"
         );
-        assert_eq!(value_literal(&Value::Double(1.0)).unwrap(), "1.0");
+        // The exponent keeps the text parsing as DOUBLE (a bare `1.0` is
+        // DECIMAL now).
+        assert_eq!(value_literal(&Value::Double(1.0)).unwrap(), "1.0e0");
         assert_eq!(value_literal(&Value::Date(0)).unwrap(), "DATE '1970-01-01'");
         assert_eq!(
             value_literal(&Value::Timestamp(0)).unwrap(),

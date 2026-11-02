@@ -150,6 +150,10 @@ const (
 	kindDroppedRole int32 = 21
 	kindGranted     int32 = 22
 	kindRevoked     int32 = 23
+	kindSetVariable int32 = 24
+	// Wave 131b schema DDL; Name carries the schema name.
+	kindCreatedSchema int32 = 25
+	kindDroppedSchema int32 = 26
 )
 
 var kindNames = map[int32]string{
@@ -177,6 +181,9 @@ var kindNames = map[int32]string{
 	kindDroppedRole:     "dropped_role",
 	kindGranted:         "granted",
 	kindRevoked:         "revoked",
+	kindSetVariable:     "set_variable",
+	kindCreatedSchema:   "created_schema",
+	kindDroppedSchema:   "dropped_schema",
 }
 
 // Value and column type tags; these mirror the PINKDB_TYPE_* values in
@@ -233,7 +240,8 @@ type Result struct {
 	// "dropped_table", "dropped_view", "created_database",
 	// "dropped_database", "used", "loaded_extension", "checkpointed",
 	// "altered_table", "created_user", "altered_user", "dropped_user",
-	// "created_role", "dropped_role", "granted", "revoked".
+	// "created_role", "dropped_role", "granted", "revoked", "set_variable",
+	// "created_schema", "dropped_schema".
 	Kind string
 	// Columns and ColumnTypes describe a "selected" result (column names and
 	// one of "null", "boolean", "integer", "bigint", "double", "varchar",

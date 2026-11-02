@@ -149,6 +149,7 @@ fn the_catalog_relation_lists_objects_a_session_may_read() {
             "main|open_y|INDEX|open|y (hash)",
             "main|plus1|MACRO|NULL|a",
             "main|add_y|PROCEDURE|NULL|v INTEGER · SQL",
+            "main|main|SCHEMA|NULL|NULL",
             "main|big|TABLE|NULL|NULL",
             "main|open|TABLE|NULL|NULL",
             "main|open_v|VIEW|NULL|NULL",

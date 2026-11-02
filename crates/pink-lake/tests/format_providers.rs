@@ -140,7 +140,7 @@ impl LakeFormat for PinkWrap {
         let (bytes, saved) = mini.to_pink_bytes_with_stats().unwrap();
         let stats: SavedTableStats = saved
             .into_iter()
-            .find(|s| s.db == db && s.table == table)
+            .find(|s| s.db == db && s.schema == "main" && s.table == table)
             .expect("the single-table encoder publishes its statistics");
         let mut wrapped = Vec::with_capacity(HEADER.len() + bytes.len());
         wrapped.extend_from_slice(HEADER);

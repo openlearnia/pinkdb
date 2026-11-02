@@ -185,7 +185,9 @@ fn comparison_and_arithmetic_infer_from_the_other_side() {
 
     // Arithmetic: `? + 1` infers INTEGER; BIGINT stays exact.
     let stmt = db.prepare("SELECT ? + 1;").unwrap();
-    let bound = stmt.bind(&db, "main", &[Value::Bigint(3)]).unwrap();
+    let bound = stmt
+        .bind(&db, &pinkdb::SchemaPath::main("main"), &[Value::Bigint(3)])
+        .unwrap();
     assert_eq!(bound.parameter_types(), &[DataType::Bigint]);
     assert_eq!(
         one_int(prepared_rows(&mut db, "SELECT ? + 1;", &[Value::Bigint(3)])),
@@ -258,7 +260,9 @@ fn cast_pins_the_parameter_type() {
         vec![vec![Value::Null]]
     );
     let stmt = db.prepare("SELECT CAST(? AS BIGINT);").unwrap();
-    let bound = stmt.bind(&db, "main", &[Value::Null]).unwrap();
+    let bound = stmt
+        .bind(&db, &pinkdb::SchemaPath::main("main"), &[Value::Null])
+        .unwrap();
     assert_eq!(bound.parameter_types(), &[DataType::Bigint]);
 }
 
@@ -271,7 +275,7 @@ fn insert_and_update_targets_pin_the_parameter_type() {
     insert
         .bind(
             &db,
-            "main",
+            &pinkdb::SchemaPath::main("main"),
             &[
                 Value::Varchar("7".into()),
                 Value::Integer(8),
@@ -339,7 +343,7 @@ fn insert_and_update_targets_pin_the_parameter_type() {
     let bound = update
         .bind(
             &db,
-            "main",
+            &pinkdb::SchemaPath::main("main"),
             &[Value::Varchar("11".into()), Value::Integer(9)],
         )
         .unwrap();
@@ -481,7 +485,7 @@ fn prepare_reports_its_parameters_in_order() {
     let bound = stmt
         .bind(
             &db,
-            "main",
+            &pinkdb::SchemaPath::main("main"),
             &[Value::Integer(1), Value::Varchar("x".into())],
         )
         .unwrap();
@@ -524,7 +528,7 @@ fn a_prepared_statement_is_reusable_and_state_is_fresh_per_execute() {
     let use_stmt = db.prepare("USE other;").unwrap();
     assert!(matches!(
         db.execute_prepared(&use_stmt, &[]).unwrap(),
-        QueryResult::Used { db } if db == "other"
+        QueryResult::Used { db, schema } if db == "other" && schema == "main"
     ));
     assert_eq!(db.current_db(), "other");
 }

@@ -727,7 +727,15 @@ fn build_result(
         DoneKind::DroppedView => QueryResult::DroppedView { name },
         DoneKind::CreatedDatabase => QueryResult::CreatedDatabase { name },
         DoneKind::DroppedDatabase => QueryResult::DroppedDatabase { name },
-        DoneKind::Used => QueryResult::Used { db: name },
+        DoneKind::CreatedSchema => QueryResult::CreatedSchema { name },
+        DoneKind::DroppedSchema => QueryResult::DroppedSchema { name },
+        DoneKind::Used => {
+            let (db, schema) = name.split_once('\0').unwrap_or((&name, "main"));
+            QueryResult::Used {
+                db: db.to_string(),
+                schema: schema.to_string(),
+            }
+        }
         DoneKind::SetVariable => QueryResult::SetVariable { name },
         DoneKind::LoadedExtension => QueryResult::LoadedExtension { name },
         DoneKind::Checkpointed => QueryResult::Checkpointed,

@@ -95,6 +95,7 @@ fn candidates(app: &App, text: &str, pos: usize) -> (usize, Vec<Item>) {
     let refs = sql::table_refs(&statement);
     let catalog = app.catalog.get_untracked();
     let db = app.db.get_untracked();
+    let schema = app.schema.get_untracked();
     let mut items: Vec<Item> = Vec::new();
     let mut push = |label: &str, kind: &'static str, insert: String| {
         if label.to_ascii_lowercase().starts_with(&prefix)
@@ -149,7 +150,18 @@ fn candidates(app: &App, text: &str, pos: usize) -> (usize, Vec<Item>) {
                     "TABLE" | "VIEW" | "MATERIALIZED VIEW" | "LAKE TABLE"
                 )
             {
-                push(&object.name, "table", sql::quote_ident(&object.name));
+                // The qualifier names a database: a bare name would resolve
+                // as a schema.
+                push(
+                    &object.name,
+                    "table",
+                    format!(
+                        "{}.{}.{}",
+                        sql::quote_ident(&object.database),
+                        sql::quote_ident(&object.schema),
+                        sql::quote_ident(&object.name)
+                    ),
+                );
             }
         }
     } else {
@@ -167,12 +179,15 @@ fn candidates(app: &App, text: &str, pos: usize) -> (usize, Vec<Item>) {
                 object.kind.as_str(),
                 "TABLE" | "VIEW" | "MATERIALIZED VIEW" | "LAKE TABLE"
             ) {
-                let insert = if object.database.eq_ignore_ascii_case(&db) {
+                let insert = if object.database.eq_ignore_ascii_case(&db)
+                    && object.schema.eq_ignore_ascii_case(&schema)
+                {
                     sql::quote_ident(&object.name)
                 } else {
                     format!(
-                        "{}.{}",
+                        "{}.{}.{}",
                         sql::quote_ident(&object.database),
+                        sql::quote_ident(&object.schema),
                         sql::quote_ident(&object.name)
                     )
                 };

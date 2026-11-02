@@ -111,18 +111,18 @@ pub(crate) fn returning_result(
 /// updated are not counted, matching DuckDB's `INSERT` count).
 pub(crate) fn insert(
     db: &mut PinkDb,
-    target_db: &str,
+    target_ns: &crate::storage::SchemaPath,
     table: &str,
     staged: Vec<Vec<Value>>,
     conflict: Option<&ConflictPlan>,
     budget: &Arc<ExecBudget>,
 ) -> Result<usize> {
-    let keyed = !db.table_in(target_db, table)?.constraints.keys.is_empty();
+    let keyed = !db.table_in(target_ns, table)?.constraints.keys.is_empty();
     if conflict.is_none() {
         // No conflict clause: nothing to resolve, the trigger funnel checks the
         // rows against the table's cached key map.
         let count = staged.len();
-        crate::trigger::insert_rows(db, target_db, table, staged, budget)?;
+        crate::trigger::insert_rows(db, target_ns, table, staged, budget)?;
         return Ok(count);
     }
     if !keyed {
@@ -135,7 +135,7 @@ pub(crate) fn insert(
     // `shortcut:` a staged update is not visible to a later source row of the
     // same statement (DuckDB resolves upserts in source order), which only
     // matters when an ON CONFLICT action rewrites a key column.
-    let space = crate::keys::take_or_build(db, target_db, table)?
+    let space = crate::keys::take_or_build(db, target_ns, table)?
         .expect("checked that the table declares a key");
     let mut side = space.empty_like();
     // Images of the rows staged for insertion, so a second conflict against
@@ -145,7 +145,7 @@ pub(crate) fn insert(
     let mut inserts: Vec<Vec<Value>> = Vec::new();
     let mut updates: Vec<(RowId, Vec<Value>)> = Vec::new();
     {
-        let t = db.table_in(target_db, table)?;
+        let t = db.table_in(target_ns, table)?;
         let target = conflict.and_then(|cp| cp.target.as_deref());
         for values in staged {
             budget.check_deadline()?;
@@ -202,18 +202,18 @@ pub(crate) fn insert(
             updates.push((id, new));
         }
     }
-    crate::keys::store(db, target_db, table, Some(space));
+    crate::keys::store(db, target_ns, table, Some(space));
     let inserted = inserts.len();
     let mut ops: Vec<Op> = Vec::with_capacity(updates.len() + inserts.len());
     ops.extend(updates.into_iter().map(|(id, new)| Op::Update(id, new)));
     ops.extend((0..inserts.len()).map(Op::Insert));
-    apply(db, target_db, table, ops, &inserts, budget)?;
+    apply(db, target_ns, table, ops, &inserts, budget)?;
     Ok(inserted)
 }
 
 pub(crate) fn update_from(
     db: &mut PinkDb,
-    target_db: &str,
+    target_ns: &crate::storage::SchemaPath,
     table: &str,
     source: &LogicalPlan,
     sets: &[(usize, BoundExpr)],
@@ -225,7 +225,7 @@ pub(crate) fn update_from(
         let out = eval(&cx, source)?;
         (out.chunks, out.types)
     };
-    let t = db.table_in(target_db, table)?;
+    let t = db.table_in(target_ns, table)?;
     let schema = t.schema();
     let mut per_chunk: Vec<Vec<(usize, usize, Value)>> = vec![Vec::new(); t.num_chunks()];
     let mut count = 0usize;
@@ -288,7 +288,7 @@ pub(crate) fn update_from(
             }
         }
     }
-    crate::trigger::update_rows(db, target_db, table, per_chunk, budget)?;
+    crate::trigger::update_rows(db, target_ns, table, per_chunk, budget)?;
     Ok(count)
 }
 
@@ -296,7 +296,7 @@ pub(crate) fn update_from(
 /// source row. Duplicate matches are irrelevant — the row is deleted once.
 pub(crate) fn delete_using(
     db: &mut PinkDb,
-    target_db: &str,
+    target_ns: &crate::storage::SchemaPath,
     table: &str,
     source: &LogicalPlan,
     predicate: Option<&BoundExpr>,
@@ -307,7 +307,7 @@ pub(crate) fn delete_using(
         let out = eval(&cx, source)?;
         (out.chunks, out.types)
     };
-    let t = db.table_in(target_db, table)?;
+    let t = db.table_in(target_ns, table)?;
     let schema = t.schema();
     let mut drops: Vec<Vec<usize>> = Vec::with_capacity(t.num_chunks());
     {
@@ -365,7 +365,7 @@ pub(crate) fn delete_using(
             drops.push(dropped);
         }
     }
-    crate::trigger::delete_rows(db, target_db, table, drops, budget)
+    crate::trigger::delete_rows(db, target_ns, table, drops, budget)
 }
 
 /// `MERGE INTO … USING … ON … WHEN …`: the source is materialized, then every
@@ -391,7 +391,7 @@ pub(crate) fn delete_using(
 /// `INSERT … SELECT` does.
 pub(crate) fn merge(
     db: &mut PinkDb,
-    target_db: &str,
+    target_ns: &crate::storage::SchemaPath,
     table: &str,
     source: &LogicalPlan,
     on: &BoundExpr,
@@ -424,10 +424,10 @@ pub(crate) fn merge(
     // Constraints are checked against a copy of the table's cached key map: the
     // write funnels take and maintain the canonical one themselves, so it goes
     // back pristine. A keyless table stages nothing.
-    let mut keys = match crate::keys::take_or_build(db, target_db, table)? {
+    let mut keys = match crate::keys::take_or_build(db, target_ns, table)? {
         Some(space) => {
             let staged = space.clone();
-            crate::keys::store(db, target_db, table, Some(space));
+            crate::keys::store(db, target_ns, table, Some(space));
             Some(staged)
         }
         None => None,
@@ -449,7 +449,7 @@ pub(crate) fn merge(
     // condition — and at most one `WHEN NOT MATCHED` clause, so the batches
     // land in the order the row path stages them (see below).
     let bulk = db.trigger_capture.is_none()
-        && db.table_in(target_db, table)?.constraints.keys.is_empty()
+        && db.table_in(target_ns, table)?.constraints.keys.is_empty()
         && clauses
             .iter()
             .filter(|c| c.matched == MergeMatch::NotMatched)
@@ -457,19 +457,18 @@ pub(crate) fn merge(
             <= 1
         && !crate::trigger::has_row_triggers(
             db,
-            target_db,
+            target_ns,
             table,
             crate::trigger::TriggerEvent::Insert,
         );
     let (per_chunk, drops, inserts, batches, updated) = {
         let cx = Cx::with_budget(db, budget.clone());
-        let t = db.table_in(target_db, table)?;
+        let t = db.table_in(target_ns, table)?;
         let schema = t.schema();
-        let defaults: Vec<Value> = t
-            .columns
-            .iter()
-            .map(|c| c.default.clone().unwrap_or(Value::Null))
-            .collect();
+        // The binder gives every `WHEN NOT MATCHED … INSERT` a value for every
+        // target column — the written cells plus each omitted column's
+        // DEFAULT expression (wave 139a) — so nothing is filled in here.
+        let defaults: Vec<Value> = vec![Value::Null; schema.len()];
         let num_chunks = t.num_chunks();
         let mut per_chunk: Vec<Vec<(usize, usize, Value)>> = vec![Vec::new(); num_chunks];
         let mut drops: Vec<Vec<usize>> = vec![Vec::new(); num_chunks];
@@ -499,6 +498,7 @@ pub(crate) fn merge(
             src_cols: &src_cols,
             src_types: &src_types,
             schema: &schema,
+            next_ordinal: std::cell::Cell::new(0),
         };
         let mut hits: Vec<RowHit> = Vec::new();
         for ci in 0..num_chunks {
@@ -685,13 +685,13 @@ pub(crate) fn merge(
             .map(|batch| batch.first().map_or(0, |column| column.len()))
             .sum::<usize>();
     if per_chunk.iter().any(|writes| !writes.is_empty()) {
-        crate::trigger::update_rows(db, target_db, table, per_chunk, budget)?;
+        crate::trigger::update_rows(db, target_ns, table, per_chunk, budget)?;
     }
     if !inserts.is_empty() {
-        crate::trigger::insert_rows(db, target_db, table, inserts, budget)?;
+        crate::trigger::insert_rows(db, target_ns, table, inserts, budget)?;
     }
     if !batches.is_empty() {
-        let t = db.table_mut_in(target_db, table)?;
+        let t = db.table_mut_in(target_ns, table)?;
         for batch in &batches {
             t.append_shared_chunk(batch)?;
         }
@@ -699,7 +699,7 @@ pub(crate) fn merge(
     let deleted = if drops.iter().all(|d| d.is_empty()) {
         0
     } else {
-        crate::trigger::delete_rows(db, target_db, table, drops, budget)?
+        crate::trigger::delete_rows(db, target_ns, table, drops, budget)?
     };
     Ok((inserted, updated, deleted))
 }
@@ -715,6 +715,11 @@ struct MergeCtx<'a, 'db> {
     src_cols: &'a [Vec<&'a Vector>],
     src_types: &'a [DataType],
     schema: &'a [(String, DataType)],
+    /// The next joined chunk's ordinal. Seeded volatile functions (`uuid()`,
+    /// `random()`, wave 139b) derive each value from (chunk ordinal, row), so
+    /// every batch of one statement needs its own; the batches are built in
+    /// one deterministic order, so a replay numbers them the same way.
+    next_ordinal: std::cell::Cell<usize>,
 }
 
 impl MergeCtx<'_, '_> {
@@ -750,7 +755,10 @@ impl MergeCtx<'_, '_> {
                 }
             }
         }
-        DataChunk::new(cols)
+        let mut chunk = DataChunk::new(cols)?;
+        chunk.ordinal = self.next_ordinal.get();
+        self.next_ordinal.set(chunk.ordinal + 1);
+        Ok(chunk)
     }
 
     /// Match one batch of `(target row, source chunk, source row)` candidates:
@@ -1028,7 +1036,7 @@ enum Op {
 
 fn apply(
     db: &mut PinkDb,
-    target_db: &str,
+    target_ns: &crate::storage::SchemaPath,
     table: &str,
     ops: Vec<Op>,
     inserts: &[Vec<Value>],
@@ -1039,7 +1047,7 @@ fn apply(
             Op::Insert(i) => {
                 crate::trigger::insert_rows(
                     db,
-                    target_db,
+                    target_ns,
                     table,
                     vec![inserts[i].clone()],
                     budget,
@@ -1047,7 +1055,7 @@ fn apply(
             }
             Op::Update(id, new) => {
                 let chunk = db
-                    .table_in(target_db, table)?
+                    .table_in(target_ns, table)?
                     .scan_chunk(id.chunk)
                     .ok_or_else(|| {
                         PinkDbError::Execution("storage changed during UPDATE".to_string())
@@ -1067,9 +1075,9 @@ fn apply(
                     // first column as a same-value write.
                     writes.push((0, id.row, new[0].clone()));
                 }
-                let mut per_chunk = vec![Vec::new(); db.table_in(target_db, table)?.num_chunks()];
+                let mut per_chunk = vec![Vec::new(); db.table_in(target_ns, table)?.num_chunks()];
                 per_chunk[id.chunk] = writes;
-                crate::trigger::update_rows(db, target_db, table, per_chunk, budget)?;
+                crate::trigger::update_rows(db, target_ns, table, per_chunk, budget)?;
             }
         }
     }

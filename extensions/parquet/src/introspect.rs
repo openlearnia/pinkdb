@@ -247,8 +247,10 @@ fn push_schema_element(
     };
     let decimal = matches!(info.converted_type(), ConvertedType::DECIMAL)
         || matches!(info.logical_type_ref(), Some(LogicalType::Decimal(_)));
+    // This element's own leaf ordinal, before the counter moves past it.
+    let leaf_index = *leaf;
     let engine_type = if primitive {
-        let ty = meta.columns.get(*leaf).map(|c| c.ty);
+        let ty = meta.columns.get(leaf_index).map(|c| c.ty);
         *leaf += 1;
         ty
     } else {
@@ -264,7 +266,11 @@ fn push_schema_element(
         match physical {
             Some(PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
                 // Flat schemas only: the leaf ordinal is the element order.
-                let length = meta.columns.get(*leaf).map(|c| c.type_length).unwrap_or(0);
+                let length = meta
+                    .columns
+                    .get(leaf_index)
+                    .map(|c| c.type_length)
+                    .unwrap_or(0);
                 Value::Varchar(length.to_string())
             }
             _ => Value::Null,

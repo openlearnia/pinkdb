@@ -306,6 +306,7 @@ fn worksheet_conn(
     shared: &Shared,
     session: &UiSession,
     db: Option<&str>,
+    schema: Option<&str>,
     limits: ExecLimits,
     cancel: Option<CancelFlag>,
 ) -> Result<Connection, String> {
@@ -313,11 +314,19 @@ fn worksheet_conn(
     conn.set_exec_limits(limits);
     conn.set_external_services(shared.opts.allow_external_services);
     conn.set_cancel_flag(cancel);
-    if let Some(db) = db.filter(|db| !db.is_empty())
-        && !db.eq_ignore_ascii_case(conn.current_db())
-    {
-        conn.execute(&format!("USE {}", quote_ident(db)))
-            .map_err(|e| e.to_string())?;
+    if let Some(db) = db.filter(|db| !db.is_empty()) {
+        let schema = schema.filter(|schema| !schema.is_empty());
+        // A session connection starts in its database's `main` schema; the
+        // engine decides whether the named one needs a switch.
+        if schema.is_some_and(|schema| !schema.eq_ignore_ascii_case("main"))
+            || !db.eq_ignore_ascii_case(conn.current_db())
+        {
+            let sql = match schema {
+                Some(schema) => format!("USE {}.{}", quote_ident(db), quote_ident(schema)),
+                None => format!("USE {}", quote_ident(db)),
+            };
+            conn.execute(&sql).map_err(|e| e.to_string())?;
+        }
     }
     Ok(conn)
 }
@@ -443,6 +452,7 @@ fn run_worksheet(
         shared,
         session,
         body.db.as_deref(),
+        body.schema.as_deref(),
         query_limits(shared),
         Some(flag.clone()),
     ) {
@@ -551,7 +561,14 @@ pub async fn export(State(shared): State<Arc<Shared>>, headers: HeaderMap, body:
             max_result_rows: Some(worker.opts.max_export_rows),
             max_result_bytes: Some(worker.opts.query_max_bytes),
         };
-        let mut conn = worksheet_conn(&worker, &session, body.db.as_deref(), limits, None)?;
+        let mut conn = worksheet_conn(
+            &worker,
+            &session,
+            body.db.as_deref(),
+            body.schema.as_deref(),
+            limits,
+            None,
+        )?;
         store_hook(&body.sql);
         let result = conn
             .execute(&body.sql)
@@ -787,10 +804,11 @@ pub async fn catalog(
         // A database the browser still names may have been dropped: the
         // catalog then answers from the session's default, so the app can
         // pick an existing one.
-        let mut conn = match worksheet_conn(&worker, &session, query.db.as_deref(), limits, None) {
-            Ok(conn) => conn,
-            Err(_) => worksheet_conn(&worker, &session, None, limits, None)?,
-        };
+        let mut conn =
+            match worksheet_conn(&worker, &session, query.db.as_deref(), None, limits, None) {
+                Ok(conn) => conn,
+                Err(_) => worksheet_conn(&worker, &session, None, None, limits, None)?,
+            };
         let mut select = |sql: &str| -> Result<Vec<Vec<Value>>, String> {
             store_hook(sql);
             match conn.execute(sql).map_err(|e| e.to_string())?.pop() {
@@ -816,18 +834,19 @@ pub async fn catalog(
         let mut objects: Vec<CatalogObject> = select(
             // Plain views are session-local (never stored), so the catalog
             // leaves them out; materialized views are listed. DATABASE rows
-            // (wave 124) describe the databases, not objects in them.
-            "SELECT \"database\", \"name\", \"kind\", \"table_name\", \"detail\" FROM pinkdb_catalog() \
-             WHERE \"kind\" NOT IN ('VIEW', 'DATABASE')",
+            // (wave 124) describe the databases, not objects in them; SCHEMA
+            // rows give the tree its empty schemas (wave 131e).
+            "SELECT \"database\", \"schema\", \"name\", \"kind\", \"table_name\", \"detail\" \
+             FROM pinkdb_catalog() WHERE \"kind\" NOT IN ('VIEW', 'DATABASE')",
         )?
         .into_iter()
         .map(|row| CatalogObject {
             database: text(&row, 0).unwrap_or_default(),
-            schema: crate::api::DEFAULT_SCHEMA.to_string(),
-            name: text(&row, 1).unwrap_or_default(),
-            kind: text(&row, 2).unwrap_or_default(),
-            table_name: text(&row, 3),
-            detail: text(&row, 4),
+            schema: text(&row, 1).unwrap_or_default(),
+            name: text(&row, 2).unwrap_or_default(),
+            kind: text(&row, 3).unwrap_or_default(),
+            table_name: text(&row, 4),
+            detail: text(&row, 5),
             rows: None,
             columns: Vec::new(),
         })
@@ -836,7 +855,10 @@ pub async fn catalog(
             "SELECT \"database\", \"table_name\", \"column_name\", \"data_type\", \"row_count\", \
              \"null_count\", \"distinct_count\", \"min\", \"max\" FROM pinkdb_column_stats()",
         )? {
-            let (db, table) = (text(&row, 0).unwrap_or_default(), text(&row, 1).unwrap_or_default());
+            let (db, table) = (
+                text(&row, 0).unwrap_or_default(),
+                text(&row, 1).unwrap_or_default(),
+            );
             if let Some(object) = objects.iter_mut().find(|o| {
                 o.table_name.is_none()
                     && o.database.eq_ignore_ascii_case(&db)

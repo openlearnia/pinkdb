@@ -95,7 +95,9 @@ not planned to change.
 | case | pinkdb | DuckDB 2.0.0 |
 |---|---|---|
 | `'{"a":1}'::VARIANT` | the **object** (VARCHAR→VARIANT parses JSON, which gives the type a literal form the parser/WAL/prepared statements carry) | the **string**; `json(...)::VARIANT` is needed for an object |
-| `1.e2` | parse error, `a number with an exponent needs digits after the dot (write 1.0e2)` | a float (`100`) |
+| `1.e2`, `5.` (a point with no digits after it) | parse error, `a number with an exponent needs digits after the dot (write 1.0e2)` | `5.` is `DECIMAL(1,0)`, `1.e2` is DOUBLE |
+| an unaliased decimal literal written `1_000.5` or `00.5` | the column is named from the folded value (`1000.5`, `0.5`); the written *scale* survives, so `1.50` stays `1.50` | the source text (`1_000.5`, `00.5`) |
+| `[1.5, 2.5]` (an ARRAY of decimal literals) | `DOUBLE[2]`: the fixed-size `ARRAY` has no DECIMAL element kind, so a decimal element types as DOUBLE (wave 126a) | `DECIMAL(2,1)[2]`; a column of that ARRAY must be `DOUBLE[]` in pinkdb |
 | `v.js.a` (database-qualified three-part column vs a VARIANT chain) | `database "v" not found` — wave 94 keeps `db.table.column` authoritative; write `js.a['b']` for nested VARIANT access | a VARIANT path |
 | `SIMILAR TO 'a{1,2,3}'` | literal text (matches nothing) | invalid-regular-expression error |
 | `SIMILAR TO … ESCAPE '\'` | parse error (unsupported) | `Unrecognized Regex option` error |

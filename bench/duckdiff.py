@@ -756,6 +756,66 @@ NAN_QUERIES = [
     ("nan-window-rank", "SELECT id, rank() OVER (ORDER BY d) FROM fz ORDER BY id;", True, False),
 ]
 
+# ---- wave 126a: decimal literal typing ----
+#
+# A point literal is DECIMAL(written width, written scale) like DuckDB's
+# `NumberToValue`; exponents and over-38-digit literals stay DOUBLE. The
+# battery pins the dtype (via `typeof`) and the value of the table in the
+# wave's brief, then every place a literal meets another type: arithmetic,
+# CASE/LEAST/GREATEST/COALESCE/UNION, IN/BETWEEN, GROUP BY, ORDER BY, window
+# frames, LIMIT/OFFSET, INTERVAL arithmetic and assignment into typed columns.
+LITERAL_SETUP = """
+CREATE TABLE xd (x DECIMAL(15,2));
+INSERT INTO xd VALUES (10.25), (0.00);
+CREATE TABLE xi (i INTEGER);
+INSERT INTO xi VALUES (3), (7);
+CREATE TABLE xv (d DOUBLE);
+INSERT INTO xv VALUES (1.5), (2.5);
+"""
+
+LITERAL_QUERIES = [
+    # (label, sql, ordered, expect_error)
+    ("lit-typeof", "SELECT typeof(1.5), typeof(0.06), typeof(.5), typeof(1.50), typeof(12345678901234567890.5), typeof(1e3), typeof(1.5e2);", False, False),
+    ("lit-typeof-corners", "SELECT typeof(-1.5), typeof(-.5), typeof(1_000.5), typeof(00.5), typeof(0.00), typeof(.00);", False, False),
+    ("lit-typeof-width", "SELECT typeof(12345678901234567890123456789012345678.5), typeof(123456789012345678901234567890123456789.5), typeof(12345678901234567890123456789012345678901234567890.5);", False, False),
+    ("lit-values", "SELECT 1.5, 0.06, .5, 1.50, 12345678901234567890.5, 1e3, 1.5e2, 00.5, 1_000.5;", False, False),
+    ("lit-arith-types", "SELECT typeof(3 * 0.5), typeof(1.5 + 1), typeof(0.1 + 0.2), typeof(10 / 4.0), typeof(sqrt(2.0)), typeof(power(1.5, 2)), typeof(1.5 * 1.0);", False, False),
+    ("lit-arith-values", "SELECT 3 * 0.5, 1.5 + 1, 0.1 + 0.2, 10 / 4.0, sqrt(2.0), power(1.5, 2), 1.5 * 1.0, 1.5 % 1, -1.5 * 1;", False, False),
+    ("lit-unify-types", "SELECT typeof(CASE WHEN true THEN 1.5 ELSE 2 END), typeof(least(1.5, 2.25)), typeof(greatest(1.5, 2)), typeof(coalesce(NULL, 1.5)), typeof(1.5 % 1), typeof(123.45 % 2);", False, False),
+    ("lit-unify-values", "SELECT CASE WHEN true THEN 1.5 ELSE 2 END, least(1.5, 2.25), greatest(1.5, 2), coalesce(NULL, 1.5), 1.5 % 1;", False, False),
+    ("lit-union", "SELECT v, typeof(v) FROM (SELECT 1.5 AS v UNION ALL SELECT 2) s ORDER BY v;", True, False),
+    ("lit-comparisons", "SELECT 1.5 = 1.50, 1.5 < 1.51, -1.5 = -1.50, 1.5 = 1.5e0, 1.5 > 1;", False, False),
+    ("lit-in", "SELECT 1.5 IN (1.5, 2.5), 2 IN (1.5, 2.5), 1.25 IN (1.5, 2.5), 1.5 NOT IN (1.5);", False, False),
+    ("lit-between", "SELECT 1.5 BETWEEN 1.0 AND 2.0, 1.25 BETWEEN 1.5 AND 2.5, 2 BETWEEN 1.5 AND 2.5, 1.5 NOT BETWEEN 1 AND 1.5;", False, False),
+    ("lit-dec-column", "SELECT x, typeof(x - 1.5), x - 1.5 FROM xd ORDER BY x;", True, False),
+    ("lit-dec-column-aggs", "SELECT typeof(sum(x - 1.5)), sum(x - 1.5), typeof(avg(x * 0.1)), avg(x * 0.1), typeof(min(x * 1.5)), min(x * 1.5) FROM xd;", False, False),
+    ("lit-dec-column-filter", "SELECT x FROM xd WHERE x > 1.5 ORDER BY x;", True, False),
+    ("lit-int-column-filter", "SELECT i FROM xi WHERE i < 4.5 ORDER BY i;", True, False),
+    ("lit-int-column-eq", "SELECT i FROM xi WHERE i = 3.0 ORDER BY i;", True, False),
+    ("lit-double-column-filter", "SELECT d FROM xv WHERE d > 1.5 ORDER BY d;", True, False),
+    ("lit-index-probe", "CREATE TABLE xix (i INTEGER); INSERT INTO xix VALUES (2), (3); CREATE INDEX xixi ON xix(i); SELECT i FROM xix WHERE i = 2.0;", True, False),
+    ("lit-group-by-literal", "SELECT 1.5 AS k, count(*) FROM xi GROUP BY 1.5 ORDER BY 1;", True, False),
+    ("lit-group-by-column", "SELECT i > 1.5 AS k, count(*) FROM xi GROUP BY k ORDER BY k;", True, False),
+    ("lit-order-by-expr", "SELECT i FROM xi ORDER BY i * 1.5 DESC;", True, False),
+    ("lit-window-frame", "SELECT i, sum(i) OVER (ORDER BY i ROWS BETWEEN 1.5 PRECEDING AND CURRENT ROW) AS s FROM xi ORDER BY i;", True, False),
+    ("lit-window-range", "SELECT i, sum(i) OVER (ORDER BY i RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) AS s FROM xi ORDER BY i;", True, False),
+    ("lit-limit", "SELECT i FROM xi ORDER BY i LIMIT 1.5;", True, False),
+    ("lit-offset", "SELECT i FROM xi ORDER BY i OFFSET 1.4;", True, False),
+    ("lit-interval-arith", "SELECT INTERVAL '1 day' * 1.5, INTERVAL '3 days' / 2.0, TIMESTAMP '2024-01-01 00:00:00' + INTERVAL '1 day' * 1.5;", False, False),
+    ("lit-date-plus-literal", "SELECT DATE '2024-01-01' + 1.5;", False, True),
+    ("lit-concat", "SELECT 'a' || 1.5, 'a' || .5, 'a' || 0.5, CAST(.5 AS VARCHAR), 1.5 || 'x';", False, False),
+    ("lit-assign", "CREATE TABLE ca (d DOUBLE, i INTEGER, b BIGINT, s VARCHAR, m DECIMAL(4,2), n DECIMAL(2,1)); INSERT INTO ca VALUES (1.5, 1.5, 1.5, 1.5, 1.567, 1.567), (NULL, 2.5, 2.5, NULL, NULL, NULL); SELECT d, i, b, s, m, n FROM ca ORDER BY i;", True, False),
+    ("lit-assign-out-of-range", "CREATE TABLE cb (n DECIMAL(2,1)); INSERT INTO cb VALUES (100.0);", False, True),
+    ("lit-variant", "SELECT variant_type(CAST(1.5 AS VARIANT)), variant_type(CAST(1.5e0 AS VARIANT));", False, False),
+]
+
+
+def run_literals():
+    print("== decimal-literal battery (wave 126a) ==")
+    for label, sql, ordered, expect_error in LITERAL_QUERIES:
+        run_case(label, sql, ordered, expect_error, LITERAL_SETUP, LITERAL_SETUP)
+
+
 
 def run_parquet():
     print("== parquet battery ==")
@@ -767,6 +827,74 @@ def run_parquet():
         return
     for label, sql, ordered, expect_error in PARQUET_QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP)
+    run_parquet_writer()
+
+
+PARQUET_WRITER_SETUP = """
+CREATE TABLE pqw (id BIGINT, u UUID);
+INSERT INTO pqw VALUES
+ (1, '00000000-0000-0000-0000-000000000001'),
+ (2, NULL),
+ (3, '80000000-0000-4000-8000-000000000000'),
+ (4, 'ffffffff-ffff-ffff-ffff-ffffffffffff');
+COPY pqw TO '{path}' (FORMAT parquet);
+"""
+
+PARQUET_WRITER_QUERY = (
+    "SELECT CAST(id AS VARCHAR), u::VARCHAR, typeof(u) "
+    "FROM read_parquet('{path}') WHERE u IS NOT NULL ORDER BY id;"
+)
+
+PARQUET_WRITER_EXPECTED = [
+    ["1", "00000000-0000-0000-0000-000000000001", "UUID"],
+    ["3", "80000000-0000-4000-8000-000000000000", "UUID"],
+    ["4", "ffffffff-ffff-ffff-ffff-ffffffffffff", "UUID"],
+]
+
+
+def run_parquet_writer():
+    """Each engine writes the file, then both engines read it.
+
+    `run_case` cannot express this: it runs the same SQL in both engines, so
+    each would read back its own file. Reading the *other* writer's file is
+    what pins the physical type and the UUID logical type pinkdb writes: a
+    wrong layout would make DuckDB refuse the schema or read garbage.
+    """
+    directory = tempfile.mkdtemp(prefix="duckdiff_pq_")
+    try:
+        for writer in ("pinkdb", "duckdb"):
+            path = os.path.join(directory, f"{writer}.parquet")
+            setup = PARQUET_WRITER_SETUP.format(path=path)
+            if writer == "pinkdb":
+                # COPY prints its own count table, so this goes through the
+                # table reader rather than pink_query's one-table contract.
+                tables = pink_tables(setup, "SELECT 1;")
+                failed = [t for t in tables if t[0] == "error"]
+                ok = not failed and os.path.exists(path)
+                detail = failed[0][1] if failed else "no file written"
+            else:
+                wrote = duck_query(setup, "SELECT 1;")
+                ok = wrote[0] != "error" and os.path.exists(path)
+                detail = wrote[1] if wrote[0] == "error" else "no file written"
+            check(f"pq-writer-{writer}", ok, detail)
+            if not ok:
+                continue
+            for reader in ("pinkdb", "duckdb"):
+                read = pink_query if reader == "pinkdb" else duck_query
+                got = read("", PARQUET_WRITER_QUERY.format(path=path))
+                if got[0] == "error":
+                    check(f"pq-writer-{writer}-reader-{reader}", False, got[1])
+                    continue
+                rows = got[2] if reader == "pinkdb" else got[1]
+                check(
+                    f"pq-writer-{writer}-reader-{reader}",
+                    rows == PARQUET_WRITER_EXPECTED,
+                    f"{rows!r}",
+                )
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 
 
 def run_small():
@@ -789,6 +917,8 @@ def run_small():
         run_case(label, sql, ordered, expect_error, SETUP + "\n" + NAN_SETUP,
                  SETUP + "\n" + NAN_SETUP)
     run_three_part()
+    run_catalog()
+    run_defaults()
     run_arrow()
     run_parquet()
 
@@ -990,6 +1120,388 @@ CREATE TABLE db1.u (a INTEGER, c VARCHAR);
 INSERT INTO db1.u VALUES (1, 'x'), (3, 'z');
 """
 
+# ---- wave 131c: DuckDB-compatible catalog functions and information_schema ----
+#
+# The same two-database catalog on both sides. DuckDB spells a database as an
+# attached catalog; pinkdb as `CREATE DATABASE`. The probes read only user
+# objects in c1/c2: internal schemas and the engines' default databases are
+# excluded because pinkdb has no `system` database and DuckDB's default is
+# called `memory`. OIDs, `sql`, `estimated_size`, `path` and `type` are
+# excluded because they deliberately differ (OIDs are per-statement here;
+# `sql` is engine-generated; pinkdb counts storage differently; there is no
+# store path in memory; `type` names the engine). `index_count` is excluded
+# because DuckDB includes primary/unique constraint indexes while pinkdb's
+# column counts only explicit hash/vector indexes, as the 131c brief asks.
+CATALOG_PINK_SETUP = """
+CREATE DATABASE c1;
+CREATE DATABASE c2;
+CREATE SCHEMA c1.s;
+CREATE TABLE c1.main.m (x INTEGER PRIMARY KEY, y VARCHAR);
+CREATE TABLE c1.s.t (a INTEGER PRIMARY KEY, b VARCHAR NOT NULL DEFAULT 'z', c DECIMAL(18,3));
+CREATE INDEX t_b ON c1.s.t(b);
+CREATE VIEW c1.s.v AS SELECT a, b FROM c1.s.t;
+CREATE MACRO c1.s.plus1(a) AS a + 1;
+CREATE SCHEMA c2.s;
+CREATE TABLE c2.s.u (id BIGINT, ts TIMESTAMP);
+CREATE TEMP TABLE tmp (a INTEGER, b VARCHAR);
+INSERT INTO tmp VALUES (1, 'x');
+"""
+
+CATALOG_DUCK_SETUP = """
+ATTACH ':memory:' AS c1;
+ATTACH ':memory:' AS c2;
+CREATE SCHEMA c1.s;
+CREATE TABLE c1.main.m (x INTEGER PRIMARY KEY, y VARCHAR);
+CREATE TABLE c1.s.t (a INTEGER PRIMARY KEY, b VARCHAR NOT NULL DEFAULT 'z', c DECIMAL(18,3));
+CREATE INDEX t_b ON c1.s.t(b);
+CREATE VIEW c1.s.v AS SELECT a, b FROM c1.s.t;
+CREATE MACRO c1.s.plus1(a) AS a + 1;
+CREATE SCHEMA c2.s;
+CREATE TABLE c2.s.u (id BIGINT, ts TIMESTAMP);
+CREATE TEMP TABLE tmp (a INTEGER, b VARCHAR);
+INSERT INTO tmp VALUES (1, 'x');
+"""
+
+CATALOG_PROBES = [
+    ("catalog-duckdb-databases",
+     "SELECT database_name, comment, readonly, encrypted, cipher FROM duckdb_databases() "
+     "WHERE database_name IN ('c1', 'c2') ORDER BY 1;",
+     "SELECT database_name, comment, readonly, encrypted, cipher FROM duckdb_databases() "
+     "WHERE database_name IN ('c1', 'c2') ORDER BY 1;"),
+    ("catalog-duckdb-schemas",
+     # `main` is internal in both engines; the built-in schemas live under the
+     # virtual `system` database in both. `temp` is DuckDB-only (wave 139).
+     "SELECT database_name, schema_name, internal FROM duckdb_schemas() "
+     "WHERE database_name IN ('c1', 'c2', 'system') "
+     "AND schema_name IN ('information_schema', 'pg_catalog', 'main', 's') "
+     "ORDER BY 1, 2;",
+     "SELECT database_name, schema_name, internal FROM duckdb_schemas() "
+     "WHERE database_name IN ('c1', 'c2', 'system') "
+     "AND schema_name IN ('information_schema', 'pg_catalog', 'main', 's') "
+     "ORDER BY 1, 2;"),
+    ("catalog-duckdb-tables",
+     "SELECT database_name, schema_name, table_name, internal, temporary, has_primary_key, "
+     "column_count, check_constraint_count FROM duckdb_tables() "
+     "WHERE database_name IN ('c1', 'c2') ORDER BY 1, 2, 3;",
+     "SELECT database_name, schema_name, table_name, internal, temporary, has_primary_key, "
+     "column_count, check_constraint_count FROM duckdb_tables() "
+     "WHERE database_name IN ('c1', 'c2') ORDER BY 1, 2, 3;"),
+    ("catalog-duckdb-views",
+     "SELECT database_name, schema_name, view_name, internal, temporary, column_count, is_bound "
+     "FROM duckdb_views() WHERE database_name IN ('c1', 'c2') ORDER BY 1, 2, 3;",
+     "SELECT database_name, schema_name, view_name, internal, temporary, column_count, is_bound "
+     "FROM duckdb_views() WHERE database_name IN ('c1', 'c2') ORDER BY 1, 2, 3;"),
+    ("catalog-duckdb-columns",
+     "SELECT database_name, schema_name, table_name, column_name, column_index, column_default, "
+     "is_nullable, data_type, data_type_id, character_maximum_length, numeric_precision, "
+     "numeric_precision_radix, numeric_scale, is_generated, generation_expression "
+     "FROM duckdb_columns() WHERE database_name IN ('c1', 'c2') ORDER BY 1, 2, 3, 5;",
+     "SELECT database_name, schema_name, table_name, column_name, column_index, column_default, "
+     "is_nullable, data_type, data_type_id, character_maximum_length, numeric_precision, "
+     "numeric_precision_radix, numeric_scale, is_generated, generation_expression "
+     "FROM duckdb_columns() WHERE database_name IN ('c1', 'c2') ORDER BY 1, 2, 3, 5;"),
+    ("catalog-information-schema-schemata",
+     "SELECT catalog_name, schema_name, schema_owner, sql_path FROM information_schema.schemata "
+     "WHERE catalog_name IN ('c1', 'c2') "
+     "AND schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY 1, 2;",
+     "SELECT catalog_name, schema_name, schema_owner, sql_path FROM information_schema.schemata "
+     "WHERE catalog_name IN ('c1', 'c2') "
+     "AND schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY 1, 2;"),
+    ("catalog-information-schema-tables",
+     "SELECT table_catalog, table_schema, table_name, table_type, is_insertable_into, is_typed, "
+     "commit_action FROM information_schema.tables "
+     "WHERE table_catalog IN ('c1', 'c2') ORDER BY 1, 2, 3;",
+     "SELECT table_catalog, table_schema, table_name, table_type, is_insertable_into, is_typed, "
+     "commit_action FROM information_schema.tables "
+     "WHERE table_catalog IN ('c1', 'c2') ORDER BY 1, 2, 3;"),
+    ("catalog-information-schema-columns",
+     "SELECT table_catalog, table_schema, table_name, column_name, ordinal_position, "
+     "column_default, is_nullable, data_type, character_maximum_length, numeric_precision, "
+     "numeric_precision_radix, numeric_scale FROM information_schema.columns "
+     "WHERE table_catalog IN ('c1', 'c2') ORDER BY 1, 2, 3, 5;",
+     "SELECT table_catalog, table_schema, table_name, column_name, ordinal_position, "
+     "column_default, is_nullable, data_type, character_maximum_length, numeric_precision, "
+     "numeric_precision_radix, numeric_scale FROM information_schema.columns "
+     "WHERE table_catalog IN ('c1', 'c2') ORDER BY 1, 2, 3, 5;"),
+    ("catalog-information-schema-views",
+     "SELECT table_catalog, table_schema, table_name, check_option, is_updatable, "
+     "is_insertable_into FROM information_schema.views "
+     "WHERE table_catalog IN ('c1', 'c2') ORDER BY 1, 2, 3;",
+     "SELECT table_catalog, table_schema, table_name, check_option, is_updatable, "
+     "is_insertable_into FROM information_schema.views "
+     "WHERE table_catalog IN ('c1', 'c2') ORDER BY 1, 2, 3;"),
+    ("catalog-show-all-tables",
+     "SHOW ALL TABLES;",
+     "SHOW ALL TABLES;"),
+    ("catalog-show-all-tables-temp",
+     "SHOW ALL TABLES;",
+     "SHOW ALL TABLES;"),
+    ("catalog-temp-duckdb-databases",
+     "SELECT database_name, internal FROM duckdb_databases() "
+     "WHERE database_name = 'temp';",
+     "SELECT database_name, internal FROM duckdb_databases() "
+     "WHERE database_name = 'temp';"),
+    ("catalog-temp-duckdb-schemas",
+     "SELECT database_name, schema_name, internal FROM duckdb_schemas() "
+     "WHERE database_name = 'temp';",
+     "SELECT database_name, schema_name, internal FROM duckdb_schemas() "
+     "WHERE database_name = 'temp';"),
+    ("catalog-temp-duckdb-tables",
+     "SELECT database_name, schema_name, table_name, internal, temporary, "
+     "column_count FROM duckdb_tables() WHERE database_name = 'temp' "
+     "ORDER BY 3;",
+     "SELECT database_name, schema_name, table_name, internal, temporary, "
+     "column_count FROM duckdb_tables() WHERE database_name = 'temp' "
+     "ORDER BY 3;"),
+    ("catalog-temp-duckdb-columns",
+     "SELECT database_name, schema_name, table_name, column_name, column_index, "
+     "data_type FROM duckdb_columns() WHERE database_name = 'temp' "
+     "ORDER BY 3, 5;",
+     "SELECT database_name, schema_name, table_name, column_name, column_index, "
+     "data_type FROM duckdb_columns() WHERE database_name = 'temp' "
+     "ORDER BY 3, 5;"),
+    ("catalog-temp-information-schema-schemata",
+     "SELECT catalog_name, schema_name FROM information_schema.schemata "
+     "WHERE catalog_name = 'temp';",
+     "SELECT catalog_name, schema_name FROM information_schema.schemata "
+     "WHERE catalog_name = 'temp';"),
+    ("catalog-temp-information-schema-tables",
+     "SELECT table_catalog, table_schema, table_name, table_type, "
+     "is_insertable_into, commit_action FROM information_schema.tables "
+     "WHERE table_catalog = 'temp';",
+     "SELECT table_catalog, table_schema, table_name, table_type, "
+     "is_insertable_into, commit_action FROM information_schema.tables "
+     "WHERE table_catalog = 'temp';"),
+]
+
+
+def duck_list_text(values):
+    """DuckDB prints LIST values as `[a, 'b, c']`; `-json` hands them over as
+    arrays, so flatten the two SHOW ALL TABLES list columns the same way."""
+    parts = []
+    for value in values:
+        text = str(value)
+        if (
+            not text
+            or text[0].isspace()
+            or text[-1].isspace()
+            or any(ch in text for ch in ", '\"()[]{}:=")
+        ):
+            text = "'" + text.replace("'", "\\'") + "'"
+        parts.append(text)
+    return "[" + ", ".join(parts) + "]"
+
+
+def run_catalog():
+    print("== catalog functions battery (wave 131c) ==")
+    for label, psql, dsql in CATALOG_PROBES:
+        got = pink_query(CATALOG_PINK_SETUP, psql)
+        if got[0] == "error":
+            check(label, False, f"pinkdb error: {got[1]}")
+            continue
+        _, types, prows = got
+        if label.startswith("catalog-show-all-tables"):
+            keep = ("temp",) if label.endswith("-temp") else ("c1", "c2")
+            prows = [r for r in prows if r[0] in keep]
+        d = duck_query(CATALOG_DUCK_SETUP, dsql)
+        if d[0] == "error":
+            check(label, False, f"duckdb error: {d[1]}")
+            continue
+        drows = d[1]
+        if label.startswith("catalog-show-all-tables"):
+            keep = ("temp",) if label.endswith("-temp") else ("c1", "c2")
+            drows = [r for r in drows if r[0] in keep]
+            drows = [
+                [duck_list_text(c) if isinstance(c, list) else c for c in row]
+                for row in drows
+            ]
+        prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
+        ok = rows_equal(prows_n, drows, True)
+        check(label, ok, "" if ok else f"\npink={prows_n}\nduck={drows}")
+
+
+# ---- wave 139c: temporary tables ----
+#
+# A session's `temp.main` comes before the current schema in the search path,
+# so an unqualified name shadows the persistent table of the same name while
+# `main.t` still names the persistent one. Both engines run the same setup.
+TEMP_SETUP = """
+CREATE TABLE t (a INTEGER);
+INSERT INTO t VALUES (1);
+CREATE TEMP TABLE t (a INTEGER);
+INSERT INTO t VALUES (2);
+CREATE TEMP TABLE stage AS SELECT 42 AS a;
+CREATE SCHEMA s;
+"""
+
+TEMP_QUERIES = [
+    ("temp-shadow-unqualified", "SELECT a FROM t;"),
+    ("temp-two-part", "SELECT a FROM temp.t;"),
+    ("temp-three-part", "SELECT a FROM temp.main.t;"),
+    ("temp-main-qualified", "SELECT a FROM main.t;"),
+    ("temp-ctas", "SELECT a FROM stage;"),
+    ("temp-update", "UPDATE t SET a = a + 10;\nSELECT a FROM t;"),
+    ("temp-delete", "DELETE FROM t WHERE a = 2;\nSELECT count(*) FROM t;"),
+    ("temp-drop", "DROP TABLE t;\nSELECT a FROM t;"),
+    (
+        "temp-or-replace",
+        "CREATE OR REPLACE TEMP TABLE stage (b INTEGER);\n"
+        "INSERT INTO stage VALUES (9);\nSELECT b FROM temp.stage;",
+    ),
+    ("temp-search-path", "USE s;\nSELECT a FROM stage;"),
+]
+
+
+def run_temp():
+    print("== temporary tables battery (wave 139c) ==")
+    for label, sql in TEMP_QUERIES:
+        got = pink_query(TEMP_SETUP, sql)
+        if got[0] == "error":
+            check(label, False, f"pinkdb error: {got[1]}")
+            continue
+        _, types, prows = got
+        d = duck_query(TEMP_SETUP, sql)
+        if d[0] == "error":
+            check(label, False, f"duckdb error: {d[1]}")
+            continue
+        prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
+        ok = rows_equal(prows_n, d[1], True)
+        check(label, ok, "" if ok else f"\npink={prows_n}\nduck={d[1]}")
+
+
+# ---- wave 139a: column DEFAULTs are expressions ----
+#
+# A deterministic default is evaluated once per statement and broadcast, so
+# values and the written text both match DuckDB. A clock default is covered by
+# the Rust tests (the two engines cannot share one instant).
+DEFAULTS_SETUP = """
+CREATE TABLE d0 (a INTEGER DEFAULT 0, b VARCHAR DEFAULT 'x''y', c DECIMAL(10,2) DEFAULT 1.5);
+INSERT INTO d0 DEFAULT VALUES;
+CREATE TABLE d1 (a INTEGER DEFAULT 5, b INTEGER);
+INSERT INTO d1 VALUES (1, DEFAULT), (DEFAULT, 2);
+INSERT INTO d1 (b) VALUES (DEFAULT);
+CREATE TABLE d2 (a INTEGER DEFAULT 5, b INTEGER);
+INSERT INTO d2 (a) VALUES (1);
+UPDATE d2 SET a = DEFAULT;
+"""
+
+DEFAULTS_PROBES = [
+    ("default-values-insert", "SELECT a, b, c FROM d0;", False),
+    ("default-keyword-in-values", "SELECT a, b FROM d1 ORDER BY a, b;", True),
+    ("update-set-default", "SELECT a, b FROM d2;", False),
+    ("default-duckdb-columns-text",
+     "SELECT column_name, column_default FROM duckdb_columns() "
+     "WHERE table_name = 'd0' ORDER BY column_name;", True),
+    ("default-information-schema-text",
+     "SELECT column_name, column_default FROM information_schema.columns "
+     "WHERE table_name = 'd0' ORDER BY column_name;", True),
+]
+
+# DuckDB refuses these at CREATE; pinkdb must print the same message after
+# DuckDB's `Binder Error: ` class prefix.
+DEFAULTS_REFUSALS = [
+    ("CREATE TABLE x (a INTEGER DEFAULT (SELECT 1));",
+     "DEFAULT value cannot contain subqueries"),
+    ("CREATE TABLE x (a INTEGER, b INTEGER DEFAULT a);",
+     "DEFAULT value cannot contain column names"),
+    ("CREATE TABLE x (a INTEGER DEFAULT sum(1));",
+     "DEFAULT value cannot contain aggregates!"),
+    ("CREATE TABLE x (a INTEGER DEFAULT row_number() OVER ());",
+     "DEFAULT value cannot contain window functions!"),
+]
+
+
+def run_defaults():
+    print("== column defaults battery (wave 139a) ==")
+    for label, sql, ordered in DEFAULTS_PROBES:
+        run_case(label, sql, ordered, False, DEFAULTS_SETUP, DEFAULTS_SETUP)
+    for sql, want in DEFAULTS_REFUSALS:
+        # A refused CREATE prints no result table, so read the CLI's stderr
+        # `Error:` line directly instead of going through pink_query.
+        pink_msg = next(
+            (t[1] for t in pink_tables("", sql) if t[0] == "error"), None
+        )
+        d = duck_query("", sql)
+        if d[0] != "error":
+            check(f"default-refusal {want}", False, f"duck={d[0]}")
+            continue
+        duck_msg = d[1].split(": ", 1)[-1]
+        pink_msg = pink_msg.split(": ", 1)[-1] if pink_msg else None
+        check(f"default-refusal {want}", pink_msg == want and duck_msg == want,
+              f"\npink={pink_msg!r}\nduck={duck_msg!r}")
+
+
+# ---- unaliased expression names ----
+#
+# QuackLab reads result column names, so a select item without an alias must
+# render the name DuckDB gives it. `pink_tables` deliberately ignores the
+# header row, so this battery parses it instead and compares it with DuckDB's
+# `DESCRIBE` (whose first column is the name). `x NOT IN (…)` is not probed:
+# pinkdb's parser desugars IN into OR-of-equals before naming, so the names
+# cannot match without an InList node.
+NAME_SETUP = """
+CREATE TABLE nt (x INTEGER, s VARCHAR);
+INSERT INTO nt VALUES (1, 'abc'), (2, 'axy'), (NULL, NULL);
+"""
+
+NAME_QUERIES = [
+    ("name-is-null", "SELECT x IS NOT NULL, x IS NULL FROM nt;"),
+    ("name-not", "SELECT NOT (x = 1) FROM nt;"),
+    ("name-like", "SELECT s NOT LIKE 'a%', s LIKE 'a%' FROM nt;"),
+    ("name-between", "SELECT x NOT BETWEEN 1 AND 2, x BETWEEN 1 AND 2 FROM nt;"),
+    ("name-arith", "SELECT -x, x + 1, x % 2, x <> 1 FROM nt;"),
+    ("name-cast", "SELECT CAST(x AS INT), x::INT, CAST(s AS VARCHAR) FROM nt;"),
+    ("name-call", "SELECT substr(s, 2, 1), upper(s), coalesce(x, 0), 'it''s' FROM nt;"),
+]
+
+
+def pink_names(setup, sql):
+    """The result column names pinkdb printed for the last result table."""
+    script = setup + "\n" + sql + "\n.quit\n"
+    env = dict(os.environ)
+    env["PINKDB_ALLOW_LOAD_EXTENSION"] = "1"
+    env["PINKDB_AGENT_MODE"] = "0"
+    p = subprocess.run(PINKDB, input=script, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True, timeout=300,
+                       env=env)
+    header, state = None, 0
+    for line in p.stdout.splitlines():
+        s = line.strip()
+        if s.startswith("Error:"):
+            return ("error", s)
+        if s.startswith("│"):
+            if state == 0:
+                header = [c.strip() for c in s.split("│")[1:-1]]
+                state = 1
+        elif s.startswith("└"):
+            state = 0
+    if header is None:
+        return ("error", f"harness: no result table for {sql[:60]!r}")
+    return ("rows", header)
+
+
+def duck_names(setup, sql):
+    got = duck_query(setup, f"DESCRIBE {sql}")
+    if got[0] != "rows":
+        return got
+    return ("rows", [r[0] for r in got[1]])
+
+
+def run_expression_names():
+    print("== expression-name battery ==")
+    for label, sql in NAME_QUERIES:
+        p = pink_names(NAME_SETUP, sql)
+        if p[0] == "error":
+            check(label, False, f"pinkdb error: {p[1]}")
+            continue
+        d = duck_names(NAME_SETUP, sql)
+        if d[0] == "error":
+            check(label, False, f"duckdb error: {d[1]}")
+            continue
+        ok = p[1] == d[1]
+        check(label, ok, "" if ok else f"\npink={p[1]}\nduck={d[1]}")
+
+
 # (label, pinkdb sql, duckdb sql, ordered). DuckDB's parser rejects a
 # database qualifier on a star (`db1.t.*` — "more than one column in front of
 # a star"), so those probes spell the same columns out on its side; the pinkdb
@@ -1114,6 +1626,13 @@ DIALECT_QUERIES = [
     ("dialect-quantile", "SELECT quantile_cont(salary, 0.25), quantile_disc(id, 0.5) FROM emp;", False, False),
     ("dialect-contains", "SELECT contains('hello', 'ell'), contains('hello', 'z'), contains(name, 'a') FROM emp ORDER BY id;", True, False),
     ("dialect-uuid", "SELECT length(CAST(uuid() AS VARCHAR)), CAST(gen_random_uuid() AS VARCHAR) LIKE '________-____-4___-____-____________', count(DISTINCT CAST(uuid() AS VARCHAR)) FROM range(5);", False, False),
+    ("dialect-uuid-typeof", "SELECT typeof(uuid()), typeof(gen_random_uuid()), typeof(random()), length(CAST(uuid() AS VARCHAR)), CAST(CAST(uuid() AS VARCHAR) AS UUID) = uuid();", False, False),
+    ("dialect-uuid-input-forms", "SELECT CAST('{550E8400-E29B-41D4-A716-446655440000}' AS UUID), CAST('550E8400E29B41D4A716446655440000' AS UUID), CAST('550e8400-e29b-41d4-a716-446655440000' AS UUID);", False, False),
+    ("dialect-uuid-order", "SELECT u FROM (VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID), ('00000000-0000-0000-0000-000000000001'::UUID), ('80000000-0000-4000-8000-000000000000'::UUID)) t(u) ORDER BY u;", True, False),
+    ("dialect-uuid-compare", "SELECT 'ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID < '00000000-0000-0000-0000-000000000001'::UUID, '550e8400-e29b-41d4-a716-446655440000'::UUID = '550E8400-E29B-41D4-A716-446655440000'::UUID, '7fffffff-ffff-4fff-bfff-ffffffffffff'::UUID < '80000000-0000-4000-8000-000000000000'::UUID;", False, False),
+    ("dialect-uuid-group", "SELECT count(DISTINCT u), count(*) FROM (SELECT CAST('00000000-0000-4000-8000-00000000000' || CAST(i % 3 AS VARCHAR) AS UUID) AS u FROM range(9) t(i)) s;", False, False),
+    ("dialect-uuid-group-by", "CREATE TABLE ug (u UUID, k INTEGER); INSERT INTO ug VALUES ('00000000-0000-4000-8000-000000000001', 1), ('00000000-0000-4000-8000-000000000001', 2), ('ffffffff-ffff-ffff-ffff-ffffffffffff', 3); SELECT u, count(*), sum(k) FROM ug GROUP BY u ORDER BY u;", True, False),
+    ("dialect-uuid-join", "CREATE TABLE ua (u UUID, a INTEGER); INSERT INTO ua VALUES ('550e8400-e29b-41d4-a716-446655440000', 1), ('ffffffff-ffff-ffff-ffff-ffffffffffff', 2); CREATE TABLE ub (u UUID, b INTEGER); INSERT INTO ub VALUES ('550e8400-e29b-41d4-a716-446655440000', 10), ('00000000-0000-0000-0000-000000000001', 20); SELECT ua.u, ua.a, ub.b FROM ua JOIN ub ON ua.u = ub.u;", True, False),
     ("dialect-range", "SELECT * FROM range(3);", True, False),
     ("dialect-range-step", "SELECT * FROM range(10, 1, -3);", True, False),
     ("dialect-range-null", "SELECT count(*) FROM range(NULL);", False, False),
@@ -1300,6 +1819,8 @@ CSV_PROBES = [
     ("csv-gzip-option", "SELECT * FROM read_csv('{gz}', compression='gzip', header=true, delim=',') ORDER BY id;", True),
     ("csv-gzip-suffix", "SELECT COUNT(*), SUM(total) FROM read_csv('{gz}');", False),
     ("csv-insert-select-casts", "CREATE TABLE st (id VARCHAR, total DOUBLE); INSERT INTO st SELECT id, total FROM read_csv('{gz}', compression='gzip', header=true); SELECT * FROM st ORDER BY id;", True),
+    # QuackLab's ETL: stage the gzip CSV in a temp table, then load the real one.
+    ("csv-temp-stage-etl", "CREATE TABLE master (id INTEGER, region VARCHAR, total DECIMAL(10,2)); CREATE TEMP TABLE stage AS SELECT id, region, total FROM read_csv('{gz}'); INSERT INTO master SELECT id, region, total FROM stage; SELECT * FROM master ORDER BY id;", True),
 ]
 
 
@@ -1360,7 +1881,12 @@ COPY (
          CASE i % 3 WHEN 0 THEN 'west' WHEN 1 THEN 'east' ELSE 'north' END AS region,
          (i * 1.5)::DOUBLE AS total,
          (i % 2 = 0) AS active,
-         DATE '2024-01-01' + i::INTEGER AS day
+         DATE '2024-01-01' + i::INTEGER AS day,
+         CASE i % 4
+           WHEN 0 THEN '00000000-0000-4000-8000-000000000000'::UUID
+           WHEN 1 THEN 'ffffffff-ffff-4fff-bfff-ffffffffffff'::UUID
+           WHEN 2 THEN '550e8400-e29b-41d4-a716-446655440000'::UUID
+         END AS u
   FROM range(0, 50) t(i)
 ) TO '{path}' (FORMAT parquet);
 """
@@ -1450,6 +1976,8 @@ def run_remote():
         ("remote-parquet-count", f"SELECT COUNT(*), MIN(id), MAX(id), SUM(total) FROM read_parquet('{parquet_url}');", False),
         ("remote-parquet-filter", f"SELECT id, region FROM read_parquet('{parquet_url}') WHERE id >= 40 ORDER BY id;", True),
         ("remote-parquet-group", f"SELECT region, COUNT(*), SUM(total) FROM read_parquet('{parquet_url}') GROUP BY region ORDER BY region;", True),
+        ("remote-parquet-uuid", f"SELECT COUNT(*), COUNT(u), COUNT(DISTINCT u), MIN(u)::VARCHAR, MAX(u)::VARCHAR FROM read_parquet('{parquet_url}');", False),
+        ("remote-parquet-uuid-order", f"SELECT u::VARCHAR FROM read_parquet('{parquet_url}') WHERE u IS NOT NULL ORDER BY u;", True),
         ("remote-parquet-replacement", f"SELECT COUNT(*) FROM '{parquet_url}';", False),
         ("remote-csv-count", f"SELECT COUNT(*), COUNT(total), SUM(total) FROM read_csv('{csv_url}');", False),
         ("remote-csv-filter", f"SELECT id FROM read_csv('{csv_url}') WHERE active ORDER BY id;", True),
@@ -1573,8 +2101,12 @@ def main():
     import sys
     run_small()
     run_mart()
+
+    run_literals()
+    run_expression_names()
     run_csv()
     run_remote()
+    run_temp()
     if "--big" in sys.argv:
         idx = sys.argv.index("--big")
         run_big(sys.argv[idx + 1] if idx + 1 < len(sys.argv) else "/tmp/sales_1m.csv")
