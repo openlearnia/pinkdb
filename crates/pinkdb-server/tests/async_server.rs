@@ -261,7 +261,7 @@ fn use_sessions_are_isolated_per_client() {
         vec![vec![varchar("b")]]
     );
     assert_eq!(
-        rows(a.execute("SELECT v FROM main.t;").unwrap()),
+        rows(a.execute("SELECT v FROM main.main.t;").unwrap()),
         vec![vec![varchar("b")]]
     );
     assert_eq!(
