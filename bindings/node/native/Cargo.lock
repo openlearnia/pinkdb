@@ -298,6 +298,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "getrandom",
+ "libc",
  "lz4_flex",
  "peg",
  "pinkdb-ext-loader",
