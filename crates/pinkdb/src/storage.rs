@@ -40,24 +40,6 @@ pub(crate) fn reset_index_rebuild_count() {
     INDEX_REBUILDS.with(|count| count.set(0));
 }
 
-// Chunks decoded on this test thread. A test hook: a lazy open decodes none,
-// and a projected or pruned scan decodes only the chunks it reads. Thread-local
-// so parallel tests do not count each other's decodes.
-#[cfg(test)]
-thread_local! {
-    static DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn decode_count() -> u64 {
-    DECODES.with(|count| count.get())
-}
-
-#[cfg(test)]
-pub(crate) fn reset_decode_count() {
-    DECODES.with(|count| count.set(0));
-}
-
 /// One column: its schema + its chunk list.
 #[derive(Debug)]
 pub struct Column {
@@ -137,12 +119,12 @@ impl std::fmt::Debug for StoreImage {
 /// exactly these bytes, so a decode validates the page structure only.
 #[derive(Debug, Clone)]
 pub(crate) struct EncodedChunk {
-    image: Arc<StoreImage>,
+    pub(crate) image: Arc<StoreImage>,
     /// The page's byte range in the image.
-    offset: u64,
-    length: u64,
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
     /// Rows the footer recorded for this chunk.
-    rows: usize,
+    pub(crate) rows: usize,
 }
 
 impl EncodedChunk {
@@ -174,17 +156,19 @@ impl EncodedChunk {
 /// behind a `Mutex` so `chunk(&self)` can fill it while a scan holds
 /// `&Column`; the write path ([`Column::chunk_mut`]) takes the same lock.
 pub(crate) struct ChunkHandle {
-    /// The store-image descriptor of this chunk. It stays: an evicted chunk
-    /// decodes again from here (which re-checks the CRC32C).
-    encoded: Option<EncodedChunk>,
-    /// The decoded side, under one lock so that a check and the drop it
-    /// guards cannot interleave with a decode or a write.
+    /// The decoded side and the store-image descriptor, under one lock so that
+    /// a check and the drop it guards cannot interleave with a decode, a
+    /// write, or a save repointing the descriptor.
     state: Mutex<ChunkState>,
 }
 
-/// The decoded side of a [`ChunkHandle`], all under one lock.
+/// The state of a [`ChunkHandle`], all under one lock.
 #[derive(Default)]
 struct ChunkState {
+    /// Where this chunk's bytes are in the retained store image. It stays: an
+    /// evicted chunk decodes again from here (which re-checks the CRC32C), and
+    /// a save repoints it at the image it just wrote.
+    encoded: Option<EncodedChunk>,
     /// The decoded payload, shared: scans clone the `Arc`. `None` = not
     /// decoded (yet, or again).
     payload: Option<ChunkPayload>,
@@ -221,8 +205,8 @@ impl ChunkHandle {
     fn new(decoded: Arc<Vector>) -> Result<Self> {
         let charge = crate::memory::reserve(decoded.memory_size())?;
         Ok(Self {
-            encoded: None,
             state: Mutex::new(ChunkState {
+                encoded: None,
                 payload: Some(ChunkPayload {
                     vector: decoded,
                     charge: Arc::new(charge),
@@ -236,8 +220,8 @@ impl ChunkHandle {
     /// charge yet: bytes arrive through `chunk_mut`, which re-charges it.
     fn empty(dtype: DataType) -> Self {
         Self {
-            encoded: None,
             state: Mutex::new(ChunkState {
+                encoded: None,
                 payload: Some(ChunkPayload {
                     vector: Arc::new(Vector::new_empty(dtype)),
                     charge: Arc::new(crate::memory::Reservation::empty()),
@@ -256,8 +240,10 @@ impl ChunkHandle {
         rows: usize,
     ) -> Self {
         Self {
-            encoded: Some(EncodedChunk::new(image, offset, length, rows)),
-            state: Mutex::new(ChunkState::default()),
+            state: Mutex::new(ChunkState {
+                encoded: Some(EncodedChunk::new(image, offset, length, rows)),
+                ..ChunkState::default()
+            }),
         }
     }
 
@@ -289,7 +275,7 @@ impl ChunkHandle {
         if let Some(vector) = handle.decoded(dirty) {
             return Ok(vector);
         }
-        let (rows, length) = match handle.encoded.as_ref() {
+        let (rows, length) = match handle.lock().encoded.as_ref() {
             Some(encoded) => (encoded.rows, encoded.length),
             None => return Err(missing_payload()),
         };
@@ -301,9 +287,7 @@ impl ChunkHandle {
             state.dirty |= dirty;
             return Ok(vector);
         }
-        let encoded = handle.encoded.as_ref().ok_or_else(missing_payload)?;
-        #[cfg(test)]
-        DECODES.with(|count| count.set(count.get() + 1));
+        let encoded = state.encoded.clone().ok_or_else(missing_payload)?;
         let decoded = Arc::new(encoded.decode(dtype)?);
         // The bound over-estimates; the charge follows the chunk's real size.
         charge.resize(decoded.memory_size())?;
@@ -335,9 +319,10 @@ impl ChunkHandle {
     /// through [`Column::chunk_mut`]), a still-encoded one carries the count
     /// the footer recorded. Every column of a table shares the boundaries.
     fn rows(&self) -> usize {
-        match self.lock().payload.as_ref() {
+        let state = self.lock();
+        match state.payload.as_ref() {
             Some(payload) => payload.vector.len(),
-            None => self.encoded.as_ref().map_or(0, |e| e.rows),
+            None => state.encoded.as_ref().map_or(0, |e| e.rows),
         }
     }
 
@@ -376,7 +361,7 @@ impl ChunkHandle {
         let Ok(mut state) = self.state.try_lock() else {
             return Evict::Busy;
         };
-        if state.dirty || self.encoded.is_none() {
+        if state.dirty || state.encoded.is_none() {
             return Evict::Never;
         }
         let Some(payload) = state.payload.as_ref() else {
@@ -401,8 +386,8 @@ impl ChunkHandle {
     fn duplicate(&self) -> ChunkHandle {
         let state = self.lock();
         ChunkHandle {
-            encoded: self.encoded.clone(),
             state: Mutex::new(ChunkState {
+                encoded: state.encoded.clone(),
                 payload: state.payload.as_ref().map(|p| ChunkPayload {
                     vector: Arc::clone(&p.vector),
                     charge: Arc::clone(&p.charge),
@@ -410,6 +395,28 @@ impl ChunkHandle {
                 dirty: state.dirty,
             }),
         }
+    }
+
+    /// This chunk's stored form, when a save may copy it through: the handle is
+    /// clean, so whatever it holds is exactly what the image says.
+    fn stored(&self) -> Option<EncodedChunk> {
+        let state = self.lock();
+        if state.dirty {
+            return None;
+        }
+        state.encoded.clone()
+    }
+
+    /// Point the chunk at the image a save just wrote, at bytes that are its
+    /// stored form. Returns whether the chunk was dirty: a saved write is
+    /// stored now, so the cache may evict it.
+    ///
+    /// The payload is untouched and nothing is decoded: the image's bytes are
+    /// what this chunk holds, which is what makes the handle clean again.
+    fn repoint(&self, image: &Arc<StoreImage>, offset: u64, length: u64, rows: usize) -> bool {
+        let mut state = self.lock();
+        state.encoded = Some(EncodedChunk::new(Arc::clone(image), offset, length, rows));
+        std::mem::replace(&mut state.dirty, false)
     }
 }
 
@@ -424,7 +431,7 @@ impl std::fmt::Debug for ChunkHandle {
         let state = self.lock();
         let rows = match state.payload.as_ref() {
             Some(payload) => payload.vector.len(),
-            None => self.encoded.as_ref().map_or(0, |e| e.rows),
+            None => state.encoded.as_ref().map_or(0, |e| e.rows),
         };
         f.debug_struct("ChunkHandle")
             .field("rows", &rows)
@@ -434,7 +441,7 @@ impl std::fmt::Debug for ChunkHandle {
             )
             .field(
                 "encoded",
-                &self.encoded.as_ref().map(|e| (e.offset, e.length)),
+                &state.encoded.as_ref().map(|e| (e.offset, e.length)),
             )
             .field("dirty", &state.dirty)
             .field("charged", &state.payload.as_ref().map(|p| p.charge.bytes()))
@@ -471,7 +478,11 @@ fn evict_decoded(want: usize) -> usize {
             lru.remove(i);
             continue;
         };
-        match handle.evict() {
+        let result = handle.evict();
+        if std::env::var_os("PINKDB_EVICT_TRACE").is_some() {
+            eprintln!("EVICT lru={} used={}", lru.len(), crate::memory::used());
+        }
+        match result {
             Evict::Freed(bytes) => {
                 freed += bytes;
                 lru.remove(i);
@@ -527,7 +538,11 @@ fn decoded_bound(dtype: DataType, rows: usize, encoded_len: usize) -> usize {
     };
     let payload = rows * per_row + elems * per_row;
     let element_bitmap = elems.div_ceil(8);
-    payload + element_bitmap + rows.div_ceil(8) + encoded_len + std::mem::size_of::<Vector>()
+    // The encoded page is already in memory and is not charged to the pool, so
+    // only the decoded copy is: reserving the page too would double the bound
+    // and make two decoders starve each other on a pool that could hold both.
+    let _ = encoded_len;
+    payload + element_bitmap + rows.div_ceil(8) + std::mem::size_of::<Vector>()
 }
 
 /// Chunks above which a dropped column releases them in parallel.
@@ -629,6 +644,17 @@ impl Column {
     ///
     /// A chunk the loader left in the store image is decoded here on first
     /// touch and kept; a corrupt page surfaces as an error, never a panic.
+    /// How many of this column's chunks hold a decoded copy (a test hook: a
+    /// lazy open decodes none, and a projected or pruned scan decodes only the
+    /// chunks it reads, whichever thread decodes them).
+    #[cfg(test)]
+    pub(crate) fn decoded_chunks(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter(|chunk| chunk.lock().payload.is_some())
+            .count()
+    }
+
     pub fn chunk(&self, i: usize) -> Result<Arc<Vector>> {
         match self.chunks.get(i) {
             Some(handle) => ChunkHandle::get(handle, self.dtype, false),
@@ -717,6 +743,41 @@ impl Column {
     /// panicking here.
     pub(crate) fn chunks_decoded(&self) -> impl Iterator<Item = Arc<Vector>> + '_ {
         self.chunks.iter().map(|c| c.decoded_chunk())
+    }
+
+    /// The stored form of chunks `first..last`, when a save may copy the
+    /// group's bytes through instead of decoding and re-encoding them: every
+    /// chunk is clean and they still sit next to each other in one image, so
+    /// the group's encoded column chunk is those bytes. `None` falls back to
+    /// the encoder.
+    pub(crate) fn stored_group(
+        &self,
+        first: usize,
+        last: usize,
+    ) -> Option<(Arc<StoreImage>, Vec<EncodedChunk>)> {
+        let chunks = self.chunks.get(first..last)?;
+        let image = chunks.first()?.stored()?.image;
+        let mut encoded = Vec::with_capacity(chunks.len());
+        for handle in chunks {
+            let chunk = handle.stored()?;
+            if !Arc::ptr_eq(&chunk.image, &image) {
+                return None;
+            }
+            encoded.push(chunk);
+        }
+        Some((image, encoded))
+    }
+
+    /// Point the column's chunks at the image a save wrote: `ranges` holds each
+    /// chunk's `(offset, length, rows)` there, in chunk order. A chunk that was
+    /// dirty is stored now, so it becomes an eviction candidate.
+    pub(crate) fn repoint(&self, image: &Arc<StoreImage>, ranges: &[(u64, u64, usize)]) {
+        install_evictor();
+        for (handle, &(offset, length, rows)) in self.chunks.iter().zip(ranges) {
+            if handle.repoint(image, offset, length, rows) {
+                let _ = register;
+            }
+        }
     }
 }
 
@@ -2219,6 +2280,13 @@ impl DataTable {
             }
         }
         Ok(removed)
+    }
+
+    /// How many chunks of the whole table are decoded; see
+    /// [`Column::decoded_chunks`].
+    #[cfg(test)]
+    pub(crate) fn decoded_chunks(&self) -> usize {
+        self.columns.iter().map(Column::decoded_chunks).sum()
     }
 
     /// Number of stored chunks (all columns share the same count).
@@ -3905,13 +3973,22 @@ impl PinkDb {
     /// transaction on the refreshed state is the intended retry). A WAL
     /// failure returns the error and leaves the transaction open (nothing was
     /// published) and the handle fail-stopped, exactly as before this wave.
+    /// Every other failure also aborts the transaction: nothing reached the
+    /// WAL yet, so a retry can start from `begin` again.
     pub fn commit(&mut self) -> Result<()> {
         if self.txn_snapshot.is_none() {
             return Err(PinkDbError::Execution(
                 "no transaction in progress".to_string(),
             ));
         }
-        let lease = self.acquire_lease()?;
+        // A busy lease is a retryable conflict (the lake's commit loop
+        // retries it), so the transaction must be gone by the time the caller
+        // begins again: leaving the snapshot open made that `begin` fail with
+        // "already in a transaction" instead.
+        let lease = match self.acquire_lease() {
+            Ok(lease) => lease,
+            Err(e) => return Err(self.abort_unpublished(e)),
+        };
         let writes = !self.wal_txn.is_empty();
         // Cross-process validation first (durable stores with a captured
         // base): it either applies the frames that arrived for other tables
@@ -3923,7 +4000,11 @@ impl PinkDb {
             let position = base.position();
             let mut touched = self.txn_touched.clone();
             touched.canonicalize();
-            if let Some(conflict) = self.optimistic_commit_check(g, &position, &touched)? {
+            let conflict = match self.optimistic_commit_check(g, &position, &touched) {
+                Ok(conflict) => conflict,
+                Err(e) => return Err(self.abort_unpublished(e)),
+            };
+            if let Some(conflict) = conflict {
                 self.rollback()?;
                 return Err(PinkDbError::Execution(conflict.message("transaction")));
             }
@@ -3937,7 +4018,11 @@ impl PinkDb {
             self.rollback()?;
             return Err(e);
         }
-        let lake_routed = writes && !self.dirty_lake_databases()?.is_empty();
+        let dirty = match self.dirty_lake_databases() {
+            Ok(dirty) => dirty,
+            Err(e) => return Err(self.abort_unpublished(e)),
+        };
+        let lake_routed = writes && !dirty.is_empty();
         if lake_routed && let Err(e) = self.route_committed_unit() {
             self.rollback()?;
             return Err(e);
@@ -3987,6 +4072,14 @@ impl PinkDb {
         // The base is released only after the record is durable.
         self.txn_base = None;
         Ok(())
+    }
+
+    /// Abort a commit that published nothing and keep the handle usable: once
+    /// the WAL append did not run, a rollback cannot lose durable data, so the
+    /// caller can begin the transaction again.
+    fn abort_unpublished(&mut self, error: PinkDbError) -> PinkDbError {
+        let _ = self.rollback();
+        error
     }
 
     /// Roll back: restore the snapshot, discarding all changes since BEGIN

@@ -2740,18 +2740,146 @@ fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
 /// Every stored chunk of `t`, in order (columns shared by `Arc`, never
 /// copied).
 /// The chunks of `t` selected by `keep` (`None` reads every chunk).
-fn scan_chunks_of(t: &DataTable, keep: Option<&[usize]>) -> Result<Vec<DataChunk>> {
-    let selected: Vec<usize> = match keep {
-        Some(keep) => keep.to_vec(),
-        None => (0..t.num_chunks()).collect(),
-    };
-    let mut chunks = Vec::with_capacity(selected.len());
-    for i in selected {
-        if let Some(c) = t.scan_chunk(i)? {
-            chunks.push(c);
+/// A store table's chunks, read one at a time (wave 136b-4): `keep` is the
+/// chunks the zone maps left, `cols` the projection, and every consumer decodes
+/// a chunk when it starts on it instead of pinning the whole table first.
+#[derive(Clone)]
+pub(crate) struct StoreScan<'a> {
+    table: &'a DataTable,
+    keep: Option<Vec<usize>>,
+    present: Option<Vec<bool>>,
+}
+
+impl<'a> StoreScan<'a> {
+    pub(crate) fn new(t: &'a DataTable, cols: Option<&[usize]>, keep: Option<Vec<usize>>) -> Self {
+        StoreScan {
+            table: t,
+            keep,
+            present: cols.and_then(|cols| present_columns(t, cols)),
         }
     }
-    Ok(chunks)
+
+    /// The columns the scan outputs, in table order.
+    pub(crate) fn schema(&self) -> (Vec<String>, Vec<DataType>) {
+        self.table.schema().into_iter().unzip()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match &self.keep {
+            Some(keep) => keep.len(),
+            None => self.table.num_chunks(),
+        }
+    }
+
+    /// The rows the scan will output, from the footer's chunk row counts: no
+    /// chunk is decoded to count them.
+    pub(crate) fn rows(&self) -> usize {
+        (0..self.len())
+            .map(|i| self.table.chunk_rows(self.chunk_index(i)))
+            .sum()
+    }
+
+    /// Chunk `i` of the scan, or `None` when a column has fewer chunks.
+    pub(crate) fn chunk(&self, i: usize) -> Result<Option<DataChunk>> {
+        let index = self.chunk_index(i);
+        match &self.present {
+            Some(present) => self.table.scan_chunk_projected(index, present),
+            None => self.table.scan_chunk(index),
+        }
+    }
+
+    /// Every chunk of the scan, in scan order: for a consumer that cannot work
+    /// from one chunk at a time.
+    pub(crate) fn materialize(&self) -> Result<Vec<DataChunk>> {
+        let mut chunks = Vec::with_capacity(self.len());
+        for i in 0..self.len() {
+            if let Some(chunk) = self.chunk(i)? {
+                chunks.push(chunk);
+            }
+        }
+        Ok(chunks)
+    }
+
+    /// Fold every chunk of the scan, decoding each chunk when its turn comes
+    /// and dropping it before the next: at most one chunk per worker is pinned.
+    /// Tasks claim a run of chunks so the pool sees the work split the way a
+    /// scan over already-decoded chunks splits it; a task per chunk would pay
+    /// dispatch on every morsel of a long scan.
+    pub(crate) fn par_chunks<T, F>(&self, fold: F) -> Result<Vec<T>>
+    where
+        T: Send,
+        F: Fn(usize, Option<DataChunk>) -> Result<T> + Send + Sync,
+    {
+        let len = self.len();
+        let runs: Result<Vec<Vec<T>>> = (0..len.div_ceil(CHUNKS_PER_TASK))
+            .into_par_iter()
+            .map(|run| {
+                let first = run * CHUNKS_PER_TASK;
+                let last = (first + CHUNKS_PER_TASK).min(len);
+                let mut folded = Vec::with_capacity(last - first);
+                for i in first..last {
+                    folded.push(fold(i, self.chunk(i)?)?);
+                }
+                Ok(folded)
+            })
+            .collect();
+        Ok(runs?.into_iter().flatten().collect())
+    }
+
+    fn chunk_index(&self, i: usize) -> usize {
+        match &self.keep {
+            Some(keep) => keep[i],
+            None => i,
+        }
+    }
+}
+
+/// How many chunks of a scan one task folds before the next task takes over.
+const CHUNKS_PER_TASK: usize = 8;
+
+/// The columns a projection keeps, `None` when it keeps all of them (or names a
+/// column the table does not have, which reads everything and fails when the
+/// projection runs).
+fn present_columns(t: &DataTable, cols: &[usize]) -> Option<Vec<bool>> {
+    if cols.iter().any(|&i| i >= t.columns.len()) {
+        return None;
+    }
+    let mut present = vec![false; t.columns.len()];
+    for &i in cols {
+        present[i] = true;
+    }
+    if !present.iter().any(|&p| p) {
+        present[0] = true;
+    }
+    if present.iter().all(|&p| p) {
+        return None;
+    }
+    Some(present)
+}
+
+/// The store scan a plan reads, when it is one this pipeline can stream; the
+/// same zone pruning and projection `scan_output` would apply.
+pub(crate) fn store_scan<'a>(cx: &'a Cx, plan: &LogicalPlan) -> Result<Option<StoreScan<'a>>> {
+    let LogicalPlan::Scan { db: qdb, table, at } = plan else {
+        return Ok(None);
+    };
+    if at.is_some() {
+        return Ok(None);
+    }
+    if qdb.is_none() && cx.ctes.contains_key(&table.to_ascii_lowercase()) {
+        return Ok(None);
+    }
+    let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
+    if cx.db.attached_lookup(lookup, table).is_some() {
+        return Ok(None);
+    }
+    let t = cx.db.table_in(lookup, table)?;
+    let keep = scan_candidates(t, cx.prunes.for_scan(plan), &cx.dynamic.for_scan(plan));
+    Ok(Some(StoreScan::new(t, cx.projections.for_scan(plan), keep)))
+}
+
+fn scan_chunks_of(t: &DataTable, keep: Option<&[usize]>) -> Result<Vec<DataChunk>> {
+    StoreScan::new(t, None, keep.map(<[usize]>::to_vec)).materialize()
 }
 
 /// The chunks of `t` whose stored zone maps leave every simple predicate
@@ -3143,31 +3271,7 @@ fn project_scan_chunks_of(
     cols: &[usize],
     keep: Option<&[usize]>,
 ) -> Result<Vec<DataChunk>> {
-    let ncols = t.num_cols();
-    if cols.iter().any(|&i| i >= ncols) {
-        return scan_chunks_of(t, keep);
-    }
-    let mut present = vec![false; ncols];
-    for &i in cols {
-        present[i] = true;
-    }
-    if !present.iter().any(|&p| p) {
-        present[0] = true;
-    }
-    if present.iter().all(|&p| p) {
-        return scan_chunks_of(t, keep);
-    }
-    let selected: Vec<usize> = match keep {
-        Some(keep) => keep.to_vec(),
-        None => (0..t.num_chunks()).collect(),
-    };
-    let mut chunks = Vec::with_capacity(selected.len());
-    for i in selected {
-        if let Some(chunk) = t.scan_chunk_projected(i, &present)? {
-            chunks.push(chunk);
-        }
-    }
-    Ok(chunks)
+    StoreScan::new(t, Some(cols), keep.map(<[usize]>::to_vec)).materialize()
 }
 
 /// Exact aggregate answers from an attached lake table's stored statistics
@@ -3355,10 +3459,23 @@ fn count_selected(cx: &Cx, plan: &LogicalPlan) -> Result<Option<i64>> {
     let LogicalPlan::Filter { input, predicate } = plan else {
         return Ok(None);
     };
-    let inner = eval(cx, input)?;
     expr::prime(cx, [predicate])?;
-    let counts: Vec<i64> = inner
-        .chunks
+    // A store table is counted chunk by chunk: `eval` would decode the whole
+    // table before the count starts.
+    if let Some(scan) = store_scan(cx, input)? {
+        let counts = scan.par_chunks(|_, chunk| match chunk {
+            Some(chunk) => count_in(cx, predicate, std::slice::from_ref(&chunk)),
+            None => Ok(0),
+        })?;
+        return Ok(Some(counts.into_iter().sum()));
+    }
+    let inner = eval(cx, input)?;
+    Ok(Some(count_in(cx, predicate, &inner.chunks)?))
+}
+
+/// The rows of `chunks` that `predicate` selects.
+fn count_in(cx: &Cx, predicate: &BoundExpr, chunks: &[DataChunk]) -> Result<i64> {
+    let counts: Vec<i64> = chunks
         .par_iter()
         .map(|chunk| {
             let mut sel = selection::all_rows(chunk.num_rows());
@@ -3366,7 +3483,7 @@ fn count_selected(cx: &Cx, plan: &LogicalPlan) -> Result<Option<i64>> {
             Ok(sel.len() as i64)
         })
         .collect::<Result<_>>()?;
-    Ok(Some(counts.into_iter().sum()))
+    Ok(counts.into_iter().sum())
 }
 
 /// An INNER join's probe side, read through its filter's selection when it
@@ -4292,10 +4409,15 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 debug_assert_eq!(aggs.len(), 1);
                 let total: i64 = match count_selected(cx, input)? {
                     Some(n) => n,
-                    None => {
-                        let inner = eval(cx, input)?;
-                        inner.chunks.iter().map(|c| c.num_rows() as i64).sum()
-                    }
+                    None => match store_scan(cx, input)? {
+                        // A bare store scan is counted from the footer's chunk
+                        // row counts: the chunks are never decoded.
+                        Some(scan) => scan.rows() as i64,
+                        None => {
+                            let inner = eval(cx, input)?;
+                            inner.chunks.iter().map(|c| c.num_rows() as i64).sum()
+                        }
+                    },
                 };
                 let mut vec = Vector::new_empty(DataType::Bigint);
                 vec.push_valid(Value::Bigint(total))?;

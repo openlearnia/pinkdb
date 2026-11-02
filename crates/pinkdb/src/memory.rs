@@ -367,12 +367,20 @@ fn acquire(bytes: usize) -> Result<()> {
         return Ok(());
     }
     // Over the limit. The storage layer caches decoded chunks it can drop and
-    // decode again, so give it the chance to free `bytes` first and retry
-    // once: a reservation that still does not fit fails as before. The
-    // evictor only releases reservations, so it never re-enters here.
-    let freed = EVICTOR.get().map_or(0, |evict| evict(bytes));
-    if freed > 0 && try_acquire(bytes) {
-        return Ok(());
+    // decode again, so keep asking it to free room until the request fits or
+    // it finds nothing left to drop: a reservation fails only when everything
+    // charged is still in use. Asking for twice the need leaves the retry room
+    // that a concurrent decoder would otherwise take, and the loop stops on
+    // the evictor's own progress rather than a round count, so a pool holding
+    // evictable chunks always answers a request that fits under the limit.
+    // The evictor only releases reservations, so it never re-enters here.
+    let Some(evict) = EVICTOR.get() else {
+        return Err(out_of_memory(bytes));
+    };
+    while evict(bytes.saturating_mul(2)) > 0 {
+        if try_acquire(bytes) {
+            return Ok(());
+        }
     }
     Err(out_of_memory(bytes))
 }

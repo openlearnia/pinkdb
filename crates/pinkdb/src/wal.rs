@@ -6325,6 +6325,42 @@ mod tests {
         cleanup(&p);
     }
 
+    /// A COMMIT that cannot take the lease publishes nothing, so it aborts
+    /// the transaction: the caller's retry (the lake's commit loop treats a
+    /// busy lease as a conflict) must be able to `BEGIN` again instead of
+    /// tripping over "already in a transaction".
+    #[test]
+    fn a_commit_that_cannot_take_the_lease_aborts_the_transaction() {
+        let p = tmp_ckpt("commit_busy");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        // Statements inside a transaction defer their write to COMMIT, so the
+        // foreign holder only blocks the commit.
+        db.execute("BEGIN; INSERT INTO t VALUES (1);").unwrap();
+        let foreign = {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("{}.lock", p.display()))
+                .unwrap();
+            f.try_lock().unwrap();
+            f
+        };
+        db.set_busy_timeout(Duration::from_millis(30));
+        let msg = db.execute("COMMIT;").unwrap_err().to_string();
+        assert!(msg.contains("is busy"), "{msg}");
+        drop(foreign);
+        db.set_busy_timeout(Duration::from_secs(5));
+        // The aborted transaction is gone: no row from it, and the handle can
+        // begin and commit a fresh one.
+        db.execute("BEGIN;").unwrap();
+        db.execute("INSERT INTO t VALUES (2);").unwrap();
+        db.execute("COMMIT;").unwrap();
+        assert_eq!(ints(&mut db, "SELECT a FROM t;"), vec![2]);
+        drop(db);
+        cleanup(&p);
+    }
+
     /// M1: `UnsafeSingleProcess` restores today's semantics when the
     /// filesystem cannot lock; `Required` (the default) refuses to proceed.
     /// The `Unsupported` arm is injected through a test-only switch because

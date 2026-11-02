@@ -236,6 +236,26 @@ fn pipeline_matches_materialized_with_one_and_eight_workers() {
     }
 }
 
+/// The same shapes over a saved store: the pipeline's source is the store's
+/// own scan, which hands out one batch of chunks at a time instead of a
+/// materialized `Output`, and must still answer like the materialized path.
+#[test]
+fn a_store_scan_streams_the_same_rows_as_the_materialized_path() {
+    let dir = std::env::temp_dir().join(format!("pinkdb_pipe_store_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("mart.pink");
+    mart().save(path.to_str().unwrap()).unwrap();
+    for threads in [1, 8] {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        pool.install(|| check_shapes(&mut PinkDb::open(path.to_str().unwrap()).unwrap()));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An erroring aggregate argument raises only where a match reached it: the
 /// last fact row divides by zero and matches, so the statement fails.
 #[test]
