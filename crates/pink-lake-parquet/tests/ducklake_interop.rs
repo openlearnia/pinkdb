@@ -2891,8 +2891,11 @@ fn ducklake_functions_run_through_sql_and_match_duckdb() {
         &mut db,
         &binary,
         &prefix,
+        // pinkdb maps DuckLake's TIMESTAMPTZ to a UTC TIMESTAMP (functions.rs), so
+        // DuckDB's side takes the UTC date too: a local-zone cast differs between
+        // midnight local time and midnight UTC.
         "SELECT CAST(snapshot_id AS VARCHAR) AS snapshot_id, \
-         CAST(snapshot_time AS DATE) AS snapshot_time, \
+         CAST(timezone('UTC', snapshot_time) AS DATE) AS snapshot_time, \
          CAST(schema_version AS VARCHAR) AS schema_version, CAST(changes AS VARCHAR) AS changes, \
          author, commit_message, commit_extra_info \
          FROM ducklake_snapshots('l') ORDER BY snapshot_id;",

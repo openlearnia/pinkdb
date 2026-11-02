@@ -365,8 +365,8 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
                 | ast::Statement::CreateTableAs { query, .. } => {
                     work.push((NodeRef::Select(query), child));
                 }
-                ast::Statement::Explain(inner) => {
-                    work.push((NodeRef::Statement(inner), child));
+                ast::Statement::Explain { statement, .. } => {
+                    work.push((NodeRef::Statement(statement), child));
                 }
                 ast::Statement::Select(select) => {
                     work.push((NodeRef::Select(select), child));
@@ -735,8 +735,8 @@ fn take_statement_children(
         ast::Statement::CreateView { query, .. } | ast::Statement::CreateTableAs { query, .. } => {
             selects.push(std::mem::replace(&mut **query, empty_select()));
         }
-        ast::Statement::Explain(inner) => {
-            _nested.push(std::mem::replace(&mut **inner, empty_statement()));
+        ast::Statement::Explain { statement, .. } => {
+            _nested.push(std::mem::replace(&mut **statement, empty_statement()));
         }
         ast::Statement::Select(select) => {
             selects.push(std::mem::replace(select, empty_select()));

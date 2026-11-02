@@ -40,7 +40,9 @@ use parquet::data_type::{
     FloatType, Int32Type, Int64Type, Int96Type,
 };
 use parquet::file::metadata::page_index::RowGroupPageIndex;
-use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader, RowGroupMetaData};
+use parquet::file::metadata::{
+    PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+};
 use parquet::file::page_index::offset_index::PageLocation;
 use parquet::file::properties::{ReaderProperties, ReaderPropertiesPtr};
 use parquet::file::reader::{ChunkReader, FileReader, RowGroupReader, SerializedFileReader};
@@ -1900,39 +1902,205 @@ mod tests {
 /// survivors.
 const PAGE_COALESCE_GAP: u64 = 256 * 1024;
 
-/// Page-level pruning and read accounting for one streamed file scan.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// One data file's row groups as a morsel plan (wave 133b): the lake claims a
+/// row group and decodes it, so a scan holds one row group per worker and
+/// reads only the surviving pages' bytes.
+///
+/// The plan is metadata only — the footer, the page index and the projection —
+/// so it outlives the scan that built it, and several workers can decode
+/// different row groups of the same file at once. A decode fetches its own row
+/// group's spans into the plan's read cache, so the fetched bytes are shared
+/// but no decode waits on another's work.
+pub struct RowGroupMorsels {
+    path: String,
+    resolved: Resolved,
+    filters: Vec<PrunePredicate>,
+    needed: Vec<bool>,
+    placeholders: Vec<Option<Arc<Vector>>>,
+    /// The file's positioned reader, when it has one.
+    remote: Option<crate::ranged::RemoteSpec>,
+    reader: FileSource,
+    metadata: Arc<ParquetMetaData>,
+    props: ReaderPropertiesPtr,
+    transport: Arc<crate::ranged::TransportCounters>,
+    groups: Vec<GroupPlan>,
+    counters: MorselCounters,
+}
 
-pub struct PageCounts {
-    /// Data pages whose byte ranges were read.
+/// One surviving row group: what its decode reads and how many rows it yields.
+struct GroupPlan {
+    /// The row group's index in the file's footer.
+    index: usize,
+    /// The rows the decode produces (fewer than the row group's when the page
+    /// index proved pages cannot match).
+    rows: usize,
+    /// How many kept rows the row groups before this one decode to: chunk
+    /// lengths stay on the file's `CHUNK_SIZE` grid across row groups
+    /// ([`chunk_lens`]), whichever worker decodes this morsel.
+    offset: usize,
+    /// The row group's byte ranges, coalesced and ready to fetch.
+    spans: Vec<crate::ranged::ByteSpan>,
+    /// The page selection that keeps the decode to the surviving pages.
+    selection: Option<PageSelection>,
+}
+
+/// The file's reader: positioned reads over object storage, or a local file.
+enum FileSource {
+    Remote(Arc<crate::ranged::RemoteFile>),
+    Local(Box<SerializedFileReader<std::fs::File>>),
+}
+
+/// What a row-group plan settled: the row groups and pages it will read, and
+/// the ones its statistics proved no row can match.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MorselCounters {
+    pub row_groups: u64,
+    pub row_groups_pruned: u64,
     pub pages: u64,
-    /// Data pages whose statistics proved no row can match.
     pub pages_pruned: u64,
 }
 
-/// One streamed ranged scan: what was decoded, what it cost, and the page
-/// counts the lake's per-scan accounting reports.
-pub struct RangedStream {
-    pub output: TableScanOutput,
-    pub stats: RemoteReadStats,
-    pub pages: PageCounts,
-    pub meta: Option<crate::file_meta::FileMeta>,
+impl RowGroupMorsels {
+    /// How many morsels the plan hands out.
+    pub fn count(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// The rows morsel `index` decodes to.
+    pub fn rows(&self, index: usize) -> u64 {
+        self.groups.get(index).map_or(0, |group| group.rows as u64)
+    }
+
+    /// What the plan pruned, and what it will read.
+    pub fn counters(&self) -> MorselCounters {
+        self.counters
+    }
+
+    /// What the decodes issued so far: transport requests, bytes and wait.
+    pub fn stats(&self) -> crate::RemoteReadStats {
+        self.transport.snapshot()
+    }
+
+    /// Decode morsel `index` (one row group), handing `sink` its chunks.
+    pub fn decode(
+        &self,
+        index: usize,
+        sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<()> {
+        let group = self.groups.get(index).ok_or_else(|| {
+            PinkDbError::Execution(format!(
+                "parquet morsel {index} is out of range for \"{}\" ({} morsels)",
+                self.path,
+                self.groups.len()
+            ))
+        })?;
+        let file = &self.resolved.files[0];
+        let plan = self.decode_plan();
+        let decoded = decoded_columns(file, &plan);
+        let lens = chunk_lens(group.rows, group.offset);
+        if decoded.is_empty() {
+            return assemble_row_group(file, &plan, &lens, &decoded, Vec::new(), sink);
+        }
+        let pieces = match (&self.reader, &self.remote) {
+            (FileSource::Remote(chunk), Some(spec)) => {
+                self.fetch(chunk, spec, group)?;
+                let rg_meta = self.metadata.row_group(group.index);
+                let page_index = self.metadata.page_index_for_row_group(group.index);
+                let row_group = SerializedRowGroupReader::new(
+                    Arc::clone(chunk),
+                    rg_meta,
+                    page_index,
+                    Arc::clone(&self.props),
+                )
+                .map_err(|e| {
+                    PinkDbError::Execution(format!(
+                        "cannot read row group {} of \"{}\": {e}",
+                        group.index, self.path
+                    ))
+                })?;
+                match &group.selection {
+                    Some(selection) => {
+                        let filtered = PageRowGroup {
+                            inner: row_group,
+                            chunk: Arc::clone(chunk),
+                            meta: rg_meta,
+                            props: Arc::clone(&self.props),
+                            locations: selection.locations.clone(),
+                        };
+                        decode_row_group_reader(&filtered, &decoded, &lens, &self.path)?
+                    }
+                    None => decode_row_group_reader(&row_group, &decoded, &lens, &self.path)?,
+                }
+            }
+            (FileSource::Local(reader), _) => {
+                decode_row_group(reader, group.index, &decoded, &lens, &self.path)?
+            }
+            (FileSource::Remote(_), None) => {
+                return Err(PinkDbError::Execution(format!(
+                    "the parquet morsel plan for \"{}\" lost its range source",
+                    self.path
+                )));
+            }
+        };
+        assemble_row_group(file, &plan, &lens, &decoded, pieces, sink)
+    }
+
+    fn decode_plan(&self) -> DecodePlan<'_> {
+        DecodePlan {
+            resolved: &self.resolved,
+            filters: &self.filters,
+            needed: self.needed.clone(),
+            placeholders: self.placeholders.clone(),
+        }
+    }
+
+    /// Fetch this row group's byte ranges into the read cache.
+    fn fetch(
+        &self,
+        chunk: &Arc<crate::ranged::RemoteFile>,
+        spec: &crate::ranged::RemoteSpec,
+        group: &GroupPlan,
+    ) -> Result<()> {
+        if group.spans.is_empty() {
+            return Ok(());
+        }
+        let cache = chunk.cache();
+        let fetched = crate::ranged::fetch_spans(
+            spec.source.as_ref(),
+            &group.spans,
+            spec.parallelism.max(1),
+            &self.transport,
+        );
+        for (span, result) in group.spans.iter().zip(fetched) {
+            let bytes = result
+                .map_err(|e| PinkDbError::Execution(format!("remote parquet read failed: {e}")))?;
+            if bytes.len() as u64 != span.len {
+                return Err(PinkDbError::Execution(format!(
+                    "remote parquet read failed: GET {} (range {}..{}) returned {} bytes, \
+                     expected {}",
+                    self.path,
+                    span.start,
+                    span.end(),
+                    bytes.len(),
+                    span.len
+                )));
+            }
+            cache.insert(span.start, bytes);
+        }
+        Ok(())
+    }
 }
 
-/// Stream a ranged scan one row group at a time, pruning pages through the
-/// Parquet column/offset index when the file carries one.
+/// Plan a resolved file's row groups for morsel-by-morsel decoding.
 ///
-/// This is the lake's data-file read: the caller consumes a row group's chunks
-/// before the next row group is fetched, so the peak is one row group (plus
-/// the chunk the sink is holding), not the file. Page pruning is an
-/// optimization only: every path here returns exactly the rows the whole-file
-/// read would (the engine re-applies the filter above the scan).
-pub fn scan_page_streamed(
-    resolved: &Resolved,
+/// Pruning happens here, once: the surviving row groups, and the pages their
+/// statistics leave alive, are settled before any data page is read, so a scan
+/// can report what it pruned before it reads anything.
+pub fn plan_row_groups(
+    resolved: Resolved,
     projection: Option<&[usize]>,
     filters: &[PrunePredicate],
-    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
-) -> Result<RangedStream> {
+) -> Result<RowGroupMorsels> {
     let width = resolved.schema.len();
     let mut needed = vec![false; width];
     match projection {
@@ -1945,189 +2113,121 @@ pub fn scan_page_streamed(
         }
         None => needed.iter_mut().for_each(|n| *n = true),
     }
-
-    let transport = Arc::new(crate::ranged::TransportCounters::default());
-    let mut out = TableScanOutput::default();
-    let mut pages = PageCounts::default();
     let placeholders: Vec<Option<Arc<Vector>>> = (0..width)
         .map(|i| (!needed[i]).then(|| Arc::new(Vector::new_empty(resolved.schema[i].1))))
         .collect();
-    let plan = DecodePlan {
-        resolved,
-        filters,
-        needed,
-        placeholders,
-    };
-
-    for file in &resolved.files {
-        if !file_survives(resolved, file, filters) {
-            continue;
-        }
-        out.files += 1;
-        if !needs_file_decode(file, &plan) {
-            scan_metadata_only(file, &plan, &mut out, sink)?;
-            continue;
-        }
-        let Some(spec) = &file.remote else {
-            // No positional source: the serial reader still streams one row
-            // group at a time, it just cannot skip pages.
-            let reader =
-                SerializedFileReader::new(std::fs::File::open(&file.meta.path).map_err(|e| {
-                    PinkDbError::Io(std::io::Error::new(
-                        e.kind(),
-                        format!("cannot open \"{}\": {e}", file.meta.path),
-                    ))
-                })?)
+    let mut resolved = resolved;
+    let path = resolved
+        .files
+        .first()
+        .map_or_else(String::new, |file| file.meta.path.clone());
+    let remote = resolved
+        .files
+        .get_mut(0)
+        .and_then(|file| file.remote.take());
+    let transport = Arc::new(crate::ranged::TransportCounters::default());
+    let (reader, metadata) = match &remote {
+        Some(spec) => {
+            let chunk_reader = Arc::new(crate::ranged::RemoteFile::with_counters(
+                spec,
+                Arc::clone(&transport),
+            ));
+            let metadata = ParquetMetaDataReader::new()
+                .with_page_index_policy(PageIndexPolicy::Optional)
+                .parse_and_finish(chunk_reader.as_ref())
                 .map_err(|e| {
-                    PinkDbError::Execution(format!(
-                        "cannot read parquet file \"{}\": {e}",
-                        file.meta.path
-                    ))
+                    PinkDbError::Execution(format!("cannot read parquet file \"{path}\": {e}"))
                 })?;
-            scan_reader(&reader, file, &plan, &mut out, sink)?;
-            continue;
-        };
-        scan_file_pages(spec, &transport, file, &plan, &mut out, &mut pages, sink)?;
-    }
-    Ok(RangedStream {
-        output: out,
-        stats: transport.snapshot(),
-        pages,
-        meta: resolved.files.first().map(|file| file.meta.clone()),
-    })
-}
-
-/// One file through the page-aware ranged path.
-#[allow(clippy::too_many_arguments)]
-fn scan_file_pages(
-    spec: &crate::ranged::RemoteSpec,
-    transport: &Arc<crate::ranged::TransportCounters>,
-    file: &FileResolved,
-    plan: &DecodePlan<'_>,
-    out: &mut TableScanOutput,
-    pages: &mut PageCounts,
-    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
-) -> Result<()> {
-    let chunk_reader = crate::ranged::RemoteFile::with_counters(spec, Arc::clone(transport));
-    let cache = chunk_reader.cache();
-    // The footer carries the column and offset indexes when the writer wrote
-    // them (`EnabledStatistics::Page`); a file without them reads exactly as
-    // before.
-    let metadata = ParquetMetaDataReader::new()
-        .with_page_index_policy(PageIndexPolicy::Optional)
-        .parse_and_finish(&chunk_reader)
-        .map_err(|e| {
-            PinkDbError::Execution(format!(
-                "cannot read parquet file \"{}\": {e}",
-                file.meta.path
-            ))
-        })?;
-    let chunk = Arc::new(chunk_reader);
+            (FileSource::Remote(chunk_reader), Arc::new(metadata))
+        }
+        None => {
+            let reader = SerializedFileReader::new(std::fs::File::open(&path).map_err(|e| {
+                PinkDbError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("cannot open \"{path}\": {e}"),
+                ))
+            })?)
+            .map_err(|e| {
+                PinkDbError::Execution(format!("cannot read parquet file \"{path}\": {e}"))
+            })?;
+            let metadata = Arc::new(reader.metadata().clone());
+            (FileSource::Local(Box::new(reader)), metadata)
+        }
+    };
     let props: ReaderPropertiesPtr = Arc::new(ReaderProperties::builder().build());
-    let decoded = decoded_columns(file, plan);
-    if decoded.is_empty() {
-        return scan_metadata_only(file, plan, out, sink);
-    }
-
-    let mut offset = 0usize;
-    for (rg_index, rg) in file.meta.row_groups.iter().enumerate() {
-        if !row_group_survives(plan.resolved, file, rg_index, plan.filters) {
-            out.row_groups_pruned += 1;
-            continue;
-        }
-        out.row_groups += 1;
-        let rows = rg.rows as usize;
-        let rg_meta = metadata.row_group(rg_index);
-        let index = metadata.page_index_for_row_group(rg_index);
-        let selection = page_selection(
-            plan.resolved,
-            file,
-            rg_index,
-            rows,
-            &index,
-            &decoded,
-            plan.filters,
-        );
-        let kept_rows = selection.as_ref().map_or(rows, |selection| selection.rows);
-        // Chunks stay aligned to the file's CHUNK_SIZE grid across row groups
-        // even when page pruning drops rows from one of them.
-        let lens = chunk_lens(kept_rows, offset);
-        offset += kept_rows;
-        if let Some(selection) = &selection {
-            pages.pages += selection.pages_read;
-            pages.pages_pruned += selection.pages_pruned;
-        }
-        let spans = match &selection {
-            Some(selection) => selection.spans.clone(),
-            None => {
-                // No page plan: the whole chunk is read, so every indexed page
-                // is read too.
-                pages.pages += decoded
-                    .iter()
-                    .filter_map(|(_, at, _)| index.offset_index(*at))
-                    .map(|offset| offset.page_locations().len() as u64)
-                    .sum::<u64>();
-                chunk_spans(rg, &decoded)
-            }
+    let mut counters = MorselCounters::default();
+    let mut groups = Vec::new();
+    if let Some(file) = resolved.files.first() {
+        let plan = DecodePlan {
+            resolved: &resolved,
+            filters,
+            needed: needed.clone(),
+            placeholders: placeholders.clone(),
         };
-        if !spans.is_empty() {
+        let decoded = decoded_columns(file, &plan);
+        let mut kept_offset = 0usize;
+        for (rg_index, rg) in file.meta.row_groups.iter().enumerate() {
+            if !row_group_survives(&resolved, file, rg_index, filters) {
+                counters.row_groups_pruned += 1;
+                continue;
+            }
+            counters.row_groups += 1;
+            let rows = rg.rows as usize;
+            let index = metadata.page_index_for_row_group(rg_index);
+            let selection = if decoded.is_empty() || remote.is_none() {
+                None
+            } else {
+                page_selection(&resolved, file, rg_index, rows, &index, &decoded, filters)
+            };
+            let kept_rows = selection.as_ref().map_or(rows, |selection| selection.rows);
+            if let Some(selection) = &selection {
+                counters.pages += selection.pages_read;
+                counters.pages_pruned += selection.pages_pruned;
+            }
+            let spans = match &selection {
+                Some(selection) => selection.spans.clone(),
+                None => {
+                    // No page plan: the whole chunk is read, so every indexed
+                    // page is read too.
+                    counters.pages += decoded
+                        .iter()
+                        .filter_map(|(_, at, _)| index.offset_index(*at))
+                        .map(|offset| offset.page_locations().len() as u64)
+                        .sum::<u64>();
+                    chunk_spans(rg, &decoded)
+                }
+            };
             // Page spans are one page each: coalesce with a page-sized gap so
             // surviving pages far apart do not pull the file between them.
-            let coalesced = if selection.is_some() {
+            let spans = if selection.is_some() {
                 crate::ranged::coalesce_spans_with_gap(spans, PAGE_COALESCE_GAP)
             } else {
                 crate::ranged::coalesce_spans(spans)
             };
-            let fetched = crate::ranged::fetch_spans(
-                spec.source.as_ref(),
-                &coalesced,
-                spec.parallelism.max(1),
-                transport,
-            );
-            for (span, result) in coalesced.iter().zip(fetched) {
-                let bytes = result.map_err(|e| {
-                    PinkDbError::Execution(format!("remote parquet read failed: {e}"))
-                })?;
-                if bytes.len() as u64 != span.len {
-                    return Err(PinkDbError::Execution(format!(
-                        "remote parquet read failed: GET {} (range {}..{}) returned {} bytes, \
-                         expected {}",
-                        file.meta.path,
-                        span.start,
-                        span.end(),
-                        bytes.len(),
-                        span.len
-                    )));
-                }
-                cache.insert(span.start, bytes);
-            }
+            groups.push(GroupPlan {
+                index: rg_index,
+                rows: kept_rows,
+                offset: kept_offset,
+                spans,
+                selection,
+            });
+            kept_offset += kept_rows;
         }
-
-        let row_group =
-            SerializedRowGroupReader::new(Arc::clone(&chunk), rg_meta, index, Arc::clone(&props))
-                .map_err(|e| {
-                PinkDbError::Execution(format!(
-                    "cannot read row group {rg_index} of \"{}\": {e}",
-                    file.meta.path
-                ))
-            })?;
-        let pieces = match &selection {
-            Some(selection) => {
-                let filtered = PageRowGroup {
-                    inner: row_group,
-                    chunk: Arc::clone(&chunk),
-                    meta: rg_meta,
-                    props: Arc::clone(&props),
-                    locations: selection.locations.clone(),
-                };
-                decode_row_group_reader(&filtered, &decoded, &lens, &file.meta.path)?
-            }
-            None => decode_row_group_reader(&row_group, &decoded, &lens, &file.meta.path)?,
-        };
-        out.columns_decoded += decoded.len() as u64;
-        assemble_row_group(file, plan, &lens, &decoded, pieces, sink)?;
     }
-    Ok(())
+    Ok(RowGroupMorsels {
+        path,
+        resolved,
+        filters: filters.to_vec(),
+        needed,
+        placeholders,
+        remote,
+        reader,
+        metadata,
+        props,
+        transport,
+        groups,
+        counters,
+    })
 }
 
 /// The coalesced whole-column-chunk ranges a row group decodes without a page

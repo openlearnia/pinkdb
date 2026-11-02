@@ -337,7 +337,13 @@ pub enum Statement {
         name: String,
     },
     /// `EXPLAIN <select>`: print the bound (optimized) plan.
-    Explain(Box<Statement>),
+    Explain {
+        /// The statement being explained.
+        statement: Box<Statement>,
+        /// `EXPLAIN ANALYZE`: run the statement first and print what each
+        /// scan source read and pruned.
+        analyze: bool,
+    },
     /// `CREATE [OR REPLACE] PROCEDURE name(params) [LANGUAGE lang] AS <body>`
     /// (wave 44). The body is the string literal's text (preferably
     /// dollar-quoted, `$$ BEGIN ... END $$`); the binder parses it

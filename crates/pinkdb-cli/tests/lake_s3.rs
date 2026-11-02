@@ -310,14 +310,13 @@ fn lake_s3_attach_reports_and_queries() {
              USE main;\n\
              DETACH lk;\n\
              .quit\n",
-            decodes = common::DECODES,
+            decodes = common::SCAN_IO,
         ),
     );
     assert!(!out.contains("footer-only"), "{out}");
-    assert_eq!(
-        common::decode_lines(&out),
-        vec!["decodes: 0 loads, 0 columns, 0 files"],
-        "statistics-only: {out}"
+    assert!(
+        common::scan_io_lines(&out).is_empty(),
+        "statistics-only: no scan runs: {out}"
     );
     assert!(out.contains("│ 3 "), "{out}");
     assert!(out.contains("Database lk dropped."), "{out}");

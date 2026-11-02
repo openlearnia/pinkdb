@@ -191,7 +191,7 @@ fn lean_attach_answers_from_statistics_without_decoding() {
     assert!(out.contains("Saved lake version 2"), "{out}");
 
     // A fresh process: attach from the statistics block, then fast paths.
-    let d = common::DECODES;
+    let d = common::SCAN_IO;
     let out = run(&format!(
         "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake.lake;\n\
          SELECT COUNT(*), COUNT(i), COUNT(g), COUNT(s) FROM t;\n\
@@ -213,15 +213,15 @@ fn lean_attach_answers_from_statistics_without_decoding() {
     // `.pink` files decode only the columns a query needs (wave 102): the
     // first fallback reads one column, the second the two it sums. Nothing is
     // cached between queries (wave 133a), so each column is decoded again.
-    let decodes = common::decode_lines(&out);
+    // The first report is empty: every answer above came from statistics.
+    let decodes = common::scan_io_lines(&out);
     assert_eq!(
         decodes,
         vec![
-            "decodes: 0 loads, 0 columns, 0 files",
-            "decodes: 1 loads, 1 columns, 1 files",
-            "decodes: 2 loads, 3 columns, 2 files",
+            "scan: files 1 read, 0 pruned",
+            "scan: files 1 read, 0 pruned",
         ],
-        "fast paths must not decode; projected decodes, one column at a time:\n{out}"
+        "fast paths must not scan; each fallback reads its table's one file:\n{out}"
     );
     cleanup(&dir);
 }
@@ -267,7 +267,7 @@ fn lean_attach_answers_equal_open_and_in_memory() {
 
     // The fast paths are statistics-only: after COUNT/COUNT(col)/MIN/MAX the
     // decode counters stay at zero, and each fallback decodes its column.
-    let d = common::DECODES;
+    let d = common::SCAN_IO;
     let stats_arm = run(&format!(
         "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake.lake;\n\
          SELECT COUNT(*) FROM t;\n\
@@ -278,14 +278,13 @@ fn lean_attach_answers_equal_open_and_in_memory() {
         lake = lake.display()
     ));
     assert_eq!(
-        common::decode_lines(&stats_arm),
+        common::scan_io_lines(&stats_arm),
         vec![
-            "decodes: 0 loads, 0 columns, 0 files",
-            "decodes: 1 loads, 1 columns, 1 files",
-            "decodes: 2 loads, 2 columns, 2 files",
+            "scan: files 1 read, 0 pruned",
+            "scan: files 1 read, 0 pruned",
         ],
-        "fast paths must not decode; each fallback decodes only its column \
-         (wave 102) and nothing is kept between queries (wave 133a):\n{stats_arm}"
+        "fast paths must not scan; each fallback reads the table's one file \
+         and nothing is kept between queries (wave 133a):\n{stats_arm}"
     );
     cleanup(&dir);
 }
@@ -354,12 +353,13 @@ fn lean_partition_splits_commits_and_prunes() {
          SELECT id FROM t WHERE region = 'north';\n{d}\
          .quit\n",
         lake = lake.display(),
-        d = common::DECODES,
+        d = common::SCAN_IO,
     ));
     assert!(out.contains("│ 5 "), "{out}");
+    // v2's file plus the north partition's; the south file is pruned.
     assert_eq!(
-        common::decode_lines(&out),
-        vec!["decodes: 1 loads, 2 columns, 2 files"],
+        common::scan_io_lines(&out),
+        vec!["scan: files 2 read, 1 pruned"],
         "{out}"
     );
     cleanup(&dir);

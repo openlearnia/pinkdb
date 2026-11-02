@@ -333,7 +333,7 @@ fn mixed_formats_round_trip_appends_and_pins() {
     let attachment = lake.attach(None).unwrap();
     let text = attachment
         .lake
-        .load("main", "as_parquet")
+        .scan_source("main", "as_parquet", None, &[])
         .unwrap_err()
         .to_string();
     assert!(text.contains("main.as_parquet"), "{text}");

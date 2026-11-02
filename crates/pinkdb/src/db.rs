@@ -906,6 +906,18 @@ impl Connection {
         &mut self,
         stmt: &crate::sql::ast::Statement,
         sql_text: Option<&str>,
+        profile: Option<&mut ProfileDraft>,
+    ) -> Result<QueryResult> {
+        // The previous statement's scan log is what `pinkdb_scan_io()`
+        // reports; this statement records into a fresh one (wave 133b).
+        self.with_bind_store(|db| db.finish_scan_records());
+        self.execute_statement(stmt, sql_text, profile)
+    }
+
+    fn execute_statement(
+        &mut self,
+        stmt: &crate::sql::ast::Statement,
+        sql_text: Option<&str>,
         mut profile: Option<&mut ProfileDraft>,
     ) -> Result<QueryResult> {
         // One budget per statement: the deadline starts here (before bind)

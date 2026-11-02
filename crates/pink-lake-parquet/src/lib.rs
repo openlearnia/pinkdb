@@ -85,6 +85,44 @@ impl pinkdb_parquet::RangeSource for LakeRange {
 #[derive(Debug)]
 struct BytesRange(Vec<u8>);
 
+/// The parquet row-group plan as the lake's
+/// [`FileMorsels`](pink_lake::format::FileMorsels).
+///
+/// The plan owns its metadata, page index and range source, so a decode — and
+/// the error it returns — stays the parquet core's: the attach layer only adds
+/// up row counts and counters.
+struct ParquetMorsels {
+    plan: pinkdb_parquet::RowGroupMorsels,
+}
+
+impl pink_lake::format::FileMorsels for ParquetMorsels {
+    fn count(&self) -> usize {
+        self.plan.count()
+    }
+
+    fn rows(&self, index: usize) -> u64 {
+        self.plan.rows(index)
+    }
+
+    fn decode(
+        &self,
+        index: usize,
+        sink: &mut dyn FnMut(pinkdb::DataChunk) -> pinkdb::Result<()>,
+    ) -> pinkdb::Result<()> {
+        self.plan.decode(index, sink)
+    }
+
+    fn counters(&self) -> pink_lake::format::ScanCounters {
+        let counters = self.plan.counters();
+        pink_lake::format::ScanCounters {
+            row_groups: counters.row_groups,
+            row_groups_pruned: counters.row_groups_pruned,
+            pages: counters.pages,
+            pages_pruned: counters.pages_pruned,
+        }
+    }
+}
+
 impl pinkdb_parquet::RangeSource for BytesRange {
     fn len(&self) -> u64 {
         self.0.len() as u64
@@ -340,66 +378,26 @@ impl LakeFormat for ParquetLakeFormat {
         true
     }
 
-    fn scan(
+    fn morsels(
         &self,
         file: &DataFile<'_>,
         columns: &[usize],
         filters: &[pinkdb::PrunePredicate],
-        sink: &mut dyn FnMut(u64, pinkdb::DataChunk) -> Result<()>,
-    ) -> Result<(u64, pink_lake::format::ScanCounters)> {
+    ) -> Result<Option<Box<dyn pink_lake::format::FileMorsels>>> {
         let Some(source) = file.range_source() else {
-            // Encrypted (or a backend without positioned reads): decode whole.
-            return pink_lake::format::scan_whole_file(self, file, columns, filters, sink);
+            // Encrypted, or a backend without positioned reads: the attach
+            // layer decodes the file whole, as it does for a `.pink` file.
+            return Ok(None);
         };
-        let path_text = file.path().display().to_string();
-        let mut rows = 0u64;
-        let mut offset = 0u64;
-        let mut failure: Option<LakeError> = None;
-        let scan = pinkdb_parquet::scan_source_streamed(
-            &path_text,
+        let path = file.path().display().to_string();
+        let plan = pinkdb_parquet::plan_row_groups(
+            &path,
             Arc::new(LakeRange(source)),
             Some(columns),
             filters,
-            &mut |chunk| {
-                let n = chunk.num_rows() as u64;
-                match sink(offset, chunk) {
-                    Ok(()) => {
-                        offset += n;
-                        rows += n;
-                        Ok(())
-                    }
-                    Err(e) => {
-                        failure = Some(e);
-                        // The parquet core only propagates this; our error is
-                        // returned below, keeping the lake error type.
-                        Err(PinkDbError::Execution("lake scan sink failed".to_string()))
-                    }
-                }
-            },
-        );
-        let streamed = match scan {
-            Ok(streamed) => streamed,
-            Err(e) => {
-                // A failure the sink itself reported is the engine's error,
-                // not a corrupt file.
-                return match failure {
-                    Some(error) => Err(error),
-                    None => Err(corrupt(
-                        file,
-                        format!("cannot decode the parquet data: {e}"),
-                    )),
-                };
-            }
-        };
-        Ok((
-            rows,
-            pink_lake::format::ScanCounters {
-                row_groups: streamed.output.row_groups,
-                row_groups_pruned: streamed.output.row_groups_pruned,
-                pages: streamed.pages.pages,
-                pages_pruned: streamed.pages.pages_pruned,
-            },
-        ))
+        )
+        .map_err(|e| corrupt(file, format!("cannot decode the parquet data: {e}")))?;
+        Ok(Some(Box::new(ParquetMorsels { plan })))
     }
 
     fn read_projected(

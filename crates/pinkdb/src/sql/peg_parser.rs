@@ -167,8 +167,8 @@ fn reject_parameter_positions(stmts: &[Statement]) -> Result<()> {
                 where_clause: Some(e),
                 ..
             } => check_expr_positions(e)?,
-            Statement::Explain(inner) => {
-                reject_parameter_positions(std::slice::from_ref(inner.as_ref()))?
+            Statement::Explain { statement, .. } => {
+                reject_parameter_positions(std::slice::from_ref(statement.as_ref()))?
             }
             Statement::Select(query) => check_select_positions(query)?,
             _ => {}
@@ -459,7 +459,7 @@ fn collect_parameter_offsets(stmt: &Statement, out: &mut Vec<usize>) {
         Statement::CreateTableAs { query, .. } | Statement::CreateView { query, .. } => {
             collect_select_offsets(query, out)
         }
-        Statement::Explain(inner) => collect_parameter_offsets(inner, out),
+        Statement::Explain { statement, .. } => collect_parameter_offsets(statement, out),
         Statement::Insert { source, .. } => match source {
             InsertSource::Values(rows) => {
                 for row in rows {
@@ -672,7 +672,7 @@ fn apply_parameter_ranks(stmt: &mut Statement, offsets: &[usize]) {
         Statement::CreateTableAs { query, .. } | Statement::CreateView { query, .. } => {
             apply_select_ranks(query, offsets)
         }
-        Statement::Explain(inner) => apply_parameter_ranks(inner, offsets),
+        Statement::Explain { statement, .. } => apply_parameter_ranks(statement, offsets),
         Statement::Insert { source, .. } => match source {
             InsertSource::Values(rows) => {
                 for row in rows {
@@ -1979,12 +1979,18 @@ peg::parser! {
               }
             / word("describe") t:table_ref() { Statement::Describe { qual: t.0, name: t.1 } }
 
-        /// `EXPLAIN <query>` — the plain (optimized) plan text.
-        /// `EXPLAIN <query | DML>`: what may appear inside is checked at
-        /// bind time, so a refused shape gets a sentence instead of peg's
-        /// expected-token list.
+        /// `EXPLAIN <query>` — the plain (optimized) plan text — and
+        /// `EXPLAIN ANALYZE <query>`, which also runs it and prints each scan
+        /// source's reads. What may appear inside is checked at bind time, so
+        /// a refused shape gets a sentence instead of peg's expected-token
+        /// list.
         rule explain_stmt() -> Statement
-            = word("explain") s:statement() { Statement::Explain(Box::new(s)) }
+            = word("explain") word("analyze") s:statement() {
+                Statement::Explain { statement: Box::new(s), analyze: true }
+            }
+            / word("explain") s:statement() {
+                Statement::Explain { statement: Box::new(s), analyze: false }
+            }
 
         /// `CHECKPOINT` — matched as a word, not a reserved keyword, so
         /// `checkpoint` stays usable as a table or column name.

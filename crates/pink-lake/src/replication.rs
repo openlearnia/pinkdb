@@ -1378,8 +1378,7 @@ impl SourceReader<'_> {
         match self {
             SourceReader::Lake { attachment, .. } => {
                 let (db, table) = split_key(key)?;
-                attachment
-                    .load(db, table)
+                crate::attach::load_table(Arc::clone(attachment), db, table)
                     .map(|table| (*table).clone())
                     .map_err(|e| LakeError::Engine {
                         context: format!("materializing source table \"{key}\""),
@@ -1575,19 +1574,18 @@ fn sync_table(
         Some(_) => {
             let (attachment, _) = crate::attach::build(dest, None)?;
             let (db, table) = split_key(key)?;
-            Some(Arc::new(
-                attachment
-                    .load(db, table)
-                    .map(|table| (*table).clone())
-                    .map_err(|e| LakeError::Engine {
+            Some(
+                crate::attach::load_table(Arc::clone(&attachment), db, table).map_err(|e| {
+                    LakeError::Engine {
                         context: format!(
                             "materializing destination table \"{key}\" at version \
                              {base_version} ({})",
                             manifest_path.display()
                         ),
                         source: e,
-                    })?,
-            ))
+                    }
+                })?,
+            )
         }
         None => None,
     };

@@ -54,11 +54,11 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::attached::{AtSpec, AttachedLake, AttachedScan, AttachedTable, PrunePredicate};
+use crate::attached::{AtSpec, AttachedLake, AttachedTable, PrunePredicate};
 use crate::catalog_image::load_database_image;
+use crate::morsel::MorselSource;
 use crate::storage::{DataTable, DbCatalog, PinkDb, SchemaCatalog};
 use crate::types::{DataType, PinkDbError, Result, Value};
-use crate::vector::DataChunk;
 
 /// The memo name a WAL record's lake-version pins are stored under. The
 /// leading control character keeps it out of reach of every SQL identifier.
@@ -602,70 +602,30 @@ impl AttachedLake for AliasedLake {
     fn tables(&self) -> &[AttachedTable] {
         &self.tables
     }
-    fn load(&self, _db: &str, table: &str) -> Result<Arc<DataTable>> {
-        self.inner.load(&self.schema, table)
-    }
-    fn load_projected(
-        &self,
-        _db: &str,
-        table: &str,
-        columns: Option<&[usize]>,
-    ) -> Result<AttachedScan> {
-        self.inner.load_projected(&self.schema, table, columns)
-    }
-    fn load_filtered(
-        &self,
+    fn scan_source(
+        self: Arc<Self>,
         _db: &str,
         table: &str,
         columns: Option<&[usize]>,
         predicates: &[PrunePredicate],
-    ) -> Result<AttachedScan> {
-        self.inner
-            .load_filtered(&self.schema, table, columns, predicates)
+    ) -> Result<Box<dyn MorselSource>> {
+        Arc::clone(&self.inner).scan_source(&self.schema, table, columns, predicates)
     }
     fn decode_stats(&self) -> (u64, u64, u64) {
         self.inner.decode_stats()
     }
-    fn scan_streamed(
-        &self,
-        _db: &str,
-        table: &str,
-        columns: Option<&[usize]>,
-        predicates: &[PrunePredicate],
-        sink: &mut dyn FnMut(DataChunk) -> Result<()>,
-    ) -> Result<u64> {
-        self.inner
-            .scan_streamed(&self.schema, table, columns, predicates, sink)
-    }
-    fn streams_scan(&self, _db: &str, table: &str) -> bool {
-        self.inner.streams_scan(&self.schema, table)
-    }
     fn table_at(&self, _db: &str, table: &str, at: AtSpec) -> Result<AttachedTable> {
         Ok(self.rename(self.inner.table_at(&self.schema, table, at)?))
     }
-    fn load_at(&self, _db: &str, table: &str, at: AtSpec) -> Result<Arc<DataTable>> {
-        self.inner.load_at(&self.schema, table, at)
-    }
-    fn load_projected_at(
-        &self,
-        _db: &str,
-        table: &str,
-        at: AtSpec,
-        columns: Option<&[usize]>,
-    ) -> Result<AttachedScan> {
-        self.inner
-            .load_projected_at(&self.schema, table, at, columns)
-    }
-    fn load_filtered_at(
-        &self,
+    fn scan_source_at(
+        self: Arc<Self>,
         _db: &str,
         table: &str,
         at: AtSpec,
         columns: Option<&[usize]>,
         predicates: &[PrunePredicate],
-    ) -> Result<AttachedScan> {
-        self.inner
-            .load_filtered_at(&self.schema, table, at, columns, predicates)
+    ) -> Result<Box<dyn MorselSource>> {
+        Arc::clone(&self.inner).scan_source_at(&self.schema, table, at, columns, predicates)
     }
 }
 
@@ -1747,35 +1707,6 @@ impl PinkDb {
                 cat.lake_version = version;
             }
         }
-    }
-
-    /// Per read-only lake database (and session attachment): its database
-    /// (`None` for a session attachment), location and data-file decode
-    /// counters `(loads, columns, files)`, sorted by database.
-    pub fn lake_decode_stats(&self) -> Vec<(Option<String>, String, u64, u64, u64)> {
-        let slots = self.lakes.slots.lock().unwrap_or_else(|p| p.into_inner());
-        // A lake database has one reader per lake schema, all sharing the
-        // lake's counters: report the lake once, from its first schema.
-        let mut out: Vec<(Option<String>, String, u64, u64, u64)> = self
-            .attached_lakes
-            .iter()
-            .filter_map(|lake| {
-                let database = slots
-                    .iter()
-                    .find(|(_, s)| s.readers.first().is_some_and(|r| Arc::ptr_eq(r, lake)))
-                    .map(|(key, _)| self.database_display_name(key));
-                let in_slot = slots
-                    .iter()
-                    .any(|(_, s)| s.readers.iter().any(|r| Arc::ptr_eq(r, lake)));
-                if in_slot && database.is_none() {
-                    return None;
-                }
-                let (loads, columns, files) = lake.decode_stats();
-                Some((database, lake.location().to_string(), loads, columns, files))
-            })
-            .collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
     }
 
     /// The error for a statement that names an unavailable lake database, if

@@ -158,6 +158,7 @@ use std::path::Path;
 pub use file_meta::{ChunkInfo, ColStats, FileMeta, RowGroupMeta};
 pub use ranged::{RangeSource, RemoteReadStats};
 pub use resolve::{Call, Options, OutKind, Resolved};
+pub use scan::{MorselCounters, RowGroupMorsels};
 pub use schema_map::FileColumn;
 
 /// The registry name of the parquet source (`EXPLAIN` shows it; the CLI's
@@ -264,19 +265,19 @@ pub fn scan_source(
     })
 }
 
-/// Stream one parquet object through a positional [`RangeSource`], one row
-/// group at a time, pruning pages through the column index when the file has
-/// one (wave 133a). The lake uses this so a scan holds one row group, not the
-/// file, and reads only the surviving pages' byte ranges.
-pub fn scan_source_streamed(
+/// Plan one parquet object's row groups as morsels (wave 133b): the lake
+/// claims a row group, then decodes it, so a scan holds one row group per
+/// worker and reads only the surviving pages' bytes. Row-group and page
+/// pruning, and the reading it implies, are settled here — before any data
+/// page is read.
+pub fn plan_row_groups(
     path: &str,
     source: Arc<dyn RangeSource>,
     projection: Option<&[usize]>,
     filters: &[PrunePredicate],
-    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
-) -> Result<scan::RangedStream> {
+) -> Result<scan::RowGroupMorsels> {
     let resolved = resolve::resolve_source(path, source)?;
-    scan::scan_page_streamed(&resolved, projection, filters, sink)
+    scan::plan_row_groups(resolved, projection, filters)
 }
 
 /// Read one object's parquet metadata (footer only, no data pages) through a

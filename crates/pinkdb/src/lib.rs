@@ -66,6 +66,8 @@ pub mod macros;
 /// The process-wide memory budget (wave 136a): `SET memory_limit` and the
 /// reservations operators take against it.
 pub mod memory;
+/// Streaming scan sources for the pipeline executor (wave 133b).
+pub mod morsel;
 pub(crate) mod mv;
 pub mod optimizer;
 /// Extension packages (wave 86): one host-published registry entry that
@@ -128,6 +130,7 @@ pub use lake_db::{
     LakeOpenRequest, LakePolicy, LakeSpec, register_database_opener,
 };
 pub use macros::{MacroDef, MacroParamDef};
+pub use morsel::{MorselCursor, MorselSource, ScanIo, ScanRecord, ScanUnit, materialize};
 pub use package::{ExtensionPackage, extension_package_names, register_extension_package};
 /// The extension ABI's value types, re-exported so a package that declares
 /// host functions (`HostScalar`, `HostStatement`) can name its parameters
@@ -259,6 +262,9 @@ impl PinkDb {
         let parse = parse_start.map(|start| start.elapsed()).unwrap_or_default();
         let mut out = Vec::with_capacity(stmts.len());
         for (i, stmt) in stmts.iter().enumerate() {
+            // The previous statement's scan log is what `pinkdb_scan_io()`
+            // reports; this statement records into a fresh one (wave 133b).
+            self.finish_scan_records();
             // The statement that is about to run: `BEGIN` itself is outside
             // the transaction it opens, `COMMIT` itself is still inside.
             let in_transaction = self.in_transaction();
