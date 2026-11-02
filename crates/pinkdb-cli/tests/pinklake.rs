@@ -172,7 +172,8 @@ fn lean_save_open_versions_tables_info() {
 
 /// A read-only lake database answers exact COUNT/COUNT(col)/MIN/MAX from the published
 /// statistics without decoding (decode counters stay at zero), and a fallback
-/// query materializes the table exactly once and caches it.
+/// query decodes only the columns it references, per query (wave 133a dropped
+/// the session's materialized table).
 #[test]
 fn lean_attach_answers_from_statistics_without_decoding() {
     let dir = scratch("attach");
@@ -192,7 +193,7 @@ fn lean_attach_answers_from_statistics_without_decoding() {
     // A fresh process: attach from the statistics block, then fast paths.
     let d = common::DECODES;
     let out = run(&format!(
-        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake;\n\
+        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake.lake;\n\
          SELECT COUNT(*), COUNT(i), COUNT(g), COUNT(s) FROM t;\n\
          SELECT MIN(i), MAX(i), MIN(g), MAX(g), MIN(s), MAX(s), MIN(b), MAX(b) FROM t;\n\
          SELECT COUNT(*), COUNT(x), MIN(x) FROM empty;\n{d}\
@@ -210,14 +211,15 @@ fn lean_attach_answers_from_statistics_without_decoding() {
     // The fast paths decoded nothing; each fallback decoded only the columns
     // it needed.
     // `.pink` files decode only the columns a query needs (wave 102): the
-    // first fallback reads one column, the second a further one.
+    // first fallback reads one column, the second the two it sums. Nothing is
+    // cached between queries (wave 133a), so each column is decoded again.
     let decodes = common::decode_lines(&out);
     assert_eq!(
         decodes,
         vec![
             "decodes: 0 loads, 0 columns, 0 files",
             "decodes: 1 loads, 1 columns, 1 files",
-            "decodes: 2 loads, 2 columns, 2 files",
+            "decodes: 2 loads, 3 columns, 2 files",
         ],
         "fast paths must not decode; projected decodes, one column at a time:\n{out}"
     );
@@ -247,7 +249,7 @@ fn lean_attach_answers_equal_open_and_in_memory() {
         lake = lake.display()
     ));
     let attached = run(&format!(
-        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake;\n{queries}.quit\n",
+        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake.lake;\n{queries}.quit\n",
         lake = lake.display()
     ));
 
@@ -264,10 +266,10 @@ fn lean_attach_answers_equal_open_and_in_memory() {
     );
 
     // The fast paths are statistics-only: after COUNT/COUNT(col)/MIN/MAX the
-    // decode counters stay at zero, and the first fallback materializes once.
+    // decode counters stay at zero, and each fallback decodes its column.
     let d = common::DECODES;
     let stats_arm = run(&format!(
-        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake;\n\
+        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake.lake;\n\
          SELECT COUNT(*) FROM t;\n\
          SELECT MIN(i), MAX(i), COUNT(s), MIN(b), MAX(b) FROM t;\n{d}\
          SELECT SUM(i) FROM t;\n{d}\
@@ -280,10 +282,10 @@ fn lean_attach_answers_equal_open_and_in_memory() {
         vec![
             "decodes: 0 loads, 0 columns, 0 files",
             "decodes: 1 loads, 1 columns, 1 files",
-            "decodes: 1 loads, 1 columns, 1 files",
+            "decodes: 2 loads, 2 columns, 2 files",
         ],
-        "fast paths must not decode; the fallback decodes only its column once \
-         (wave 102), then the cache serves it:\n{stats_arm}"
+        "fast paths must not decode; each fallback decodes only its column \
+         (wave 102) and nothing is kept between queries (wave 133a):\n{stats_arm}"
     );
     cleanup(&dir);
 }
@@ -363,9 +365,9 @@ fn lean_partition_splits_commits_and_prunes() {
     cleanup(&dir);
 }
 
-/// Wave 67 in the lean build: `.lake merge` consolidates `.pink` data files,
-/// `.lake expire`/`.lake cleanup` prune the metadata and unreferenced
-/// objects, and the introspection commands report them.
+/// Wave 67 in the lean build: `CALL ducklake_merge_adjacent_files` consolidates
+/// `.pink` data files, `ducklake_expire_snapshots`/`ducklake_cleanup_old_files`
+/// prune the metadata and unreferenced objects, and the read functions report them.
 #[test]
 fn lean_maintenance_merge_expire_cleanup() {
     let dir = scratch("maint");
@@ -384,30 +386,44 @@ fn lean_maintenance_merge_expire_cleanup() {
         ),
         &[("PINKDB_LAKE_INLINING_ROW_LIMIT", "0")],
     );
-    let out = run(&format!(
-        ".lake merge {lake}\n\
-         .lake files {lake}\n\
-         .lake expire {lake} versions=2,3\n\
-         .lake cleanup {lake} all dry-run\n\
-         .lake cleanup {lake} all confirm\n\
-         .lake open {lake}\n\
-         .quit\n",
-        lake = lake.display()
-    ));
-    assert!(out.contains("Merged 2 files into 1 in"), "{out}");
-    assert!(out.contains("table=main.t rows=3"), "{out}");
-    assert!(out.contains("Expired 2 snapshots from"), "{out}");
-    // After the expiration both merged sources are unreferenced.
-    assert!(out.contains("2 objects would be cleaned up"), "{out}");
-    assert!(out.contains("Deleted 2 objects from"), "{out}");
-    assert!(out.contains("Opened lake version 4"), "{out}");
-    assert!(!out.contains("Error:"), "{out}");
-    // The consolidated data file is a `.pink` file.
-    let data: Vec<String> =
+    let data_files = || -> Vec<String> {
         std::fs::read_dir(PathBuf::from(format!("{}.files", lake.display())).join("data/main.t"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-            .collect();
+            .collect()
+    };
+    let out = run(&format!(
+        "ATTACH 'lake:{lake}' AS lk;\n\
+         CALL ducklake_merge_adjacent_files('lk');\n\
+         SELECT 'files=' || CAST(COUNT(*) AS VARCHAR) AS files \
+           FROM ducklake_list_files('lk', 't');\n\
+         SELECT 'rows=' || CAST(COUNT(*) AS VARCHAR) AS row_count FROM lk.t;\n\
+         CALL ducklake_expire_snapshots('lk', versions := [1, 2]);\n\
+         SELECT 'left=' || CAST(COUNT(*) AS VARCHAR) AS left_count \
+           FROM ducklake_snapshots('lk') WHERE snapshot_id IN (1, 2);\n\
+         CALL ducklake_cleanup_old_files('lk', cleanup_all := true, dry_run := true);\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("files=1"), "{out}");
+    assert!(out.contains("rows=3"), "{out}");
+    assert!(out.contains("left=0"), "{out}");
+    assert!(!out.contains("Error:"), "{out}");
+    // The dry run reports both merged sources but deletes nothing.
+    assert_eq!(data_files().len(), 3, "{:?}", data_files());
+
+    let out = run(&format!(
+        "ATTACH 'lake:{lake}' AS lk;\n\
+         CALL ducklake_cleanup_old_files('lk', cleanup_all := true);\n\
+         SELECT 'version=' || CAST(id + 1 AS VARCHAR) AS version \
+           FROM ducklake_current_snapshot('lk');\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("version=4"), "{out}");
+    assert!(!out.contains("Error:"), "{out}");
+    // The consolidated data file is a `.pink` file.
+    let data = data_files();
     assert_eq!(data.len(), 1, "{data:?}");
     assert!(data[0].ends_with(".pink"), "{data:?}");
     cleanup(&dir);

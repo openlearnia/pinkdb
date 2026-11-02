@@ -448,6 +448,24 @@ fn TopBar() -> impl IntoView {
             })
             .collect_view()
     };
+    let schemas = move || {
+        let current = app.schema.get();
+        let catalog = app.catalog.get();
+        let db = app.db.get();
+        crate::explorer::schemas_of(
+            catalog
+                .objects
+                .iter()
+                .filter(|o| o.database.eq_ignore_ascii_case(&db)),
+        )
+        .into_iter()
+        .map(|schema| {
+            let selected = schema.eq_ignore_ascii_case(&current);
+            let value = schema.clone();
+            view! { <option value=value selected=selected>{schema}</option> }
+        })
+        .collect_view()
+    };
     let user = move || app.session.get().map(|s| s.user).unwrap_or_default();
     let initials = move || {
         let u = user();
@@ -472,11 +490,22 @@ fn TopBar() -> impl IntoView {
                     class="input context-select"
                     aria-label="Database"
                     on:change=move |ev| {
-                        app.db.set(event_target_value(&ev));
-                        app.load_catalog();
+                        app.use_database(event_target_value(&ev));
                     }
                 >
                     {databases}
+                </select>
+            </label>
+            <label class="row context-label" title="The schema statements run in">
+                <Icon name="schema" class="subtle" />
+                <select
+                    class="input context-select"
+                    aria-label="Schema"
+                    on:change=move |ev| {
+                        app.schema.set(event_target_value(&ev));
+                    }
+                >
+                    {schemas}
                 </select>
             </label>
             <Search />
@@ -610,6 +639,7 @@ fn TopBar() -> impl IntoView {
 enum Hit {
     Object {
         database: String,
+        schema: String,
         name: String,
         kind: String,
     },
@@ -632,10 +662,12 @@ fn Search() -> impl IntoView {
         let mut out: Vec<Hit> = app.catalog.with(|c| {
             c.objects
                 .iter()
+                .filter(|o| o.kind != "SCHEMA")
                 .filter(|o| o.name.to_ascii_lowercase().contains(&q))
                 .take(8)
                 .map(|o| Hit::Object {
                     database: o.database.clone(),
+                    schema: o.schema.clone(),
                     name: o.name.clone(),
                     kind: o.kind.clone(),
                 })
@@ -653,8 +685,13 @@ fn Search() -> impl IntoView {
     };
     let choose = move |hit: Hit| {
         match hit {
-            Hit::Object { database, name, .. } => {
-                app.selected.set(Some((database, name)));
+            Hit::Object {
+                database,
+                schema,
+                name,
+                ..
+            } => {
+                app.selected.set(Some((database, schema, name)));
                 app.go(Section::Catalog);
             }
             Hit::Sheet(w) => {
@@ -721,12 +758,13 @@ fn Search() -> impl IntoView {
                     let (icon, label, detail) = match &hit {
                         Hit::Object {
                             database,
+                            schema,
                             name,
                             kind,
                         } => (
                             kind_icon(kind),
                             name.clone(),
-                            format!("{database} · {}", kind.to_ascii_lowercase()),
+                            format!("{database}.{schema} · {}", kind.to_ascii_lowercase()),
                         ),
                         Hit::Sheet(w) => (
                             "file-code",

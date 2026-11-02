@@ -343,6 +343,11 @@ pub const FUNCTIONS: &[&str] = &[
     "read_json",
     "pinkdb_catalog",
     "pinkdb_column_stats",
+    "duckdb_databases",
+    "duckdb_schemas",
+    "duckdb_tables",
+    "duckdb_views",
+    "duckdb_columns",
     "lake_changes",
     "embed",
 ];

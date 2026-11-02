@@ -226,7 +226,9 @@ pub(crate) fn materialize_live(
             pinkdb::storage::Column::from_chunks(
                 col.name.clone(),
                 col.dtype,
-                col.default.clone(),
+                col.default
+                    .clone()
+                    .map(pinkdb::plan::ColumnDefault::constant),
                 vec![Arc::new(vector)],
             )
             .map_err(|e| LakeError::Engine {

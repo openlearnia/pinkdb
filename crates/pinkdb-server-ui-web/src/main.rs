@@ -22,5 +22,11 @@ mod storage;
 mod ui;
 
 fn main() {
+    // A panic aborts the wasm instance (`panic = "abort"`), which the browser
+    // reports only as `RuntimeError: unreachable`; print the message first so
+    // a broken page says why.
+    std::panic::set_hook(Box::new(|info| {
+        web_sys::console::error_1(&format!("pinkdb console panicked: {info}").into());
+    }));
     leptos::mount::mount_to_body(app::Root);
 }

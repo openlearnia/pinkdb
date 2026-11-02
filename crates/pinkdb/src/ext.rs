@@ -98,6 +98,10 @@ pub(crate) fn ext_type_of(dtype: DataType) -> Option<ExtType> {
         // rejects such arguments with its usual message.
         DataType::Interval => Some(ExtType::Interval),
         DataType::Decimal { .. } => None,
+        // UUID has no ABI type: the extension ABI's value model has no
+        // 128-bit kind, and the VARCHAR channel would need an allocation per
+        // value. A function that takes or returns one is refused at bind.
+        DataType::Uuid => None,
         // VARIANT is an additive ABI v1 type (tag 10, the pinkdb C ABI's
         // number). Its payload rides the VARCHAR text channel as bytes in the
         // engine's VARIANT encoding — the extension sees no field names, only
@@ -611,6 +615,9 @@ pub(crate) fn push_ext_arg<'a>(
         VectorData::Variant(_) => {
             ExtArg::Variant(variant.expect("a VARIANT argument is encoded before it is pushed"))
         }
+        // Unreachable: `ext_type_of` rejects UUID in the binder's exact-type
+        // check before any callback can run.
+        VectorData::Uuid(_) => unreachable!("extensions v1 do not accept UUID arguments"),
         // The engine's array vector already holds its elements contiguously,
         // so the ABI view is a slice of it — no copy, no per-element boxing.
         VectorData::Array {

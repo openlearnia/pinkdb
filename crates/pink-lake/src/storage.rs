@@ -626,9 +626,10 @@ impl Location {
     /// Parse a lake location string: `s3://bucket[/prefix…]` is object
     /// storage, `pink:<path>` is a durable pinkdb catalog, `sqlite:<path>` is
     /// a SQLite catalog, `postgres://…` / `postgresql://…` is a Postgres
-    /// catalog, anything else is a local path (a directory literally named
-    /// `s3://…` is not a thing). A bare path keeps its current meaning: the
-    /// object-store JSON directory layout.
+    /// catalog URL and `postgres:<conninfo>` its libpq key=value form, anything
+    /// else is a local path (a directory literally named `s3://…` is not a
+    /// thing). A bare path keeps its current meaning: the object-store JSON
+    /// directory layout.
     pub(crate) fn parse(location: &str) -> Result<Self> {
         if let Some(rest) = location.strip_prefix("pink+s3://") {
             return Self::parse_catalog_s3(location, rest);
@@ -639,7 +640,7 @@ impl Location {
         if let Some(rest) = location.strip_prefix("sqlite:") {
             return Self::parse_sqlite(location, rest);
         }
-        if location.starts_with("postgres://") || location.starts_with("postgresql://") {
+        if location.starts_with("postgres:") || location.starts_with("postgresql://") {
             crate::catalog_store::url::PostgresUrl::parse(location).map_err(|message| {
                 LakeError::BadLocation {
                     location: crate::catalog_store::url::redact_location(location),

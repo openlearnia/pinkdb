@@ -10,12 +10,12 @@
       "steps": [
         {
           "op": "query",
-          "sql": "SELECT NULL AS n, CAST(NULL AS VARCHAR) AS ns, true AS t, false AS f, 1 AS i, CAST(1 AS BIGINT) AS big, 1.5 AS d, 'hi' AS s",
+          "sql": "SELECT NULL AS n, CAST(NULL AS VARCHAR) AS ns, true AS t, false AS f, 1 AS i, CAST(1 AS BIGINT) AS big, 1.5 AS dec, 1.5e0 AS d, 'hi' AS s",
           "expect": {
-            "columns": ["n", "ns", "t", "f", "i", "big", "d", "s"],
-            "types": ["integer", "varchar", "boolean", "boolean", "integer", "bigint", "double", "varchar"],
+            "columns": ["n", "ns", "t", "f", "i", "big", "dec", "d", "s"],
+            "types": ["integer", "varchar", "boolean", "boolean", "integer", "bigint", "decimal", "double", "varchar"],
             "rows": [
-              [null, null, ["boolean", true], ["boolean", false], ["integer", 1], ["bigint", "1"], ["double", "1.5"], ["varchar", "hi"]]
+              [null, null, ["boolean", true], ["boolean", false], ["integer", 1], ["bigint", "1"], ["decimal", "1.5"], ["double", "1.5"], ["varchar", "hi"]]
             ]
           }
         },

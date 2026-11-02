@@ -171,6 +171,9 @@ pub enum DataType {
         elem: ArrayElem,
         len: u32,
     },
+    /// 16-byte universally unique identifier, ordered and grouped by its
+    /// unsigned 128-bit value (DuckDB's rules).
+    Uuid,
 }
 
 /// Element kind of an [`DataType::Array`]. A small `Copy` enum, not a boxed
@@ -276,6 +279,7 @@ impl DataType {
             DataType::Interval => "INTERVAL".to_string(),
             DataType::Variant => "VARIANT".to_string(),
             DataType::Array { elem, len } => format!("{}[{len}]", elem.name()),
+            DataType::Uuid => "UUID".to_string(),
         }
     }
 
@@ -303,6 +307,7 @@ impl DataType {
             }),
             "INTERVAL" => Some(DataType::Interval),
             "VARIANT" => Some(DataType::Variant),
+            "UUID" => Some(DataType::Uuid),
             _ => None,
         }
     }
@@ -388,7 +393,7 @@ impl fmt::Display for DataType {
 }
 
 /// A single scalar value. `Null` carries no type; the column does.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Null,
     Boolean(bool),
@@ -400,9 +405,18 @@ pub enum Value {
     Date(i32),
     /// Microseconds since 1970-01-01 00:00:00 (naive, no time zone).
     Timestamp(i64),
-    /// Unscaled fixed-point value and its scale: the value is
-    /// `value / 10^scale`.
-    Decimal(i128, u8),
+    /// Fixed-point value: `value / 10^scale`, plus the declared precision.
+    ///
+    /// The precision is carried because it is not recoverable from the
+    /// unscaled value (`.5` and `0.5` are the same number but DuckDB types
+    /// them DECIMAL(1,1) and DECIMAL(2,1)), and because decimal arithmetic
+    /// widths depend on it. A value that has no declared type of its own
+    /// (a cell read out of a vector) carries the minimal width that holds it.
+    Decimal {
+        value: i128,
+        precision: u8,
+        scale: u8,
+    },
     /// Calendar interval (DuckDB's three-field layout).
     Interval {
         months: i32,
@@ -413,11 +427,63 @@ pub enum Value {
     Variant(std::sync::Arc<crate::variant::Variant>),
     /// One row of a fixed-size array, shared for the same reason.
     Array(std::sync::Arc<crate::array::ArrayValue>),
+    /// UUID: the unsigned 128-bit value (see [`crate::uuid`]).
+    Uuid(u128),
+}
+
+impl PartialEq for Value {
+    /// Two decimals are equal when they are the same number at the same scale;
+    /// the carried precision is a type annotation, not part of the value
+    /// (`.5` and `0.50` differ in scale and still compare unequal). Every
+    /// other variant compares as a derived `PartialEq` would. The match is
+    /// exhaustive on `self`, so a new variant cannot fall through unnoticed.
+    fn eq(&self, other: &Self) -> bool {
+        match self {
+            Value::Decimal { value, scale, .. } => matches!(
+                other,
+                Value::Decimal { value: b, scale: sb, .. } if value == b && scale == sb
+            ),
+            Value::Null => matches!(other, Value::Null),
+            Value::Boolean(a) => matches!(other, Value::Boolean(b) if a == b),
+            Value::Integer(a) => matches!(other, Value::Integer(b) if a == b),
+            Value::Bigint(a) => matches!(other, Value::Bigint(b) if a == b),
+            Value::Double(a) => matches!(other, Value::Double(b) if a == b),
+            Value::Varchar(a) => matches!(other, Value::Varchar(b) if a == b),
+            Value::Date(a) => matches!(other, Value::Date(b) if a == b),
+            Value::Timestamp(a) => matches!(other, Value::Timestamp(b) if a == b),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => matches!(
+                other,
+                Value::Interval { months: m, days: d, micros: u }
+                    if months == m && days == d && micros == u
+            ),
+            Value::Variant(a) => matches!(other, Value::Variant(b) if a == b),
+            Value::Array(a) => matches!(other, Value::Array(b) if a == b),
+            Value::Uuid(a) => matches!(other, Value::Uuid(b) if a == b),
+        }
+    }
 }
 
 impl Value {
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
+    }
+
+    /// A DECIMAL value with the minimal precision that holds it.
+    ///
+    /// Used where the value has no declared type around it yet; a literal
+    /// keeps the width it was written with instead.
+    pub fn decimal(value: i128, scale: u8) -> Value {
+        Value::Decimal {
+            value,
+            precision: decimal_digits(value)
+                .max(scale as u32 + 1)
+                .clamp(1, DECIMAL_MAX_PRECISION as u32) as u8,
+            scale,
+        }
     }
 
     pub fn data_type(&self) -> Option<DataType> {
@@ -430,13 +496,10 @@ impl Value {
             Value::Varchar(_) => Some(DataType::Varchar),
             Value::Date(_) => Some(DataType::Date),
             Value::Timestamp(_) => Some(DataType::Timestamp),
-            // A bare DECIMAL value carries its scale; its precision is the
-            // minimal width that holds it (the authoritative precision lives
-            // in the column/bound-expression type).
-            Value::Decimal(v, scale) => Some(DataType::Decimal {
-                precision: decimal_digits(*v)
-                    .max(*scale as u32)
-                    .clamp(1, DECIMAL_MAX_PRECISION as u32) as u8,
+            Value::Decimal {
+                precision, scale, ..
+            } => Some(DataType::Decimal {
+                precision: *precision,
                 scale: *scale,
             }),
             Value::Interval { .. } => Some(DataType::Interval),
@@ -445,6 +508,7 @@ impl Value {
                 elem: a.elem,
                 len: a.len() as u32,
             }),
+            Value::Uuid(_) => Some(DataType::Uuid),
         }
     }
 }
@@ -460,7 +524,11 @@ impl fmt::Display for Value {
             Value::Varchar(s) => write!(f, "{s}"),
             Value::Date(d) => write!(f, "{}", format_date(*d)),
             Value::Timestamp(us) => write!(f, "{}", format_timestamp(*us)),
-            Value::Decimal(v, scale) => write!(f, "{}", format_decimal(*v, *scale)),
+            Value::Decimal {
+                value,
+                precision,
+                scale,
+            } => write!(f, "{}", format_decimal_typed(*value, *precision, *scale)),
             Value::Interval {
                 months,
                 days,
@@ -469,6 +537,7 @@ impl fmt::Display for Value {
             // The JSON text, so `CAST(v AS VARCHAR)` and this agree.
             Value::Variant(v) => write!(f, "{v}"),
             Value::Array(a) => f.write_str(&a.text()),
+            Value::Uuid(bits) => f.write_str(&crate::uuid::format(*bits)),
         }
     }
 }
@@ -724,6 +793,25 @@ pub fn rescale_decimal(v: i128, from: u8, to: u8) -> Option<i128> {
 /// Display form: always exactly `scale` digits after the point (DuckDB
 /// prints trailing zeros; scale 0 has no point at all).
 pub fn format_decimal(v: i128, scale: u8) -> String {
+    format_decimal_unsigned(v, scale)
+}
+
+/// Display form of a typed DECIMAL: DuckDB omits the leading zero exactly when
+/// the value has no integer digits, i.e. when `precision == scale`
+/// (`DECIMAL(2,2)` prints `.25`, `DECIMAL(3,2)` prints `0.25`).
+pub(crate) fn format_decimal_typed(v: i128, precision: u8, scale: u8) -> String {
+    let text = format_decimal_unsigned(v, scale);
+    if precision != scale {
+        return text;
+    }
+    let (sign, digits) = text.split_at(if text.starts_with('-') { 1 } else { 0 });
+    match digits.strip_prefix("0.") {
+        Some(frac) => format!("{sign}.{frac}"),
+        None => text,
+    }
+}
+
+fn format_decimal_unsigned(v: i128, scale: u8) -> String {
     if scale == 0 {
         return v.to_string();
     }
@@ -1489,6 +1577,12 @@ mod tests {
     #[test]
     fn decimal_format_and_parse() {
         assert_eq!(format_decimal(1230, 2), "12.30");
+        // A typed DECIMAL drops the leading zero exactly when it has no
+        // integer digits (DuckDB's rendering).
+        assert_eq!(format_decimal_typed(25, 2, 2), ".25");
+        assert_eq!(format_decimal_typed(-5, 2, 2), "-.05");
+        assert_eq!(format_decimal_typed(0, 3, 2), "0.00");
+        assert_eq!(format_decimal_typed(25, 3, 2), "0.25");
         assert_eq!(format_decimal(-5, 2), "-0.05");
         assert_eq!(format_decimal(5, 0), "5");
         assert_eq!(format_decimal(0, 3), "0.000");

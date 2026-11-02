@@ -441,6 +441,7 @@ pub(crate) fn dtype_name(dtype: DataType) -> String {
         DataType::Timestamp => "timestamp",
         DataType::Interval => "interval",
         DataType::Variant => "variant",
+        DataType::Uuid => "uuid",
         DataType::Decimal { .. } | DataType::Array { .. } => unreachable!("handled above"),
     }
     .to_string()
@@ -467,6 +468,7 @@ pub(crate) fn dtype_from_name(name: &str) -> Option<DataType> {
         "timestamp" => DataType::Timestamp,
         "interval" => DataType::Interval,
         "variant" => DataType::Variant,
+        "uuid" => DataType::Uuid,
         _ => return None,
     })
 }
@@ -484,9 +486,13 @@ pub(crate) fn encode_value(dtype: DataType, v: &Value) -> Option<String> {
         // Bit-exact: JSON has no NaN/±INF and `-0.0` must stay distinguishable.
         (DataType::Double, Value::Double(x)) => format!("{:016x}", x.to_bits()),
         (DataType::Varchar, Value::Varchar(s)) => s.clone(),
-        (DataType::Decimal { scale, .. }, Value::Decimal(x, s)) if *s == scale => {
-            pinkdb::types::format_decimal(*x, *s)
-        }
+        (DataType::Uuid, Value::Uuid(bits)) => pinkdb::uuid::format(*bits),
+        (
+            DataType::Decimal { scale, .. },
+            Value::Decimal {
+                value: x, scale: s, ..
+            },
+        ) if *s == scale => pinkdb::types::format_decimal(*x, *s),
         (
             DataType::Interval,
             Value::Interval {
@@ -525,7 +531,7 @@ pub(crate) fn decode_value(dtype: DataType, s: &str) -> Option<Value> {
             Value::Double(f64::from_bits(u64::from_str_radix(s, 16).ok()?))
         }
         DataType::Varchar => Value::Varchar(s.to_string()),
-        DataType::Decimal { precision, scale } => Value::Decimal(
+        DataType::Decimal { precision, scale } => Value::decimal(
             pinkdb::types::parse_decimal_str(s, precision, scale).ok()?,
             scale,
         ),
@@ -544,6 +550,7 @@ pub(crate) fn decode_value(dtype: DataType, s: &str) -> Option<Value> {
                 micros: iv.micros,
             }
         }
+        DataType::Uuid => Value::Uuid(pinkdb::uuid::parse(s)?),
         DataType::Variant => {
             return None;
         }
@@ -653,6 +660,7 @@ mod tests {
     fn saved(dtype: DataType, min: Option<Value>, max: Option<Value>) -> SavedTableStats {
         SavedTableStats {
             db: "main".to_string(),
+            schema: "main".to_string(),
             table: "t".to_string(),
             rows: min.iter().chain(max.iter()).count() as u64,
             columns: vec![pinkdb::persist::SavedColumnStats {

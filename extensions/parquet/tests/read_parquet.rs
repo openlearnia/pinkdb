@@ -329,7 +329,7 @@ fn reads_types_nulls_and_projection() {
     assert_eq!(rows[1][0], Value::Integer(1));
     assert_eq!(rows[1][4], Value::Date(0));
     assert_eq!(rows[1][5], Value::Timestamp(1_000_000));
-    assert_eq!(rows[1][6], Value::Decimal(125, 2));
+    assert_eq!(rows[1][6], Value::decimal(125, 2));
     assert_eq!(rows[0][1], Value::Null);
     assert_eq!(rows[2][0], Value::Null);
     assert_eq!(rows[2][2], Value::Null);
@@ -843,8 +843,8 @@ fn reads_the_committed_duckdb_fixtures() {
     assert_eq!(rows[5][2], Value::Null);
     assert_eq!(rows[0][3], Value::Date(19723));
     assert_eq!(rows[0][4], Value::Boolean(true));
-    assert_eq!(rows[0][5], Value::Decimal(0, 2));
-    assert_eq!(rows[7][5], Value::Decimal(7, 2));
+    assert_eq!(rows[0][5], Value::decimal(0, 2));
+    assert_eq!(rows[7][5], Value::decimal(7, 2));
 
     // gzip decodes through the same path.
     let gzip = bench_fixture("gzip.parquet");

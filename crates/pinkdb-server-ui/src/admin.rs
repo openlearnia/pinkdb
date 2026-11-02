@@ -72,8 +72,8 @@ fn read_access(shared: &Shared, session: &UiSession) -> Result<Access, String> {
     .collect();
     let grants: Vec<GrantRow> = rows(
         &mut conn,
-        "SELECT \"principal\", \"privilege\", \"object_type\", \"database\", \"name\" \
-         FROM pinkdb_grants() ORDER BY 1, 3, 4, 5, 2",
+        "SELECT \"principal\", \"privilege\", \"object_type\", \"database\", \"schema\", \"name\" \
+         FROM pinkdb_grants() ORDER BY 1, 3, 4, 5, 6, 2",
     )?
     .into_iter()
     .map(|r| GrantRow {
@@ -81,7 +81,8 @@ fn read_access(shared: &Shared, session: &UiSession) -> Result<Access, String> {
         privilege: text(&r, 1).unwrap_or_default(),
         object_type: text(&r, 2).unwrap_or_default(),
         database: text(&r, 3),
-        name: text(&r, 4),
+        schema: text(&r, 4),
+        name: text(&r, 5),
     })
     .collect();
     let admin = match &session.identity {

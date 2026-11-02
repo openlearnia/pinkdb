@@ -171,6 +171,19 @@ fn store() -> Database {
     db
 }
 
+/// A store with a second schema holding a table and an empty second schema.
+fn store_with_schemas() -> Database {
+    let db = store();
+    let mut conn = db.connect();
+    conn.execute("CREATE SCHEMA audit").expect("create audit");
+    conn.execute("CREATE TABLE audit.log (n INTEGER)")
+        .expect("create the audit table");
+    conn.execute("INSERT INTO audit.log VALUES (1), (2)")
+        .expect("insert the audit rows");
+    conn.execute("CREATE SCHEMA empty").expect("create empty");
+    db
+}
+
 /// The default options (fast timeouts, a small page bound).
 fn options() -> UiOptions {
     UiOptions {
@@ -290,16 +303,27 @@ fn the_databases_endpoint_returns_the_catalog() {
 }
 
 #[test]
-fn the_schemas_endpoint_returns_the_schemas() {
-    let fixture = Fixture::start(store(), options());
+fn the_schemas_endpoint_returns_every_schema() {
+    let fixture = Fixture::start(store_with_schemas(), options());
     let response = get(fixture.addr(), "/api/schemas?db=main");
     assert_eq!(response.status, 200);
     let body = response.json();
     assert_eq!(body["db"], "main");
     let schemas = body["schemas"].as_array().expect("an array of schemas");
-    assert_eq!(schemas.len(), 1);
-    assert_eq!(schemas[0]["name"], "main");
-    assert_eq!(schemas[0]["relations"], 2);
+    assert_eq!(schemas.len(), 3, "{body}");
+    assert_eq!(schemas[0]["name"], "audit");
+    assert_eq!(schemas[0]["relations"], 1);
+    assert_eq!(schemas[1]["name"], "empty");
+    assert_eq!(schemas[1]["relations"], 0);
+    assert_eq!(schemas[2]["name"], "main");
+    assert_eq!(schemas[2]["relations"], 2);
+}
+
+#[test]
+fn a_missing_database_has_no_schemas() {
+    let fixture = Fixture::start(store(), options());
+    let response = get(fixture.addr(), "/api/schemas?db=nope");
+    assert_eq!(response.status, 404, "{}", response.body);
 }
 
 #[test]
@@ -317,6 +341,29 @@ fn the_tables_endpoint_returns_the_relations_and_their_columns() {
     let columns = first["columns"].as_array().expect("an array of columns");
     assert_eq!(columns[0]["name"], "x");
     assert_eq!(columns[0]["type"], "BIGINT");
+}
+
+#[test]
+fn the_tables_endpoint_serves_any_schema() {
+    let fixture = Fixture::start(store_with_schemas(), options());
+    let body = get(fixture.addr(), "/api/tables?db=main&schema=audit").json();
+    assert_eq!(body["schema"], "audit");
+    let tables = body["tables"].as_array().expect("an array of tables");
+    assert_eq!(tables.len(), 1, "{body}");
+    assert_eq!(tables[0]["name"], "log");
+
+    let body = get(fixture.addr(), "/api/tables?db=main&schema=empty").json();
+    assert_eq!(body["schema"], "empty");
+    assert!(body["tables"].as_array().expect("tables").is_empty());
+
+    let response = get(fixture.addr(), "/api/tables?db=main&schema=nope");
+    assert_eq!(response.status, 404, "{}", response.body);
+    assert!(
+        response.json()["error"]
+            .as_str()
+            .expect("an error")
+            .contains("not found")
+    );
 }
 
 #[test]

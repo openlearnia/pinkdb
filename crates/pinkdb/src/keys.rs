@@ -58,10 +58,10 @@ pub(crate) struct KeySpace {
 /// key", so a keyless table never pays for a map.
 pub(crate) fn take_or_build(
     db: &mut crate::storage::PinkDb,
-    db_name: &str,
+    ns: &crate::storage::SchemaPath,
     table: &str,
 ) -> Result<Option<KeySpace>> {
-    let t = db.table_mut_in(db_name, table)?;
+    let t = db.table_mut_in(ns, table)?;
     if t.constraints.keys.is_empty() {
         return Ok(None);
     }
@@ -80,11 +80,11 @@ pub(crate) fn take_or_build(
 /// Put a map (built, taken or already empty) back into the table.
 pub(crate) fn store(
     db: &mut crate::storage::PinkDb,
-    db_name: &str,
+    ns: &crate::storage::SchemaPath,
     table: &str,
     keys: Option<KeySpace>,
 ) {
-    if let Ok(t) = db.table_mut_in(db_name, table) {
+    if let Ok(t) = db.table_mut_in(ns, table) {
         t.key_index = keys.map(|mut k| {
             k.version = t.version;
             k
@@ -93,8 +93,12 @@ pub(crate) fn store(
 }
 
 /// Drop the cache after a mutation that moved rows (deletes shift indices).
-pub(crate) fn invalidate(db: &mut crate::storage::PinkDb, db_name: &str, table: &str) {
-    if let Ok(t) = db.table_mut_in(db_name, table) {
+pub(crate) fn invalidate(
+    db: &mut crate::storage::PinkDb,
+    ns: &crate::storage::SchemaPath,
+    table: &str,
+) {
+    if let Ok(t) = db.table_mut_in(ns, table) {
         t.key_index = None;
     }
 }

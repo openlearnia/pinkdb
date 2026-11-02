@@ -975,10 +975,13 @@ fn old_v2_wal_upgrades_cleanly() {
     cli.marker("INSERT INTO t VALUES (3);", "post-upgrade");
     cli.quit();
 
-    // The WAL is v5 now: version 5, a nonzero wal_id, records preserved.
+    // The WAL is at the current version now: a nonzero wal_id, records kept.
     let data = std::fs::read(&wal).unwrap();
     assert_eq!(&data[..8], b"PINKWAL1");
-    assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 5);
+    assert_eq!(
+        u32::from_le_bytes(data[8..12].try_into().unwrap()),
+        pinkdb::wal::WAL_VERSION
+    );
     assert_ne!(&data[20..36], [0u8; 16], "fresh wal_id");
     verify(&ckpt, &[0, 1, 2, 3]);
     cleanup(&ckpt);
@@ -1341,7 +1344,7 @@ fn attached_lake_survives_a_full_rebuild() {
     ));
     b.wait_for("Database lake created.");
     b.expect_marker(
-        "SELECT 'attached-3' AS m FROM lake.lt WHERE i = 3;",
+        "SELECT 'attached-3' AS m FROM lake.lake.lt WHERE i = 3;",
         "attached-3",
     );
 
@@ -1349,13 +1352,13 @@ fn attached_lake_survives_a_full_rebuild() {
     // rebuild (new WAL incarnation + new checkpoint identity).
     a.marker("INSERT INTO t VALUES (11); checkpoint;", "a-ckpt");
     b.expect_marker(
-        "SELECT 'still-attached' AS m FROM lake.lt WHERE i = 3;",
+        "SELECT 'still-attached' AS m FROM lake.lake.lt WHERE i = 3;",
         "still-attached",
     );
     // The attachment still answers every query shape, and the durable side
     // of the rebuild is right too.
     b.expect_marker(
-        "SELECT 'attached-count' AS m FROM lake.lt HAVING COUNT(*) = 3;",
+        "SELECT 'attached-count' AS m FROM lake.lake.lt HAVING COUNT(*) = 3;",
         "attached-count",
     );
     b.expect_marker("SELECT 'sees-11' AS m FROM t WHERE a = 11;", "sees-11");

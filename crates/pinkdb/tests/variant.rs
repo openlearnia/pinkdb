@@ -62,6 +62,7 @@ fn every_stored_type_casts_into_variant() {
         "SELECT typeof(CAST(1 AS VARIANT)),
                 variant_type(CAST(true AS VARIANT)),
                 variant_type(CAST(1 AS VARIANT)),
+                variant_type(CAST(1.5e0 AS VARIANT)),
                 variant_type(CAST(1.5 AS VARIANT)),
                 variant_type(CAST(CAST(1.25 AS DECIMAL(10,2)) AS VARIANT)),
                 variant_type(CAST('\"s\"' AS VARIANT)),
@@ -80,6 +81,8 @@ fn every_stored_type_casts_into_variant() {
             text("BOOL"),
             text("BIGINT"),
             text("DOUBLE"),
+            // A decimal literal is DECIMAL, in VARIANT as in the engine.
+            text("DECIMAL"),
             text("DECIMAL"),
             text("VARCHAR"),
             text("DATE"),
@@ -114,7 +117,7 @@ fn variant_casts_back_to_every_scalar() {
             Value::Integer(42),
             Value::Bigint(42),
             Value::Double(1.5),
-            Value::Decimal(125, 2),
+            Value::decimal(125, 2),
             // VARIANT -> VARCHAR is the JSON text (quoted), unlike DuckDB's
             // scalar text extraction; the JSON round trip needs the quotes.
             Value::Varchar("\"hi\"".into()),
@@ -139,7 +142,7 @@ fn variant_casts_back_to_every_scalar() {
             Value::Integer(5),
             Value::Double(1000.0),
             Value::Boolean(false),
-            Value::Decimal(12300, 2),
+            Value::decimal(12300, 2),
             // pinkdb rounds a DOUBLE like DuckDB does.
             Value::Integer(2),
             Value::Integer(-2),

@@ -23,8 +23,8 @@ use crate::state::{App, Section, encode};
 pub enum Route {
     /// The worksheets; the saved worksheet's id when it has one.
     Query(Option<String>),
-    /// The catalog; an object `(database, name)` when one is open.
-    Catalog(Option<(String, String)>),
+    /// The catalog; an object `(database, schema, name)` when one is open.
+    Catalog(Option<(String, String, String)>),
     History,
     Access,
     Storage,
@@ -63,7 +63,9 @@ pub fn parse(path: &str) -> Route {
     match parts.as_slice() {
         ["query", id] => Route::Query(Some(decode(id))),
         ["catalog"] => Route::Catalog(None),
-        ["catalog", db, name] => Route::Catalog(Some((decode(db), decode(name)))),
+        ["catalog", db, schema, name] => {
+            Route::Catalog(Some((decode(db), decode(schema), decode(name))))
+        }
         ["history"] => Route::History,
         ["access"] => Route::Access,
         ["storage"] => Route::Storage,
@@ -78,7 +80,12 @@ pub fn path(route: &Route) -> String {
         Route::Query(None) => "/query".to_string(),
         Route::Query(Some(id)) => format!("/query/{}", encode(id)),
         Route::Catalog(None) => "/catalog".to_string(),
-        Route::Catalog(Some((db, name))) => format!("/catalog/{}/{}", encode(db), encode(name)),
+        Route::Catalog(Some((db, schema, name))) => format!(
+            "/catalog/{}/{}/{}",
+            encode(db),
+            encode(schema),
+            encode(name)
+        ),
         Route::History => "/history".to_string(),
         Route::Access => "/access".to_string(),
         Route::Storage => "/storage".to_string(),
@@ -156,7 +163,7 @@ fn title(app: App) -> String {
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| "Untitled".to_string()),
         Section::Catalog => match app.selected.get() {
-            Some((db, name)) => format!("{db}.{name}"),
+            Some((db, schema, name)) => format!("{db}.{schema}.{name}"),
             None => "Catalog".to_string(),
         },
         Section::History => "Query history".to_string(),
@@ -212,7 +219,11 @@ mod tests {
             Route::Query(None),
             Route::Query(Some("w 1".to_string())),
             Route::Catalog(None),
-            Route::Catalog(Some(("my db".to_string(), "a/b".to_string()))),
+            Route::Catalog(Some((
+                "my db".to_string(),
+                "s 1".to_string(),
+                "a/b".to_string(),
+            ))),
             Route::History,
             Route::Access,
             Route::Storage,
@@ -221,8 +232,12 @@ mod tests {
             assert_eq!(parse(&path(&route)), route, "{route:?}");
         }
         assert_eq!(
-            path(&Route::Catalog(Some(("my db".into(), "a/b".into())))),
-            "/catalog/my%20db/a%2Fb"
+            path(&Route::Catalog(Some((
+                "my db".into(),
+                "s 1".into(),
+                "a/b".into()
+            )))),
+            "/catalog/my%20db/s%201/a%2Fb"
         );
         assert_eq!(parse("/"), Route::Query(None));
         assert_eq!(parse("/nope/x"), Route::Query(None));

@@ -264,6 +264,21 @@ pub fn scan_source(
     })
 }
 
+/// Stream one parquet object through a positional [`RangeSource`], one row
+/// group at a time, pruning pages through the column index when the file has
+/// one (wave 133a). The lake uses this so a scan holds one row group, not the
+/// file, and reads only the surviving pages' byte ranges.
+pub fn scan_source_streamed(
+    path: &str,
+    source: Arc<dyn RangeSource>,
+    projection: Option<&[usize]>,
+    filters: &[PrunePredicate],
+    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+) -> Result<scan::RangedStream> {
+    let resolved = resolve::resolve_source(path, source)?;
+    scan::scan_page_streamed(&resolved, projection, filters, sink)
+}
+
 /// Read one object's parquet metadata (footer only, no data pages) through a
 /// positional [`RangeSource`]. This is the lake provider's footer read.
 pub fn read_meta_source(path: &str, source: Arc<dyn RangeSource>) -> Result<FileMeta> {

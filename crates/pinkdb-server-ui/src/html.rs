@@ -20,6 +20,8 @@ pub type Cell = (String, bool, bool);
 pub struct PreviewPage {
     /// The database the rows come from.
     pub db: String,
+    /// The schema the rows come from.
+    pub schema: String,
     /// The relation the rows come from.
     pub table: String,
     /// The 1-based page number.
@@ -90,7 +92,7 @@ pub fn preview_page(page: &PreviewPage) -> Markup {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "pinkdb — " (page.db) "." (page.table) }
+                title { "pinkdb — " (page.db) "." (page.schema) "." (page.table) }
                 link rel="icon" type="image/svg+xml" href=(FAVICON);
                 link rel="stylesheet" href="/assets/console.css";
             }
@@ -100,7 +102,7 @@ pub fn preview_page(page: &PreviewPage) -> Markup {
                     span class="brand__name" { "pinkdb " span class="brand__sub" { "Warehouse" } }
                     span class="topbar__sep" {}
                     span class="crumbs" {
-                        (page.db) span class="crumbs__sep" { "›" } span class="mono" { (page.table) }
+                        (page.db) span class="crumbs__sep" { "›" } (page.schema) span class="crumbs__sep" { "›" } span class="mono" { (page.table) }
                     }
                     span class="spacer" {}
                     span class="badge badge--warning" { "Read-only preview" }
@@ -163,8 +165,9 @@ pub fn preview_page(page: &PreviewPage) -> Markup {
 /// The link to another page of the same preview.
 fn page_link(page: &PreviewPage, target: u64) -> String {
     format!(
-        "/preview?db={}&table={}&page={}&page_size={}",
+        "/preview?db={}&schema={}&table={}&page={}&page_size={}",
         url_encode(&page.db),
+        url_encode(&page.schema),
         url_encode(&page.table),
         target,
         page.page_size

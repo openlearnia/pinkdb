@@ -16,7 +16,7 @@ use super::{Cx, Memo, eval};
 use crate::array::ArrayElems;
 use crate::plan::{compare_values, num_cmp};
 use crate::sql::ast::BinaryOp;
-use crate::sql::binder::{BoundExpr, OuterBind, ScalarFunc, common_numeric};
+use crate::sql::binder::{BoundExpr, OuterBind, ScalarFunc, Volatile, common_numeric};
 use crate::types::FastSet;
 use crate::types::{
     DataType, POW10_I128, PinkDbError, Result, Value, decimal_fits, format_decimal, rescale_decimal,
@@ -194,10 +194,14 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
             _ => eval_arith(*op, *dtype, left, right, chunk, cx),
         },
         BoundExpr::Scalar {
-            func: ScalarFunc::Uuid,
-            ..
-        } => random_uuids(chunk.num_rows()),
-        BoundExpr::Scalar { func, args, dtype } => {
+            func,
+            args,
+            dtype,
+            volatile: Some(v),
+        } => eval_volatile(*func, *dtype, args, *v, chunk, cx),
+        BoundExpr::Scalar {
+            func, args, dtype, ..
+        } => {
             let mut vecs = Vec::with_capacity(args.len());
             for a in args {
                 vecs.push(eval_expr(a, chunk, cx)?);
@@ -973,6 +977,9 @@ fn eval_comparison(
                     &mut out,
                 )?;
             }
+            (VectorData::Uuid(a), VectorData::Uuid(b)) => {
+                cmp_loop(op, &l, &r, a, b, |x, y| x.cmp(y), &mut out)?;
+            }
             (VectorData::Variant(a), VectorData::Variant(b)) => {
                 // `variant::cmp` is the same total order (and equality) that
                 // `compare_values` uses, so `=` here agrees with GROUP BY.
@@ -1097,7 +1104,14 @@ impl<'a> ScalarCmp<'a> {
             (V::Float64(a), Value::Integer(s)) => CmpKind::FloatInt(a, *s as i128),
             (V::Float64(a), Value::Bigint(s)) => CmpKind::FloatInt(a, *s as i128),
             (V::Float64(a), Value::Double(s)) => CmpKind::FloatFloat(a, *s),
-            (V::Float64(a), Value::Decimal(s, ss)) => CmpKind::FloatDec(a, *s, *ss),
+            (
+                V::Float64(a),
+                Value::Decimal {
+                    value: s,
+                    scale: ss,
+                    ..
+                },
+            ) => CmpKind::FloatDec(a, *s, *ss),
             (V::Decimal { values, scale, .. }, Value::Integer(s)) => {
                 CmpKind::DecInt(values, *scale, *s as i128)
             }
@@ -1107,9 +1121,14 @@ impl<'a> ScalarCmp<'a> {
             (V::Decimal { values, scale, .. }, Value::Double(s)) => {
                 CmpKind::DecFloat(values, *scale, *s)
             }
-            (V::Decimal { values, scale, .. }, Value::Decimal(s, ss)) => {
-                CmpKind::DecDec(values, *scale, *s, *ss)
-            }
+            (
+                V::Decimal { values, scale, .. },
+                Value::Decimal {
+                    value: s,
+                    scale: ss,
+                    ..
+                },
+            ) => CmpKind::DecDec(values, *scale, *s, *ss),
             (V::Boolean(a), Value::Boolean(s)) => CmpKind::Bool(a, *s),
             // One `Arc<str>` for the scalar (one allocation per chunk)
             // instead of one clone per element.
@@ -1680,15 +1699,20 @@ fn coerce_value(v: Value, target: DataType) -> Result<Value> {
         (Value::Integer(i), DataType::Bigint) => Ok(Value::Bigint(i as i64)),
         (Value::Integer(i), DataType::Double) => Ok(Value::Double(i as f64)),
         (Value::Bigint(i), DataType::Double) => Ok(Value::Double(i as f64)),
-        (Value::Decimal(x, from), DataType::Double) => {
-            Ok(Value::Double(crate::types::decimal_to_f64(x, from)))
-        }
+        (
+            Value::Decimal {
+                value: x,
+                scale: from,
+                ..
+            },
+            DataType::Double,
+        ) => Ok(Value::Double(crate::types::decimal_to_f64(x, from))),
         // INSERT/UPDATE coercion of a VARCHAR cell into the target column
         // type parses like a cast (DuckDB accepts string literals for typed
         // columns).
         (Value::Varchar(s), DataType::Decimal { precision, scale }) => {
             crate::types::parse_decimal_str(&s, precision, scale)
-                .map(|x| Value::Decimal(x, scale))
+                .map(|x| Value::decimal(x, scale))
                 .map_err(PinkDbError::Type)
         }
         (Value::Varchar(s), DataType::Interval) => match crate::types::parse_interval(&s) {
@@ -1701,7 +1725,14 @@ fn coerce_value(v: Value, target: DataType) -> Result<Value> {
                 "cannot parse \"{s}\" as INTERVAL"
             ))),
         },
-        (Value::Decimal(x, from), DataType::Decimal { precision, scale }) => {
+        (
+            Value::Decimal {
+                value: x,
+                scale: from,
+                ..
+            },
+            DataType::Decimal { precision, scale },
+        ) => {
             let y = crate::types::rescale_decimal(x, from, scale)
                 .filter(|y| crate::types::decimal_fits(*y, precision))
                 .ok_or_else(|| {
@@ -1710,11 +1741,11 @@ fn coerce_value(v: Value, target: DataType) -> Result<Value> {
                         crate::types::format_decimal(x, from)
                     ))
                 })?;
-            Ok(Value::Decimal(y, scale))
+            Ok(Value::decimal(y, scale))
         }
         (Value::Integer(i), DataType::Decimal { precision, scale }) => {
             crate::types::int_to_decimal(i as i128, precision, scale)
-                .map(|x| Value::Decimal(x, scale))
+                .map(|x| Value::decimal(x, scale))
                 .ok_or_else(|| {
                     PinkDbError::Execution(format!(
                         "cannot coerce {i} to DECIMAL({precision},{scale}): value out of range"
@@ -1723,7 +1754,7 @@ fn coerce_value(v: Value, target: DataType) -> Result<Value> {
         }
         (Value::Bigint(i), DataType::Decimal { precision, scale }) => {
             crate::types::int_to_decimal(i as i128, precision, scale)
-                .map(|x| Value::Decimal(x, scale))
+                .map(|x| Value::decimal(x, scale))
                 .ok_or_else(|| {
                     PinkDbError::Execution(format!(
                         "cannot coerce {i} to DECIMAL({precision},{scale}): value out of range"
@@ -1745,9 +1776,14 @@ fn negate_value(v: Value, dtype: DataType) -> Result<Value> {
             .map(Value::Bigint)
             .ok_or_else(|| overflow_err("negation", "BIGINT", format_args!("-({i})"))),
         (Value::Double(x), DataType::Double) => Ok(Value::Double(-x)),
-        (Value::Decimal(x, scale), DataType::Decimal { .. }) => x
+        (
+            Value::Decimal {
+                value: x, scale, ..
+            },
+            DataType::Decimal { .. },
+        ) => x
             .checked_neg()
-            .map(|y| Value::Decimal(y, scale))
+            .map(|y| Value::decimal(y, scale))
             .ok_or_else(|| overflow_err("negation", "DECIMAL", format_args!("-({x})"))),
         (
             Value::Interval {
@@ -1802,9 +1838,11 @@ fn eval_arith(
         return eval_decimal_mul(&l, &r, dtype);
     }
     // Integer division by zero errors even though `/` widens to DOUBLE
-    // (DuckDB rule); 0.0/0.0 with a float operand stays IEEE Inf/NaN.
-    let int_div =
-        op == BinaryOp::Divide && l.dtype() != DataType::Double && r.dtype() != DataType::Double;
+    // (DuckDB rule); 0.0/0.0 with a float or decimal operand stays IEEE Inf/NaN
+    // (`CAST(1 AS DECIMAL(10,0)) / 0` is `inf`).
+    let int_div = op == BinaryOp::Divide
+        && matches!(l.dtype(), DataType::Integer | DataType::Bigint)
+        && matches!(r.dtype(), DataType::Integer | DataType::Bigint);
     // Move instead of deep-cloning when a side already has the target dtype.
     let l = if l.dtype() == dtype {
         l
@@ -2204,7 +2242,7 @@ fn eval_decimal_const(
     };
     if !matches!(
         lit,
-        Value::Integer(_) | Value::Bigint(_) | Value::Decimal(..)
+        Value::Integer(_) | Value::Bigint(_) | Value::Decimal { .. }
     ) || matches!(column, BoundExpr::Literal(_))
     {
         return Ok(None);
@@ -2225,7 +2263,7 @@ fn eval_decimal_const(
     if *col_scale != scale || *src > precision {
         return Ok(None);
     }
-    let Value::Decimal(k, _) = coerce_value(lit.clone(), dtype)? else {
+    let Value::Decimal { value: k, .. } = coerce_value(lit.clone(), dtype)? else {
         return Ok(None);
     };
     Ok(Some(arith_decimal_const(
@@ -2379,7 +2417,9 @@ fn as_interval_number(v: &Value) -> Result<f64> {
         Value::Integer(i) => Ok(*i as f64),
         Value::Bigint(i) => Ok(*i as f64),
         Value::Double(x) => Ok(*x),
-        Value::Decimal(x, scale) => Ok(crate::types::decimal_to_f64(*x, *scale)),
+        Value::Decimal {
+            value: x, scale, ..
+        } => Ok(crate::types::decimal_to_f64(*x, *scale)),
         v => Err(PinkDbError::Execution(format!(
             "interval arithmetic needs a number, got {v}"
         ))),
@@ -2526,7 +2566,18 @@ fn arith_values(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
             Ok(Value::Double(v))
         }
         // Decimal `+`/`-`/`%`: both values arrive at the result scale.
-        (Value::Decimal(a, sa), Value::Decimal(b, sb)) => {
+        (
+            Value::Decimal {
+                value: a,
+                scale: sa,
+                ..
+            },
+            Value::Decimal {
+                value: b,
+                scale: sb,
+                ..
+            },
+        ) => {
             debug_assert_eq!(sa, sb, "decimal values are coerced to one scale");
             let scale = sa.max(sb);
             let (a, b) = if sa < sb {
@@ -2550,7 +2601,7 @@ fn arith_values(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
                 }
                 _ => unreachable!("binder types {op:?} on DECIMAL"),
             };
-            v.map(|v| Value::Decimal(v, scale))
+            v.map(|v| Value::decimal(v, scale))
                 .ok_or_else(|| PinkDbError::Execution("Overflow in DECIMAL arithmetic".to_string()))
         }
         (l, r) => Err(PinkDbError::Execution(format!(
@@ -2566,7 +2617,9 @@ fn as_i64(v: &Value) -> Result<i64> {
         Value::Integer(i) => Ok(*i as i64),
         Value::Bigint(i) => Ok(*i),
         Value::Double(x) => Ok(*x as i64),
-        Value::Decimal(x, scale) => crate::types::rescale_decimal(*x, *scale, 0)
+        Value::Decimal {
+            value: x, scale, ..
+        } => crate::types::rescale_decimal(*x, *scale, 0)
             .and_then(|v| i64::try_from(v).ok())
             .ok_or_else(|| PinkDbError::Execution(format!("expected numeric, got {v}"))),
         _ => Err(PinkDbError::Execution(format!("expected numeric, got {v}"))),
@@ -2578,7 +2631,9 @@ fn as_f64(v: &Value) -> Result<f64> {
         Value::Integer(i) => Ok(*i as f64),
         Value::Bigint(i) => Ok(*i as f64),
         Value::Double(x) => Ok(*x),
-        Value::Decimal(x, scale) => Ok(crate::types::decimal_to_f64(*x, *scale)),
+        Value::Decimal {
+            value: x, scale, ..
+        } => Ok(crate::types::decimal_to_f64(*x, *scale)),
         _ => Err(PinkDbError::Execution(format!("expected numeric, got {v}"))),
     }
 }
@@ -2587,19 +2642,25 @@ fn as_f64(v: &Value) -> Result<f64> {
 /// family on DECIMAL: ABS keeps the type, ROUND/FLOOR/CEIL return
 /// DECIMAL(p, n)/DECIMAL(p, 0)).
 fn decimal_scalar(func: ScalarFunc, dtype: DataType, v: &Value) -> Result<Option<Value>> {
-    let Value::Decimal(x, scale) = v else {
+    let Value::Decimal {
+        value: x, scale, ..
+    } = v
+    else {
         return Ok(None);
     };
+    // SIGN returns INTEGER, so it does not need a DECIMAL result type.
+    if func == ScalarFunc::Sign {
+        return Ok(Some(Value::Integer(x.signum() as i32)));
+    }
     let DataType::Decimal { precision, .. } = dtype else {
         return Ok(None);
     };
     Ok(match func {
-        ScalarFunc::Abs => Some(Value::Decimal(
+        ScalarFunc::Abs => Some(Value::decimal(
             x.checked_abs()
                 .ok_or_else(|| overflow_err("abs", "DECIMAL", format_args!("abs({x})")))?,
             *scale,
         )),
-        ScalarFunc::Sign => Some(Value::Integer(x.signum() as i32)),
         // FLOOR rounds toward -inf, CEIL toward +inf (DuckDB: FLOOR(-1.5) =
         // -2, CEIL(-1.5) = -1); both return DECIMAL(p, 0).
         ScalarFunc::Floor => {
@@ -2611,7 +2672,7 @@ fn decimal_scalar(func: ScalarFunc, dtype: DataType, v: &Value) -> Result<Option
             let q = decimal_fits(q, precision)
                 .then_some(q)
                 .ok_or_else(|| overflow_err("floor", "DECIMAL", format_args!("floor of {v}")))?;
-            Some(Value::Decimal(q, 0))
+            Some(Value::decimal(q, 0))
         }
         ScalarFunc::Ceil => {
             let q = if *scale == 0 {
@@ -2622,41 +2683,62 @@ fn decimal_scalar(func: ScalarFunc, dtype: DataType, v: &Value) -> Result<Option
             let q = decimal_fits(q, precision)
                 .then_some(q)
                 .ok_or_else(|| overflow_err("ceil", "DECIMAL", format_args!("ceil of {v}")))?;
-            Some(Value::Decimal(q, 0))
+            Some(Value::decimal(q, 0))
         }
         // The general ROUND path handles decimal digits below.
         _ => None,
     })
 }
 
-/// `n` random version-4 UUIDs in their canonical text form.
-#[cfg(not(target_arch = "wasm32"))]
-fn random_uuids(n: usize) -> Result<Vector> {
-    let mut bytes = vec![0u8; n * 16];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|e| PinkDbError::Execution(format!("cannot obtain randomness for uuid(): {e}")))?;
-    let mut out = Vector::new_empty(DataType::Varchar);
-    for raw in bytes.as_chunks_mut::<16>().0 {
-        raw[6] = (raw[6] & 0x0f) | 0x40;
-        raw[8] = (raw[8] & 0x3f) | 0x80;
-        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
-        out.push_valid(Value::Varchar(format!(
-            "{}-{}-{}-{}-{}",
-            &hex[0..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..32]
-        )))?;
+/// Volatile built-ins (`uuid()`, `gen_random_uuid()`, `random()`): the value
+/// is `mix(seed, call site, chunk ordinal, row)` — a pure function of inputs
+/// fixed at bind and of the row's position in the operator's input, so a
+/// parallel run and a WAL replay produce the same values.
+fn eval_volatile(
+    func: ScalarFunc,
+    dtype: DataType,
+    args: &[BoundExpr],
+    v: Volatile,
+    chunk: &DataChunk,
+    cx: &Cx,
+) -> Result<Vector> {
+    // A volatile function has no arguments today; evaluate any that appear so
+    // their errors and NULL handling do not change.
+    for a in args {
+        eval_expr(a, chunk, cx)?;
     }
-    Ok(out)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn random_uuids(_n: usize) -> Result<Vector> {
-    Err(PinkDbError::Execution(
-        "uuid() needs OS randomness, which the wasm build has not".to_string(),
-    ))
+    let n = chunk.num_rows;
+    let chunk_ordinal = chunk.ordinal as u64;
+    // The statement seed (from the WAL record, or a fresh one) plus the nest,
+    // the call site, the chunk and the row: every input is
+    // scheduling-independent, so a replay draws the same bits.
+    let (seed, nest) = cx.db.volatile_evaluation()?;
+    let site = v.site;
+    match func {
+        ScalarFunc::Uuid => {
+            let mut out = Vector::new_empty(DataType::Uuid);
+            for row in 0..n {
+                let bits = crate::uuid::version4(crate::uuid::mix(
+                    seed,
+                    nest,
+                    site,
+                    chunk_ordinal,
+                    row as u64,
+                ));
+                out.push_uuid(bits)?;
+            }
+            Ok(out)
+        }
+        ScalarFunc::Random => {
+            let mut out = Vector::new_empty(dtype);
+            for row in 0..n {
+                let bits = crate::uuid::mix(seed, nest, site, chunk_ordinal, row as u64);
+                out.push_valid(Value::Double(crate::uuid::random_unit(bits)))?;
+            }
+            Ok(out)
+        }
+        other => Err(PinkDbError::Execution(format!("{other:?} is not volatile"))),
+    }
 }
 
 fn eval_scalar(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Result<Vector> {
@@ -3175,16 +3257,16 @@ fn decimal_round(x: i128, scale: u8, digits: i64, precision: u8) -> Result<Value
         )
     };
     if digits >= scale as i64 {
-        return Ok(Value::Decimal(x, scale));
+        return Ok(Value::decimal(x, scale));
     }
     if digits >= 0 {
         let want = digits as u8;
         let y = rescale_decimal(x, scale, want).ok_or_else(out_of_range)?;
-        return Ok(Value::Decimal(y, want));
+        return Ok(Value::decimal(y, want));
     }
     let drop = digits.unsigned_abs();
     if drop > 38 {
-        return Ok(Value::Decimal(0, 0));
+        return Ok(Value::decimal(0, 0));
     }
     let unit = POW10_I128[drop as usize];
     // Round x / unit half away from zero, then scale back up. `unit` is
@@ -3196,7 +3278,7 @@ fn decimal_round(x: i128, scale: u8, digits: i64, precision: u8) -> Result<Value
     let v = q
         .checked_mul(divisor)
         .filter(|v| decimal_fits(*v, precision));
-    v.map(|v| Value::Decimal(v, 0)).ok_or_else(out_of_range)
+    v.map(|v| Value::decimal(v, 0)).ok_or_else(out_of_range)
 }
 
 /// Half-away-from-zero integer division (positive divisor).
@@ -3226,12 +3308,15 @@ fn array_index(v: &Value) -> Result<Option<i64>> {
 
 fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Value> {
     // DECIMAL keeps the numeric family (ABS/ROUND/FLOOR/CEIL/SIGN).
-    if matches!(row[0], Value::Decimal(..)) {
+    if matches!(row[0], Value::Decimal { .. }) {
         if let Some(v) = decimal_scalar(func, dtype, &row[0])? {
             return Ok(v);
         }
         if func == ScalarFunc::Round {
-            let Value::Decimal(x, scale) = row[0] else {
+            let Value::Decimal {
+                value: x, scale, ..
+            } = row[0]
+            else {
                 unreachable!("checked above")
             };
             let DataType::Decimal { precision, .. } = dtype else {
@@ -3530,8 +3615,10 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
                 "contains of {s} and {search}"
             ))),
         },
-        ScalarFunc::Uuid => Err(PinkDbError::Execution(
-            "uuid() is evaluated per chunk".to_string(),
+        // Volatile: `eval_expr` routes both of these through
+        // `eval_volatile`, which owns the seed, so no row-wise path sees them.
+        ScalarFunc::Uuid | ScalarFunc::Random => Err(PinkDbError::Execution(
+            "the volatile built-ins are evaluated per chunk".to_string(),
         )),
         ScalarFunc::SimilarTo => match (&row[0], &row[1]) {
             (Value::Varchar(s), Value::Varchar(pat)) => {
@@ -3573,6 +3660,21 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
                     return Err(PinkDbError::Execution("mod by zero".to_string()));
                 }
                 Ok(Value::Integer(a.wrapping_rem(*b)))
+            }
+            // `mod()` is `%` with function syntax: both operands were cast to
+            // the same DECIMAL type, so the remainder stays on that scale.
+            (
+                Value::Decimal {
+                    value: a, scale, ..
+                },
+                Value::Decimal { value: b, .. },
+            ) => {
+                if *b == 0 {
+                    return Err(PinkDbError::Execution(
+                        "Division by zero in expression".to_string(),
+                    ));
+                }
+                Ok(Value::decimal(a.wrapping_rem(*b), *scale))
             }
             (a, b) => Err(PinkDbError::Execution(format!("mod of {a} and {b}"))),
         },
@@ -4501,9 +4603,14 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
         (Value::Integer(i), DataType::Bigint) => Ok(Value::Bigint(i as i64)),
         (Value::Integer(i), DataType::Double) => Ok(Value::Double(i as f64)),
         (Value::Bigint(i), DataType::Double) => Ok(Value::Double(i as f64)),
-        (Value::Decimal(x, from), DataType::Double) => {
-            Ok(Value::Double(crate::types::decimal_to_f64(x, from)))
-        }
+        (
+            Value::Decimal {
+                value: x,
+                scale: from,
+                ..
+            },
+            DataType::Double,
+        ) => Ok(Value::Double(crate::types::decimal_to_f64(x, from))),
         (Value::Bigint(i), DataType::Integer) => i32::try_from(i)
             .map(Value::Integer)
             .map_err(|_| cast_out_of_range(&Value::Bigint(i), DataType::Integer)),
@@ -4576,17 +4683,27 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
         // DECIMAL ↔ numeric. DECIMAL → INTEGER/BIGINT rounds half away from
         // zero (DuckDB: CAST(DECIMAL '12.7' AS INTEGER) = 13), DECIMAL →
         // DOUBLE divides by the power of ten in f64.
-        (Value::Decimal(x, scale), DataType::Integer) => {
+        (
+            Value::Decimal {
+                value: x, scale, ..
+            },
+            DataType::Integer,
+        ) => {
             let d =
                 crate::types::rescale_decimal(x, scale, 0).filter(|v| i32::try_from(*v).is_ok());
             d.map(|v| Value::Integer(v as i32))
-                .ok_or_else(|| cast_out_of_range(&Value::Decimal(x, scale), DataType::Integer))
+                .ok_or_else(|| cast_out_of_range(&Value::decimal(x, scale), DataType::Integer))
         }
-        (Value::Decimal(x, scale), DataType::Bigint) => {
+        (
+            Value::Decimal {
+                value: x, scale, ..
+            },
+            DataType::Bigint,
+        ) => {
             let d =
                 crate::types::rescale_decimal(x, scale, 0).filter(|v| i64::try_from(*v).is_ok());
             d.map(|v| Value::Bigint(v as i64))
-                .ok_or_else(|| cast_out_of_range(&Value::Decimal(x, scale), DataType::Bigint))
+                .ok_or_else(|| cast_out_of_range(&Value::decimal(x, scale), DataType::Bigint))
         }
         // Anything numeric → DECIMAL(precision, scale): rounding half away
         // from zero, precision overflow is an error.
@@ -4594,17 +4711,25 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
             let out = match &v {
                 Value::Integer(i) => crate::types::int_to_decimal(*i as i128, precision, scale),
                 Value::Bigint(i) => crate::types::int_to_decimal(*i as i128, precision, scale),
-                Value::Decimal(x, from) => crate::types::rescale_decimal(*x, *from, scale)
+                Value::Decimal {
+                    value: x,
+                    scale: from,
+                    ..
+                } => crate::types::rescale_decimal(*x, *from, scale)
                     .filter(|y| crate::types::decimal_fits(*y, precision)),
                 Value::Double(x) => crate::types::f64_to_decimal(*x, precision, scale),
                 Value::Varchar(s) => crate::types::parse_decimal_str(s, precision, scale).ok(),
                 _ => None,
             };
-            out.map(|y| Value::Decimal(y, scale))
+            out.map(|y| Value::decimal(y, scale))
                 .ok_or_else(|| cast_out_of_range(&v, DataType::Decimal { precision, scale }))
         }
         // VARCHAR → INTERVAL (INTERVAL → VARCHAR rides the generic
         // "everything formats to VARCHAR" arm above).
+        // VARCHAR → UUID: DuckDB accepts braces and upper case on input.
+        (Value::Varchar(s), DataType::Uuid) => crate::uuid::parse(&s)
+            .map(Value::Uuid)
+            .ok_or_else(|| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS UUID"))),
         (Value::Varchar(s), DataType::Interval) => crate::types::parse_interval(s.as_str())
             .map(|iv| Value::Interval {
                 months: iv.months,
@@ -5072,7 +5197,7 @@ mod tests {
     fn decimal_round_handles_i64_min_digits() {
         // `-digits` would overflow for i64::MIN; the helper must not panic
         // (SQL caps the digit count at INTEGER, but the helper defends anyway).
-        assert_eq!(decimal_round(15, 1, i64::MIN, 2).unwrap(), V::Decimal(0, 0));
+        assert_eq!(decimal_round(15, 1, i64::MIN, 2).unwrap(), V::decimal(0, 0));
     }
 
     fn chunk2() -> DataChunk {
@@ -5254,10 +5379,25 @@ mod tests {
         };
         let mut dec1 = Vector::new_empty(dec);
         dec1.push_null().unwrap();
-        dec1.push_valid(V::Decimal(150, 2)).unwrap();
+        dec1.push_valid(V::Decimal {
+            value: 150,
+            precision: 9,
+            scale: 2,
+        })
+        .unwrap();
         let mut dec2 = Vector::new_empty(dec);
-        dec2.push_valid(V::Decimal(250, 2)).unwrap();
-        dec2.push_valid(V::Decimal(350, 2)).unwrap();
+        dec2.push_valid(V::Decimal {
+            value: 250,
+            precision: 9,
+            scale: 2,
+        })
+        .unwrap();
+        dec2.push_valid(V::Decimal {
+            value: 350,
+            precision: 9,
+            scale: 2,
+        })
+        .unwrap();
         let mut date1 = Vector::new_empty(DataType::Date);
         date1.push_null().unwrap();
         date1.push_valid(V::Date(19000)).unwrap();
@@ -5290,7 +5430,18 @@ mod tests {
         );
         assert_eq!(
             got(vec![col(2, dec), col(3, dec)], dec),
-            [V::Decimal(250, 2), V::Decimal(150, 2)]
+            [
+                V::Decimal {
+                    value: 250,
+                    precision: 9,
+                    scale: 2,
+                },
+                V::Decimal {
+                    value: 150,
+                    precision: 9,
+                    scale: 2,
+                },
+            ]
         );
         assert_eq!(
             got(
@@ -5746,6 +5897,7 @@ mod tests {
                     dtype: DataType::Varchar,
                 }],
                 dtype,
+                volatile: None,
             };
             eval_expr(&e, &chunk, &cx).unwrap()
         };
@@ -5775,6 +5927,7 @@ mod tests {
                 dtype: DataType::Integer,
             }],
             dtype: DataType::Integer,
+            volatile: None,
         };
         let err = eval_expr(&abs, &chunk2, &cx).unwrap_err();
         assert!(
@@ -5797,6 +5950,7 @@ mod tests {
                 dtype: DataType::Double,
             }],
             dtype: DataType::Double,
+            volatile: None,
         };
         let out = eval_expr(&round, &chunk2, &cx).unwrap();
         assert_eq!((out.get(0), out.get(1)), (V::Double(3.0), V::Double(-3.0)));
@@ -5870,7 +6024,7 @@ mod tests {
             DataType::Timestamp => V::Timestamp(rng.below(200) as i64 * 86_400_000_000 - 1000),
             DataType::Decimal { precision, scale } => {
                 let wide = 10i128.pow(precision as u32 - scale as u32) - 1;
-                V::Decimal(
+                V::decimal(
                     match rng.below(5) {
                         0 => 0,
                         1 => wide,

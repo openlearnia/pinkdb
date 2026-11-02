@@ -627,7 +627,7 @@ fn creating_and_dropping_macros_need_database_create() {
         .expect_err("must be denied")
         .to_string();
     assert!(
-        e.contains("permission denied") && e.contains("CREATE privilege on database \"main\""),
+        e.contains("permission denied") && e.contains("CREATE privilege on schema \"main.main\""),
         "{e}"
     );
     let e = alice

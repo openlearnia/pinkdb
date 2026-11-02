@@ -1725,12 +1725,17 @@ pub(crate) struct ProcFrame {
     touched: crate::wal::FrameSets,
     /// The `(database, table)` pairs among those that were *written* (the ON
     /// COMMIT materialized-view trigger's dirty set).
-    writes: std::collections::HashSet<(String, String)>,
+    writes: std::collections::HashSet<crate::storage::TableRef>,
     /// Wave 83: set when the call used `COMMIT`/`ROLLBACK`. The runner then
     /// logs these statements (the final segment, executed in the named
     /// database) instead of the `CALL` text — re-running a call that
     /// committed part of its work would apply that part twice.
-    segment_log: Option<(String, Vec<String>)>,
+    segment_log: Option<(crate::storage::SchemaPath, Vec<String>)>,
+    /// The dynamic functions the body's statements reference, so the record
+    /// that carries the call (its text, or one segment at a time) can pin the
+    /// clock reading they bound (`now()` inside a body is as much part of the
+    /// record as one in the `CALL` statement itself).
+    memo_deps: Vec<String>,
 }
 
 impl ProcFrame {
@@ -1742,7 +1747,27 @@ impl ProcFrame {
         self.touched.extend(sets);
     }
 
-    pub(crate) fn add_writes(&mut self, writes: &std::collections::HashSet<(String, String)>) {
+    /// Note the dynamic functions a body statement bound.
+    pub(crate) fn add_memo_deps(&mut self, deps: &[String]) {
+        self.memo_deps.extend(deps.iter().cloned());
+    }
+
+    /// The dynamic functions the body's statements bound since the last
+    /// segment was logged.
+    pub(crate) fn memo_deps(&self) -> &[String] {
+        &self.memo_deps
+    }
+
+    /// A logged segment ends the record: the next one starts with no body
+    /// bindings of its own.
+    pub(crate) fn clear_memo_deps(&mut self) {
+        self.memo_deps.clear();
+    }
+
+    pub(crate) fn add_writes(
+        &mut self,
+        writes: &std::collections::HashSet<crate::storage::TableRef>,
+    ) {
         self.writes.extend(writes.iter().cloned());
     }
 
@@ -1756,19 +1781,23 @@ impl ProcFrame {
     /// The final segment to log instead of the `CALL` statement (wave 83),
     /// as `(database, statements)`; `None` for a call without transaction
     /// control (it logs its own text, as before).
-    pub(crate) fn segment_log(&self) -> Option<&(String, Vec<String>)> {
+    pub(crate) fn segment_log(&self) -> Option<&(crate::storage::SchemaPath, Vec<String>)> {
         self.segment_log.as_ref()
     }
 
     /// The set of tables the call wrote.
-    pub(crate) fn writes(&self) -> std::collections::HashSet<(String, String)> {
+    pub(crate) fn writes(&self) -> std::collections::HashSet<crate::storage::TableRef> {
         self.writes.clone()
     }
 
     /// The set of tables the call `read` (touched minus written).
-    pub(crate) fn reads(&self) -> std::collections::HashSet<(String, String)> {
-        let mut out: std::collections::HashSet<(String, String)> =
-            self.touched.table_pairs().iter().cloned().collect();
+    pub(crate) fn reads(&self) -> std::collections::HashSet<crate::storage::TableRef> {
+        let mut out: std::collections::HashSet<crate::storage::TableRef> = self
+            .touched
+            .table_refs()
+            .iter()
+            .map(|(db, schema, table)| (crate::storage::SchemaPath::new(db, schema), table.clone()))
+            .collect();
         for w in &self.writes {
             out.remove(w);
         }
@@ -1804,7 +1833,7 @@ struct Var {
 /// Per-call execution state.
 struct Frame<'a> {
     name: &'a str,
-    db_name: String,
+    db_name: crate::storage::SchemaPath,
     scopes: Vec<Vec<Var>>,
     /// Body statements executed so far (reported by `QueryResult::Called`).
     statements: usize,
@@ -1893,7 +1922,7 @@ impl<'a> Frame<'a> {
 /// call's result. See the module docs for the transaction/atomicity rule.
 pub(crate) fn execute_call(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     args: Vec<Value>,
     budget: &std::sync::Arc<crate::exec::ExecBudget>,
@@ -1906,7 +1935,7 @@ pub(crate) fn execute_call(
 /// transaction control.
 pub(crate) fn execute_do(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     budget: &std::sync::Arc<crate::exec::ExecBudget>,
 ) -> Result<QueryResult> {
@@ -1915,7 +1944,7 @@ pub(crate) fn execute_do(
 
 fn execute_call_kind(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     args: Vec<Value>,
     kind: CallKind,
@@ -1936,7 +1965,7 @@ fn execute_call_kind(
 
 fn execute_call_inner(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     args: Vec<Value>,
     kind: CallKind,
@@ -2004,7 +2033,7 @@ fn execute_call_inner(
 /// call-start snapshot, or the state at the body's last `COMMIT`/`ROLLBACK`.
 fn run_sql_body(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     scope: Vec<Var>,
     kind: CallKind,
@@ -2030,7 +2059,7 @@ fn run_sql_body(
         .then(Vec::new);
     let mut frame = Frame {
         name: &def.name,
-        db_name: db_name.to_string(),
+        db_name: db_name.clone(),
         scopes: vec![scope],
         statements: 0,
         last: None,
@@ -2071,7 +2100,7 @@ fn run_sql_body(
 #[cfg(feature = "js")]
 fn run_js_body(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     scope: Vec<Var>,
 ) -> Result<QueryResult> {
@@ -2082,7 +2111,7 @@ fn run_js_body(
 #[cfg(not(feature = "js"))]
 fn run_js_body(
     _db: &mut PinkDb,
-    _db_name: &str,
+    _db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     _scope: Vec<Var>,
 ) -> Result<QueryResult> {
@@ -2403,6 +2432,7 @@ fn eval_bound(
     let single = crate::vector::DataChunk {
         columns: Vec::new(),
         num_rows: 1,
+        ordinal: 0,
     };
     let cx = crate::exec::Cx::with_budget(db, frame.budget.clone());
     let v = crate::exec::expr::eval_expr(bound, &single, &cx)?;
@@ -2450,7 +2480,7 @@ fn exec_sql(
 /// language-specific "this statement cannot be part of a logged call" error.
 pub(crate) fn run_call_statement(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     slots: crate::sql::binder::ParamSlots,
     sql: &Statement,
     budget: Option<&std::sync::Arc<crate::exec::ExecBudget>>,
@@ -2459,8 +2489,11 @@ pub(crate) fn run_call_statement(
     let slots = slots.with_logged_procedure(db.is_durable());
     // `db` is the handle this call runs on, so its session is the caller's
     // (a network connection installs its own before running the statement).
-    let (plan, _dynamic) =
+    let (plan, dynamic_used) =
         crate::sql::binder::bind_tracked_with(db, sql, db_name, Some(slots), &db.session)?;
+    // The statement's clock reading (and anything else it recorded) has to
+    // reach the record that will carry this call, which may be a segment.
+    db.proc_frame.add_memo_deps(&dynamic_used);
     // Lazy index lifecycle: mutation times only set a flag (see
     // `PinkDb::rebuild_stale_indexes`).
     db.rebuild_stale_indexes();
@@ -2513,6 +2546,10 @@ pub(crate) fn run_call_statement(
     db.proc_frame.add_sets(&sets);
     db.proc_frame.add_writes(&writes);
     let wrote = crate::plan::writes_tables(&plan);
+    // A body statement joins the record being filled (the caller's segment or
+    // the statement that fired the trigger), so it draws from that record's
+    // seed at its own ordinal.
+    db.begin_volatile_statement(&plan)?;
     let result = match budget {
         Some(budget) => crate::exec::run_with_budget(db, &plan, budget.clone())?,
         None => crate::exec::run(db, &plan)?,
@@ -2561,7 +2598,14 @@ fn txn_control(db: &mut PinkDb, frame: &mut Frame, off: usize, commit: bool) -> 
             && !segment.is_empty()
         {
             let sets = db.proc_frame.touched();
-            let memo = frame.budget.take_external_calls();
+            // The segment's statements drew from the record's seed; it travels
+            // with the record so replay reproduces them.
+            let memo = frame
+                .budget
+                .take_external_calls()
+                .into_iter()
+                .chain(db.statement_memo(&[]))
+                .collect::<Vec<_>>();
             db.wal_append_session(
                 &frame.db_name,
                 &frame.db_name,
@@ -2569,9 +2613,13 @@ fn txn_control(db: &mut PinkDb, frame: &mut Frame, off: usize, commit: bool) -> 
                 &[],
                 &[],
                 Some(&sets),
+                None,
                 &memo,
             )?;
             segment.clear();
+            // The segment's clock reading is in its record now; the next
+            // segment's statements bind their own.
+            db.proc_frame.clear_memo_deps();
         }
     } else {
         if let Some(point) = frame.restore.take() {
@@ -2582,6 +2630,7 @@ fn txn_control(db: &mut PinkDb, frame: &mut Frame, off: usize, commit: bool) -> 
         }
         // The rolled-back segment is gone: so is what it recorded.
         frame.budget.take_external_calls();
+        db.proc_frame.clear_memo_deps();
     }
     frame.restore = Some(boxed_snapshot(db));
     frame.txn_controlled = true;
@@ -3027,7 +3076,7 @@ mod tests {
             vec![vec![
                 Value::Integer(1),
                 Value::Varchar("x".to_string()),
-                Value::Decimal(150, 2),
+                Value::decimal(150, 2),
                 Value::Date(19_724),
             ]]
         );

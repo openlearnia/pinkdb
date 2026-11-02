@@ -85,12 +85,13 @@ fn requests_round_trip() {
 /// `Login`/`LoggedIn` tags, and the seven RBAC `Done` kinds. Wave 84 adds the
 /// v10 profiling messages; wave 101a adds the VARIANT value and dtype tags;
 /// wave 95c adds the `SetVariable` `Done` kind (v12); wave 107a adds the ARRAY
-/// value (tag 11) and dtype (tag 10) tags (v13); wave 136a adds the memory
-/// limit and peak to the profile frame (v14).
+/// value (tag 11) and dtype (tag 10) tags (v13); wave 139b adds the UUID value
+/// (tag 12) and dtype (tag 11) tags (v15); wave 136a adds the memory limit and
+/// peak to the profile frame (v16).
 /// A change here is a protocol change and must bump [`PROTOCOL_VERSION`].
 #[test]
-fn protocol_v14_pins_the_variant_tags_and_keeps_the_v10_surface() {
-    assert_eq!(PROTOCOL_VERSION, 14);
+fn protocol_v16_pins_the_memory_profile_and_keeps_the_v15_surface() {
+    assert_eq!(PROTOCOL_VERSION, 16);
     assert_eq!(msg_type::LOGIN, 6);
     assert_eq!(msg_type::LOGGED_IN, 18);
     assert_eq!(msg_type::SET_PROFILING, 7);
@@ -112,6 +113,8 @@ fn protocol_v14_pins_the_variant_tags_and_keeps_the_v10_surface() {
         (DoneKind::Granted, 24),
         (DoneKind::Revoked, 25),
         (DoneKind::SetVariable, 26),
+        (DoneKind::CreatedSchema, 27),
+        (DoneKind::DroppedSchema, 28),
     ] {
         let frame = encode_response(&Response::Done {
             kind,
@@ -131,10 +134,10 @@ fn protocol_v14_pins_the_variant_tags_and_keeps_the_v10_surface() {
         );
     }
     // A tag past the current surface is still rejected.
-    let bytes = frame(msg_type::DONE, &[27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let bytes = frame(msg_type::DONE, &[29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert!(matches!(
         decode_response(&bytes),
-        Err(ProtocolError::Malformed(msg)) if msg.contains("unknown Done kind 27")
+        Err(ProtocolError::Malformed(msg)) if msg.contains("unknown Done kind 29")
     ));
 }
 
@@ -264,9 +267,11 @@ fn set_profiling_rejects_a_non_boolean_byte() {
 
 #[test]
 fn result_set_round_trips_every_data_type() {
-    let names = ["b", "i", "bi", "d", "v", "dt", "ts", "va", "ai", "ab", "ad"]
-        .map(String::from)
-        .to_vec();
+    let names = [
+        "b", "i", "bi", "d", "v", "dt", "ts", "va", "ai", "ab", "ad", "uu",
+    ]
+    .map(String::from)
+    .to_vec();
     let types = vec![
         DataType::Boolean,
         DataType::Integer,
@@ -288,6 +293,7 @@ fn result_set_round_trips_every_data_type() {
             elem: ArrayElem::Double,
             len: 768,
         },
+        DataType::Uuid,
     ];
     response_round_trip(Response::ResultSet { names, types });
 }
@@ -846,6 +852,19 @@ fn ragged_rows_frames_do_not_encode() {
 }
 
 #[test]
+fn uuid_values_round_trip() {
+    let rows = vec![
+        vec![
+            Value::Uuid(0),
+            Value::Uuid(u128::MAX),
+            Value::Uuid(0x550e_8400_e29b_41d4_a716_4466_5544_0000),
+        ],
+        vec![Value::Null, Value::Null, Value::Null],
+    ];
+    response_round_trip(Response::Rows { rows });
+}
+
+#[test]
 fn result_set_length_mismatch_does_not_encode() {
     let response = Response::ResultSet {
         names: vec!["a".to_string(), "b".to_string()],
@@ -859,10 +878,10 @@ fn result_set_length_mismatch_does_not_encode() {
 fn decimal_and_interval_values_round_trip() {
     let rows = vec![
         vec![
-            Value::Decimal(0, 0),
-            Value::Decimal(-123_456_789_012_345_678_901_234_567_890, 18),
-            Value::Decimal(i128::MIN, 38),
-            Value::Decimal(i128::MAX, 38),
+            Value::decimal(0, 0),
+            Value::decimal(-123_456_789_012_345_678_901_234_567_890, 18),
+            Value::decimal(i128::MIN, 38),
+            Value::decimal(i128::MAX, 38),
             Value::Interval {
                 months: i32::MIN,
                 days: i32::MAX,

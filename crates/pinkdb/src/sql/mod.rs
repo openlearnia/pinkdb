@@ -182,6 +182,11 @@ pub fn parse_prepared(sql: &str) -> Result<(Vec<ast::Statement>, Vec<usize>)> {
     peg_parser::parse_prepared(sql)
 }
 
+/// Parse one expression (a persisted column default).
+pub(crate) fn parse_expr(sql: &str) -> Result<ast::Expr> {
+    peg_parser::parse_expr(sql)
+}
+
 /// Byte offsets of every `?` placeholder in `sql`, in textual order (strings,
 /// quoted identifiers and comments skipped). Used by
 /// [`crate::PreparedStatement::parse`] to cross-check the parser's captured
@@ -236,15 +241,15 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
         // error type cannot carry the written text), and this walk reports it
         // with the reference named (wave 94).
         if let NodeRef::Expr(ast::Expr::Column {
-            db: Some(marker),
+            qual,
             table: None,
             name,
         }) = node
-            && marker == FOUR_PART_MARKER
+            && qual.catalog.as_deref() == Some(FOUR_PART_MARKER)
         {
             return Err(PinkDbError::Parse(format!(
-                "column references have at most three parts (database.table.column), \
-                 got \"{name}\""
+                "column references have at most four parts \
+                 (catalog.schema.table.column), got \"{name}\""
             )));
         }
         max = max.max(depth);
@@ -268,6 +273,7 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
                         ast::InsertSource::Select(query) => {
                             work.push((NodeRef::Select(query), child));
                         }
+                        ast::InsertSource::DefaultValues => {}
                     }
                     if let Some(ast::OnConflict {
                         action: ast::OnConflictAction::DoUpdate { sets, where_clause },
@@ -385,7 +391,7 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
                         },
                     ..
                 } => {
-                    work.push((NodeRef::Expr(e), child));
+                    work.push((NodeRef::Expr(&e.expr), child));
                 }
                 ast::Statement::CreateTable { items, .. } => {
                     for item in items {
@@ -393,7 +399,7 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
                             default: Some(e), ..
                         }) = item
                         {
-                            work.push((NodeRef::Expr(e), child));
+                            work.push((NodeRef::Expr(&e.expr), child));
                         }
                     }
                 }
@@ -509,7 +515,8 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
                 | ast::Expr::Parameter(_)
                 | ast::Expr::Star
                 | ast::Expr::Column { .. }
-                | ast::Expr::QualifiedStar { .. } => {}
+                | ast::Expr::QualifiedStar { .. }
+                | ast::Expr::Default => {}
             },
             NodeRef::FromClause(from) => {
                 work.push((NodeRef::FromSource(&from.source), child));
@@ -638,6 +645,7 @@ fn take_statement_children(
                 ast::InsertSource::Select(query) => {
                     selects.push(std::mem::replace(&mut **query, empty_select()));
                 }
+                ast::InsertSource::DefaultValues => {}
             }
             if let Some(ast::OnConflict {
                 action: ast::OnConflictAction::DoUpdate { sets, where_clause },
@@ -746,7 +754,7 @@ fn take_statement_children(
             ..
         } => {
             if let Some(e) = default.take() {
-                exprs.push(e);
+                exprs.push(*e.expr);
             }
         }
         ast::Statement::CreateTable { items, .. } => {
@@ -754,7 +762,7 @@ fn take_statement_children(
                 if let ast::TableItem::Column(col) = item
                     && let Some(e) = col.default.take()
                 {
-                    exprs.push(*e);
+                    exprs.push(*e.expr);
                 }
             }
         }
@@ -808,7 +816,7 @@ fn take_projection(projection: &mut ast::Projection, exprs: &mut Vec<ast::Expr>)
 fn empty_from() -> ast::FromClause {
     ast::FromClause {
         source: ast::FromSource::Table {
-            db: None,
+            qual: ast::Qualifier::none(),
             name: String::new(),
         },
         alias: None,
@@ -918,7 +926,8 @@ fn take_expr_children(
         | ast::Expr::Parameter(_)
         | ast::Expr::Star
         | ast::Expr::Column { .. }
-        | ast::Expr::QualifiedStar { .. } => {}
+        | ast::Expr::QualifiedStar { .. }
+        | ast::Expr::Default => {}
     }
 }
 

@@ -31,7 +31,7 @@ use pinkdb_ffi::{
     PinkPrepared, PinkResult, PinkValue, array_tag_len,
 };
 
-const KIND_NAMES: [&str; 24] = [
+const KIND_NAMES: [&str; 27] = [
     "selected",
     "created",
     "inserted",
@@ -56,6 +56,9 @@ const KIND_NAMES: [&str; 24] = [
     "dropped_role",
     "granted",
     "revoked",
+    "set_variable",
+    "created_schema",
+    "dropped_schema",
 ];
 
 const TYPE_NAMES: [&str; 11] = [

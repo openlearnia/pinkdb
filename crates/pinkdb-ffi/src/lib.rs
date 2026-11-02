@@ -77,12 +77,16 @@ pub const PINKDB_STMT_CREATED_ROLE: i32 = 20;
 /// `DROP ROLE`; `pinkdb_result_name` carries the role.
 pub const PINKDB_STMT_DROPPED_ROLE: i32 = 21;
 /// `GRANT …`; `pinkdb_result_name` carries the grant's description
-/// (`SELECT ON TABLE main.t TO alice`).
+/// (`SELECT ON TABLE main.main.t TO alice`).
 pub const PINKDB_STMT_GRANTED: i32 = 22;
 /// `REVOKE …`; `pinkdb_result_name` carries the revoked grant's description.
 pub const PINKDB_STMT_REVOKED: i32 = 23;
 /// `SET VARIABLE` (wave 95c); `pinkdb_result_name` is the variable.
 pub const PINKDB_STMT_SET_VARIABLE: i32 = 24;
+/// `CREATE SCHEMA` (wave 131b).
+pub const PINKDB_STMT_CREATED_SCHEMA: i32 = 25;
+/// `DROP SCHEMA` (wave 131b).
+pub const PINKDB_STMT_DROPPED_SCHEMA: i32 = 26;
 
 // ----- value / column type tags -----
 pub const PINKDB_TYPE_NULL: i32 = 0;
@@ -329,7 +333,9 @@ impl Cell {
                 d: 0.0,
                 text: None,
             },
-            Value::Decimal(x, scale) => {
+            Value::Decimal {
+                value: x, scale, ..
+            } => {
                 let mut b = pinkdb::types::format_decimal(*x, *scale).into_bytes();
                 b.push(0);
                 Cell {
@@ -340,6 +346,15 @@ impl Cell {
                     text: Some(b),
                 }
             }
+            // UUID has no cell in the ABI, so it crosses as its text form
+            // (and its column type tag is PINKDB_TYPE_VARCHAR).
+            Value::Uuid(bits) => Cell {
+                tag: PINKDB_TYPE_VARCHAR,
+                is_null: false,
+                i: 0,
+                d: 0.0,
+                text: Some(nul_terminated(&pinkdb::uuid::format(*bits))),
+            },
             Value::Variant(v) => {
                 let mut b = v.to_json().into_bytes();
                 b.push(0);
@@ -465,6 +480,7 @@ fn dtype_tag(t: DataType) -> i32 {
         DataType::Decimal { .. } => PINKDB_TYPE_DECIMAL,
         DataType::Interval => PINKDB_TYPE_INTERVAL,
         DataType::Variant => PINKDB_TYPE_VARIANT,
+        DataType::Uuid => PINKDB_TYPE_VARCHAR,
     }
 }
 
@@ -545,6 +561,8 @@ fn kind_of(r: &QueryResult) -> i32 {
         QueryResult::CreatedDatabase { .. } => PINKDB_STMT_CREATED_DATABASE,
         QueryResult::DroppedDatabase { .. } => PINKDB_STMT_DROPPED_DATABASE,
         QueryResult::Used { .. } => PINKDB_STMT_USED,
+        QueryResult::CreatedSchema { .. } => PINKDB_STMT_CREATED_SCHEMA,
+        QueryResult::DroppedSchema { .. } => PINKDB_STMT_DROPPED_SCHEMA,
         QueryResult::SetVariable { .. } => PINKDB_STMT_SET_VARIABLE,
         QueryResult::LoadedExtension { .. } => PINKDB_STMT_LOADED_EXTENSION,
         QueryResult::Checkpointed => PINKDB_STMT_CHECKPOINTED,
@@ -625,6 +643,8 @@ fn build_result(results: Vec<QueryResult>) -> std::result::Result<PinkResult, St
                         | QueryResult::DroppedView { name }
                         | QueryResult::CreatedDatabase { name }
                         | QueryResult::DroppedDatabase { name }
+                        | QueryResult::CreatedSchema { name }
+                        | QueryResult::DroppedSchema { name }
                         | QueryResult::AlteredTable { name }
                         | QueryResult::CreatedProcedure { name }
                         | QueryResult::DroppedProcedure { name }
@@ -641,7 +661,9 @@ fn build_result(results: Vec<QueryResult>) -> std::result::Result<PinkResult, St
                         | QueryResult::Revoked { description } => {
                             (0, Some(nul_terminated(description)))
                         }
-                        QueryResult::Used { db } => (0, Some(nul_terminated(db))),
+                        QueryResult::Used { db, schema } => {
+                            (0, Some(nul_terminated(&format!("{db}.{schema}"))))
+                        }
                         QueryResult::SetVariable { name } => (0, Some(nul_terminated(name))),
                         QueryResult::LoadedExtension { name } => (0, Some(nul_terminated(name))),
                         _ => (0, None),
@@ -1053,7 +1075,7 @@ pub extern "C" fn pinkdb_execute_prepared(
         // The engine's profiled runner takes SQL, so bind first (the same bind
         // `execute_prepared` does) and then run the substituted statement.
         match catch_unwind(AssertUnwindSafe(|| {
-            let bound_stmt = stmt.stmt.bind(&h.db, h.db.current_db(), &bound)?;
+            let bound_stmt = stmt.stmt.bind(&h.db, h.db.current_ns(), &bound)?;
             h.db.execute_profiled(bound_stmt.sql())
         })) {
             Ok(Ok(pairs)) => into_boxed_result(|| build_profiled_result(pairs)),
@@ -1577,6 +1599,24 @@ mod tests {
             ]
         );
         assert_eq!(pinkdb_result_kind(r, 6), -1, "out of range");
+        pinkdb_result_free(r);
+        close(h);
+    }
+
+    #[test]
+    fn schema_statement_kinds_round_trip() {
+        let h = pinkdb_open_memory();
+        let r = exec_ok(h, "CREATE SCHEMA s; DROP SCHEMA s;");
+        assert_eq!(pinkdb_result_kind(r, 0), PINKDB_STMT_CREATED_SCHEMA);
+        assert_eq!(pinkdb_result_kind(r, 1), PINKDB_STMT_DROPPED_SCHEMA);
+        for i in 0..2 {
+            let name = pinkdb_result_name(r, i);
+            assert!(!name.is_null());
+            assert_eq!(
+                unsafe { std::ffi::CStr::from_ptr(name) }.to_str().unwrap(),
+                "s"
+            );
+        }
         pinkdb_result_free(r);
         close(h);
     }

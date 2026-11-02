@@ -123,7 +123,7 @@ func TestMemoryAllTypesRoundTrip(t *testing.T) {
 	results := mustExecute(t, db, `
 		CREATE TABLE types (b BOOLEAN, i INTEGER, bi BIGINT, d DOUBLE, s VARCHAR, dt DATE, ts TIMESTAMP);
 		INSERT INTO types VALUES
-			(TRUE, -2147483647 - 1, 9223372036854775807, -0.0, 'héllo 🌍', DATE '2024-01-15', TIMESTAMP '2024-01-15 10:00:00.123456'),
+			(TRUE, -2147483647 - 1, 9223372036854775807, -0.0::DOUBLE, 'héllo 🌍', DATE '2024-01-15', TIMESTAMP '2024-01-15 10:00:00.123456'),
 			(NULL, NULL, NULL, NULL, NULL, NULL, NULL),
 			(FALSE, 7, 8, 2.5, '', DATE '1970-01-01', TIMESTAMP '1970-01-01 00:00:00');
 		SELECT * FROM types ORDER BY i;
@@ -296,7 +296,7 @@ func TestDoubleSpecialValues(t *testing.T) {
 	defer db.Close()
 
 	results := mustExecute(t, db,
-		"SELECT 1.0 / 0.0 AS pos, -1.0 / 0.0 AS neg, 0.0 / 0.0 AS nan, -0.0 AS negzero;")
+		"SELECT 1.0 / 0.0 AS pos, -1.0 / 0.0 AS neg, 0.0 / 0.0 AS nan, -0.0::DOUBLE AS negzero;")
 	row := results[0].Rows[0]
 	pos := floatAt(t, row, 0)
 	if !math.IsInf(pos, 1) {
@@ -571,7 +571,7 @@ func TestMultiStatementKindsAndMetadata(t *testing.T) {
 			t.Fatalf("results[%d].Affected = %d, want %d", i, got, want)
 		}
 	}
-	wantNames := map[int]string{4: "v", 5: "v", 6: "t", 7: "db1", 8: "db1", 13: "main", 14: "db1"}
+	wantNames := map[int]string{4: "v", 5: "v", 6: "t", 7: "db1", 8: "db1.main", 13: "main.main", 14: "db1"}
 	for i, want := range wantNames {
 		if got := results[i].Name; got != want {
 			t.Fatalf("results[%d].Name = %q, want %q", i, got, want)
@@ -845,7 +845,7 @@ func TestNativeErrorMessagesExact(t *testing.T) {
 	}{
 		{"missing table", "", "SELECT * FROM nope;", `table "nope" not found`},
 		{"drop missing table", "", "DROP TABLE nope;", `table "nope" not found`},
-		{"missing database", "", "USE nope;", `database "nope" not found`},
+		{"missing database", "", "USE nope;", `database or schema "nope" not found`},
 		{"duplicate table", "CREATE TABLE dup (a INTEGER);", "CREATE TABLE dup (a INTEGER);", `table "dup" already exists`},
 		{"missing column", "CREATE TABLE t (a INTEGER);", "SELECT nosuchcol FROM t;", `no column "nosuchcol"`},
 		{"nested transaction", "", "BEGIN; BEGIN;", "already in a transaction"},
@@ -1628,8 +1628,8 @@ func TestStmtRBACKinds(t *testing.T) {
 	}{
 		{"CREATE USER alice PASSWORD 'secret'", "created_user", "alice"},
 		{"CREATE ROLE analyst", "created_role", "analyst"},
-		{"GRANT SELECT ON TABLE t TO alice", "granted", "SELECT ON TABLE main.t TO alice"},
-		{"REVOKE SELECT ON TABLE t FROM alice", "revoked", "SELECT ON TABLE main.t TO alice"},
+		{"GRANT SELECT ON TABLE t TO alice", "granted", "SELECT ON TABLE main.main.t TO alice"},
+		{"REVOKE SELECT ON TABLE t FROM alice", "revoked", "SELECT ON TABLE main.main.t TO alice"},
 		{"ALTER USER alice PASSWORD 'rotated'", "altered_user", "alice"},
 		{"DROP ROLE analyst", "dropped_role", "analyst"},
 		{"DROP USER alice", "dropped_user", "alice"},

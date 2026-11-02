@@ -60,7 +60,7 @@ fn remote_repl_round_trip() {
     assert!(text.contains("│ 1       │ x       │"), "{text}");
     assert!(text.contains("│ 2       │ NULL    │"), "{text}");
     assert!(text.contains("2 rows"), "{text}");
-    assert!(text.contains("Using database main."), "{text}");
+    assert!(text.contains("Using main.main."), "{text}");
     // Non-interactive runs print no timing unless asked (.timer on).
     assert!(!text.contains("Run Time (s): real "), "{text}");
 

@@ -85,12 +85,16 @@ mod regex;
 /// The extension-repository client (cargo feature `repo`) — see [`install`].
 #[cfg(feature = "repo")]
 pub mod repo;
+/// Wave 132b: DuckDB-style secrets, the only carrier of a credential.
+pub mod secret;
 /// Serving an extension's client (ABI minor 2; native targets only).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod serve;
 pub mod sql;
 pub mod stats;
 pub mod storage;
+/// The `database.schema` namespace (wave 131).
+pub use storage::SchemaPath;
 pub mod strings;
 /// Host-registered table sources (wave 70): the engine-adjacent surface the
 /// `pinkdb-parquet` crate (`read_parquet`, `FROM 'file.parquet'`) plugs into.
@@ -99,6 +103,7 @@ pub mod table_source;
 pub mod text;
 pub mod trigger;
 pub mod types;
+pub mod uuid;
 pub mod variant;
 pub mod variant_shred;
 pub mod vector;
@@ -116,8 +121,8 @@ pub use filefmt::FileFormat;
 pub use fsutil::{CopyToPolicy, write_atomic_private};
 pub use install::{InstalledExtension, NO_REPO_SUPPORT};
 pub use lake_db::{
-    DatabaseInfo, DatabaseOpener, DbStorage, LakeContent, LakeDatabase, LakeOpenRequest,
-    LakePolicy, LakeSpec, register_database_opener,
+    DatabaseInfo, DatabaseOpener, DbStorage, LakeContent, LakeDatabase, LakeFunctionCall,
+    LakeOpenRequest, LakePolicy, LakeSpec, register_database_opener,
 };
 pub use macros::{MacroDef, MacroParamDef};
 pub use package::{ExtensionPackage, extension_package_names, register_extension_package};
@@ -271,7 +276,7 @@ impl PinkDb {
             if !self.in_transaction() && !self.replaying {
                 self.boundary_auto_refresh()?;
             }
-            let session_db = self.current_db().to_string();
+            let ns = self.current_ns().clone();
             // Indexes are invalidated by mutation and rebuilt lazily here:
             // one rebuild per indexed table at the next statement boundary,
             // rather than per-row maintenance on every INSERT/UPDATE/DELETE.
@@ -296,17 +301,16 @@ impl PinkDb {
                 } else {
                     Default::default()
                 };
-                let (result, storages) =
-                    db.run_storage_checked(plan, &session_db, &prior, |db| {
-                        exec::run_with_budget(db, plan, budget.clone())
-                    })?;
+                let (result, storages) = db.run_storage_checked(plan, ns.db(), &prior, |db| {
+                    exec::run_with_budget(db, plan, budget.clone())
+                })?;
                 if db.in_transaction() {
                     db.txn_storages = storages;
                 }
                 Ok::<_, types::PinkDbError>(result)
             };
             let bind_start = profiling.then(std::time::Instant::now);
-            let (plan, dynamic_functions_used) = sql::bind_tracked(self, stmt, &session_db)?;
+            let (plan, dynamic_functions_used) = sql::bind_tracked(self, stmt, &ns)?;
             // The runner (not the binder) holds the per-statement source text;
             // a `CREATE MATERIALIZED VIEW` plan persists it (wave 80).
             let plan = plan::with_mv_source(plan, texts.as_ref().map(|t| t[i].as_str()));
@@ -323,7 +327,7 @@ impl PinkDb {
             } else {
                 Default::default()
             };
-            self.check_statement_storages(&plan, &session_db, &txn_storages)?;
+            self.check_statement_storages(&plan, ns.db(), &txn_storages)?;
             // A record replay serves these results instead of calling the
             // function; only a statement that is actually WAL-logged records.
             budget.set_collect_external_calls(
@@ -354,17 +358,17 @@ impl PinkDb {
                 if self.is_durable() {
                     // Store-aware: a materialized-view statement depends on
                     // objects the plan alone cannot name (wave 80).
-                    let sets = self.plan_sets_store(&plan, &session_db);
+                    let sets = self.plan_sets_store(&plan, &ns);
                     self.txn_touched.extend(&sets);
-                    if let plan::LogicalPlan::Use { name } = &plan {
-                        self.txn_touched.add_database(name);
+                    if let plan::LogicalPlan::Use { ns } = &plan {
+                        self.txn_touched.add_database(ns.db());
                     }
                 }
                 if plan::writes_tables(&plan) && self.has_materialized_views() {
                     // The transaction's writes become the ON COMMIT trigger
                     // when it finally commits (never on ROLLBACK) — durable
                     // and in-memory stores alike.
-                    let writes = self.plan_writes_of(&plan, &session_db);
+                    let writes = self.plan_writes_of(&plan, &ns);
                     self.txn_writes.extend(writes);
                 }
             }
@@ -385,10 +389,11 @@ impl PinkDb {
                     && plan::optimistic_eligible(&plan);
                 if optimistic {
                     let mut sets = crate::wal::FrameSets::default();
-                    plan::plan_sets(&plan, &session_db, &mut sets);
+                    plan::plan_sets(&plan, &ns, &mut sets);
                     sets.canonicalize();
                     let base = self.capture_base()?;
                     // The execution span no other writer waits for.
+                    self.begin_volatile_statement(&plan)?;
                     let first = run_plan(self, &plan)?;
                     // Past this point a failure must not leave the uncommitted
                     // effect observable: without the lease it cannot be undone,
@@ -421,18 +426,21 @@ impl PinkDb {
                         // replayed frames; rebuild before planning.
                         self.rebuild_stale_indexes();
                         self.note_optimistic_fallback_for_test();
-                        let (p, d) = sql::bind_tracked(self, stmt, &session_db)?;
+                        let (p, d) = sql::bind_tracked(self, stmt, &ns)?;
                         let p = plan::with_mv_source(p, texts.as_ref().map(|t| t[i].as_str()));
                         let p = optimizer::optimize(self, p);
                         if plan::writes_tables(&p) {
                             self.refuse_logged_attached_reads(&p)?;
                         }
+                        self.begin_volatile_statement(&p)?;
                         (run_plan(self, &p)?, p, d)
                     };
                     // Session transitions are applied before WAL logging so the
                     // log record carries the post-statement session database.
                     match &result {
-                        QueryResult::Used { db } => self.set_current_db(db),
+                        QueryResult::Used { db, schema } => {
+                            self.set_current_ns(crate::storage::SchemaPath::new(db, schema))
+                        }
                         QueryResult::DroppedDatabase { name }
                             if name.eq_ignore_ascii_case(self.current_db()) =>
                         {
@@ -441,7 +449,7 @@ impl PinkDb {
                         }
                         _ => {}
                     }
-                    self.mark_committed_mv_writes(&plan, &session_db);
+                    self.mark_committed_mv_writes(&plan, &ns);
                     execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
                     let log_start = profiling.then(std::time::Instant::now);
                     if let Some(texts) = &texts {
@@ -480,7 +488,7 @@ impl PinkDb {
                             // replayed frames may name objects bound above):
                             // rebind against the refreshed state.
                             self.rebuild_stale_indexes();
-                            let (p, d) = sql::bind_tracked(self, stmt, &session_db)?;
+                            let (p, d) = sql::bind_tracked(self, stmt, &ns)?;
                             let p = plan::with_mv_source(p, texts.as_ref().map(|t| t[i].as_str()));
                             (optimizer::optimize(self, p), d)
                         } else {
@@ -492,6 +500,7 @@ impl PinkDb {
                 // Wave 83: a `CALL` outside a transaction may `COMMIT`/`ROLLBACK`
                 // in its body (the flag never outlives this statement).
                 self.standalone_call = !self.in_transaction();
+                self.begin_volatile_statement(&plan)?;
                 let result = run_plan(self, &plan);
                 self.standalone_call = false;
                 let result = result?;
@@ -502,7 +511,10 @@ impl PinkDb {
                 // Session transitions are applied before WAL logging so the log
                 // record carries the post-statement session database.
                 match &result {
-                    QueryResult::Used { db } => self.set_current_db(db),
+                    QueryResult::Used { db, schema } => {
+                        let ns = crate::storage::SchemaPath::new(db, schema);
+                        self.set_current_ns(ns);
+                    }
                     QueryResult::DroppedDatabase { name }
                         if name.eq_ignore_ascii_case(self.current_db()) =>
                     {
@@ -511,7 +523,7 @@ impl PinkDb {
                     }
                     _ => {}
                 }
-                self.mark_committed_mv_writes(&plan, &session_db);
+                self.mark_committed_mv_writes(&plan, &ns);
                 execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
                 let log_start = profiling.then(std::time::Instant::now);
                 if let Some(texts) = &texts {
@@ -576,7 +588,9 @@ fn result_facts(result: &QueryResult) -> (u64, u32, &'static str) {
         QueryResult::DroppedMaterializedView { .. } => (0, 0, "DroppedMaterializedView"),
         QueryResult::DroppedView { .. } => (0, 0, "DroppedView"),
         QueryResult::CreatedDatabase { .. } => (0, 0, "CreatedDatabase"),
+        QueryResult::CreatedSchema { .. } => (0, 0, "CreatedSchema"),
         QueryResult::DroppedDatabase { .. } => (0, 0, "DroppedDatabase"),
+        QueryResult::DroppedSchema { .. } => (0, 0, "DroppedSchema"),
         QueryResult::Used { .. } => (0, 0, "Used"),
         QueryResult::SetVariable { .. } => (0, 0, "SetVariable"),
         QueryResult::LoadedExtension { .. } => (0, 0, "LoadedExtension"),

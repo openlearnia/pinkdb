@@ -16,7 +16,7 @@
 //!
 //! ```text
 //! "PINKDBI1"                       magic
-//! u32                              format version (1)
+//! u32                              format version (2)
 //! u64, u8[len]                     .pink metadata image
 //! u32                              CRC32C of every preceding byte
 //! ```
@@ -32,13 +32,15 @@ use std::sync::Arc;
 
 use crate::lake_db::DbStorage;
 use crate::persist::crc32c;
-use crate::storage::{DataTable, DbCatalog, PinkDb};
+use crate::storage::{DataTable, DbCatalog, PinkDb, SchemaPath};
 use crate::{PinkDbError, Result};
 
 /// `PINKDBI1`, the image magic (a `.pink` file ends with `PINKDB06`).
 const MAGIC: &[u8; 8] = b"PINKDBI1";
-/// The image format this build writes and reads.
-const FORMAT: u32 = 1;
+/// The image format this build writes and reads. Format 2 (wave 131a) carries
+/// the database's schemas: the image embeds a footer whose per-database
+/// sections are now per-schema.
+const FORMAT: u32 = 2;
 
 impl PinkDb {
     /// The image of database `db`: its catalog objects with each table's
@@ -72,8 +74,8 @@ impl PinkDb {
     /// Append a lake table's materialized rows to its (empty) image table.
     /// The hash indexes and the primary-key cache are marked stale: rows
     /// arrived behind their back, exactly like a bulk load.
-    fn attach_rows_in(&mut self, dbname: &str, name: &str, rows: &DataTable) -> Result<()> {
-        let table = self.table_mut_in(dbname, name)?;
+    fn attach_rows_in(&mut self, ns: &SchemaPath, name: &str, rows: &DataTable) -> Result<()> {
+        let table = self.table_mut_in(ns.clone(), name)?;
         for chunk_idx in 0..rows.num_chunks() {
             let chunk = rows.scan_chunk(chunk_idx)?.ok_or_else(|| {
                 PinkDbError::Execution("lake table changed while it was being loaded".to_string())
@@ -95,7 +97,7 @@ pub(crate) fn load_database_image(
     name: &str,
     storage: DbStorage,
     image: Option<&[u8]>,
-    tables: &[(String, Arc<DataTable>)],
+    tables: &[(String, String, Arc<DataTable>)],
 ) -> Result<DbCatalog> {
     let mut scratch = match image {
         Some(image) => PinkDb::from_pink_bytes(decode(image)?)?,
@@ -118,26 +120,40 @@ pub(crate) fn load_database_image(
             name.to_string()
         }
     };
-    let image_tables = scratch.list_tables_in(&db);
-    // Image tables the lake no longer has are gone.
-    for t in &image_tables {
-        if !tables.iter().any(|(n, _)| n.eq_ignore_ascii_case(t)) {
-            scratch.drop_table_in(&db, t)?;
+    // Image tables the lake no longer has are gone. Image schemas stay: an
+    // empty schema is an engine object the lake cannot describe, so the
+    // image is the only place `CREATE SCHEMA` survives.
+    let image_tables: Vec<(SchemaPath, String)> = scratch
+        .all_tables_of(&db)
+        .into_iter()
+        .map(|(ns, _, t)| (ns, t.name.clone()))
+        .collect();
+    for (ns, tname) in image_tables {
+        let kept = tables.iter().any(|(schema, name, _)| {
+            ns.schema().eq_ignore_ascii_case(schema) && name.eq_ignore_ascii_case(&tname)
+        });
+        if !kept {
+            scratch.drop_table_in(ns, &tname)?;
         }
     }
-    for (tname, rows) in tables {
+    for (schema, tname, rows) in tables {
+        let ns = SchemaPath::new(&db, schema);
+        if !scratch.schema_exists(&ns) {
+            scratch.create_schema(&ns, true)?;
+            scratch.set_schema_display(&ns, schema)?;
+        }
         let described = scratch
-            .table_in(&db, tname)
+            .table_in(&ns, tname)
             .is_ok_and(|t| t.schema() == rows.schema());
         if described {
-            scratch.attach_rows_in(&db, tname, rows)?;
+            scratch.attach_rows_in(&ns, tname, rows)?;
         } else {
-            if scratch.table_in(&db, tname).is_ok() {
-                scratch.drop_table_in(&db, tname)?;
+            if scratch.table_in(&ns, tname).is_ok() {
+                scratch.drop_table_in(&ns, tname)?;
             }
             let mut table = (**rows).clone();
             table.name = tname.clone();
-            scratch.tables_insert_in(&db, tname.to_ascii_lowercase(), table)?;
+            scratch.tables_insert_in(&ns, tname.to_ascii_lowercase(), table)?;
         }
     }
     let mut cat = scratch
@@ -146,11 +162,13 @@ pub(crate) fn load_database_image(
         .expect("the database was found above");
     if !cat.name.eq_ignore_ascii_case(name) {
         // Attached under another name: the definitions follow the database.
-        for trigger in &mut cat.triggers {
-            trigger.db = name.to_string();
-        }
-        for mv in cat.materialized_views.values_mut() {
-            mv.query = None;
+        for schema in cat.schemas.values_mut() {
+            for trigger in &mut schema.triggers {
+                trigger.db = name.to_string();
+            }
+            for mv in schema.materialized_views.values_mut() {
+                mv.query = None;
+            }
         }
     }
     cat.name = name.to_string();
@@ -247,5 +265,31 @@ impl<'a> Reader<'a> {
 
     fn rest(&self) -> &'a [u8] {
         &self.bytes[self.pos..]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::DataType;
+
+    /// Wave 131a: format 2 carries the database's schemas. A format-1 image
+    /// (one flat table list) is refused instead of misread.
+    #[test]
+    fn a_format_one_image_is_refused() {
+        let mut db = PinkDb::new();
+        db.create_table("t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        let mut bytes = db.to_database_image("main").unwrap();
+        // The format word follows the 8-byte magic.
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let n = bytes.len();
+        let crc = crc32c(&bytes[..n - 4]);
+        bytes[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        let err = decode(&bytes).unwrap_err().to_string();
+        assert!(
+            err.contains("database image format 1 is not supported"),
+            "{err}"
+        );
     }
 }

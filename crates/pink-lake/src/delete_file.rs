@@ -137,6 +137,12 @@ pub(crate) fn read_positions(
     data_file: &str,
     path: &std::path::Path,
 ) -> Result<Vec<u64>> {
+    if format.eq_ignore_ascii_case("puffin") {
+        return Err(LakeError::UnsupportedDeleteFile {
+            path: path.to_path_buf(),
+            format: format.to_string(),
+        });
+    }
     if format.is_empty() || format == crate::format::PINK_FORMAT_ID {
         return decode(bytes, path);
     }
@@ -148,6 +154,13 @@ pub(crate) fn read_positions(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn puffin_deletion_vectors_are_refused_by_name() {
+        let err = read_positions(b"", "puffin", "x.parquet", Path::new("d.puffin")).unwrap_err();
+        assert!(err.to_string().contains("puffin"), "{err}");
+        assert!(err.to_string().contains("Puffin"), "{err}");
+    }
 
     #[test]
     fn roundtrip_is_exact() {

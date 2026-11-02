@@ -82,6 +82,10 @@ pub(crate) fn key_hash(v: &Vector, row: usize) -> u64 {
             mix(crate::types::interval_key(iv.months, iv.days, iv.micros) as u64 ^ 0x50)
         }
         // The general encodings (they own the canonical form of these kinds).
+        VectorData::Uuid(d) => {
+            let x = d[row];
+            mix(x as u64 ^ ((x >> 64) as u64).rotate_left(17) ^ 0x60)
+        }
         VectorData::Variant(_) | VectorData::Array { .. } => value_hash(&v.get(row)),
     }
 }
@@ -99,9 +103,10 @@ pub(crate) fn value_hash(v: &Value) -> u64 {
         Value::Timestamp(us) => mix(*us as u64 ^ 0x40),
         Value::Double(x) => mix(double_bits(*x)),
         Value::Varchar(s) => hash_bytes(s.as_bytes()),
-        Value::Decimal(x, scale) => {
-            mix(*x as u64 ^ ((*x >> 64) as u64).rotate_left(17) ^ ((*scale as u64) << 56))
-        }
+        Value::Uuid(x) => mix(*x as u64 ^ ((*x >> 64) as u64).rotate_left(17) ^ 0x60),
+        Value::Decimal {
+            value: x, scale, ..
+        } => mix(*x as u64 ^ ((*x >> 64) as u64).rotate_left(17) ^ ((*scale as u64) << 56)),
         Value::Interval {
             months,
             days,
@@ -432,6 +437,12 @@ impl Zone {
                 zone.min = min.map(Value::Bigint);
                 zone.max = max.map(Value::Bigint);
             }
+            // UUIDs zone on their unsigned 128-bit value, like `ORDER BY`.
+            VectorData::Uuid(data) => {
+                let (min, max) = int_stats(v, data);
+                zone.min = min.map(Value::Uuid);
+                zone.max = max.map(Value::Uuid);
+            }
             VectorData::Date32(data) => {
                 let (min, max) = int_stats(v, data);
                 zone.min = min.map(Value::Date);
@@ -477,8 +488,8 @@ impl Zone {
             }
             VectorData::Decimal { values, scale, .. } => {
                 let (min, max) = int_stats(v, values);
-                zone.min = min.map(|x| Value::Decimal(x, *scale));
-                zone.max = max.map(|x| Value::Decimal(x, *scale));
+                zone.min = min.map(|x| Value::decimal(x, *scale));
+                zone.max = max.map(|x| Value::decimal(x, *scale));
             }
             VectorData::Interval(data) => {
                 let (mut min, mut max): (Option<Interval>, Option<Interval>) = (None, None);
@@ -1219,10 +1230,10 @@ mod tests {
                         },
                         1,
                     );
-                    v.push_valid(Value::Decimal(12345, 2)).expect("push");
+                    v.push_valid(Value::decimal(12345, 2)).expect("push");
                     v
                 },
-                vec![Value::Decimal(12345, 2)],
+                vec![Value::decimal(12345, 2)],
             ),
         ];
         for (vector, values) in cases {

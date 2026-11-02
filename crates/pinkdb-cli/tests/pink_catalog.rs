@@ -291,14 +291,19 @@ fn maintenance_and_settings_commands_work() {
          .lake save {catalog} data {data}\n\
          ATTACH 'lake:{catalog}' AS lk;\n\
          INSERT INTO lk.t VALUES (2, 'two'), (3, 'three'), (4, 'four');\n\
-         DETACH lk;\n\
-         .lake flush {catalog}\n\
-         .lake open {catalog}\n\
-         SELECT count(*) FROM t;\n\
-         SELECT a, b FROM t ORDER BY a;\n\
+         SELECT 'before=' || CAST(COUNT(*) AS VARCHAR) AS before_count \
+           FROM ducklake_list_files('lk', 't');\n\
+         CALL ducklake_flush_inlined_data('lk');\n\
+         SELECT 'after=' || CAST(COUNT(*) AS VARCHAR) AS after_count \
+           FROM ducklake_list_files('lk', 't');\n\
+         SELECT count(*) FROM lk.t;\n\
+         SELECT a, b FROM lk.t ORDER BY a;\n\
          .quit\n"
     ));
-    assert!(out.contains("Flushed 3 inlined rows"), "{out}");
+    // The rows arrive two ways (the saved file, three inlined rows); the flush
+    // materializes the inlined ones into one more data file.
+    assert!(out.contains("before=1"), "{out}");
+    assert!(out.contains("after=2"), "{out}");
     assert!(out.contains("│ 4        │"), "{out}");
     assert!(out.contains("│ 4       │ four    │"), "{out}");
     assert!(!out.contains("Error"), "{out}");
@@ -320,12 +325,13 @@ fn maintenance_and_settings_commands_work() {
         script.push_str(&format!("INSERT INTO lk.t VALUES ({i});\n"));
     }
     script.push_str(&format!(
-        "DETACH lk;\n\
-         .lake merge {maint}\n\
-         ATTACH 'lake:{maint}' AS lk;\n\
+        "CALL ducklake_merge_adjacent_files('lk');\n\
+         SELECT 'merged=' || CAST(COUNT(*) AS VARCHAR) AS merged \
+           FROM ducklake_list_files('lk', 't');\n\
          DELETE FROM lk.t WHERE a = 1;\n\
+         CALL ducklake_rewrite_data_files('lk', delete_threshold := 0.0);\n\
+         SELECT 'rows=' || CAST(COUNT(*) AS VARCHAR) AS row_count FROM lk.t;\n\
          DETACH lk;\n\
-         .lake rewrite {maint} delete_threshold=0.0\n\
          .lake partition {maint} t by (a)\n\
          .lake inlining {maint} t 5\n\
          .lake open {maint}\n\
@@ -333,10 +339,10 @@ fn maintenance_and_settings_commands_work() {
          .quit\n"
     ));
     let out = run(&script);
-    assert!(out.contains("Merged"), "{out}");
-    assert!(!out.contains("Nothing to merge"), "{out}");
-    assert!(out.contains("Rewrote"), "{out}");
-    assert!(!out.contains("Nothing to rewrite"), "{out}");
+    // The five appends left four data files; the merge consolidated them, and
+    // the rewrite materialized the delete, so four rows remain in one file.
+    assert!(out.contains("merged=1"), "{out}");
+    assert!(out.contains("rows=4"), "{out}");
     assert!(out.contains("Partitioned"), "{out}");
     assert!(out.contains("5 rows are stored"), "{out}");
     assert!(out.contains("│ 4        │"), "{out}");
@@ -374,13 +380,13 @@ fn maintenance_and_settings_commands_work() {
     std::fs::create_dir_all(target_file.parent().unwrap()).unwrap();
     std::fs::copy(source_dir.join(&file), &target_file).unwrap();
     let out = run(&format!(
-        ".lake add_data_files {target_catalog} t {rel}\n\
-         .lake open {target_catalog}\n\
-         SELECT count(*) FROM t;\n\
-         .quit\n"
+        "ATTACH 'lake:{target_catalog}' AS lk;\n\
+         CALL ducklake_add_data_files('lk', 't', '{}');\n\
+         SELECT count(*) FROM lk.t;\n\
+         .quit\n",
+        std::path::Path::new(&target_data).join(&rel).display(),
     ));
-    assert!(out.contains("Registered"), "{out}");
-    assert!(out.contains("2 rows"), "{out}");
+    assert!(out.contains("│ 2        │"), "{out}");
     assert!(out.contains("│ 2        │"), "{out}");
     assert!(!out.contains("Error"), "{out}");
 

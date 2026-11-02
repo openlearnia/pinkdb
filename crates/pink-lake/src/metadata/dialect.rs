@@ -11,8 +11,17 @@
 //! (`ducklake_inlined_data_<table_id>_<schema_version>`), and that name is
 //! derived from two integers the store allocated, never from user input.
 
-/// The DuckLake metadata format this build writes and reads.
-pub(crate) const DUCKLAKE_VERSION: &str = "1.1";
+/// The DuckLake metadata format this build writes. Stock DuckDB 2.x reports
+/// `1.1-dev1` for its own catalogs, so writing the same string lets DuckDB
+/// attach a pinkdb-written lake without a version override.
+pub(crate) const DUCKLAKE_VERSION: &str = "1.1-dev1";
+
+/// The DuckLake versions this build reads. They share the v1.1 table shape;
+/// later versions only add tables pinkdb does not use.
+pub(crate) const SUPPORTED_DUCKLAKE_VERSIONS: &[&str] = &["1.1-dev1", "1.1", "1.2", "1.3"];
+
+/// The supported range, for the refusal message.
+pub(crate) const SUPPORTED_DUCKLAKE_RANGE: &str = "1.1-dev1 through 1.3";
 
 /// A SQL dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,47 +90,94 @@ impl Dialect {
         format!("{tables}{INDEX_DDL}")
     }
 
-    /// The exact DuckLake v1.1 catalog tables. Column names, order and types
-    /// match `/tmp/w96a/ref/ducklake-v1.1-schema.sql`; `IF NOT EXISTS` is the
-    /// only addition, so opening an existing DuckLake-created catalog is
-    /// idempotent.
+    /// The exact DuckLake v1.1 catalog tables. Column names and order match
+    /// what DuckDB's own DuckLake extension creates; the three column types a
+    /// backend spells differently are [`Dialect::ducklake_column_type`], and
+    /// `IF NOT EXISTS` is the only other addition, so opening an existing
+    /// DuckLake-created catalog is idempotent.
     pub(crate) fn ducklake_ddl(&self) -> String {
         let mut out = String::new();
         for statement in DUCKLAKE_TABLES {
             out.push_str("CREATE TABLE IF NOT EXISTS ");
-            out.push_str(statement);
+            out.push_str(&self.ducklake_table(statement));
             out.push_str(";\n");
         }
         out
     }
+
+    /// One table's text with this backend's spelling of the three DuckLake
+    /// column types DuckDB does not write the same way everywhere.
+    ///
+    /// DuckDB creates a boolean as `BIGINT` in a SQLite catalog and as
+    /// `BOOLEAN` in Postgres, a uuid as `VARCHAR`/`UUID`, and a timestamp as
+    /// `VARCHAR`/`TIMESTAMP WITH TIME ZONE`. A pinkdb catalog keeps the SQLite
+    /// spellings at the engine level (it has no boolean or uuid type), and a
+    /// DuckDB reader is told the catalog's type by `ducklake_metadata.version`,
+    /// never by the column text.
+    fn ducklake_table(&self, statement: &str) -> String {
+        let mut sql = statement.to_string();
+        // The tokens are upper-case type names and no DuckLake column name
+        // spells one, so a plain replace cannot hit data.
+        for (token, written) in [
+            ("BOOL", self.ducklake_column_type(DuckLakeType::Bool)),
+            ("UUID", self.ducklake_column_type(DuckLakeType::Uuid)),
+            (
+                "TIMESTAMP",
+                self.ducklake_column_type(DuckLakeType::Timestamp),
+            ),
+        ] {
+            sql = sql.replace(token, written);
+        }
+        sql
+    }
+
+    fn ducklake_column_type(&self, ducklake_type: DuckLakeType) -> &'static str {
+        match (self, ducklake_type) {
+            (Self::Postgres, DuckLakeType::Bool) => "BOOLEAN",
+            (Self::Postgres, DuckLakeType::Uuid) => "UUID",
+            (Self::Postgres, DuckLakeType::Timestamp) => "TIMESTAMP WITH TIME ZONE",
+            (_, DuckLakeType::Bool) => "BIGINT",
+            (_, DuckLakeType::Uuid | DuckLakeType::Timestamp) => "VARCHAR",
+        }
+    }
 }
 
-/// The DuckLake v1.1 tables, exactly as DuckLake creates them. Kept as a
-/// constant list so a test can compare the generated DDL against the
-/// reference file.
+/// The three DuckLake column types a backend spells differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DuckLakeType {
+    Bool,
+    Uuid,
+    Timestamp,
+}
+
+/// The DuckLake v1.1 tables, exactly as DuckLake creates them. A column whose
+/// type a backend spells differently carries the token [`DuckLakeType`] names
+/// (`BOOL`, `UUID`, `TIMESTAMP`); [`Dialect::ducklake_ddl`] resolves it. Kept as
+/// a constant list so the parity test can compare it with a catalog DuckDB
+/// created.
 pub(crate) const DUCKLAKE_TABLES: &[&str] = &[
     r#"ducklake_metadata("key" VARCHAR NOT NULL, "value" VARCHAR NOT NULL, "scope" VARCHAR, scope_id BIGINT)"#,
-    "ducklake_snapshot(snapshot_id BIGINT PRIMARY KEY, snapshot_time VARCHAR, schema_version BIGINT, next_catalog_id BIGINT, next_file_id BIGINT)",
+    "ducklake_snapshot(snapshot_id BIGINT PRIMARY KEY, snapshot_time TIMESTAMP, schema_version BIGINT, next_catalog_id BIGINT, next_file_id BIGINT)",
     "ducklake_snapshot_changes(snapshot_id BIGINT PRIMARY KEY, changes_made VARCHAR, author VARCHAR, commit_message VARCHAR, commit_extra_info VARCHAR)",
-    "ducklake_schema(schema_id BIGINT PRIMARY KEY, schema_uuid VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT, schema_name VARCHAR, path VARCHAR, path_is_relative BIGINT, parent_schema_id BIGINT)",
-    "ducklake_table(table_id BIGINT, table_uuid VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT, schema_id BIGINT, table_name VARCHAR, path VARCHAR, path_is_relative BIGINT)",
-    "ducklake_view(view_id BIGINT, view_uuid VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT, schema_id BIGINT, view_name VARCHAR, dialect VARCHAR, \"sql\" VARCHAR, column_aliases VARCHAR)",
+    "ducklake_schema(schema_id BIGINT PRIMARY KEY, schema_uuid UUID, begin_snapshot BIGINT, end_snapshot BIGINT, schema_name VARCHAR, path VARCHAR, path_is_relative BOOL)",
+    "ducklake_table(table_id BIGINT, table_uuid UUID, begin_snapshot BIGINT, end_snapshot BIGINT, schema_id BIGINT, table_name VARCHAR, path VARCHAR, path_is_relative BOOL)",
+    "ducklake_view(view_id BIGINT, view_uuid UUID, begin_snapshot BIGINT, end_snapshot BIGINT, schema_id BIGINT, view_name VARCHAR, dialect VARCHAR, \"sql\" VARCHAR, column_aliases VARCHAR)",
     "ducklake_tag(object_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, \"key\" VARCHAR, \"value\" VARCHAR)",
     "ducklake_column_tag(table_id BIGINT, column_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, \"key\" VARCHAR, \"value\" VARCHAR)",
-    "ducklake_data_file(data_file_id BIGINT PRIMARY KEY, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, file_order BIGINT, path VARCHAR, path_is_relative BIGINT, file_format VARCHAR, record_count BIGINT, file_size_bytes BIGINT, footer_size BIGINT, row_id_start BIGINT, partition_id BIGINT, encryption_key VARCHAR, mapping_id BIGINT, partial_max BIGINT, row_group_count BIGINT)",
-    "ducklake_file_column_stats(data_file_id BIGINT, table_id BIGINT, column_id BIGINT, column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT, min_value VARCHAR, max_value VARCHAR, contains_nan BIGINT, extra_stats VARCHAR, min_is_exact BIGINT, max_is_exact BIGINT)",
-    "ducklake_file_variant_stats(data_file_id BIGINT, table_id BIGINT, column_id BIGINT, variant_path VARCHAR, shredded_type VARCHAR, column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT, min_value VARCHAR, max_value VARCHAR, contains_nan BIGINT, extra_stats VARCHAR)",
-    "ducklake_delete_file(delete_file_id BIGINT PRIMARY KEY, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, data_file_id BIGINT, path VARCHAR, path_is_relative BIGINT, format VARCHAR, delete_count BIGINT, file_size_bytes BIGINT, footer_size BIGINT, encryption_key VARCHAR, partial_max BIGINT, row_group_count BIGINT)",
-    "ducklake_column(column_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, table_id BIGINT, column_order BIGINT, column_name VARCHAR, column_type VARCHAR, initial_default VARCHAR, default_value VARCHAR, nulls_allowed BIGINT, parent_column BIGINT, default_value_type VARCHAR, default_value_dialect VARCHAR)",
+    "ducklake_data_file(data_file_id BIGINT PRIMARY KEY, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, file_order BIGINT, path VARCHAR, path_is_relative BOOL, file_format VARCHAR, record_count BIGINT, file_size_bytes BIGINT, footer_size BIGINT, row_id_start BIGINT, partition_id BIGINT, encryption_key VARCHAR, mapping_id BIGINT, partial_max BIGINT, row_group_count BIGINT)",
+    "ducklake_file_column_stats(data_file_id BIGINT, table_id BIGINT, column_id BIGINT, column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT, min_value VARCHAR, max_value VARCHAR, contains_nan BOOL, extra_stats VARCHAR, min_is_exact BOOL, max_is_exact BOOL)",
+    "ducklake_file_variant_stats(data_file_id BIGINT, table_id BIGINT, column_id BIGINT, variant_path VARCHAR, shredded_type VARCHAR, column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT, min_value VARCHAR, max_value VARCHAR, contains_nan BOOL, extra_stats VARCHAR)",
+    "ducklake_delete_file(delete_file_id BIGINT PRIMARY KEY, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, data_file_id BIGINT, path VARCHAR, path_is_relative BOOL, format VARCHAR, delete_count BIGINT, file_size_bytes BIGINT, footer_size BIGINT, encryption_key VARCHAR, partial_max BIGINT, row_group_count BIGINT)",
+    "ducklake_column(column_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, table_id BIGINT, column_order BIGINT, column_name VARCHAR, column_type VARCHAR, initial_default VARCHAR, default_value VARCHAR, nulls_allowed BOOL, parent_column BIGINT, default_value_type VARCHAR, default_value_dialect VARCHAR)",
     "ducklake_table_stats(table_id BIGINT, record_count BIGINT, next_row_id BIGINT, file_size_bytes BIGINT)",
-    "ducklake_table_column_stats(table_id BIGINT, column_id BIGINT, contains_null BIGINT, contains_nan BIGINT, min_value VARCHAR, max_value VARCHAR, extra_stats VARCHAR, min_is_exact BIGINT, max_is_exact BIGINT)",
+    "ducklake_table_column_stats(table_id BIGINT, column_id BIGINT, contains_null BOOL, contains_nan BOOL, min_value VARCHAR, max_value VARCHAR, extra_stats VARCHAR, min_is_exact BOOL, max_is_exact BOOL)",
     "ducklake_partition_info(partition_id BIGINT, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT)",
     "ducklake_partition_column(partition_id BIGINT, table_id BIGINT, partition_key_index BIGINT, column_id BIGINT, \"transform\" VARCHAR)",
     "ducklake_file_partition_value(data_file_id BIGINT, table_id BIGINT, partition_key_index BIGINT, partition_value VARCHAR)",
-    "ducklake_files_scheduled_for_deletion(data_file_id BIGINT, path VARCHAR, path_is_relative BIGINT, schedule_start VARCHAR)",
+    "ducklake_files_scheduled_for_deletion(data_file_id BIGINT, path VARCHAR, path_is_relative BOOL, schedule_start TIMESTAMP)",
     "ducklake_inlined_data_tables(table_id BIGINT, table_name VARCHAR, schema_version BIGINT)",
     "ducklake_column_mapping(mapping_id BIGINT, table_id BIGINT, \"type\" VARCHAR)",
-    "ducklake_name_mapping(mapping_id BIGINT, column_id BIGINT, source_name VARCHAR, target_field_id BIGINT, parent_column BIGINT, is_partition BIGINT)",
+    "ducklake_name_mapping(mapping_id BIGINT, column_id BIGINT, source_name VARCHAR, target_field_id BIGINT, parent_column BIGINT, is_partition BOOL)",
     "ducklake_schema_versions(begin_snapshot BIGINT, schema_version BIGINT, table_id BIGINT)",
     "ducklake_macro(schema_id BIGINT, macro_id BIGINT, macro_name VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT)",
     "ducklake_macro_impl(macro_id BIGINT, impl_id BIGINT, dialect VARCHAR, \"sql\" VARCHAR, \"type\" VARCHAR)",

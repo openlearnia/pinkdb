@@ -214,9 +214,6 @@ fn log_arity_is_enforced_with_the_ranged_wording() {
     // The declared type is still DOUBLE at every position; a NULL literal is
     // typeless and allowed (the callback decides).
     assert_eq!(one(&mut db, "SELECT log(NULL);"), Value::Null);
-    // `random()` takes no arguments.
-    let err = error(&mut db, "SELECT random(1);");
-    assert!(err.contains("takes 0 argument(s)"), "{err}");
 }
 
 // ---------- numeric coercion (wave 54 design point) ----------
@@ -303,11 +300,20 @@ fn engine_math_builtins_stay_duckdb_pinned() {
     );
     assert!(dbl(&mut db, "SELECT pow(-1.0, 0.5);").is_nan());
     assert_eq!(dbl(&mut db, "SELECT pow(0.0, -1.0);"), f64::INFINITY);
-    // floor/ceil on DOUBLE and integer columns (DuckDB returns DOUBLE).
-    assert_eq!(dbl(&mut db, "SELECT floor(1.7);"), 1.0);
-    assert_eq!(dbl(&mut db, "SELECT floor(-1.5);"), -2.0);
-    assert_eq!(dbl(&mut db, "SELECT ceil(1.2);"), 2.0);
-    assert_eq!(dbl(&mut db, "SELECT ceil(-1.2);"), -1.0);
+    // floor/ceil keep a DECIMAL argument's type — a decimal literal is
+    // DECIMAL(2,0) here, exactly as in DuckDB — and return DOUBLE for a
+    // DOUBLE argument.
+    let dec = |value, scale| Value::Decimal {
+        value,
+        precision: 2,
+        scale,
+    };
+    assert_eq!(one(&mut db, "SELECT floor(1.7);"), dec(1, 0));
+    assert_eq!(one(&mut db, "SELECT floor(-1.5);"), dec(-2, 0));
+    assert_eq!(one(&mut db, "SELECT ceil(1.2);"), dec(2, 0));
+    assert_eq!(one(&mut db, "SELECT ceil(-1.2);"), dec(-1, 0));
+    assert_eq!(dbl(&mut db, "SELECT floor(1.7e0);"), 1.0);
+    assert_eq!(dbl(&mut db, "SELECT ceil(-1.2e0);"), -1.0);
     assert_eq!(dbl(&mut db, "SELECT floor(id) FROM emp WHERE id = 3;"), 3.0);
     assert_eq!(
         dbl(&mut db, "SELECT ceil(salary) FROM emp WHERE id = 3;"),
@@ -333,7 +339,8 @@ fn engine_math_builtins_stay_duckdb_pinned() {
             Value::Integer(3),
             Value::Integer(1),
             Value::Null,
-            Value::Double(2.5),
+            // greatest(INTEGER, DECIMAL(2,1)) is DECIMAL(11,1).
+            Value::decimal(25, 1),
             Value::Varchar("a".to_string()),
         ]]
     );
@@ -462,73 +469,6 @@ fn prepared_statements_bind_numeric_and_ranged_arguments() {
     );
 }
 
-// ---------- volatility ----------
-
-#[test]
-fn random_is_readable_but_refused_in_every_wal_logged_statement() {
-    let mut db = db_with_math();
-    // Read-only: allowed, a DOUBLE in [0, 1).
-    let value = dbl(&mut db, "SELECT random();");
-    assert!((0.0..1.0).contains(&value), "{value}");
-    // Volatile means "may differ on replay", not "constant": the predicate is
-    // still deterministic in its *type*, and many calls land in range.
-    assert_eq!(
-        rows(
-            &mut db,
-            "SELECT random() >= 0.0 AND random() < 1.0 AND random() <> random();"
-        ),
-        vec![vec![Value::Boolean(true)]]
-    );
-    // A read over a table, in WHERE, and in a subquery are all reads.
-    db.execute("CREATE TABLE t (x DOUBLE); INSERT INTO t VALUES (0.5);")
-        .unwrap();
-    assert_eq!(
-        rows(&mut db, "SELECT COUNT(*) FROM t WHERE random() < 1.0;"),
-        vec![vec![Value::Bigint(1)]]
-    );
-    assert_eq!(
-        rows(&mut db, "SELECT (SELECT random()) < 1.0;"),
-        vec![vec![Value::Boolean(true)]]
-    );
-
-    // Every statement class the engine WAL-logs is refused, before it runs.
-    for sql in [
-        "INSERT INTO t VALUES (random());",
-        "INSERT INTO t SELECT random() FROM t;",
-        "UPDATE t SET x = random();",
-        "DELETE FROM t WHERE random() < 1.0;",
-        "CREATE TABLE t2 AS SELECT random();",
-        "CREATE TABLE t3 AS SELECT random() FROM t;",
-        "INSERT INTO t VALUES (1.0 + random());",
-    ] {
-        let err = error(&mut db, sql);
-        assert!(
-            err.contains("random()")
-                && err.contains("volatile (nondeterministic)")
-                && err.contains("cannot be called in a statement the engine WAL-logs"),
-            "{sql}: {err}"
-        );
-    }
-    // Nothing was applied by the refused statements.
-    assert_eq!(
-        rows(&mut db, "SELECT COUNT(*) FROM t;"),
-        vec![vec![Value::Bigint(1)]]
-    );
-    let err = error(&mut db, "SELECT COUNT(*) FROM t2;");
-    assert!(err.contains("not found"), "{err}");
-
-    // A view *body* is a read: CREATE VIEW only stores the text, and querying
-    // the view is a read, so both are allowed. Writing through the view is a
-    // WAL-logged statement and is refused (the body's volatile call would be
-    // re-evaluated on replay).
-    db.execute("CREATE VIEW v AS SELECT random() AS r;")
-        .unwrap();
-    let value = dbl(&mut db, "SELECT r FROM v;");
-    assert!((0.0..1.0).contains(&value), "{value}");
-    let err = error(&mut db, "INSERT INTO t SELECT r FROM v;");
-    assert!(err.contains("volatile"), "{err}");
-}
-
 #[test]
 fn deterministic_math_is_wal_logged_and_replays() {
     registered();
@@ -549,12 +489,9 @@ fn deterministic_math_is_wal_logged_and_replays() {
             "INSERT INTO t VALUES (exp(1), log(100)), (log(2, 8), sqrt(4)), (sin(0), pi());",
         )
         .unwrap();
-        // Refused: random is volatile, so it is never logged.
-        let err = db
-            .execute("INSERT INTO t VALUES (random(), 0.0);")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("volatile"), "{err}");
+        // `random()` is the engine's own seeded function (wave 139b): a write
+        // that calls it is logged with its seed and replays the same value.
+        db.execute("INSERT INTO t VALUES (random(), 0.5);").unwrap();
         db.checkpoint().unwrap();
         // After the checkpoint the next touching record is prefixed again.
         db.execute("INSERT INTO t VALUES (log2(8), log10(1000));")
@@ -568,7 +505,7 @@ fn deterministic_math_is_wal_logged_and_replays() {
         );
         assert!(
             !wal.contains("random"),
-            "a volatile call is never logged: {wal}"
+            "the checkpoint absorbed the earlier records: {wal}"
         );
     }
 
@@ -578,7 +515,7 @@ fn deterministic_math_is_wal_logged_and_replays() {
         let mut db = PinkDb::open_durable(ckpt).unwrap();
         assert_eq!(
             rows(&mut db, "SELECT COUNT(*) FROM t;"),
-            vec![vec![Value::Bigint(4)]]
+            vec![vec![Value::Bigint(5)]]
         );
         approx(dbl(&mut db, "SELECT a FROM t ORDER BY a LIMIT 1;"), 0.0);
         assert_eq!(

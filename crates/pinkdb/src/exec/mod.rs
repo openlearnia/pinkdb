@@ -428,12 +428,19 @@ pub enum QueryResult {
     CreatedDatabase {
         name: String,
     },
+    CreatedSchema {
+        name: String,
+    },
     DroppedDatabase {
         name: String,
     },
-    /// `USE <db>`: the session layer applies this to its current database.
+    DroppedSchema {
+        name: String,
+    },
+    /// `USE`: the session layer applies this to its current schema.
     Used {
         db: String,
+        schema: String,
     },
     /// `SET VARIABLE <name> = <value>`: the session variable now holds the
     /// value. Variables are session-scoped, so a durable store logs the
@@ -511,7 +518,7 @@ pub enum QueryResult {
         name: String,
     },
     /// `GRANT …` (wave 48): `description` is the human-readable grant
-    /// (`SELECT ON TABLE main.t TO alice`).
+    /// (`SELECT ON TABLE main.main.t TO alice`).
     Granted {
         description: String,
     },
@@ -710,7 +717,7 @@ fn join_nodes<'p>(plan: &'p LogicalPlan, out: &mut Vec<&'p LogicalPlan>) {
 fn reads_cte(plan: &LogicalPlan) -> bool {
     use LogicalPlan as P;
     match plan {
-        P::Scan { db: None, .. } => true,
+        P::Scan { ns: None, .. } => true,
         P::Join { left, right, .. }
         | P::NestedLoopJoin { left, right, .. }
         | P::SetOp { left, right, .. } => reads_cte(left) || reads_cte(right),
@@ -1092,7 +1099,7 @@ impl<'a> Cx<'a> {
 /// the new one is created. Its grants stay: replacing is how a pipeline
 /// rebuilds the same table, and losing access on every rebuild would be a
 /// surprise (a plain `DROP TABLE` does remove them).
-fn replace_table(db: &mut PinkDb, target: &str, name: &str) -> Result<()> {
+fn replace_table(db: &mut PinkDb, target: &crate::storage::SchemaPath, name: &str) -> Result<()> {
     if let Some(err) = db.attached_read_only(target, name) {
         return Err(err);
     }
@@ -1102,8 +1109,8 @@ fn replace_table(db: &mut PinkDb, target: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn resolve_db(db: &PinkDb, qdb: &Option<String>) -> String {
-    qdb.clone().unwrap_or_else(|| db.current_db().to_string())
+fn resolve_ns(db: &PinkDb, qdb: &Option<crate::storage::SchemaPath>) -> crate::storage::SchemaPath {
+    qdb.clone().unwrap_or_else(|| db.current_ns().clone())
 }
 
 /// `SET VARIABLE`: evaluate the value (a constant expression, like a `CALL`
@@ -1113,6 +1120,7 @@ fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
     let single = DataChunk {
         columns: Vec::new(),
         num_rows: 1,
+        ordinal: 0,
     };
     let v = eval_expr(value, &single, cx)?;
     if v.len() != 1 {
@@ -1146,15 +1154,25 @@ fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
 /// `dbname` when `table` is `None` (wave 122). Statistics are advisory: this
 /// touches no rows, writes no WAL record, and the next checkpoint persists
 /// the result.
-fn analyze_tables(db: &mut PinkDb, dbname: &str, table: Option<&str>) -> Result<usize> {
-    let names = match table {
-        Some(name) => vec![name.to_string()],
-        None => db.list_tables_in(dbname),
+fn analyze_tables(
+    db: &mut PinkDb,
+    ns: &crate::storage::SchemaPath,
+    table: Option<&str>,
+) -> Result<usize> {
+    // A named table is the binder-resolved one; the all-tables form means
+    // every table of the database, in every schema.
+    let targets: Vec<(crate::storage::SchemaPath, String)> = match table {
+        Some(name) => vec![(ns.clone(), name.to_string())],
+        None => db
+            .all_tables_of(ns.db())
+            .into_iter()
+            .map(|(ns, name, _)| (ns, name))
+            .collect(),
     };
-    for name in &names {
-        db.table_mut_in(dbname, name)?.analyze()?;
+    for (ns, name) in &targets {
+        db.table_mut_in(ns, name)?.analyze()?;
     }
-    Ok(names.len())
+    Ok(targets.len())
 }
 
 /// The shared gate for the statements that load native code (`LOAD EXTENSION`,
@@ -1175,14 +1193,29 @@ fn sql_load_gate(db: &PinkDb, statement: &str, source: &str) -> Result<()> {
 /// `USE` validation + result. Bind already checks existence; re-checking here
 /// closes the window for the multi-writer `Connection` path (bind and run are
 /// separate lock acquisitions) and keeps `run` self-contained.
-fn use_result(db: &PinkDb, name: &str) -> Result<QueryResult> {
-    if !db.database_exists(name) {
+fn use_result(db: &PinkDb, ns: &crate::storage::SchemaPath) -> Result<QueryResult> {
+    // `temp` exists for the session but is never a current database: DuckDB
+    // refuses `USE temp` as an internal schema.
+    if ns.db().eq_ignore_ascii_case("temp") {
+        return Err(PinkDbError::Catalog(
+            "cannot USE the internal database \"temp\"".to_string(),
+        ));
+    }
+    if !db.database_exists(ns.db()) {
         return Err(PinkDbError::Catalog(format!(
-            "database \"{name}\" not found"
+            "database \"{}\" not found",
+            ns.db()
+        )));
+    }
+    if !db.schema_exists(ns) {
+        return Err(PinkDbError::Catalog(format!(
+            "schema \"{}\" not found",
+            ns.schema()
         )));
     }
     Ok(QueryResult::Used {
-        db: name.to_ascii_lowercase(),
+        db: ns.db().to_string(),
+        schema: ns.schema().to_string(),
     })
 }
 
@@ -1190,7 +1223,11 @@ fn use_result(db: &PinkDb, name: &str) -> Result<QueryResult> {
 /// store**: the schema/rows a refresh would write. Rebinds the definition from
 /// its persisted SQL when the catalog has no bound plan (a file whose base
 /// objects were missing at load), caching the rebound plan.
-fn evaluate_materialized_view(db: &mut PinkDb, target: &str, name: &str) -> Result<Output> {
+fn evaluate_materialized_view(
+    db: &mut PinkDb,
+    target: &crate::storage::SchemaPath,
+    name: &str,
+) -> Result<Output> {
     let query = match db.materialized_view_in(target, name)?.query.clone() {
         Some(q) => q,
         None => {
@@ -1213,7 +1250,12 @@ fn evaluate_materialized_view(db: &mut PinkDb, target: &str, name: &str) -> Resu
 /// recreating the table when the output schema changed. Shared by `CREATE
 /// MATERIALIZED VIEW` and every refresh: evaluation happens first, so a
 /// failing query can neither clear good data nor leave a half-written table.
-fn store_materialized_view(db: &mut PinkDb, target: &str, name: &str, out: &Output) -> Result<()> {
+fn store_materialized_view(
+    db: &mut PinkDb,
+    target: &crate::storage::SchemaPath,
+    name: &str,
+    out: &Output,
+) -> Result<()> {
     let schema: Vec<(String, DataType)> = out
         .names
         .iter()
@@ -1255,7 +1297,11 @@ fn store_materialized_view(db: &mut PinkDb, target: &str, name: &str, out: &Outp
 /// Shared by the manual statement and the boundary pass (wave 80). Errors
 /// propagate to the caller: the manual statement reports them, the automatic
 /// pass records them in the definition.
-pub(crate) fn refresh_materialized_view(db: &mut PinkDb, target: &str, name: &str) -> Result<()> {
+pub(crate) fn refresh_materialized_view(
+    db: &mut PinkDb,
+    target: &crate::storage::SchemaPath,
+    name: &str,
+) -> Result<()> {
     let out = evaluate_materialized_view(db, target, name)?;
     store_materialized_view(db, target, name, &out)?;
     db.mark_refreshed(target, name, crate::mv::now_ms())
@@ -1296,15 +1342,19 @@ fn run_with_budget_inner(
     // A `CALL` recurses through this function; dispatch it before the
     // statement match so one nesting level does not hold `run_plain`'s frame.
     if let LogicalPlan::Call {
-        db: qdb,
+        ns: qdb,
         name,
         args,
         inline,
+        lake,
     } = plan
     {
+        if let Some(call) = lake {
+            return db.lake_function_write(call).map(query_result_from_table);
+        }
         return run_call_plan(db, qdb, name, args, inline, &budget);
     }
-    if let Some((target, table, event)) = crate::trigger::plan_dml(plan, db.current_db())
+    if let Some((target, table, event)) = crate::trigger::plan_dml(plan, db.current_ns())
         && crate::trigger::has_triggers(db, &target, &table)
     {
         return crate::trigger::run_with_triggers(db, plan, &budget, &target, &table, event);
@@ -1318,18 +1368,19 @@ fn run_with_budget_inner(
 /// keeps the documented 32-level call depth inside a default thread stack.
 fn run_call_plan(
     db: &mut PinkDb,
-    qdb: &Option<String>,
+    qdb: &Option<crate::storage::SchemaPath>,
     name: &str,
     args: &[crate::sql::binder::BoundExpr],
     inline: &Option<Box<crate::procedure::ProcedureDef>>,
     budget: &std::sync::Arc<ExecBudget>,
 ) -> Result<QueryResult> {
-    let target = resolve_db(db, qdb);
+    let target = resolve_ns(db, qdb);
     // The arguments are constant expressions: evaluate them against an empty
     // single-row chunk, exactly like an ALTER default.
     let single = DataChunk {
         columns: Vec::new(),
         num_rows: 1,
+        ordinal: 0,
     };
     let mut values = Vec::with_capacity(args.len());
     {
@@ -1369,7 +1420,7 @@ fn run_call_plan(
 /// the deleted row instead.
 fn finish_dml(
     db: &mut PinkDb,
-    target: &str,
+    target: &crate::storage::SchemaPath,
     table: &str,
     run: impl FnOnce(&mut PinkDb) -> Result<usize>,
     returning: Option<&crate::plan::Returning>,
@@ -1484,7 +1535,7 @@ pub(crate) fn run_plain(
     budget.check_deadline()?;
     match plan {
         LogicalPlan::CreateTable {
-            db: qdb,
+            ns: qdb,
             name,
             schema,
             constraints,
@@ -1492,35 +1543,16 @@ pub(crate) fn run_plain(
             or_replace,
             defaults,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             // `IF NOT EXISTS`: an existing table makes the statement a no-op
             // (DuckDB semantics). A same-named view still conflicts, like
             // the plain CREATE.
             if *if_not_exists && db.table_in(&target, name).is_ok() {
                 return Ok(QueryResult::Created);
             }
-            // Evaluate every DEFAULT once, against an empty single-row chunk
-            // (like an INSERT cell), before anything changes.
-            let mut values = Vec::with_capacity(defaults.len());
-            for (default, (_, dtype)) in defaults.iter().zip(schema) {
-                values.push(match default {
-                    None => None,
-                    Some(expr) => {
-                        let single = DataChunk {
-                            columns: Vec::new(),
-                            num_rows: 1,
-                        };
-                        let cx = Cx::with_budget(db, budget.clone());
-                        let v = eval_expr(expr, &single, &cx)?;
-                        if v.len() != 1 {
-                            return Err(PinkDbError::Execution(
-                                "a column DEFAULT did not evaluate to one value".to_string(),
-                            ));
-                        }
-                        Some(DataTable::coerce(v.get(0), *dtype)?)
-                    }
-                });
-            }
+            // Defaults are stored as written and evaluated per row that takes
+            // them; CREATE itself never runs the expression (a failing cast
+            // fails at INSERT, like DuckDB).
             if *or_replace {
                 replace_table(db, &target, name)?;
             }
@@ -1530,22 +1562,20 @@ pub(crate) fn run_plain(
                 schema.clone(),
                 constraints.clone(),
             )?;
-            if values.iter().any(Option::is_some) {
-                let t = db.table_mut_in(&target, name)?;
-                for (column, value) in t.columns.iter_mut().zip(values) {
-                    column.default = value;
-                }
+            let t = db.table_mut_in(&target, name)?;
+            for (column, default) in t.columns.iter_mut().zip(defaults.iter()) {
+                column.default = default.clone();
             }
             Ok(QueryResult::Created)
         }
         LogicalPlan::CreateTableAs {
-            db: qdb,
+            ns: qdb,
             name,
             query,
             if_not_exists,
             or_replace,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             if *if_not_exists && db.table_in(&target, name).is_ok() {
                 return Ok(QueryResult::Created);
             }
@@ -1577,23 +1607,26 @@ pub(crate) fn run_plain(
             Ok(QueryResult::Created)
         }
         LogicalPlan::Insert {
-            db: qdb,
+            ns: qdb,
             table,
             rows,
             conflict,
             returning,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             // Evaluate constant cells against an empty single-row chunk, then
-            // append (storage coerces INTEGER → BIGINT → DOUBLE).
-            let single = DataChunk {
-                columns: Vec::new(),
-                num_rows: 1,
-            };
+            // append (storage coerces INTEGER → BIGINT → DOUBLE). The chunk's
+            // ordinal is the row's position, so a volatile cell (a DEFAULT
+            // like `uuid()`) gives each row its own value.
             let mut staged = Vec::with_capacity(rows.len());
             {
                 let cx = Cx::with_budget(db, budget.clone());
-                for row in rows {
+                for (ordinal, row) in rows.iter().enumerate() {
+                    let single = DataChunk {
+                        columns: Vec::new(),
+                        num_rows: 1,
+                        ordinal,
+                    };
                     let values: Vec<Value> = row
                         .iter()
                         .map(|e| {
@@ -1644,14 +1677,15 @@ pub(crate) fn run_plain(
             )
         }
         LogicalPlan::InsertSelect {
-            db: qdb,
+            ns: qdb,
             table,
             columns,
+            defaults: default_exprs,
             query,
             conflict,
             returning,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             let out = {
                 let cx = Cx::with_budget(db, budget.clone()).with_projections(plan);
                 eval(&cx, query)?
@@ -1660,11 +1694,6 @@ pub(crate) fn run_plain(
             // resolves one entry per source column).
             let t0 = db.table_in(&target, table)?;
             let schema = t0.schema();
-            let defaults: Vec<Value> = t0
-                .columns
-                .iter()
-                .map(|c| c.default.clone().unwrap_or(Value::Null))
-                .collect();
             let order: Vec<usize> = columns
                 .clone()
                 .unwrap_or_else(|| (0..schema.len()).collect());
@@ -1687,8 +1716,44 @@ pub(crate) fn run_plain(
                 for (src, &tgt) in order.iter().enumerate() {
                     sources[tgt] = Some(src);
                 }
+                // Each unlisted column with a DEFAULT (wave 139a) evaluates it
+                // once per source chunk, against that chunk, so a volatile
+                // default varies per row; the result rides as one more shared
+                // column of the chunk, mapped like a source column.
+                let unlisted: Vec<(usize, &BoundExpr)> = default_exprs
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| !order.contains(idx))
+                    .filter_map(|(idx, e)| e.as_ref().map(|e| (idx, e)))
+                    .collect();
+                for (k, (idx, _)) in unlisted.iter().enumerate() {
+                    sources[*idx] = Some(order.len() + k);
+                }
+                let chunks: Vec<DataChunk> = if unlisted.is_empty() {
+                    out.chunks.clone()
+                } else {
+                    let cx = Cx::with_budget(db, budget.clone());
+                    let mut widened = Vec::with_capacity(out.chunks.len());
+                    for chunk in &out.chunks {
+                        let mut cols = chunk.columns.clone();
+                        for (_, expr) in &unlisted {
+                            let v = eval_expr(expr, chunk, &cx)?;
+                            if v.len() != chunk.num_rows() {
+                                return Err(PinkDbError::Execution(
+                                    "a column DEFAULT did not evaluate per row".to_string(),
+                                ));
+                            }
+                            cols.push(std::sync::Arc::new(v));
+                        }
+                        let mut widened_chunk = DataChunk::projected(cols, chunk.num_rows());
+                        widened_chunk.ordinal = chunk.ordinal;
+                        widened.push(widened_chunk);
+                    }
+                    widened
+                };
+                let defaults = vec![Value::Null; schema.len()];
                 let count: usize = out.chunks.iter().map(|c| c.num_rows()).sum();
-                let staged = stage_batches(&out.chunks, &sources, &schema, &defaults, &budget)?;
+                let staged = stage_batches(&chunks, &sources, &schema, &defaults, &budget)?;
                 let t = db.table_mut_in(&target, table)?;
                 for batch in &staged {
                     t.append_shared_chunk(batch)?;
@@ -1700,12 +1765,32 @@ pub(crate) fn run_plain(
             let mut staged = Vec::new();
             for chunk in &out.chunks {
                 budget.check_deadline()?;
+                // Unlisted columns take their DEFAULT once per source chunk,
+                // evaluated against that chunk so a volatile default (`uuid()`)
+                // varies per row the way the source rows do.
+                let cx = Cx::with_budget(db, budget.clone());
+                let mut defaults = Vec::new();
+                for (idx, default) in default_exprs.iter().enumerate() {
+                    if order.contains(&idx) {
+                        continue;
+                    }
+                    let Some(expr) = default else { continue };
+                    let v = eval_expr(expr, chunk, &cx)?;
+                    if v.len() != chunk.num_rows() {
+                        return Err(PinkDbError::Execution(
+                            "a column DEFAULT did not evaluate per row".to_string(),
+                        ));
+                    }
+                    defaults.push((idx, v));
+                }
                 for i in 0..chunk.num_rows() {
-                    // Unlisted columns take their DEFAULT (wave 65).
-                    let mut values = defaults.clone();
+                    let mut values = vec![Value::Null; schema.len()];
                     for (src, &target_idx) in order.iter().enumerate() {
                         values[target_idx] =
                             DataTable::coerce(chunk.columns[src].get(i), schema[target_idx].1)?;
+                    }
+                    for (idx, v) in &defaults {
+                        values[*idx] = DataTable::coerce(v.get(i), schema[*idx].1)?;
                     }
                     staged.push(values);
                 }
@@ -1731,14 +1816,14 @@ pub(crate) fn run_plain(
             )
         }
         LogicalPlan::Update {
-            db: qdb,
+            ns: qdb,
             table,
             sets,
             predicate,
             from,
             returning,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             let run = |db: &mut PinkDb| -> Result<usize> {
                 // `UPDATE … FROM`: the source row precedes the target row in
                 // every expression's input.
@@ -1796,13 +1881,13 @@ pub(crate) fn run_plain(
             )
         }
         LogicalPlan::Delete {
-            db: qdb,
+            ns: qdb,
             table,
             predicate,
             using,
             returning,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             let run = |db: &mut PinkDb| -> Result<usize> {
                 if let Some(source) = using {
                     return dml::delete_using(
@@ -1841,14 +1926,14 @@ pub(crate) fn run_plain(
             })
         }
         LogicalPlan::Merge {
-            db: qdb,
+            ns: qdb,
             table,
             source,
             on,
             clauses,
             returning,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             let run = |db: &mut PinkDb| -> Result<usize> {
                 let (inserted, updated, deleted) =
                     dml::merge(db, &target, table, source, on, clauses, &budget)?;
@@ -1877,14 +1962,14 @@ pub(crate) fn run_plain(
             Ok(QueryResult::RolledBack)
         }
         LogicalPlan::CreateView {
-            db: qdb,
+            ns: qdb,
             name,
             cols,
             query,
             source,
             or_replace,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             if *or_replace && db.view_in(&target, name).is_ok() {
                 db.drop_view_in(&target, name)?;
             }
@@ -1895,14 +1980,15 @@ pub(crate) fn run_plain(
             Ok(QueryResult::CreatedView { name: name.clone() })
         }
         LogicalPlan::DropTable {
-            db: qdb,
+            ns: qdb,
             name,
             if_exists,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
+            let ns = target.clone();
             // An attached (read-only) name is refused before the existence
             // probe: DROP TABLE must never look like a missing-table no-op.
-            if let Some(err) = db.attached_read_only(&target, name) {
+            if let Some(err) = db.attached_read_only(&ns, name) {
                 return Err(err);
             }
             if db.table_in(&target, name).is_err() {
@@ -1915,11 +2001,11 @@ pub(crate) fn run_plain(
             // Wave 48: a table's grants go with the table — leaving them
             // behind would silently hand them to a future table of the same
             // name.
-            db.rbac_mut().remove_table(&target, name);
+            db.rbac_mut().remove_table(ns.db(), ns.schema(), name);
             Ok(QueryResult::DroppedTable { name: name.clone() })
         }
         LogicalPlan::CreateIndex {
-            db: qdb,
+            ns: qdb,
             name,
             table,
             column,
@@ -1928,7 +2014,7 @@ pub(crate) fn run_plain(
             options,
             ..
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             if db.table_in(&target, table).is_err() {
                 if *if_not_exists {
                     return Ok(QueryResult::CreatedIndex { name: name.clone() });
@@ -1958,12 +2044,12 @@ pub(crate) fn run_plain(
             Ok(QueryResult::CreatedIndex { name: name.clone() })
         }
         LogicalPlan::DropIndex {
-            db: qdb,
+            ns: qdb,
             name,
             table,
             if_exists,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             // The binder resolved the owning table (and the touched set a
             // durable frame records). Use it, so execution drops the same
             // object the plan named.
@@ -1983,11 +2069,12 @@ pub(crate) fn run_plain(
             }
             Ok(QueryResult::DroppedIndex { name: name.clone() })
         }
-        LogicalPlan::AlterTable { db: qdb, name, op } => {
-            let target = resolve_db(db, qdb);
+        LogicalPlan::AlterTable { ns: qdb, name, op } => {
+            let target = resolve_ns(db, qdb);
+            let ns = target.clone();
             // An attached (read-only) name is refused before anything runs:
             // ALTER must never look like a no-op on a lake table.
-            if let Some(err) = db.attached_read_only(&target, name) {
+            if let Some(err) = db.attached_read_only(&ns, name) {
                 return Err(err);
             }
             match op {
@@ -1998,7 +2085,7 @@ pub(crate) fn run_plain(
                     not_null,
                     if_not_exists,
                 } => {
-                    {
+                    let rows = {
                         let t = db.table_in(&target, name)?;
                         if t.columns
                             .iter()
@@ -2011,37 +2098,45 @@ pub(crate) fn run_plain(
                                 "Column with name \"{column}\" already exists!"
                             )));
                         }
-                    }
-                    // Evaluate the DEFAULT once, against an empty single-row
-                    // chunk (like an INSERT cell), then coerce to the column.
-                    let value = match default {
-                        None => None,
-                        Some(expr) => {
-                            let single = DataChunk {
-                                columns: Vec::new(),
-                                num_rows: 1,
-                            };
-                            let cx = Cx::with_budget(db, budget.clone());
-                            let v = eval_expr(expr, &single, &cx)?;
-                            if v.len() != 1 {
-                                return Err(PinkDbError::Execution(
-                                    "the ADD COLUMN default did not evaluate to one value"
-                                        .to_string(),
-                                ));
+                        t.num_rows
+                    };
+                    // Every existing row evaluates the default for itself.
+                    let values = match default {
+                        None => vec![Value::Null; rows],
+                        Some(default) => {
+                            let mut values = Vec::with_capacity(rows);
+                            // One row at a time, with the row's own ordinal:
+                            // a volatile default (`uuid()`) must differ per
+                            // row, and a one-row chunk's ordinal is what the
+                            // seeded mixer reads.
+                            for row in 0..rows {
+                                let single = DataChunk {
+                                    columns: Vec::new(),
+                                    num_rows: 1,
+                                    ordinal: row,
+                                };
+                                let cx = Cx::with_budget(db, budget.clone());
+                                let v = eval_expr(&default.expr, &single, &cx)?;
+                                if v.len() != 1 {
+                                    return Err(PinkDbError::Execution(
+                                        "the ADD COLUMN default did not evaluate to one value"
+                                            .to_string(),
+                                    ));
+                                }
+                                values.push(DataTable::coerce(v.get(0), *dtype)?);
                             }
-                            Some(DataTable::coerce(v.get(0), *dtype)?)
+                            values
                         }
                     };
                     let table = db.table_mut_in(&target, name)?;
                     // DuckDB's rule: `ADD COLUMN … NOT NULL` needs a non-NULL
                     // default once the table has rows (an empty one is fine).
-                    if *not_null && table.num_rows > 0 && value.as_ref().is_none_or(|v| v.is_null())
-                    {
+                    if *not_null && values.iter().any(Value::is_null) {
                         return Err(PinkDbError::Execution(format!(
                             "NOT NULL constraint failed: {name}.{column}"
                         )));
                     }
-                    table.add_column(column.clone(), *dtype, value)?;
+                    table.add_column(column.clone(), *dtype, default.clone(), &values)?;
                     if *not_null {
                         let idx = table.columns.len() - 1;
                         table.constraints.not_null.push(idx);
@@ -2112,25 +2207,25 @@ pub(crate) fn run_plain(
                 AlterTablePlan::RenameTable { to } => {
                     db.rename_table_in(&target, name, to)?;
                     // Wave 48: privileges follow the table to its new name.
-                    db.rbac_mut().rename_table(&target, name, to);
+                    db.rbac_mut().rename_table(ns.db(), ns.schema(), name, to);
                     Ok(QueryResult::AlteredTable { name: to.clone() })
                 }
             }
         }
-        LogicalPlan::DropView { db: qdb, name } => {
-            let target = resolve_db(db, qdb);
+        LogicalPlan::DropView { ns: qdb, name } => {
+            let target = resolve_ns(db, qdb);
             db.drop_view_in(&target, name)?;
             Ok(QueryResult::DroppedView { name: name.clone() })
         }
         LogicalPlan::CreateMaterializedView {
-            db: qdb,
+            ns: qdb,
             name,
             query,
             if_not_exists,
             policy,
             source,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             if *if_not_exists
                 && (db.materialized_view_in(&target, name).is_ok()
                     || db.table_in(&target, name).is_ok())
@@ -2171,13 +2266,13 @@ pub(crate) fn run_plain(
             )?;
             Ok(QueryResult::CreatedMaterializedView { name: name.clone() })
         }
-        LogicalPlan::RefreshMaterializedView { db: qdb, name } => {
-            let target = resolve_db(db, qdb);
+        LogicalPlan::RefreshMaterializedView { ns: qdb, name } => {
+            let target = resolve_ns(db, qdb);
             refresh_materialized_view(db, &target, name)?;
             Ok(QueryResult::RefreshedMaterializedView { name: name.clone() })
         }
-        LogicalPlan::RefreshMaterializedViews { db: qdb } => {
-            let target = resolve_db(db, qdb);
+        LogicalPlan::RefreshMaterializedViews { ns: qdb } => {
+            let target = resolve_ns(db, qdb);
             let names = db.materialized_view_names_in(&target);
             // All-or-nothing: every defining query is evaluated before any
             // backing table is touched, so one broken view cannot leave the
@@ -2196,11 +2291,11 @@ pub(crate) fn run_plain(
             Ok(QueryResult::RefreshedMaterializedViews { names })
         }
         LogicalPlan::DropMaterializedView {
-            db: qdb,
+            ns: qdb,
             name,
             if_exists,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             if db.materialized_view_in(&target, name).is_err() {
                 if *if_exists {
                     return Ok(QueryResult::DroppedMaterializedView { name: name.clone() });
@@ -2218,6 +2313,54 @@ pub(crate) fn run_plain(
             db.materialized_views_remove_in(&target, &name.to_ascii_lowercase());
             Ok(QueryResult::DroppedMaterializedView { name: name.clone() })
         }
+        LogicalPlan::CreateSchema {
+            ns,
+            name,
+            if_not_exists,
+        } => {
+            db.refuse_lake_write(ns.db())?;
+            if !db.database_exists(ns.db()) {
+                return Err(PinkDbError::Catalog(format!(
+                    "database \"{}\" not found",
+                    ns.db()
+                )));
+            }
+            if !*if_not_exists && db.schema_exists(ns) {
+                return Err(PinkDbError::Catalog(format!(
+                    "schema \"{}\" already exists",
+                    ns.schema()
+                )));
+            }
+            let existed = db.schema_exists(ns);
+            db.create_schema(ns, *if_not_exists)?;
+            if !existed {
+                db.set_schema_display(ns, name)?;
+            }
+            Ok(QueryResult::CreatedSchema { name: name.clone() })
+        }
+        LogicalPlan::DropSchema {
+            ns,
+            if_exists,
+            cascade,
+        } => {
+            db.refuse_lake_write(ns.db())?;
+            if !*if_exists && !db.schema_exists(ns) {
+                return Err(PinkDbError::Catalog(format!(
+                    "schema \"{}\" not found",
+                    ns.schema()
+                )));
+            }
+            if db.schema_exists(ns) {
+                db.drop_schema(ns, *if_exists, *cascade)?;
+                if db.current_ns() == ns {
+                    let fallback = db.fallback_ns();
+                    db.set_current_ns(fallback);
+                }
+            }
+            Ok(QueryResult::DroppedSchema {
+                name: ns.schema().to_string(),
+            })
+        }
         LogicalPlan::CreateDatabase {
             name,
             if_not_exists,
@@ -2234,7 +2377,11 @@ pub(crate) fn run_plain(
         }
         // Wave 124: `ATTACH` reports the database it created, `DETACH` the one
         // it removed (so a session on it falls back like after a DROP).
-        LogicalPlan::Attach { name, spec } => {
+        LogicalPlan::Attach { name, spec, secret } => {
+            if let Some(secret) = secret {
+                let session = db.session.clone();
+                db.put_secret(secret.clone(), true, true, false, &session)?;
+            }
             db.attach_lake_database(name, spec.clone())?;
             Ok(QueryResult::CreatedDatabase { name: name.clone() })
         }
@@ -2243,6 +2390,39 @@ pub(crate) fn run_plain(
                 db.rbac_mut().remove_database(name);
             }
             Ok(QueryResult::DroppedDatabase { name: name.clone() })
+        }
+        // Wave 132b: secrets are the only carrier of a credential. A
+        // temporary secret lives in the session (and shadows a persistent
+        // one); a persistent secret is store state, checkpointed in the
+        // footer's own sealed section and shipped in WAL records' own
+        // section, never as statement text.
+        LogicalPlan::CreateSecret {
+            secret,
+            persistent,
+            or_replace,
+            if_not_exists,
+        } => {
+            let session = db.session.clone();
+            db.put_secret(
+                secret.clone(),
+                *persistent,
+                *or_replace,
+                *if_not_exists,
+                &session,
+            )?;
+            Ok(QueryResult::Created)
+        }
+        LogicalPlan::DropSecret {
+            name,
+            persistent,
+            if_exists,
+        } => {
+            let session = db.session.clone();
+            // Replay re-runs a logged DROP against the record's snapshot; the
+            // statement may have dropped a temporary secret only, so a
+            // missing name is not a recovery error.
+            db.remove_secret(name, *persistent, *if_exists || db.replaying, &session)?;
+            Ok(QueryResult::Created)
         }
         LogicalPlan::DropDatabase { name, if_exists } => {
             if *if_exists && !db.database_exists(name) {
@@ -2254,7 +2434,7 @@ pub(crate) fn run_plain(
             db.rbac_mut().remove_database(name);
             Ok(QueryResult::DroppedDatabase { name: name.clone() })
         }
-        LogicalPlan::Use { name } => use_result(db, name),
+        LogicalPlan::Use { ns } => use_result(db, ns),
         LogicalPlan::SetVariable { name, value } => {
             let cx = Cx::with_budget(db, budget.clone());
             set_variable(&cx, name, value)
@@ -2265,7 +2445,7 @@ pub(crate) fn run_plain(
             }
             Ok(QueryResult::Checkpointed)
         }
-        LogicalPlan::Analyze { db: adb, table } => {
+        LogicalPlan::Analyze { ns: adb, table } => {
             analyze_tables(db, adb, table.as_deref())?;
             // DuckDB-shaped outcome: one BOOLEAN row.
             Ok(QueryResult::Selected {
@@ -2296,6 +2476,9 @@ pub(crate) fn run_plain(
             Ok(QueryResult::LoadedExtension { name })
         }
         LogicalPlan::InstallExtension { name, from, force } => {
+            if is_builtin_extension(name) {
+                return Ok(QueryResult::LoadedExtension { name: name.clone() });
+            }
             // Name a missing `repo` feature before gate or network: the
             // build, not the connection, is what cannot install.
             db.require_repository_support()?;
@@ -2308,6 +2491,9 @@ pub(crate) fn run_plain(
             Ok(QueryResult::LoadedExtension { name })
         }
         LogicalPlan::LoadInstalledExtension { name } => {
+            if is_builtin_extension(name) {
+                return Ok(QueryResult::LoadedExtension { name: name.clone() });
+            }
             let path = db.installed_extension_path(name)?;
             if db.replaying {
                 // The cache path is the source a logged statement that calls
@@ -2321,12 +2507,12 @@ pub(crate) fn run_plain(
             Ok(QueryResult::LoadedExtension { name })
         }
         LogicalPlan::CreateProcedure {
-            db: qdb,
+            ns: qdb,
             name,
             def,
             or_replace,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             // The procedure shares the table/view/materialized-view name
             // space at creation: a callable named like a table would make
             // `CALL` and queries silently disagree. A materialized view is
@@ -2357,11 +2543,11 @@ pub(crate) fn run_plain(
             Ok(QueryResult::CreatedProcedure { name: name.clone() })
         }
         LogicalPlan::DropProcedure {
-            db: qdb,
+            ns: qdb,
             name,
             if_exists,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             if db.procedure_in(&target, name).is_err() {
                 if *if_exists {
                     return Ok(QueryResult::DroppedProcedure { name: name.clone() });
@@ -2374,13 +2560,14 @@ pub(crate) fn run_plain(
             Ok(QueryResult::DroppedProcedure { name: name.clone() })
         }
         LogicalPlan::CreateTrigger {
-            db: qdb,
+            ns: qdb,
             def,
             or_replace,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             let mut def = (**def).clone();
-            def.db = target.clone();
+            def.db = target.db().to_string();
+            def.schema = target.schema().to_string();
             // A trigger shares the callable/catalog name space with nothing —
             // it is looked up per table — but two triggers of one table with
             // the same name would make `DROP TRIGGER` ambiguous.
@@ -2397,12 +2584,12 @@ pub(crate) fn run_plain(
             Ok(QueryResult::CreatedTrigger { name })
         }
         LogicalPlan::DropTrigger {
-            db: qdb,
+            ns: qdb,
             name,
             table,
             if_exists,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             let existing = db.trigger_in(&target, name).ok().cloned();
             let Some(existing) = existing else {
                 if *if_exists {
@@ -2538,20 +2725,26 @@ pub(crate) fn run_plain(
             })
         }
         LogicalPlan::Call {
-            db: qdb,
+            ns: qdb,
             name,
             args,
             inline,
-        } => run_call_plan(db, qdb, name, args, inline, &budget),
+            lake,
+        } => {
+            if let Some(call) = lake {
+                return db.lake_function_write(call).map(query_result_from_table);
+            }
+            run_call_plan(db, qdb, name, args, inline, &budget)
+        }
         LogicalPlan::CreateMacro {
-            db: qdb,
+            ns: qdb,
             name,
             def,
             or_replace,
             if_not_exists,
             source,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             // The definition is persisted as its statement text; a plan that
             // reached the executor without one (a host calling the raw
             // bind/run API) could never be saved, so refuse loudly instead of
@@ -2580,11 +2773,11 @@ pub(crate) fn run_plain(
             Ok(QueryResult::CreatedMacro { name: name.clone() })
         }
         LogicalPlan::DropMacro {
-            db: qdb,
+            ns: qdb,
             name,
             if_exists,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             if db.macro_in(&target, name).is_err() {
                 if *if_exists {
                     return Ok(QueryResult::DroppedMacro { name: name.clone() });
@@ -2635,8 +2828,8 @@ pub(crate) fn run_read_with_budget(
 fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
     // `USE` is read-only for locking but is not a row-producing plan: it
     // returns the target database for the session layer to apply.
-    if let LogicalPlan::Use { name } = plan {
-        return use_result(cx.db, name);
+    if let LogicalPlan::Use { ns } = plan {
+        return use_result(cx.db, ns);
     }
     // `SET VARIABLE` writes session state only: it is read-only for the store
     // (no lock upgrade, nothing logged) but must still run on the read path.
@@ -2693,7 +2886,7 @@ fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
 /// `BIGINT` column naming the rows written.
 fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
     let LogicalPlan::CopyTo {
-        db: qdb,
+        ns: qdb,
         table,
         format,
         path,
@@ -2701,7 +2894,7 @@ fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
     else {
         unreachable!("execute_copy_to needs a CopyTo node");
     };
-    let target = resolve_db(db, qdb);
+    let target = resolve_ns(db, qdb);
     // M-3: the destination policy is enforced in the engine, not at bind
     // time, so a policy changed after prepare still applies. A disabled
     // server refuses even an ADMIN; the opt-in form confines the parent.
@@ -2860,7 +3053,7 @@ fn present_columns(t: &DataTable, cols: &[usize]) -> Option<Vec<bool>> {
 /// The store scan a plan reads, when it is one this pipeline can stream; the
 /// same zone pruning and projection `scan_output` would apply.
 pub(crate) fn store_scan<'a>(cx: &'a Cx, plan: &LogicalPlan) -> Result<Option<StoreScan<'a>>> {
-    let LogicalPlan::Scan { db: qdb, table, at } = plan else {
+    let LogicalPlan::Scan { ns: qdb, table, at } = plan else {
         return Ok(None);
     };
     if at.is_some() {
@@ -2869,11 +3062,18 @@ pub(crate) fn store_scan<'a>(cx: &'a Cx, plan: &LogicalPlan) -> Result<Option<St
     if qdb.is_none() && cx.ctes.contains_key(&table.to_ascii_lowercase()) {
         return Ok(None);
     }
-    let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
-    if cx.db.attached_lookup(lookup, table).is_some() {
+    let lookup = qdb
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| cx.db.current_ns().clone());
+    if cx
+        .db
+        .attached_lookup(lookup.db(), lookup.schema(), table)
+        .is_some()
+    {
         return Ok(None);
     }
-    let t = cx.db.table_in(lookup, table)?;
+    let t = cx.db.table_in(&lookup, table)?;
     let keep = scan_candidates(t, cx.prunes.for_scan(plan), &cx.dynamic.for_scan(plan));
     Ok(Some(StoreScan::new(t, cx.projections.for_scan(plan), keep)))
 }
@@ -2936,7 +3136,7 @@ fn scan_candidates(
 /// every column decoded. A time-travel scan (`at`) reads the attached lake at
 /// the target version instead of the pinned one.
 fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
-    let LogicalPlan::Scan { db: qdb, table, at } = plan else {
+    let LogicalPlan::Scan { ns: qdb, table, at } = plan else {
         unreachable!("scan_output needs a Scan node");
     };
     if qdb.is_none()
@@ -2944,11 +3144,14 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     {
         return Ok(out.clone());
     }
-    let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
+    let lookup = qdb
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| cx.db.current_ns().clone());
     let projected = cx.projections.for_scan(plan);
     // Join filters a completed build side registered for this scan (wave 122).
     let dynamic = cx.dynamic.for_scan(plan);
-    if let Some((_, lake)) = cx.db.attached_lookup(lookup, table) {
+    if let Some((_, lake)) = cx.db.attached_lookup(lookup.db(), lookup.schema(), table) {
         // The simple `WHERE` conjuncts this scan may be pruned by (analyzed
         // with the projections). The lake decodes only the files whose zone
         // maps leave the predicate satisfiable.
@@ -2964,8 +3167,8 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             }
         }
         let scan = match at {
-            None => lake.load_filtered(lookup, table, projected, &prunes)?,
-            Some(at) => lake.load_filtered_at(lookup, table, *at, projected, &prunes)?,
+            None => lake.load_filtered(lookup.db(), table, projected, &prunes)?,
+            Some(at) => lake.load_filtered_at(lookup.db(), table, *at, projected, &prunes)?,
         };
         let (names, types) = scan.table.schema().into_iter().unzip();
         return Ok(Output {
@@ -2974,7 +3177,7 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             types,
         });
     }
-    let t = cx.db.table_in(lookup, table)?;
+    let t = cx.db.table_in(&lookup, table)?;
     let (names, types) = t.schema().into_iter().unzip();
     let keep = scan_candidates(t, cx.prunes.for_scan(plan), &dynamic);
     let chunks = match projected {
@@ -3000,6 +3203,35 @@ fn table_function_output(
     call: &crate::table_source::TableFunctionCall,
     schema: &[(String, DataType)],
 ) -> Result<Output> {
+    if source.eq_ignore_ascii_case("ducklake") {
+        let (Some(name), crate::table_source::TableFunctionCall::Function { args, .. }) =
+            (call.function_name(), call)
+        else {
+            return Err(PinkDbError::Execution(
+                "a DuckLake function needs a function call".to_string(),
+            ));
+        };
+        let lake = crate::lake_db::LakeFunctionCall::from_table_call(&name, args);
+        let table = cx.db.lake_function_read(&lake)?;
+        let mut chunks = Vec::with_capacity(table.columns[0].num_chunks());
+        for i in 0..table.columns[0].num_chunks() {
+            chunks.push(DataChunk {
+                columns: table
+                    .columns
+                    .iter()
+                    .map(|c| c.chunk(i))
+                    .collect::<Result<Vec<_>>>()?,
+                num_rows: table.columns[0].chunk_rows(i),
+                ordinal: i,
+            });
+        }
+        let (names, types) = schema.iter().cloned().unzip();
+        return Ok(Output {
+            chunks,
+            names,
+            types,
+        });
+    }
     let Some(src) = cx.db.table_source(source) else {
         return Err(PinkDbError::Execution(format!(
             "the table source \"{source}\" is not registered in this session (it was \
@@ -3009,7 +3241,13 @@ fn table_function_output(
     };
     let projection = cx.projections.for_scan(plan);
     let prunes = cx.prunes.for_scan(plan);
-    let scan = src.scan(call, projection, prunes)?;
+    let secrets: Vec<_> = cx
+        .db
+        .visible_secrets(&cx.session)
+        .into_iter()
+        .map(|entry| entry.secret)
+        .collect();
+    let scan = src.scan_with(call, projection, prunes, &secrets)?;
     let mut chunks = Vec::with_capacity(scan.chunks.len());
     for chunk in scan.chunks {
         check_source_chunk(source, schema, &chunk)?;
@@ -3022,6 +3260,26 @@ fn table_function_output(
         names,
         types,
     })
+}
+
+/// A DuckLake function's result table as a `CALL` result.
+fn query_result_from_table(table: DataTable) -> QueryResult {
+    let mut rows = Vec::with_capacity(table.num_rows());
+    for row in 0..table.num_rows() {
+        rows.push(
+            (0..table.columns.len())
+                // A freshly materialized table cannot fail to decode a cell,
+                // and a poisoned one reads as NULL rather than aborting the
+                // write that already succeeded.
+                .map(|col| table.get(row, col).ok().flatten().unwrap_or(Value::Null))
+                .collect(),
+        );
+    }
+    QueryResult::Selected {
+        names: table.columns.iter().map(|c| c.name.clone()).collect(),
+        types: table.columns.iter().map(|c| c.dtype).collect(),
+        rows,
+    }
 }
 
 /// Check one chunk a table source returned against the schema the binder
@@ -3110,7 +3368,7 @@ impl PartialOrd for ExactHit {
 #[allow(clippy::too_many_arguments)]
 fn exact_topk_rows(
     cx: &Cx,
-    db: &str,
+    db: &crate::storage::SchemaPath,
     table: &str,
     column: usize,
     dim: usize,
@@ -3184,7 +3442,7 @@ fn exact_topk_rows(
 /// interior chunk shorter than [`CHUNK_SIZE`].
 fn index_scan_output(
     cx: &Cx,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     table: &str,
     _col: usize,
     row_indices: &[usize],
@@ -3311,14 +3569,16 @@ fn attached_stats_aggregate(
     // a CTE); the attached lookup decides whether it is an attached lake
     // table at all.
     let LogicalPlan::Scan {
-        db: Some(db),
+        ns: Some(ns),
         table,
         at,
     } = input
     else {
         return Ok(None);
     };
-    let Some((pinned, lake)) = cx.db.attached_lookup(db, table) else {
+    // Attached lakes (and lake databases) resolve in their own schema.
+    let db = ns.db();
+    let Some((pinned, lake)) = cx.db.attached_lookup(db, ns.schema(), table) else {
         return Ok(None);
     };
     // `AT` asks about another version: the exact statistics of *that*
@@ -3592,6 +3852,19 @@ fn project_mask(cx: &Cx, plan: &LogicalPlan, width: usize) -> Option<Vec<bool>> 
 }
 
 fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
+    let mut out = eval_planned(cx, plan)?;
+    // A chunk's ordinal is its position in this operator's output — which is
+    // its consumer's input order — never the worker that happened to produce
+    // it. Parallel operators collect in input order, so serial and parallel
+    // runs agree, and the volatile built-ins derive identical per-row values
+    // from it on WAL replay.
+    for (i, chunk) in out.chunks.iter_mut().enumerate() {
+        chunk.ordinal = i;
+    }
+    Ok(out)
+}
+
+fn eval_planned(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     if matches!(plan, LogicalPlan::Join { .. }) && cx.subplans.has_candidates() {
         return eval_shared_join(cx, plan);
     }
@@ -3666,9 +3939,13 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::CreateSchema { .. }
         | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::DropSchema { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
+        | LogicalPlan::CreateSecret { .. }
+        | LogicalPlan::DropSecret { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::InstallExtension { .. }
         | LogicalPlan::LoadInstalledExtension { .. }
@@ -3713,13 +3990,13 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             "COPY does not produce rows".to_string(),
         )),
         LogicalPlan::IndexScan {
-            db,
+            ns: db,
             table,
             index,
             value,
         } => {
             // Use the index to get matching row indices, then gather columns.
-            let target = resolve_db(cx.db, db);
+            let target = resolve_ns(cx.db, db);
             let t = cx.db.table_in(&target, table)?;
             let idx = t
                 .indexes
@@ -3753,7 +4030,7 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             index_scan_output(cx, &target, table, idx.column, &row_indices)
         }
         LogicalPlan::VectorTopK {
-            db,
+            ns: db,
             table,
             column,
             index,
@@ -3763,7 +4040,7 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             k,
             ..
         } => {
-            let target = resolve_db(cx.db, db);
+            let target = resolve_ns(cx.db, db);
             let t = cx.db.table_in(&target, table)?;
             let def = t
                 .vector_indexes
@@ -3794,10 +4071,14 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             };
             index_scan_output(cx, &target, table, *column, &rows)
         }
-        LogicalPlan::ShowTables { db } => {
-            // DuckDB lists tables and views together, sorted by name.
-            let mut names = cx.db.list_tables_in(db);
-            for v in cx.db.list_views_in(db) {
+        LogicalPlan::ShowTables { ns } => {
+            // DuckDB lists tables and views together, sorted by name, with the
+            // session's temporary tables first in the search path (they keep
+            // their duplicate names: `SHOW TABLES` is a name list, not a map).
+            let temp = crate::storage::SchemaPath::temp(cx.session.id());
+            let mut names = cx.db.list_tables_in(&temp);
+            names.extend(cx.db.list_tables_in(ns));
+            for v in cx.db.list_views_in(ns) {
                 if !names.iter().any(|n| n.eq_ignore_ascii_case(&v)) {
                     names.push(v);
                 }
@@ -3858,8 +4139,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 ],
             })
         }
-        LogicalPlan::ShowMacros { db: qdb } => {
-            let target = resolve_db(cx.db, &Some(qdb.clone()));
+        LogicalPlan::ShowMacros { ns: qdb } => {
+            let target = qdb.clone();
             let defs = cx.db.macros_in(&target);
             let mut name = Vector::with_capacity(DataType::Varchar, defs.len());
             let mut kind = Vector::with_capacity(DataType::Varchar, defs.len());
@@ -3879,8 +4160,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 types: vec![DataType::Varchar, DataType::Varchar, DataType::Varchar],
             })
         }
-        LogicalPlan::ShowTriggers { db: qdb, table } => {
-            let target = resolve_db(cx.db, qdb);
+        LogicalPlan::ShowTriggers { ns: qdb, table } => {
+            let target = resolve_ns(cx.db, qdb);
             let defs: Vec<&crate::trigger::TriggerDef> = cx
                 .db
                 .triggers_in(&target)
@@ -3923,7 +4204,7 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 ],
             })
         }
-        LogicalPlan::DescribeMacro { db: qdb, name } => {
+        LogicalPlan::DescribeMacro { ns: qdb, name } => {
             let def = cx.db.macro_in(qdb, name)?.clone();
             // DuckDB-shaped macro metadata (`duckdb_functions()`' columns for
             // a `function_type = 'macro'` row). `return_type` is NULL for an
@@ -3958,8 +4239,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 ],
             })
         }
-        LogicalPlan::ShowMaterializedViews { db: qdb } => {
-            let target = resolve_db(cx.db, qdb);
+        LogicalPlan::ShowMaterializedViews { ns: qdb } => {
+            let target = resolve_ns(cx.db, qdb);
             let rows = cx
                 .db
                 .materialized_view_status_in(&target, crate::mv::now_ms());
@@ -4093,7 +4374,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             let scope = DataChunk {
                 columns: Vec::new(),
                 num_rows: 1,
-            };
+            ordinal: 0,
+};
             // A chunk holds at most CHUNK_SIZE rows: a longer VALUES list
             // (or a catalog relation of many rows) spans several chunks.
             let empty = || -> Vec<Vector> { types.iter().map(|t| Vector::new_empty(*t)).collect() };
@@ -4122,7 +4404,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             chunks: vec![DataChunk {
                 columns: Vec::new(),
                 num_rows: 1,
-            }],
+            ordinal: 0,
+}],
             names: vec![],
             types: vec![],
         }),
@@ -5681,6 +5964,44 @@ fn candidate_pairs_of<'k, K: KeyRows<'k>>(
     pairs
 }
 
+/// A join residual rewritten into the dense column space
+/// [`residual_selection`] gathers: the joined-row columns it reads (sorted) and
+/// the predicate over them.
+///
+/// Built **once per join**, before the probe chunks fan out, and primed there:
+/// an uncorrelated subquery's memo is keyed by its plan node's address, so a
+/// predicate rebuilt per chunk would miss the memo on every chunk and run the
+/// subquery again on a worker — the contention wave 111ab's priming exists to
+/// prevent (`tests/subquery_parallel.rs`).
+struct GatheredResidual {
+    cols: Vec<usize>,
+    pred: BoundExpr,
+}
+
+impl GatheredResidual {
+    fn new(cx: &Cx, residual: &BoundExpr) -> Result<Self> {
+        let mut cols = Vec::new();
+        columns_in(residual, &mut cols);
+        cols.sort_unstable();
+        cols.dedup();
+        if cols.contains(&usize::MAX) {
+            return Err(PinkDbError::Execution(
+                "internal: join residual reads an aggregate or window column".to_string(),
+            ));
+        }
+        let pred = if cols.is_empty() {
+            residual.clone()
+        } else {
+            crate::plan::map_columns(residual.clone(), &|i| {
+                cols.binary_search(&i)
+                    .expect("residual column was gathered")
+            })
+        };
+        expr::prime(cx, [&pred])?;
+        Ok(Self { cols, pred })
+    }
+}
+
 /// The candidate pairs that satisfy `residual`, as indices into `pairs`. The
 /// predicate reads the joined row in `preserved ++ build` space; only the
 /// columns it mentions are gathered into a dense chunk, so it evaluates once
@@ -5692,7 +6013,7 @@ fn candidate_pairs_of<'k, K: KeyRows<'k>>(
 /// src/execution/operator/join/physical_hash_join.cpp) gather the same way.
 fn residual_selection(
     cx: &Cx,
-    residual: &BoundExpr,
+    residual: &GatheredResidual,
     pairs: &[MatchPair],
     preserved: &DataChunk,
     preserved_cols: usize,
@@ -5701,30 +6022,18 @@ fn residual_selection(
     if pairs.is_empty() {
         return Ok(Vec::new());
     }
-    let mut cols = Vec::new();
-    columns_in(residual, &mut cols);
-    cols.sort_unstable();
-    cols.dedup();
-    if cols.contains(&usize::MAX) {
-        return Err(PinkDbError::Execution(
-            "internal: join residual reads an aggregate or window column".to_string(),
-        ));
-    }
+    let GatheredResidual { cols, pred } = residual;
     if cols.is_empty() {
         // A residual folded to a constant reads no column, so the column space
         // is irrelevant: one evaluation answers for every pair.
         let mut sel = selection::all_rows(preserved.num_rows());
-        expr::select_predicate(residual, preserved, cx, &mut sel)?;
+        expr::select_predicate(pred, preserved, cx, &mut sel)?;
         return Ok(if sel.is_empty() {
             Vec::new()
         } else {
             (0..pairs.len() as u32).collect()
         });
     }
-    let pred = crate::plan::map_columns(residual.clone(), &|i| {
-        cols.binary_search(&i)
-            .expect("residual column was gathered")
-    });
     // A chunk is at most `CHUNK_SIZE` rows, and a probe chunk can have many
     // more candidate pairs than that (several matches per row), so the pairs
     // are gathered and tested a chunk's worth at a time.
@@ -5750,7 +6059,7 @@ fn residual_selection(
             .collect();
         let chunk = DataChunk::new(dense)?;
         let mut sel = selection::all_rows(chunk.num_rows());
-        expr::select_predicate(&pred, &chunk, cx, &mut sel)?;
+        expr::select_predicate(pred, &chunk, cx, &mut sel)?;
         let base = (batch * CHUNK_SIZE) as u32;
         out.extend(sel.into_iter().map(|k| base + k));
     }
@@ -5991,13 +6300,19 @@ fn shift_join_columns(expr: &BoundExpr, left_cols: usize) -> BoundExpr {
             expr: Box::new(shift_join_columns(expr, left_cols)),
             negated: *negated,
         },
-        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => BoundExpr::Scalar {
             func: *func,
             args: args
                 .iter()
                 .map(|a| shift_join_columns(a, left_cols))
                 .collect(),
             dtype: *dtype,
+            volatile: *volatile,
         },
         BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
             expr: Box::new(shift_join_columns(expr, left_cols)),
@@ -6079,20 +6394,25 @@ struct JoinSide<'a> {
 /// default.
 fn estimate_rows(cx: &Cx, plan: &LogicalPlan) -> Option<u64> {
     match plan {
-        LogicalPlan::Scan { db: qdb, table, at } => {
+        LogicalPlan::Scan { ns: qdb, table, at } => {
             if qdb.is_none()
                 && let Some(out) = cx.ctes.get(&table.to_ascii_lowercase())
             {
                 return Some(out.chunks.iter().map(|c| c.num_rows() as u64).sum());
             }
-            let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
-            if let Some((attached, lake)) = cx.db.attached_lookup(lookup, table) {
+            let lookup = qdb
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| cx.db.current_ns().clone());
+            if let Some((attached, lake)) =
+                cx.db.attached_lookup(lookup.db(), lookup.schema(), table)
+            {
                 // A time-travel target's own row count is exact too; a target
                 // this lake cannot resolve keeps the unknown-size default
                 // (the query itself will surface the error).
                 return match at {
                     None => Some(attached.rows),
-                    Some(at) => lake.table_at(lookup, table, *at).ok().map(|t| t.rows),
+                    Some(at) => lake.table_at(lookup.db(), table, *at).ok().map(|t| t.rows),
                 };
             }
             cx.db
@@ -6255,6 +6575,10 @@ fn semi_by_marking_left(
     let residual = how
         .residual
         .map(|r| swap_join_space(r, left.types.len(), right.types.len()));
+    let residual = residual
+        .as_ref()
+        .map(|r| GatheredResidual::new(cx, r))
+        .transpose()?;
     let (table, ints) = join_table(cx, left.chunks, left_keys, right_keys, commons, ints, true)?;
     let marks: Vec<Vec<AtomicBool>> = left
         .chunks
@@ -6357,8 +6681,9 @@ struct MarkJoin<'a> {
     /// The build side's row filters, which only a SEMI join may drop rows
     /// through.
     filters: Option<Vec<std::sync::Arc<crate::stats::JoinFilter>>>,
-    /// The residual in `preserved ++ build` space.
-    residual: Option<BoundExpr>,
+    /// The residual in `preserved ++ build` space, gathered and primed once
+    /// per join like every other residual (see [`GatheredResidual`]).
+    residual: Option<GatheredResidual>,
     /// The preserved side's column count.
     preserved_cols: usize,
     /// The build side's kept rows, which the residual gathers pairs from.
@@ -6419,6 +6744,7 @@ impl<'a> MarkJoin<'a> {
                 }
             }
         }
+        let residual = residual.map(|r| GatheredResidual::new(cx, r)).transpose()?;
         let mut dtypes = preserved_types.to_vec();
         if kind == JoinKind::Mark {
             dtypes.push(DataType::Boolean);
@@ -6430,7 +6756,7 @@ impl<'a> MarkJoin<'a> {
             commons,
             groups,
             filters,
-            residual: residual.cloned(),
+            residual,
             preserved_cols: preserved_types.len(),
             build: build_chunks,
             dtypes,
@@ -6962,7 +7288,10 @@ struct ProbePlan<'a> {
     build: &'a [DataChunk],
     n_preserved: usize,
     filters: Option<Vec<std::sync::Arc<crate::stats::JoinFilter>>>,
-    residual: Option<&'a BoundExpr>,
+    /// The residual in `preserved ++ build` space, gathered and primed once
+    /// per statement (see [`GatheredResidual`]): every morsel of this probe
+    /// reuses it instead of rebuilding the predicate.
+    residual: Option<GatheredResidual>,
     /// Output layout `left ++ right`: the dtypes, the left width, and whether
     /// the preserved (probe) side is the right one.
     dtypes: Vec<DataType>,
@@ -7021,6 +7350,7 @@ impl<'a> ProbePlan<'a> {
             .iter()
             .all(|key| matches!(key, BoundExpr::Column { .. }));
         let build_cols = JoinAssembler::build_columns(build, build_types.len());
+        let residual = residual.map(|r| GatheredResidual::new(cx, r)).transpose()?;
         Ok(ProbePlan {
             table,
             ints,
@@ -7055,8 +7385,8 @@ impl<'a> ProbePlan<'a> {
         // tests gathered pairs, and a key expression reads whole columns, so
         // both get a compacted chunk.
         let compacted;
-        let (chunk, sel) = match (sel, self.residual, self.sel_safe) {
-            (Some(sel), Some(_), _) | (Some(sel), None, false) => {
+        let (chunk, sel) = match (sel, self.residual.is_some(), self.sel_safe) {
+            (Some(sel), true, _) | (Some(sel), false, false) => {
                 compacted = chunk.take(sel);
                 (&compacted, None)
             }
@@ -7078,7 +7408,7 @@ impl<'a> ProbePlan<'a> {
             self.present.as_deref(),
             &self.build_cols,
         );
-        if let Some(residual) = self.residual {
+        if let Some(residual) = &self.residual {
             // Two passes: the residual decides which candidate pairs are
             // matches before any of them is assembled.
             let pairs = candidate_pairs(chunk, &probe, &self.table, self.filters.as_deref());
@@ -7301,11 +7631,11 @@ fn fused_scan_aggregate(
             .is_some_and(|src| src.streams_scan(call)),
         // A time-travel scan has no streaming loader.
         LogicalPlan::Scan { at: Some(_), .. } => return Ok(None),
-        LogicalPlan::Scan { db, table, .. } => {
-            let lookup = db.as_deref().unwrap_or_else(|| cx.db.current_db());
+        LogicalPlan::Scan { ns, table, .. } => {
+            let lookup = ns.as_ref().unwrap_or(cx.db.current_ns());
             cx.db
-                .attached_lookup(lookup, table)
-                .is_some_and(|(_, lake)| lake.streams_scan(lookup, table))
+                .attached_lookup(lookup.db(), lookup.schema(), table)
+                .is_some_and(|(_, lake)| lake.streams_scan(lookup.db(), table))
         }
         _ => return Ok(None),
     };
@@ -7358,12 +7688,21 @@ fn stream_leaf_chunks(
                 check_source_chunk(source, schema, &chunk)?;
                 sink(chunk)
             };
-            src.scan_stream(call, projection, prunes, &mut push)?;
+            let secrets: Vec<_> = cx
+                .db
+                .visible_secrets(&cx.session)
+                .into_iter()
+                .map(|entry| entry.secret)
+                .collect();
+            src.scan_stream_with(call, projection, prunes, &secrets, &mut push)?;
             cx.check_deadline()
         }
-        LogicalPlan::Scan { db, table, .. } => {
-            let lookup = db.as_deref().unwrap_or_else(|| cx.db.current_db());
-            let Some((_, lake)) = cx.db.attached_lookup(lookup, table) else {
+        LogicalPlan::Scan { ns, table, .. } => {
+            let lookup = ns
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| cx.db.current_ns().clone());
+            let Some((_, lake)) = cx.db.attached_lookup(lookup.db(), lookup.schema(), table) else {
                 return Err(PinkDbError::Execution(format!(
                     "the attached table \"{lookup}.{table}\" is no longer loaded in this session; \
                      run the statement again"
@@ -7371,7 +7710,7 @@ fn stream_leaf_chunks(
             };
             let projected = cx.projections.for_scan(plan);
             let prunes = cx.prunes.for_scan(plan);
-            lake.scan_streamed(lookup, table, projected, prunes, sink)?;
+            lake.scan_streamed(lookup.db(), table, projected, prunes, sink)?;
             cx.check_deadline()
         }
         _ => unreachable!("stream_leaf_chunks needs a leaf the fusion accepted"),
@@ -7580,6 +7919,15 @@ fn encode_key_into(v: &Vector, idx: usize, spec: SortSpec, out: &mut Vec<u8>) {
                 + iv.days as i128 * 86_400_000_000i128
                 + iv.micros as i128;
             push_be_i128(out, key, desc);
+        }
+        // UUID: unsigned 128-bit big-endian, the order `compare_values` uses.
+        VectorData::Uuid(d) => {
+            let be = d[idx].to_be_bytes();
+            if desc {
+                out.extend(be.iter().map(|b| !b));
+            } else {
+                out.extend_from_slice(&be);
+            }
         }
         // Unreachable: `encode_sort_keys` bails to the `Value` comparator for
         // VARIANT and ARRAY, whose byte order is not their sort order.
@@ -8384,7 +8732,7 @@ fn explain_into(
     let mut children: Vec<&LogicalPlan> = Vec::new();
     let head = match plan {
         LogicalPlan::CopyTo {
-            db,
+            ns: db,
             table,
             format,
             path,
@@ -8392,7 +8740,7 @@ fn explain_into(
             format!("CopyTo {} ({format}) -> '{path}'", qualify(db, table))
         }
         LogicalPlan::CreateTable {
-            db,
+            ns: db,
             name,
             if_not_exists,
             ..
@@ -8401,7 +8749,7 @@ fn explain_into(
             format!("CreateTable{ine} {}", qualify(db, name))
         }
         LogicalPlan::CreateTableAs {
-            db,
+            ns: db,
             name,
             query,
             if_not_exists,
@@ -8412,7 +8760,10 @@ fn explain_into(
             format!("CreateTableAs{ine} {}", qualify(db, name))
         }
         LogicalPlan::Insert {
-            db, table, rows, ..
+            ns: db,
+            table,
+            rows,
+            ..
         } => {
             let mut text = format!("Insert {} ({} rows)", qualify(db, table), rows.len());
             if let Some(c) = conflict_text(plan) {
@@ -8420,7 +8771,7 @@ fn explain_into(
             }
             text
         }
-        LogicalPlan::AlterTable { db, name, op } => {
+        LogicalPlan::AlterTable { ns, name, op } => {
             let what = match op {
                 AlterTablePlan::AddColumn { column, .. } => format!("AddColumn {column}"),
                 AlterTablePlan::DropColumn { column, .. } => format!("DropColumn {column}"),
@@ -8429,10 +8780,10 @@ fn explain_into(
                 }
                 AlterTablePlan::RenameTable { to } => format!("RenameTable ->{to}"),
             };
-            format!("AlterTable {} ({what})", qualify(db, name))
+            format!("AlterTable {} ({what})", qualify(ns, name))
         }
         LogicalPlan::InsertSelect {
-            db,
+            ns: db,
             table,
             query,
             columns,
@@ -8449,7 +8800,7 @@ fn explain_into(
             )
         }
         LogicalPlan::Update {
-            db,
+            ns: db,
             table,
             sets,
             predicate,
@@ -8466,10 +8817,13 @@ fn explain_into(
             s
         }
         LogicalPlan::Merge {
-            db, table, clauses, ..
+            ns: db,
+            table,
+            clauses,
+            ..
         } => format!("Merge {} ({} clauses)", qualify(db, table), clauses.len()),
         LogicalPlan::Delete {
-            db,
+            ns: db,
             table,
             predicate,
             using,
@@ -8487,10 +8841,10 @@ fn explain_into(
         LogicalPlan::Begin => "Begin".to_string(),
         LogicalPlan::Commit => "Commit".to_string(),
         LogicalPlan::Rollback => "Rollback".to_string(),
-        LogicalPlan::CreateView { db, name, .. } => format!("CreateView {}", qualify(db, name)),
-        LogicalPlan::DropTable { db, name, .. } => format!("DropTable {}", qualify(db, name)),
+        LogicalPlan::CreateView { ns: db, name, .. } => format!("CreateView {}", qualify(db, name)),
+        LogicalPlan::DropTable { ns: db, name, .. } => format!("DropTable {}", qualify(db, name)),
         LogicalPlan::CreateIndex {
-            db,
+            ns: db,
             name,
             table,
             using,
@@ -8521,30 +8875,33 @@ fn explain_into(
             }
             None => format!("CreateIndex {} ON {}", name, qualify(db, table)),
         },
-        LogicalPlan::DropIndex { db, name, .. } => format!("DropIndex {}", qualify(db, name)),
-        LogicalPlan::CreateMaterializedView { db, name, .. } => {
+        LogicalPlan::DropIndex { ns: db, name, .. } => format!("DropIndex {}", qualify(db, name)),
+        LogicalPlan::CreateMaterializedView { ns: db, name, .. } => {
             format!("CreateMaterializedView {}", qualify(db, name))
         }
-        LogicalPlan::RefreshMaterializedView { db, name } => {
+        LogicalPlan::RefreshMaterializedView { ns: db, name } => {
             format!("RefreshMaterializedView {}", qualify(db, name))
         }
         LogicalPlan::CreateProcedure { name, .. } => format!("CreateProcedure {name}"),
         LogicalPlan::DropProcedure { name, .. } => format!("DropProcedure {name}"),
-        LogicalPlan::CreateTrigger { db, def, .. } => {
+        LogicalPlan::CreateTrigger { ns: db, def, .. } => {
             format!("CreateTrigger {}", qualify(db, &def.name))
         }
-        LogicalPlan::DropTrigger { db, name, .. } => {
+        LogicalPlan::DropTrigger { ns: db, name, .. } => {
             format!("DropTrigger {}", qualify(db, name))
         }
-        LogicalPlan::ShowTriggers { db, .. } => {
-            format!("ShowTriggers {}", db.as_deref().unwrap_or(""))
+        LogicalPlan::ShowTriggers { ns, .. } => {
+            format!(
+                "ShowTriggers {}",
+                ns.as_ref().map(|n| n.to_string()).unwrap_or_default()
+            )
         }
-        LogicalPlan::CreateMacro { db, name, .. } => {
+        LogicalPlan::CreateMacro { ns: db, name, .. } => {
             format!("CreateMacro {}", qualify(db, name))
         }
-        LogicalPlan::DropMacro { db, name, .. } => format!("DropMacro {}", qualify(db, name)),
-        LogicalPlan::ShowMacros { db } => format!("ShowMacros {db}"),
-        LogicalPlan::DescribeMacro { db, name } => {
+        LogicalPlan::DropMacro { ns: db, name, .. } => format!("DropMacro {}", qualify(db, name)),
+        LogicalPlan::ShowMacros { ns } => format!("ShowMacros {ns}"),
+        LogicalPlan::DescribeMacro { ns: db, name } => {
             format!("DescribeMacro {}", qualify(&Some(db.clone()), name))
         }
         LogicalPlan::Call { name, .. } => format!("Call {name}"),
@@ -8555,21 +8912,29 @@ fn explain_into(
         LogicalPlan::DropRole { name, .. } => format!("DropRole {name}"),
         LogicalPlan::Grant { spec } => format!("Grant {}", spec.description),
         LogicalPlan::Revoke { spec } => format!("Revoke {}", spec.description),
-        LogicalPlan::RefreshMaterializedViews { db } => format!(
-            "RefreshMaterializedViews {}",
-            db.clone().unwrap_or_default()
-        ),
-        LogicalPlan::DropMaterializedView { db, name, .. } => {
+        LogicalPlan::RefreshMaterializedViews { ns } => {
+            format!(
+                "RefreshMaterializedViews {}",
+                ns.as_ref().map(|n| n.to_string()).unwrap_or_default()
+            )
+        }
+        LogicalPlan::DropMaterializedView { ns: db, name, .. } => {
             format!("DropMaterializedView {}", qualify(db, name))
         }
-        LogicalPlan::ShowMaterializedViews { db } => {
-            format!("ShowMaterializedViews {}", db.clone().unwrap_or_default())
+        LogicalPlan::ShowMaterializedViews { ns } => {
+            format!(
+                "ShowMaterializedViews {}",
+                ns.as_ref().map(|n| n.to_string()).unwrap_or_default()
+            )
         }
         LogicalPlan::IndexScan {
-            db, table, index, ..
+            ns: db,
+            table,
+            index,
+            ..
         } => format!("IndexScan {} using {}", qualify(db, table), index),
         LogicalPlan::VectorTopK {
-            db,
+            ns: db,
             table,
             index,
             metric,
@@ -8639,12 +9004,16 @@ fn explain_into(
             }
             line
         }
-        LogicalPlan::DropView { db, name } => format!("DropView {}", qualify(db, name)),
+        LogicalPlan::DropView { ns: db, name } => format!("DropView {}", qualify(db, name)),
         LogicalPlan::CreateDatabase { name, .. } => format!("CreateDatabase {name}"),
+        LogicalPlan::CreateSchema { ns, .. } => format!("CreateSchema {ns}"),
+        LogicalPlan::DropSchema { ns, .. } => format!("DropSchema {ns}"),
         LogicalPlan::DropDatabase { name, .. } => format!("DropDatabase {name}"),
         LogicalPlan::Attach { name, .. } => format!("Attach {name}"),
+        LogicalPlan::CreateSecret { secret, .. } => format!("CreateSecret {}", secret.name()),
+        LogicalPlan::DropSecret { name, .. } => format!("DropSecret {name}"),
         LogicalPlan::Detach { name, .. } => format!("Detach {name}"),
-        LogicalPlan::Use { name } => format!("Use {name}"),
+        LogicalPlan::Use { ns } => format!("Use {ns}"),
         LogicalPlan::Sample { input, sample } => {
             children.push(input);
             let size = match sample.size {
@@ -8677,11 +9046,11 @@ fn explain_into(
             format!("LoadInstalledExtension {name}")
         }
         LogicalPlan::Checkpoint => "Checkpoint".to_string(),
-        LogicalPlan::Analyze { db, table } => match table {
-            Some(t) => format!("Analyze {}.{t}", db),
-            None => format!("Analyze {db}"),
+        LogicalPlan::Analyze { ns, table } => match table {
+            Some(t) => format!("Analyze {ns}.{t}"),
+            None => format!("Analyze {ns}"),
         },
-        LogicalPlan::ShowTables { db } => format!("ShowTables {db}"),
+        LogicalPlan::ShowTables { ns } => format!("ShowTables {ns}"),
         LogicalPlan::ShowDatabases => "ShowDatabases".to_string(),
         LogicalPlan::Describe { columns } => format!("Describe ({} cols)", columns.len()),
         LogicalPlan::Explain { plan } => {
@@ -8706,7 +9075,7 @@ fn explain_into(
             };
             format!("{name} ({} cols)", types.len())
         }
-        LogicalPlan::Scan { db, table, at } => {
+        LogicalPlan::Scan { ns: db, table, at } => {
             let text = if db.is_none() {
                 format!("Scan CTE {table}")
             } else {
@@ -8864,7 +9233,7 @@ fn join_name(kind: JoinKind) -> &'static str {
     }
 }
 
-fn qualify(db: &Option<String>, table: &str) -> String {
+fn qualify(db: &Option<crate::storage::SchemaPath>, table: &str) -> String {
     match db {
         Some(d) => format!("{d}.{table}"),
         None => table.to_string(),
@@ -9116,6 +9485,7 @@ impl<'p> Stream<'p> {
                     return Ok(Some(DataChunk {
                         columns: Vec::new(),
                         num_rows: 1,
+                        ordinal: 0,
                     }));
                 }
                 StreamKind::Filter { input, predicate } => {
@@ -9229,8 +9599,18 @@ fn plan_schema_of(cx: &Cx, plan: &LogicalPlan) -> Result<(Vec<String>, Vec<DataT
             )
         })
         .collect();
-    let schema = crate::sql::binder::plan_schema(cx.db, cx.db.current_db(), &ctes, plan)?;
+    let schema = crate::sql::binder::plan_schema(cx.db, cx.db.current_ns(), &ctes, plan)?;
     Ok(schema.into_iter().unzip())
+}
+
+/// Extensions pinkdb ships in-process. DuckDB scripts install and load them
+/// unconditionally, so their names are accepted as no-ops; every other name
+/// keeps the repository path.
+fn is_builtin_extension(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "ducklake" | "postgres_scanner" | "httpfs"
+    )
 }
 
 #[cfg(test)]
@@ -9752,7 +10132,7 @@ mod tests {
     fn float_key_encoding_matches_equality() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE d (v DOUBLE);").unwrap();
-        db.execute("INSERT INTO d VALUES (-0.0), (0.0), (1.0);")
+        db.execute("INSERT INTO d VALUES (-0.0e0), (0.0e0), (1.0e0);")
             .unwrap();
         let rows = select(&mut db, "SELECT v, COUNT(*) FROM d GROUP BY v;");
         assert_eq!(rows.len(), 2);
@@ -12303,7 +12683,7 @@ mod tests {
                 "  Sort [#0]".to_string(),
                 "    Project [x]".to_string(),
                 "      Filter (#0 > 1)".to_string(),
-                "        Scan main.wj".to_string(),
+                "        Scan main.main.wj".to_string(),
             ]
         );
         // EXPLAIN binds but never executes: a query against a missing table
@@ -12317,7 +12697,7 @@ mod tests {
                 other => panic!("{other:?}"),
             })
             .collect();
-        assert!(explained.contains("Insert main.wj"), "{explained}");
+        assert!(explained.contains("Insert main.main.wj"), "{explained}");
         assert!(
             db.execute("EXPLAIN CREATE TABLE nope (a INTEGER);")
                 .expect_err("EXPLAIN of DDL")
@@ -12887,7 +13267,8 @@ mod tests {
                 V::Integer(3),
                 V::Integer(1),
                 V::Null,
-                V::Double(2.5),
+                // greatest(INTEGER, DECIMAL(2,1)) is DECIMAL(11,1).
+                V::decimal(25, 1),
                 V::Varchar("a".to_string()),
             ]]
         );
@@ -12964,17 +13345,19 @@ mod tests {
             rows,
             vec![vec![
                 V::Double(2.0),
-                V::Double(1.0),
-                V::Double(-2.0),
+                // floor/ceil of a DECIMAL stay DECIMAL(p, 0); mod() of a
+                // DECIMAL is DECIMAL(11,1), like `%` (DuckDB).
+                V::decimal(1, 0),
+                V::decimal(-2, 0),
                 V::Double(3.0),
-                V::Double(2.0),
+                V::decimal(2, 0),
                 V::Integer(-1),
                 V::Integer(1),
                 V::Double(1024.0),
                 V::Double(0.5),
                 V::Integer(1),
                 V::Integer(-1),
-                V::Double(1.5),
+                V::decimal(15, 1),
             ]]
         );
         match &select(&mut db, "SELECT sqrt(-1);")[0][0] {
@@ -13731,7 +14114,8 @@ mod tests {
                 vec![V::Varchar("anon".to_string())],
             ]
         );
-        // Nested CASE + mixed numeric widths unify to DOUBLE.
+        // Nested CASE + mixed numeric widths unify to DECIMAL(11,1) (DuckDB:
+        // INTEGER widens to DECIMAL(10,0) next to the decimal literal).
         let rows = select(
             &mut db,
             "SELECT CASE WHEN id = 1 THEN 1 WHEN id = 2 THEN 2.5 ELSE 0 END FROM t ORDER BY id;",
@@ -13739,9 +14123,9 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                vec![V::Double(1.0)],
-                vec![V::Double(2.5)],
-                vec![V::Double(0.0)]
+                vec![V::decimal(10, 1)],
+                vec![V::decimal(25, 1)],
+                vec![V::decimal(0, 1)]
             ]
         );
         let rows = select(
@@ -14332,7 +14716,7 @@ mod tests {
         let stmts = crate::sql::parse_statements(sql).unwrap();
         crate::optimizer::optimize(
             db,
-            crate::sql::bind(db, &stmts[0], db.current_db()).unwrap(),
+            crate::sql::bind(db, &stmts[0], db.current_ns()).unwrap(),
         )
     }
 
@@ -15668,13 +16052,15 @@ mod tests {
         assert_eq!(
             results[0],
             QueryResult::Used {
-                db: "db1".to_string()
+                db: "db1".to_string(),
+                schema: "main".to_string(),
             }
         );
         assert_eq!(
             results[2],
             QueryResult::Used {
-                db: "main".to_string()
+                db: "main".to_string(),
+                schema: "main".to_string(),
             }
         );
         assert_eq!(
@@ -15983,7 +16369,7 @@ mod tests {
         let cx = Cx::new(&db);
         let rows = db.table("w").unwrap().num_rows() as u64;
         let scan = LogicalPlan::Scan {
-            db: Some(db.current_db().to_string()),
+            ns: Some(db.current_ns().clone()),
             table: "w".to_string(),
             at: None,
         };
@@ -16048,7 +16434,7 @@ mod tests {
             estimate_rows(
                 &cx,
                 &LogicalPlan::Scan {
-                    db: Some("main".to_string()),
+                    ns: Some(crate::storage::SchemaPath::main("main")),
                     table: "nope".to_string(),
                     at: None,
                 }
@@ -16216,7 +16602,13 @@ mod tests {
     #[test]
     fn install_and_load_are_refused_in_transactions_and_by_explain() {
         let mut db = PinkDb::new();
-        for sql in ["INSTALL httpfs;", "FORCE INSTALL httpfs;", "LOAD httpfs;"] {
+        // `spatial` is not built in (ducklake/postgres_scanner/httpfs are
+        // accepted as no-ops), so the refusal paths stay exercised.
+        for sql in [
+            "INSTALL spatial;",
+            "FORCE INSTALL spatial;",
+            "LOAD spatial;",
+        ] {
             let e = db.execute(&format!("EXPLAIN {sql}")).expect_err("refused");
             assert!(
                 e.to_string()
@@ -16226,12 +16618,12 @@ mod tests {
         }
         db.execute("BEGIN;").unwrap();
         for (sql, what) in [
-            ("INSTALL httpfs;", "INSTALL"),
+            ("INSTALL spatial;", "INSTALL"),
             (
-                "FORCE INSTALL httpfs FROM 'https://example.test';",
+                "FORCE INSTALL spatial FROM 'https://example.test';",
                 "INSTALL",
             ),
-            ("LOAD httpfs;", "LOAD"),
+            ("LOAD spatial;", "LOAD"),
         ] {
             let e = db.execute(sql).expect_err("refused inside a transaction");
             assert_eq!(
@@ -16243,7 +16635,7 @@ mod tests {
         db.execute("ROLLBACK;").unwrap();
         // Outside a transaction the statements reach execution (and, in a
         // build without the repository, say precisely that).
-        let e = db.execute("LOAD httpfs;").expect_err("not installed");
+        let e = db.execute("LOAD spatial;").expect_err("not installed");
         assert!(
             e.to_string().contains("no extension repository support")
                 || e.to_string().contains("is not installed"),
@@ -16263,7 +16655,9 @@ mod tests {
             ("LOAD math_ext", true),
         ] {
             let stmt = crate::sql::parse_statements(sql).unwrap().remove(0);
-            let plan = crate::sql::binder::bind(&db, &stmt, "main").unwrap();
+            let plan =
+                crate::sql::binder::bind(&db, &stmt, &crate::storage::SchemaPath::main("main"))
+                    .unwrap();
             assert_eq!(crate::plan::writes_tables(&plan), logged, "{sql}");
         }
     }
@@ -16507,7 +16901,10 @@ mod tests {
             !lines.iter().any(|l| l.contains("Join")),
             "the parent join must be eliminated: {lines:?}"
         );
-        assert!(lines.iter().any(|l| l.contains("Scan main.c")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("Scan main.main.c")),
+            "{lines:?}"
+        );
         // Results agree with the declaration satisfied (and with the join
         // written out).
         let with_join = select(
@@ -16674,32 +17071,21 @@ mod tests {
         assert_eq!(got, vec![vec![V::Integer(1)], vec![V::Integer(2)]]);
     }
 
-    /// Declared foreign keys work across databases (`REFERENCES db.table`)
-    /// and eliminate the cross-database join the same way.
+    /// A foreign key cannot leave its table's schema (wave 131: DuckDB's
+    /// rule), so the old cross-database spelling is refused.
     #[test]
     fn wave41_cross_database_fk() {
         let mut db = PinkDb::new();
         db.execute("CREATE DATABASE d2;").unwrap();
         db.execute("CREATE TABLE d2.p (id INTEGER PRIMARY KEY, v INTEGER);")
             .unwrap();
-        db.execute("INSERT INTO d2.p VALUES (1, 10);").unwrap();
-        db.execute("CREATE TABLE c (cid INTEGER, pid INTEGER NOT NULL REFERENCES d2.p(id));")
-            .unwrap();
-        db.execute("INSERT INTO c VALUES (7, 1);").unwrap();
-        let fk = &db.table("c").unwrap().constraints.foreign_keys[0];
-        assert_eq!(fk.ref_db, "d2");
-        assert_eq!(fk.ref_table, "p");
-        let lines = explain_lines(
-            &mut db,
-            "SELECT c.cid FROM c JOIN d2.p AS x ON c.pid = x.id",
-        );
-        assert!(!lines.iter().any(|l| l.contains("Join")), "{lines:?}");
-        assert_eq!(
-            select(
-                &mut db,
-                "SELECT c.cid FROM c JOIN d2.p AS x ON c.pid = x.id;"
-            ),
-            vec![vec![V::Integer(7)]]
+        let err = db
+            .execute("CREATE TABLE c (cid INTEGER, pid INTEGER NOT NULL REFERENCES d2.p(id));")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("foreign keys across different schemas or catalogs is not supported"),
+            "{err}"
         );
     }
 

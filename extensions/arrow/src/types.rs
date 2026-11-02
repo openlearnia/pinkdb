@@ -155,6 +155,16 @@ pub fn arrow_type(dtype: DataType) -> Result<ArrowType> {
                     .to_string(),
             ));
         }
+        // DuckDB writes a UUID as FixedSizeBinary(16) plus `arrow.uuid`
+        // metadata; this writer has no extension metadata, and the 16 bytes
+        // mean nothing without it.
+        DataType::Uuid => {
+            return Err(PinkDbError::Type(
+                "arrow has no UUID type pinkdb can write exactly; the arrow extension \
+                 refuses rather than writing it as text"
+                    .to_string(),
+            ));
+        }
         DataType::Array { .. } => {
             return Err(PinkDbError::Type(
                 "arrow has no fixed-size list type pinkdb can write exactly; the arrow \

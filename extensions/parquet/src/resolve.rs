@@ -656,18 +656,24 @@ pub fn convert_value(value: Value, to: DataType) -> std::result::Result<Value, S
             Value::Integer(i32::try_from(n).map_err(|_| format!("{n} does not fit in INTEGER"))?)
         }
         (Value::Date(d), DataType::Timestamp) => Value::Timestamp(d as i64 * 86_400_000_000),
-        (Value::Decimal(v, s), DataType::Double) => {
-            Value::Double(pinkdb::types::decimal_to_f64(v, s))
-        }
+        (
+            Value::Decimal {
+                value: v, scale: s, ..
+            },
+            DataType::Double,
+        ) => Value::Double(pinkdb::types::decimal_to_f64(v, s)),
         (Value::Integer(n), DataType::Decimal { scale, .. }) => {
-            Value::Decimal(n as i128 * 10i128.pow(scale as u32), scale)
+            Value::decimal(n as i128 * 10i128.pow(scale as u32), scale)
         }
         (Value::Bigint(n), DataType::Decimal { scale, .. }) => {
-            Value::Decimal(n as i128 * 10i128.pow(scale as u32), scale)
+            Value::decimal(n as i128 * 10i128.pow(scale as u32), scale)
         }
-        (Value::Decimal(v, s), DataType::Decimal { scale, .. }) if s == scale => {
-            Value::Decimal(v, scale)
-        }
+        (
+            Value::Decimal {
+                value: v, scale: s, ..
+            },
+            DataType::Decimal { scale, .. },
+        ) if s == scale => Value::decimal(v, scale),
         (v, DataType::Varchar) => Value::Varchar(format!("{v}")),
         (v, to) => {
             return Err(format!(

@@ -330,23 +330,290 @@ fn an_unavailable_lake_does_not_block_the_open() {
     db.execute("DETACH gone;").unwrap();
 }
 
+/// The rows of a `SELECT` over `information_schema.tables`/`duckdb_tables`,
+/// as `db.schema.table` strings.
+fn table_names(db: &mut PinkDb, sql: &str) -> Vec<String> {
+    match db.execute(sql).unwrap().pop().unwrap() {
+        QueryResult::Selected { rows, names, .. } => {
+            let db_at = names
+                .iter()
+                .position(|n| n == "database_name" || n == "database" || n == "table_catalog")
+                .unwrap();
+            let schema_at = names
+                .iter()
+                .position(|n| n == "schema_name" || n == "table_schema" || n == "schema")
+                .unwrap();
+            let table_at = names
+                .iter()
+                .position(|n| n == "table_name" || n == "name")
+                .unwrap();
+            let mut out: Vec<String> = rows
+                .iter()
+                .map(|r| match (&r[db_at], &r[schema_at], &r[table_at]) {
+                    (Value::Varchar(db), Value::Varchar(schema), Value::Varchar(table)) => {
+                        format!("{db}.{schema}.{table}")
+                    }
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            out.sort();
+            out
+        }
+        r => panic!("expected rows, got {r:?}"),
+    }
+}
+
 #[test]
-fn a_lake_with_two_schemas_is_refused() {
+fn every_lake_schema_is_a_database_schema_through_every_path() {
     let scratch = Scratch::new("schemas");
+    let file = scratch.path("store.pink");
+    let lakes = scratch.path("lakes");
+    {
+        let mut db = open_durable(&file, &lakes);
+        db.execute(&create_lake_sql("r2_cat", &scratch, "r2"))
+            .unwrap();
+        // DuckLake's `master`, `ingest` and an empty `staging`, as QuackLab's
+        // lake has.
+        db.execute("CREATE SCHEMA r2_cat.master; CREATE SCHEMA r2_cat.ingest;")
+            .unwrap();
+        db.execute("CREATE TABLE r2_cat.master.fact (id INTEGER, amount DOUBLE);")
+            .unwrap();
+        db.execute("INSERT INTO r2_cat.master.fact VALUES (1, 2.5), (2, 3.5);")
+            .unwrap();
+        db.execute("CREATE TABLE r2_cat.ingest.events (id INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO r2_cat.ingest.events VALUES (7);")
+            .unwrap();
+        db.execute("CREATE SCHEMA r2_cat.staging;").unwrap();
+        // The spelling is DuckLake's, the lookup is case-insensitive.
+        assert_eq!(
+            ints(&mut db, "SELECT id FROM R2_CAT.Master.FACT ORDER BY id;"),
+            vec![1, 2]
+        );
+        // Two-part names still mean the default schema, `main`.
+        let e = err(&mut db, "SELECT * FROM r2_cat.fact;");
+        assert!(e.contains("not found"), "{e}");
+        db.execute("CHECKPOINT;").unwrap();
+    }
+    // The lake's own catalog carries one schema row per engine schema, the
+    // empty one included.
+    let lake = Lake::open_with_catalog(&format!("pink:{}", scratch.s("r2.pink")), None).unwrap();
+    let first_head = lake.current_version();
+    let mut schemas = lake.schemas().unwrap();
+    schemas.sort();
+    assert_eq!(schemas, vec!["ingest", "main", "master", "staging"]);
+
+    {
+        // Reopen writable: the image restored the empty schema and both
+        // tables, and the engine can create and drop schemas.
+        let mut db = open_durable(&file, &lakes);
+        assert_eq!(
+            ints(&mut db, "SELECT id FROM r2_cat.master.fact ORDER BY id;"),
+            vec![1, 2]
+        );
+        assert_eq!(
+            ints(&mut db, "SELECT id FROM r2_cat.ingest.events;"),
+            vec![7]
+        );
+        assert_eq!(
+            table_names(
+                &mut db,
+                "SELECT * FROM information_schema.tables WHERE table_catalog = 'r2_cat';"
+            ),
+            vec!["r2_cat.ingest.events", "r2_cat.master.fact"]
+        );
+        assert_eq!(
+            table_names(
+                &mut db,
+                "SELECT * FROM duckdb_tables() WHERE database_name = 'r2_cat';"
+            ),
+            vec!["r2_cat.ingest.events", "r2_cat.master.fact"]
+        );
+        // The empty schema survived the reopen and is listed.
+        let schemata = match db
+            .execute("SELECT schema_name FROM information_schema.schemata WHERE catalog_name = 'r2_cat';")
+            .unwrap()
+            .pop()
+            .unwrap()
+        {
+            QueryResult::Selected { rows, .. } => rows
+                .into_iter()
+                .map(|r| match &r[0] {
+                    Value::Varchar(s) => s.clone(),
+                    v => panic!("{v:?}"),
+                })
+                .collect::<Vec<_>>(),
+            r => panic!("{r:?}"),
+        };
+        assert_eq!(schemata, vec!["ingest", "main", "master", "staging"]);
+        // A write in a schema is one lake version.
+        db.execute("INSERT INTO r2_cat.master.fact VALUES (3, 1.5);")
+            .unwrap();
+        // CASCADE drops the schema's tables in the lake too.
+        db.execute("DROP SCHEMA r2_cat.ingest CASCADE;").unwrap();
+        db.execute("DROP SCHEMA r2_cat.staging;").unwrap();
+        db.execute("CHECKPOINT;").unwrap();
+    }
+    let lake = Lake::open_with_catalog(&format!("pink:{}", scratch.s("r2.pink")), None).unwrap();
+    assert_eq!(lake.schemas().unwrap(), vec!["main", "master"]);
+    assert_eq!(lake.tables().unwrap(), vec![("master.fact".to_string(), 3)]);
+    // The snapshot changes use DuckLake's spellings: a created schema by its
+    // quoted name, a dropped one by its id (ducklake_transaction_state.cpp).
+    drop(lake);
+    // The `pink:` catalog is a durable store (checkpoint plus WAL).
+    let catalog = Database::open(&scratch.s("r2.pink")).unwrap();
+    let changes = match catalog
+        .connect()
+        .execute("SELECT changes_made FROM ducklake_snapshot_changes;")
+        .unwrap()
+        .pop()
+        .unwrap()
+    {
+        QueryResult::Selected { rows, .. } => rows
+            .into_iter()
+            .filter_map(|r| match &r[0] {
+                Value::Varchar(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        r => panic!("{r:?}"),
+    };
+    assert!(changes.contains("created_schema:\"staging\""), "{changes}");
+    let dropped: Vec<&str> = changes
+        .split(',')
+        .filter_map(|c| c.strip_prefix("dropped_schema:"))
+        .collect();
+    assert_eq!(dropped.len(), 2, "{changes}");
+    assert!(
+        dropped.iter().all(|id| id.parse::<i64>().is_ok()),
+        "{changes}"
+    );
+    drop(catalog);
+
+    // A read-only attachment shows the same schemas.
+    let mut reader = PinkDb::new();
+    reader
+        .execute(&format!(
+            "ATTACH 'lake:pink:{}' AS r2_cat (READ_ONLY);",
+            scratch.s("r2.pink")
+        ))
+        .unwrap();
+    assert_eq!(
+        ints(
+            &mut reader,
+            "SELECT id FROM r2_cat.master.fact ORDER BY id;"
+        ),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        table_names(
+            &mut reader,
+            "SELECT * FROM duckdb_tables() WHERE database_name = 'r2_cat';"
+        ),
+        vec!["r2_cat.master.fact"]
+    );
+    let e = err(&mut reader, "SELECT * FROM r2_cat.ingest.events;");
+    assert!(e.contains("not found"), "{e}");
+    // A pinned read of one schema's table.
+    let e = err(
+        &mut reader,
+        "SELECT * FROM r2_cat.master.fact AT (VERSION => 1);",
+    );
+    assert!(e.contains("does not exist at version 1"), "{e}");
+    assert_eq!(
+        ints(
+            &mut reader,
+            &format!("SELECT id FROM r2_cat.master.fact AT (VERSION => {first_head}) ORDER BY id;")
+        ),
+        vec![1, 2]
+    );
+    // Read-only lake databases refuse schema changes.
+    let e = err(&mut reader, "CREATE SCHEMA r2_cat.other;");
+    assert!(e.contains("read-only lake"), "{e}");
+    let e = err(&mut reader, "DROP SCHEMA r2_cat.master CASCADE;");
+    assert!(e.contains("read-only lake"), "{e}");
+}
+
+#[test]
+fn a_lake_written_with_two_schemas_attaches_read_only() {
+    let scratch = Scratch::new("api_schemas");
+    // A lake written by pink-lake's own API, not through the engine: QuackLab
+    // writes `master.fact` and `ingest.events`.
     let mut store = PinkDb::new();
     store
-        .execute(
-            "CREATE DATABASE a; CREATE TABLE a.t (x INTEGER); CREATE TABLE main.u (y INTEGER);",
-        )
+        .execute("CREATE DATABASE master; CREATE TABLE master.fact (x INTEGER);")
+        .unwrap();
+    store
+        .execute("INSERT INTO master.fact VALUES (1), (2);")
+        .unwrap();
+    store
+        .execute("CREATE DATABASE ingest; CREATE TABLE ingest.events (y INTEGER);")
+        .unwrap();
+    store
+        .execute("INSERT INTO ingest.events VALUES (9);")
         .unwrap();
     let dir = scratch.s("two");
     pink_lake::save_store(&store, &dir).unwrap();
     let mut db = PinkDb::new();
-    let e = err(&mut db, &format!("ATTACH 'lake:{dir}' AS two (READ_ONLY);"));
-    assert!(e.contains("2 schemas"), "{e}");
-    let e = err(&mut db, &format!("ATTACH 'lake:{dir}' AS two;"));
-    assert!(e.contains("2 schemas"), "{e}");
-    assert!(!db.database_exists("two"));
+    db.execute(&format!("ATTACH 'lake:{dir}' AS r2_cat (READ_ONLY);"))
+        .unwrap();
+    assert_eq!(
+        ints(&mut db, "SELECT x FROM r2_cat.master.fact ORDER BY x;"),
+        vec![1, 2]
+    );
+    assert_eq!(
+        ints(&mut db, "SELECT y FROM r2_cat.ingest.events;"),
+        vec![9]
+    );
+    assert_eq!(
+        table_names(
+            &mut db,
+            "SELECT * FROM information_schema.tables WHERE table_catalog = 'r2_cat';"
+        ),
+        vec!["r2_cat.ingest.events", "r2_cat.master.fact"]
+    );
+    assert_eq!(
+        ints(
+            &mut db,
+            "SELECT count(*) FROM r2_cat.ingest.events WHERE y = 9;"
+        ),
+        vec![1]
+    );
+    // The lake's other schema is not the default one: a two-part name stays
+    // in `main`.
+    let e = err(&mut db, "SELECT * FROM r2_cat.fact;");
+    assert!(e.contains("not found"), "{e}");
+    // `pinkdb_catalog()` names the lake schema too.
+    let catalog = match db
+        .execute(
+            "SELECT \"database\", \"schema\", name, kind FROM pinkdb_catalog() \
+             WHERE \"database\" = 'r2_cat' AND kind = 'LAKE TABLE' \
+             ORDER BY \"schema\", name;",
+        )
+        .unwrap()
+        .pop()
+        .unwrap()
+    {
+        QueryResult::Selected { rows, .. } => rows,
+        r => panic!("{r:?}"),
+    };
+    let listed: Vec<String> = catalog
+        .iter()
+        .map(|row| match (&row[0], &row[1], &row[2], &row[3]) {
+            (
+                Value::Varchar(db),
+                Value::Varchar(schema),
+                Value::Varchar(table),
+                Value::Varchar(kind),
+            ) => {
+                assert_eq!(kind, "LAKE TABLE");
+                format!("{db}.{schema}.{table}")
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(listed, vec!["r2_cat.ingest.events", "r2_cat.master.fact"]);
 }
 
 #[test]
@@ -398,4 +665,209 @@ fn passwords_in_lake_urls_are_refused() {
     assert!(!e.contains("hunter2"), "{e}");
     let e = err(&mut db, "ATTACH '/tmp/x.pink' AS p;");
     assert!(e.contains("not a lake"), "{e}");
+}
+
+/// Wave 132d: DuckLake's functions are SQL over a lake database, and a
+/// writing `CALL` refreshes the engine's view of the lake in the same session.
+#[test]
+fn ducklake_functions_run_through_sql_on_a_lake_database() {
+    let scratch = Scratch::new("functions");
+    let mut db = PinkDb::new();
+    db.execute(&create_lake_sql("w", &scratch, "w")).unwrap();
+    db.execute("CREATE TABLE w.t (a INTEGER);").unwrap();
+    db.execute("INSERT INTO w.t VALUES (1), (2);").unwrap();
+
+    // Reads bind and run through the engine's SQL surface.
+    assert_eq!(
+        ints(
+            &mut db,
+            "SELECT id + 1 FROM ducklake_current_snapshot('w');"
+        ),
+        vec![3]
+    );
+    let snapshots = ints(&mut db, "SELECT COUNT(*) FROM ducklake_snapshots('w');");
+    assert_eq!(snapshots, vec![3]);
+
+    // `CALL <db>.<fn>` implies the catalog; every scope stores an option row.
+    db.execute("CALL w.set_option('parquet_compression', 'zstd');")
+        .unwrap();
+    db.execute("CALL ducklake_set_option('w', 'data_inlining_row_limit', 5);")
+        .unwrap();
+    db.execute("CALL ducklake_set_option('w', 'data_inlining_row_limit', 2, table_name := 't');")
+        .unwrap();
+    db.execute("CALL ducklake_set_option('w', 'expire_older_than', '1 week');")
+        .unwrap();
+    let options: Vec<(String, String, Option<String>)> = match db
+        .execute("SELECT option_name, value, scope_entry FROM ducklake_options('w');")
+        .unwrap()
+        .pop()
+        .unwrap()
+    {
+        QueryResult::Selected { rows, .. } => rows
+            .into_iter()
+            .map(|r| match (&r[0], &r[1], &r[2]) {
+                (Value::Varchar(name), Value::Varchar(value), entry) => (
+                    name.clone(),
+                    value.clone(),
+                    match entry {
+                        Value::Varchar(entry) => Some(entry.clone()),
+                        _ => None,
+                    },
+                ),
+                other => panic!("unexpected option row: {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert!(options.contains(&("parquet_compression".to_string(), "zstd".to_string(), None)));
+    assert!(options.contains(&(
+        "data_inlining_row_limit".to_string(),
+        "2".to_string(),
+        Some("main.t".to_string())
+    )));
+    assert!(options.contains(&("expire_older_than".to_string(), "1 week".to_string(), None)));
+
+    // A writing CALL that changes rows refreshes the engine's catalog: the
+    // file the flush wrote is registered again and the table now reads twice.
+    db.execute("CALL ducklake_flush_inlined_data('w');")
+        .unwrap();
+    // The session that committed the flush knows its snapshot id (DuckLake is
+    // 0-based; pinkdb versions are 1-based).
+    assert_eq!(
+        ints(
+            &mut db,
+            "SELECT id FROM ducklake_last_committed_snapshot('w');"
+        ),
+        vec![3]
+    );
+    let files: Vec<String> = match db
+        .execute("SELECT data_file FROM ducklake_list_files('w', 't');")
+        .unwrap()
+        .pop()
+        .unwrap()
+    {
+        QueryResult::Selected { rows, .. } => rows
+            .into_iter()
+            .map(|r| match &r[0] {
+                Value::Varchar(path) => path.clone(),
+                other => panic!("not a path: {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert!(!files.is_empty(), "{files:?}");
+    // Register a copy under a new path: re-registering the same path would
+    // name a file the table already lists and read the same rows. The flush
+    // lists an empty schema-only file first, so copy the last (data) file.
+    let source = files.last().unwrap();
+    let copy = source.replace(".pink", "-copy.pink");
+    std::fs::copy(source, &copy).unwrap();
+    db.execute(&format!(
+        "CALL ducklake_add_data_files('w', 't', '{copy}');"
+    ))
+    .unwrap();
+    assert_eq!(ints(&mut db, "SELECT COUNT(*) FROM w.t;"), vec![4]);
+    assert_eq!(
+        ints(
+            &mut db,
+            "SELECT id FROM ducklake_last_committed_snapshot('w');"
+        ),
+        vec![4]
+    );
+
+    // A database that is not a lake, and a read-only lake for a write.
+    db.execute("CREATE DATABASE plain;").unwrap();
+    let e = err(&mut db, "SELECT * FROM ducklake_snapshots('plain');");
+    assert!(e.contains("not a lake database"), "{e}");
+    let mut ro = PinkDb::new();
+    ro.execute(&format!(
+        "ATTACH 'lake:pink:{}' AS r (READ_ONLY);",
+        scratch.s("w.pink")
+    ))
+    .unwrap();
+    let e = err(&mut ro, "CALL ducklake_flush_inlined_data('r');");
+    assert!(e.contains("read-only lake"), "{e}");
+}
+
+/// DuckLake's `set_option` values are not only reported: the inlining limit
+/// and the expire/delete defaults decide what a commit writes and prunes.
+#[test]
+fn ducklake_options_change_behaviour_like_ducklake() {
+    let scratch = Scratch::new("options");
+    let mut db = PinkDb::new();
+    db.execute(&create_lake_sql("w", &scratch, "w")).unwrap();
+    db.execute("CREATE TABLE w.t (a INTEGER);").unwrap();
+    db.execute("CREATE TABLE w.u (a INTEGER);").unwrap();
+
+    // Creating a table writes its schema-only data file and nothing else.
+    let files_dir = scratch.path("w.files").join("data/main.t");
+    let files_on_disk = || {
+        std::fs::read_dir(&files_dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "pink")
+            })
+            .count()
+    };
+    assert_eq!(files_on_disk(), 1);
+
+    // The global `data_inlining_row_limit` decides per append batch, and a
+    // table-scoped 0 turns inlining off for that table alone.
+    db.execute("CALL ducklake_set_option('w', 'data_inlining_row_limit', 5);")
+        .unwrap();
+    db.execute("INSERT INTO w.t VALUES (1), (2), (3);").unwrap();
+    assert_eq!(files_on_disk(), 1, "3 rows <= 5 stay inlined");
+    db.execute("INSERT INTO w.t VALUES (4), (5), (6), (7), (8), (9);")
+        .unwrap();
+    assert_eq!(files_on_disk(), 2, "6 rows > 5 write a data file");
+    db.execute("CALL ducklake_set_option('w', 'data_inlining_row_limit', 0, table_name := 'u');")
+        .unwrap();
+    db.execute("INSERT INTO w.u VALUES (1);").unwrap();
+    assert_eq!(
+        ints(
+            &mut db,
+            "SELECT COUNT(*) FROM ducklake_list_files('w', 'u');"
+        ),
+        vec![2]
+    );
+    db.execute("INSERT INTO w.t VALUES (10);").unwrap();
+    assert_eq!(files_on_disk(), 2, "t keeps the global limit of 5");
+    assert_eq!(ints(&mut db, "SELECT COUNT(*) FROM w.t;"), vec![10]);
+    assert_eq!(ints(&mut db, "SELECT COUNT(*) FROM w.u;"), vec![1]);
+
+    // A third data file, merged into one: the sources are only unreferenced
+    // once the snapshots that name them are gone.
+    db.execute("INSERT INTO w.t VALUES (11), (12), (13), (14), (15), (16);")
+        .unwrap();
+    assert_eq!(files_on_disk(), 3);
+    db.execute("CALL ducklake_merge_adjacent_files('w');")
+        .unwrap();
+    assert_eq!(
+        ints(
+            &mut db,
+            "SELECT COUNT(*) FROM ducklake_list_files('w', 't');"
+        ),
+        vec![1]
+    );
+    assert!(files_on_disk() > 1, "the merged sources are still on disk");
+
+    // `expire_older_than` and `delete_older_than` are the defaults the calls
+    // fall back on when no cutoff is passed.
+    db.execute("CALL ducklake_set_option('w', 'expire_older_than', '0 seconds');")
+        .unwrap();
+    db.execute("CALL ducklake_set_option('w', 'delete_older_than', '0 seconds');")
+        .unwrap();
+    db.execute("CALL ducklake_expire_snapshots('w');").unwrap();
+    assert_eq!(
+        ints(&mut db, "SELECT COUNT(*) FROM ducklake_snapshots('w');"),
+        vec![1]
+    );
+    db.execute("CALL ducklake_cleanup_old_files('w');").unwrap();
+    assert_eq!(files_on_disk(), 1);
+    assert_eq!(ints(&mut db, "SELECT COUNT(*) FROM w.t;"), vec![16]);
 }

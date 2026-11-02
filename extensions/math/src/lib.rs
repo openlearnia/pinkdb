@@ -1,7 +1,7 @@
 //! pinkdb's core **math** extension (wave 54): the DuckDB math surface that
 //! the engine does not already provide — the exponential/logarithm family,
-//! the trigonometric family, `degrees`/`radians`/`pi` and the volatile
-//! `random()` — authored with the Rust extension SDK.
+//! the trigonometric family, `degrees`/`radians`/`pi` — authored with the
+//! Rust extension SDK.
 //!
 //! One [`pinkdb_extension!`] declaration defines every function; the same
 //! declaration publishes the linked registration the CLI loads at startup
@@ -33,7 +33,10 @@
 //! | `atan2` | `(DOUBLE, DOUBLE) → DOUBLE` | `atan2(y, x)` (y first, like DuckDB) |
 //! | `degrees` / `radians` | `(DOUBLE) → DOUBLE` | π-based conversions |
 //! | `pi` | `() → DOUBLE` | π |
-//! | `random` | `() → DOUBLE` | uniform `[0, 1)`; **volatile** |
+//!
+//! `random()` is a core built-in since wave 139b (seeded per statement so a
+//! logged write replays exactly), so this extension no longer declares it —
+//! an extension cannot shadow a built-in.
 //!
 //! # Semantics, pinned to DuckDB `v2.0.0-alpha46057`
 //!
@@ -58,12 +61,6 @@
 //! * Every function is NULL-propagating (`ln(NULL)` is NULL) and a NULL in
 //!   *any* position of `log`/`atan2` yields NULL — `log(2, NULL)` is NULL,
 //!   never the one-argument form.
-//! * `random()` returns a DOUBLE in `[0, 1)`. It is declared **volatile**:
-//!   the engine refuses it in any statement it WAL-logs (`INSERT`,
-//!   `UPDATE`, `DELETE`, CTAS, ...) while a read-only `SELECT random()`
-//!   works — replaying a logged statement could otherwise produce a
-//!   different value.
-//!
 //! # Divergences from DuckDB (documented)
 //!
 //! * **`sign` returns INTEGER here** (DuckDB's is TINYINT — the engine has no
@@ -81,8 +78,6 @@
 //!   `greatest-least` differential probes, and this crate's SQL tests cover
 //!   them end to end (`sqrt(4)`, `pow(2, 10)`, integer/DOUBLE columns,
 //!   NaN/`-inf` edge cases).
-//! * **`random()` cannot be WAL-logged** (by design); DuckDB has no WAL and
-//!   allows it anywhere.
 //! * No `gamma`/`lgamma`/`factorial`/`even`/`odd`/`gcd`/`lcm` in v1 — the
 //!   brief's surface plus `log2`/`log10`/`cot`/`degrees`/`radians`/`pi`.
 //!
@@ -98,7 +93,7 @@
 //! ```
 //!
 //! The CLI's default `math` feature does both at startup for every store the
-//! session creates or opens, so `exp`/`log`/`random` work without a statement
+//! session creates or opens, so `exp`/`log` work without a statement
 //! (`LOAD EXTENSION 'math'` is then the documented duplicate-load error);
 //! `--no-default-features` leaves it out. A durable store replays math calls
 //! through the registry (each touching record is prefixed with
@@ -113,69 +108,16 @@
 //! native ABI exports: it is an rlib in the host binary, not a shared
 //! library.
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use pinkdb_ext_sdk::{Optional, pinkdb_extension};
 
 /// The registry name: `LOAD EXTENSION 'math'`.
 pub const EXTENSION_NAME: &str = "math";
 
-// ---------- the volatile function's random source ----------
-
-/// The next SplitMix64 output. One global stream, advanced with a
-/// compare-and-exchange so concurrent callers each get a distinct value.
-///
-/// The state cell is *initialized* with the seed (not sentinel-zero): a
-/// compare-and-exchange against a cell nobody ever writes would spin
-/// forever, and `splitmix64(0)` is a perfectly good first step.
-fn next_u64() -> u64 {
-    fn state_cell() -> &'static AtomicU64 {
-        static CELL: OnceLock<AtomicU64> = OnceLock::new();
-        CELL.get_or_init(|| AtomicU64::new(seed_from_entropy()))
-    }
-
-    let state = state_cell();
-    let mut current = state.load(Ordering::Relaxed);
-    loop {
-        let next = splitmix64(current);
-        match state.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return next,
-            Err(actual) => current = actual,
-        }
-    }
-}
-
-/// A nonzero seed from the platform's `RandomState` (OS entropy on native
-/// targets; a fixed fallback where the target has none — wasm builds are
-/// linked, and a `random()` stream with a platform seed is a documented
-/// limit, not a correctness issue: no statement may depend on the value).
-fn seed_from_entropy() -> u64 {
-    use std::hash::{BuildHasher, Hasher, RandomState};
-    static SALT: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
-    let salt = SALT.fetch_add(1, Ordering::Relaxed);
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(salt);
-    match hasher.finish() {
-        0 => 0x2545_F491_4F6C_DD1D,
-        seed => seed,
-    }
-}
-
-/// The SplitMix64 mixer (Steele et al.); a full-period permutation of `u64`.
-fn splitmix64(mut z: u64) -> u64 {
-    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
 // ---------- the declaration ----------
 //
 // The Rust fn names are the SQL names (the SDK registers `stringify!(fname)`),
 // so the bodies are the functions themselves. `ext_math_*` names would make
-// the extension unusable from DuckDB-compatible SQL; the crate-internal
-// helpers above carry the only non-SQL names.
+// the extension unusable from DuckDB-compatible SQL.
 
 pinkdb_extension! {
     name = "math",
@@ -272,15 +214,6 @@ pinkdb_extension! {
         },
     ],
 
-    volatile = [
-        /// `random()` — a uniform DOUBLE in `[0, 1)`, from a process-global
-        /// SplitMix64 stream; refused in any statement the engine WAL-logs.
-        fn random() -> f64 {
-            // 53 bits of mantissa: `next >> 11` is uniform in [0, 2^53), and
-            // 2^53 * 2^-53 covers [0, 1) exactly (DuckDB's range).
-            (next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
-        },
-    ],
 }
 
 /// The extension as the engine registers it: the declared functions, exactly
@@ -456,36 +389,8 @@ mod tests {
         assert_eq!(atan2(Some(1.0), None), None);
     }
 
-    #[test]
-    fn random_is_uniform_double_in_the_unit_interval() {
-        let first = random();
-        assert!((0.0..1.0).contains(&first), "{first}");
-        let mut distinct = std::collections::HashSet::new();
-        for _ in 0..1000 {
-            let value = random();
-            assert!((0.0..1.0).contains(&value), "{value}");
-            distinct.insert(value.to_bits());
-        }
-        // A stream that never advances (or a broken seed) would fail here.
-        assert!(distinct.len() > 900, "{} distinct values", distinct.len());
-        // Concurrency: the exchange loop must not hand out duplicates.
-        let mut handles = Vec::new();
-        for _ in 0..4 {
-            handles.push(std::thread::spawn(|| {
-                (0..250).map(|_| random().to_bits()).collect::<Vec<_>>()
-            }));
-        }
-        let mut all = std::collections::HashSet::new();
-        for handle in handles {
-            for bits in handle.join().unwrap() {
-                all.insert(bits);
-            }
-        }
-        assert!(all.len() > 900, "{} distinct across threads", all.len());
-    }
-
-    /// The declaration, through the SDK: the SQL names are DuckDB's, the
-    /// arities are pinned, and `random` is the volatile one.
+    /// The declaration, through the SDK: the SQL names are DuckDB's and the
+    /// arities are pinned.
     #[test]
     fn declaration_metadata_is_pinned() {
         let ext = extension().unwrap();
@@ -495,7 +400,7 @@ mod tests {
             names,
             vec![
                 "exp", "ln", "log", "log2", "log10", "sin", "cos", "tan", "cot", "asin", "acos",
-                "atan", "atan2", "degrees", "radians", "pi", "random",
+                "atan", "atan2", "degrees", "radians", "pi",
             ]
         );
         let by_name = |name: &str| {
@@ -517,8 +422,6 @@ mod tests {
         assert_eq!(by_name("pi").max_args(), 0);
         // L-6: a zero-argument function has no argument type to clamp to.
         assert_eq!(by_name("pi").arg_type_at(0), None);
-        assert_eq!(by_name("random").arg_type_at(0), None);
-        assert!(by_name("random").is_volatile());
         assert!(!by_name("exp").is_volatile());
         // None of the names shadows an engine built-in (the engine refuses
         // the whole load otherwise): the overlapping DuckDB math surface stays

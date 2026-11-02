@@ -375,7 +375,7 @@ impl ArrayValue {
                         ArrayElem::Bigint
                     }
                 }
-                Value::Double(_) | Value::Decimal(..) => ArrayElem::Double,
+                Value::Double(_) | Value::Decimal { .. } => ArrayElem::Double,
                 other => {
                     return Err(PinkDbError::Type(format!(
                         "an array element cannot be {other} (elements are numeric)"

@@ -75,7 +75,7 @@ class MemoryValueTests(unittest.TestCase):
             "CREATE TABLE types (b BOOLEAN, i INTEGER, bi BIGINT, d DOUBLE, "
             "s VARCHAR, dt DATE, ts TIMESTAMP);"
             "INSERT INTO types VALUES "
-            "(TRUE, -2147483647 - 1, 9223372036854775807, -0.0, "
+            "(TRUE, -2147483647 - 1, 9223372036854775807, -0.0::DOUBLE, "
             "'héllo 🌍', DATE '2024-01-15', "
             "TIMESTAMP '2024-01-15 10:00:00.123456'), "
             "(NULL, NULL, NULL, NULL, NULL, NULL, NULL), "
@@ -245,7 +245,7 @@ class StatementKindTests(unittest.TestCase):
         self.assertEqual(results[3].affected, 1)
         self.assertEqual(
             [results[i].name for i in (4, 5, 6, 7, 8, 13, 14)],
-            ["v", "v", "t", "db1", "db1", "main", "db1"],
+            ["v", "v", "t", "db1", "db1.main", "main.main", "db1"],
         )
         # Non-SELECT results expose empty column/row surface, SELECT their own.
         for result in results[:-1]:
@@ -1093,8 +1093,8 @@ class PreparedStatementTests(unittest.TestCase):
         cases = [
             ("CREATE USER alice PASSWORD 'secret'", "created_user", "alice"),
             ("CREATE ROLE analyst", "created_role", "analyst"),
-            ("GRANT SELECT ON TABLE t TO alice", "granted", "SELECT ON TABLE main.t TO alice"),
-            ("REVOKE SELECT ON TABLE t FROM alice", "revoked", "SELECT ON TABLE main.t TO alice"),
+            ("GRANT SELECT ON TABLE t TO alice", "granted", "SELECT ON TABLE main.main.t TO alice"),
+            ("REVOKE SELECT ON TABLE t FROM alice", "revoked", "SELECT ON TABLE main.main.t TO alice"),
             ("ALTER USER alice PASSWORD 'rotated'", "altered_user", "alice"),
             ("DROP ROLE analyst", "dropped_role", "analyst"),
             ("DROP USER alice", "dropped_user", "alice"),

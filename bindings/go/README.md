@@ -98,6 +98,7 @@ usable.
   `committed`, `rolledback`, `created_view`, `dropped_table`, `dropped_view`,
   `created_database`, `dropped_database`, `used`, `loaded_extension`,
   `checkpointed`, `altered_table`, `created_user`, `altered_user`,
+  `set_variable`, `created_schema`, `dropped_schema`,
   `dropped_user`, `created_role`, `dropped_role`, `granted`, `revoked`;
 - `Columns` / `ColumnTypes` (SELECT only; types `boolean`, `integer`,
   `bigint`, `double`, `varchar`, `date`, `timestamp`, `decimal`, `interval`),

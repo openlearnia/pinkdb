@@ -113,7 +113,8 @@ fn fixture_store() -> PinkDb {
     db.execute("INSERT INTO analytics.u VALUES (7);").unwrap();
     db.execute("CREATE TABLE analytics.\"a.b\" (z DOUBLE);")
         .unwrap();
-    db.execute("INSERT INTO analytics.\"a.b\" VALUES (1.5), (-0.0);")
+    // `-0.0e0` is a DOUBLE literal: a decimal literal has no signed zero.
+    db.execute("INSERT INTO analytics.\"a.b\" VALUES (1.5), (-0.0e0);")
         .unwrap();
     db
 }

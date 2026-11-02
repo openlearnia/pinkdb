@@ -60,7 +60,7 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
         LogicalPlan::Filter { input, predicate } => {
             let input = apply_indexes(db, *input);
             // Try to match input: Scan + predicate: col = literal.
-            if let LogicalPlan::Scan { db: qdb, table, .. } = &input
+            if let LogicalPlan::Scan { ns: qdb, table, .. } = &input
                 && let BoundExpr::Binary {
                     op: crate::sql::ast::BinaryOp::Eq,
                     left,
@@ -83,7 +83,7 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
                         };
                     }
                 };
-                let lookup = qdb.clone().unwrap_or_else(|| db.current_db().to_string());
+                let lookup = qdb.clone().unwrap_or_else(|| db.current_ns().clone());
                 let candidate = match db.table_in(&lookup, table) {
                     Ok(t) if !t.indexes_stale => t
                         .indexes
@@ -107,7 +107,7 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
                     };
                     return LogicalPlan::Filter {
                         input: Box::new(LogicalPlan::IndexScan {
-                            db: qdb.clone(),
+                            ns: qdb.clone(),
                             table: table.clone(),
                             index: index_name,
                             value: BoundExpr::Literal(canonical),
@@ -395,6 +395,7 @@ fn const_chunk() -> DataChunk {
     DataChunk {
         columns: Vec::new(),
         num_rows: 1,
+        ordinal: 0,
     }
 }
 
@@ -440,10 +441,16 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
             expr: Box::new(fold_expr(cx, *expr)),
             negated,
         },
-        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => BoundExpr::Scalar {
             func,
             args: args.into_iter().map(|a| fold_expr(cx, a)).collect(),
             dtype,
+            volatile,
         },
         BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
             expr: Box::new(fold_expr(cx, *expr)),
@@ -499,16 +506,35 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
         && rebuilt.is_aggregate_free()
         && !rebuilt.has_subquery()
         && !rebuilt.contains_dynamic_scalar()
-        // A folded value cannot carry a parameterized type (a DECIMAL value
-        // only knows its scale, not its precision) while downstream
-        // output-schema/flush paths read the type off the expression, so
-        // DECIMAL/INTERVAL casts stay unfolded. Evaluation is per-row either
-        // way; this is a correctness guard, not a perf choice.
-        && !contains_parameterized_cast(&rebuilt)
         && let Ok(v) = eval_expr(&rebuilt, &const_chunk(), cx)
-            && v.len() == 1
+        && v.len() == 1
     {
-        let value = v.get(0);
+        let dtype = rebuilt.dtype();
+        let mut value = v.get(0);
+        // Keep the expression's type: a DECIMAL value cannot reproduce the
+        // precision its arithmetic type carries (`3 * 0.5` is DECIMAL(12,1)
+        // while the value 1.5 alone is (2,1)), and a folded literal is typed
+        // by its value.
+        if let Value::Decimal {
+            value: x, scale, ..
+        } = value
+        {
+            let DataType::Decimal {
+                precision,
+                scale: want,
+            } = dtype
+            else {
+                return rebuilt;
+            };
+            if want != scale {
+                return rebuilt;
+            }
+            value = Value::Decimal {
+                value: x,
+                precision,
+                scale,
+            };
+        }
         // A folded NULL would lose the expression's type: a bare
         // `Literal(Null)` is INTEGER-typed (the `SELECT NULL`
         // convention), while the folded expression may be BOOLEAN (a
@@ -516,54 +542,15 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
         // (`WHERE` needs BOOLEAN), so pin the original type with a
         // CAST of NULL. Fixes `SELECT * FROM t WHERE NULL` and
         // `WHERE 1 = NULL` (plus procedure variables that are NULL).
-        if value.is_null() {
-            let dtype = rebuilt.dtype();
-            if dtype != DataType::Integer {
-                return BoundExpr::Cast {
-                    expr: Box::new(BoundExpr::Literal(crate::types::Value::Null)),
-                    dtype,
-                };
-            }
+        if value.is_null() && dtype != DataType::Integer {
+            return BoundExpr::Cast {
+                expr: Box::new(BoundExpr::Literal(crate::types::Value::Null)),
+                dtype,
+            };
         }
         return BoundExpr::Literal(value);
     }
     rebuilt
-}
-
-/// True when any node of `expr` is a cast whose target type carries
-/// parameters a `Value` cannot round-trip (DECIMAL precision, INTERVAL).
-/// Such a tree must not be constant-folded into a literal.
-fn contains_parameterized_cast(expr: &BoundExpr) -> bool {
-    match expr {
-        BoundExpr::Cast { expr, dtype } => {
-            matches!(
-                dtype,
-                crate::types::DataType::Decimal { .. } | crate::types::DataType::Interval
-            ) || contains_parameterized_cast(expr)
-        }
-        BoundExpr::Literal(_) | BoundExpr::Column { .. } | BoundExpr::AggRef { .. } => false,
-        BoundExpr::Not(e)
-        | BoundExpr::Negate { expr: e, .. }
-        | BoundExpr::IsNull { expr: e, .. } => contains_parameterized_cast(e),
-        BoundExpr::Binary { left, right, .. } => {
-            contains_parameterized_cast(left) || contains_parameterized_cast(right)
-        }
-        BoundExpr::Scalar { args, .. } | BoundExpr::Coalesce { args, .. } => {
-            args.iter().any(contains_parameterized_cast)
-        }
-        BoundExpr::Case {
-            branches, else_, ..
-        } => {
-            branches
-                .iter()
-                .any(|(c, v)| contains_parameterized_cast(c) || contains_parameterized_cast(v))
-                || else_
-                    .as_ref()
-                    .is_some_and(|e| contains_parameterized_cast(e))
-        }
-        // Subqueries/dynamic calls/window refs: not folded anyway.
-        _ => false,
-    }
 }
 
 fn fold_aggs(
@@ -696,13 +683,13 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             offset,
         },
         LogicalPlan::Insert {
-            db,
+            ns,
             table,
             rows,
             conflict,
             returning,
         } => LogicalPlan::Insert {
-            db,
+            ns,
             table,
             rows: rows
                 .into_iter()
@@ -712,16 +699,18 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             returning,
         },
         LogicalPlan::InsertSelect {
-            db: qdb,
+            ns: qdb,
             table,
             columns,
+            defaults,
             query,
             conflict,
             returning,
         } => LogicalPlan::InsertSelect {
-            db: qdb,
+            ns: qdb,
             table,
             columns,
+            defaults,
             query: Box::new(fold_plan(db, *query)),
             conflict,
             returning,
@@ -741,13 +730,13 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             plan: Box::new(fold_plan(db, *plan)),
         },
         LogicalPlan::CreateTableAs {
-            db: qdb,
+            ns: qdb,
             name,
             query,
             if_not_exists,
             or_replace,
         } => LogicalPlan::CreateTableAs {
-            db: qdb,
+            ns: qdb,
             name,
             query: Box::new(fold_plan(db, *query)),
             if_not_exists,
@@ -889,7 +878,9 @@ fn value_num(v: &Value) -> Option<f64> {
         Value::Integer(i) => Some(*i as f64),
         Value::Bigint(i) => Some(*i as f64),
         Value::Double(f) => Some(*f),
-        Value::Decimal(i, s) => Some(*i as f64 / 10f64.powi(*s as i32)),
+        Value::Decimal {
+            value: i, scale: s, ..
+        } => Some(*i as f64 / 10f64.powi(*s as i32)),
         Value::Date(d) => Some(*d as f64),
         Value::Timestamp(t) => Some(*t as f64),
         _ => None,
@@ -1426,7 +1417,7 @@ fn comma_join_leaves(
     }
     // A join records its left input's width, so the last leaf's width has to
     // come from its own schema.
-    let last = crate::sql::binder::plan_schema(db, db.current_db(), &[], leaves.last()?)
+    let last = crate::sql::binder::plan_schema(db, db.current_ns(), &[], leaves.last()?)
         .ok()?
         .len();
     widths.push(last);
@@ -1468,12 +1459,12 @@ const REORDER_GAIN: f64 = 0.9;
 fn leaf_base_rows(db: &crate::storage::PinkDb, leaf: &LogicalPlan) -> Option<f64> {
     match leaf {
         LogicalPlan::Scan {
-            db: qdb,
+            ns: qdb,
             table,
             at: None,
         } => {
-            let name = qdb.clone().unwrap_or_else(|| db.current_db().to_string());
-            if let Some((attached, _)) = db.attached_lookup(&name, table) {
+            let name = qdb.clone().unwrap_or_else(|| db.current_ns().clone());
+            if let Some((attached, _)) = db.attached_lookup(name.db(), name.schema(), table) {
                 return Some(attached.rows as f64);
             }
             db.table_in(&name, table).ok().map(|t| t.num_rows() as f64)
@@ -1497,11 +1488,11 @@ pub(crate) fn leaf_stats<'a>(
 ) -> Option<&'a crate::stats::TableStats> {
     match leaf {
         LogicalPlan::Scan {
-            db: qdb,
+            ns: qdb,
             table,
             at: None,
         } => {
-            let name = qdb.clone().unwrap_or_else(|| db.current_db().to_string());
+            let name = qdb.clone().unwrap_or_else(|| db.current_ns().clone());
             db.table_in(&name, table).ok().map(|t| t.stats())
         }
         LogicalPlan::Filter { input, .. }
@@ -1530,7 +1521,9 @@ fn numeric(v: &Value) -> Option<f64> {
         Value::Double(d) if d.is_finite() => Some(*d),
         Value::Date(d) => Some(f64::from(*d)),
         Value::Timestamp(t) => Some(*t as f64),
-        Value::Decimal(v, scale) => Some(*v as f64 / 10f64.powi(i32::from(*scale))),
+        Value::Decimal {
+            value: v, scale, ..
+        } => Some(*v as f64 / 10f64.powi(i32::from(*scale))),
         _ => None,
     }
 }
@@ -2357,7 +2350,7 @@ fn reorder_comma_join(
     let above = and_all(outside);
     // The parent still addresses the chain's original column order, so put a
     // transparent projection on top. Its width is the chain's width.
-    let schema = crate::sql::binder::plan_schema(db, db.current_db(), &[], plan).ok()?;
+    let schema = crate::sql::binder::plan_schema(db, db.current_ns(), &[], plan).ok()?;
     let mut exprs = Vec::with_capacity(schema.len());
     let mut names = Vec::with_capacity(schema.len());
     for (g, (name, dtype)) in schema.iter().enumerate() {
@@ -2562,13 +2555,19 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
             right: Box::new(rewrite_through_project(right, exprs)?),
             dtype: *dtype,
         }),
-        BoundExpr::Scalar { func, args, dtype } => Some(BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => Some(BoundExpr::Scalar {
             func: *func,
             args: args
                 .iter()
                 .map(|a| rewrite_through_project(a, exprs))
                 .collect::<Option<Vec<_>>>()?,
             dtype: *dtype,
+            volatile: *volatile,
         }),
         // A dynamic call is row-wise like any other function: pushing a
         // predicate through a projection is row-preserving (same rows, same
@@ -2640,13 +2639,19 @@ fn rewrite_through_keys(pred: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExp
             expr: Box::new(rewrite_through_keys(expr, keys)?),
             negated: *negated,
         }),
-        BoundExpr::Scalar { func, args, dtype } => Some(BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => Some(BoundExpr::Scalar {
             func: *func,
             args: args
                 .iter()
                 .map(|a| rewrite_through_keys(a, keys))
                 .collect::<Option<Vec<_>>>()?,
             dtype: *dtype,
+            volatile: *volatile,
         }),
         BoundExpr::Cast { expr, dtype } => Some(BoundExpr::Cast {
             expr: Box::new(rewrite_through_keys(expr, keys)?),
@@ -3331,28 +3336,30 @@ fn pushdown_inner(plan: LogicalPlan, pdb: Option<&crate::storage::PinkDb>) -> Lo
             types,
         },
         LogicalPlan::InsertSelect {
-            db,
+            ns,
             table,
             columns,
+            defaults,
             query,
             conflict,
             returning,
         } => LogicalPlan::InsertSelect {
-            db,
+            ns,
             table,
             columns,
+            defaults,
             query: Box::new(pushdown_inner(*query, pdb)),
             conflict,
             returning,
         },
         LogicalPlan::CreateTableAs {
-            db,
+            ns,
             name,
             query,
             if_not_exists,
             or_replace,
         } => LogicalPlan::CreateTableAs {
-            db,
+            ns,
             name,
             query: Box::new(pushdown_inner(*query, pdb)),
             if_not_exists,
@@ -3460,7 +3467,7 @@ impl Live {
 fn plan_width(db: &crate::storage::PinkDb, plan: &LogicalPlan) -> Option<usize> {
     match plan {
         LogicalPlan::Scan {
-            db: Some(dbname),
+            ns: Some(dbname),
             table,
             ..
         } => db.table_in(dbname, table).ok().map(|t| t.num_cols()),
@@ -3497,14 +3504,14 @@ fn column_origin(
 ) -> Option<(String, String, usize, bool)> {
     match plan {
         LogicalPlan::Scan {
-            db: Some(dbname),
+            ns: Some(dbname),
             table,
             ..
         } => {
             let t = db.table_in(dbname, table).ok()?;
             (index < t.num_cols()).then(|| {
                 (
-                    dbname.to_ascii_lowercase(),
+                    dbname.db().to_ascii_lowercase(),
                     table.to_ascii_lowercase(),
                     index,
                     false,
@@ -3590,7 +3597,7 @@ fn fk_join_eliminable(
     right_keys: &[BoundExpr],
 ) -> bool {
     let LogicalPlan::Scan {
-        db: Some(ref_db),
+        ns: Some(ref_db),
         table: ref_table,
         ..
     } = right
@@ -3639,7 +3646,8 @@ fn fk_join_eliminable(
     }) else {
         return false;
     };
-    if !fk.ref_db.eq_ignore_ascii_case(ref_db) || !fk.ref_table.eq_ignore_ascii_case(ref_table) {
+    if !fk.ref_db.eq_ignore_ascii_case(ref_db.db()) || !fk.ref_table.eq_ignore_ascii_case(ref_table)
+    {
         return false;
     }
     // Every FK column must be NOT NULL by declaration (see the rule above).
@@ -3953,28 +3961,30 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
             recursive: recursive.map(|r| Box::new(r.map(&|p| elim(db, p, &Live::All)))),
         },
         LogicalPlan::InsertSelect {
-            db: qdb,
+            ns: qdb,
             table,
             columns,
+            defaults,
             query,
             conflict,
             returning,
         } => LogicalPlan::InsertSelect {
-            db: qdb,
+            ns: qdb,
             table,
             columns,
+            defaults,
             query: Box::new(elim(db, *query, &Live::All)),
             conflict,
             returning,
         },
         LogicalPlan::CreateTableAs {
-            db: qdb,
+            ns: qdb,
             name,
             query,
             if_not_exists,
             or_replace,
         } => LogicalPlan::CreateTableAs {
-            db: qdb,
+            ns: qdb,
             name,
             query: Box::new(elim(db, *query, &Live::All)),
             if_not_exists,
@@ -4067,7 +4077,7 @@ fn rewrite_sort(
         return None;
     };
     let LogicalPlan::Scan {
-        db: qdb,
+        ns: qdb,
         table,
         at: None,
     } = *scan
@@ -4097,8 +4107,11 @@ fn rewrite_sort(
         (BoundExpr::Literal(v), BoundExpr::Column { index, .. }) => (*index, v),
         _ => return None,
     };
-    let lookup = qdb.as_deref().unwrap_or_else(|| db.current_db());
-    let t = db.table_in(lookup, &table).ok()?;
+    let lookup = qdb
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| db.current_ns().clone());
+    let t = db.table_in(&lookup, &table).ok()?;
     let col = t.columns.get(col_idx)?;
     let dtype @ crate::types::DataType::Array { len, .. } = col.dtype else {
         return None;
@@ -4136,7 +4149,7 @@ fn rewrite_sort(
     }
     Some(LogicalPlan::Project {
         input: Box::new(LogicalPlan::VectorTopK {
-            db: qdb,
+            ns: qdb,
             table: table.clone(),
             column: col_idx,
             column_name: col.name.clone(),

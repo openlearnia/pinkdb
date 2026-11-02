@@ -111,7 +111,11 @@ impl TableSchema {
                 .map(|c| SchemaColumn {
                     name: c.name.clone(),
                     dtype: c.dtype,
-                    default: c.default.clone().filter(|v| !v.is_null()),
+                    default: c
+                        .default
+                        .as_ref()
+                        .and_then(|d| d.constant.clone())
+                        .filter(|v| !v.is_null()),
                     added: 1,
                 })
                 .collect(),
@@ -317,7 +321,10 @@ impl TableSchema {
                     // (rename); the data is shared, never copied. The record
                     // is authoritative for the DEFAULT too.
                     c.name = col.name.clone();
-                    c.default = col.default.clone();
+                    c.default = col
+                        .default
+                        .clone()
+                        .map(pinkdb::plan::ColumnDefault::constant);
                     present.push(file_present.get(pi).copied().unwrap_or(true));
                     columns.push(c);
                 }
@@ -388,12 +395,16 @@ pub(crate) fn constant_column(
         }
         chunks.push(std::sync::Arc::new(v));
     }
-    pinkdb::storage::Column::from_chunks(name.to_string(), dtype, default.cloned(), chunks).map_err(
-        |e| LakeError::Engine {
-            context: format!("building column \"{name}\""),
-            source: e,
-        },
+    pinkdb::storage::Column::from_chunks(
+        name.to_string(),
+        dtype,
+        default.cloned().map(pinkdb::plan::ColumnDefault::constant),
+        chunks,
     )
+    .map_err(|e| LakeError::Engine {
+        context: format!("building column \"{name}\""),
+        source: e,
+    })
 }
 
 /// How each *current* column reads from a base-version row (the write-side
@@ -454,7 +465,7 @@ pub(crate) fn plan_schema_delta(
                 .map(|c| SchemaColumn {
                     name: c.name.clone(),
                     dtype: c.dtype,
-                    default: c.default.clone(),
+                    default: c.default.as_ref().and_then(|d| d.constant.clone()),
                     added: 1,
                 })
                 .collect(),
@@ -531,7 +542,11 @@ pub(crate) fn plan_schema_delta(
             None => match pair_of[ci] {
                 Some(bi) => view.push(DiffCol::Base(bi)),
                 None => view.push(DiffCol::Added(
-                    current.columns[ci].default.clone().filter(|v| !v.is_null()),
+                    current.columns[ci]
+                        .default
+                        .as_ref()
+                        .and_then(|d| d.constant.clone())
+                        .filter(|v| !v.is_null()),
                 )),
             },
         }
@@ -596,7 +611,11 @@ pub(crate) fn plan_schema_delta(
         columns.push(SchemaColumn {
             name: c.name.clone(),
             dtype: c.dtype,
-            default: c.default.clone().filter(|v| !v.is_null()),
+            default: c
+                .default
+                .as_ref()
+                .and_then(|d| d.constant.clone())
+                .filter(|v| !v.is_null()),
             added: added_at,
         });
     }

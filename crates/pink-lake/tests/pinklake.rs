@@ -577,7 +577,7 @@ fn lean_time_travel_reads_old_versions_through_the_stats_blocks() {
     );
     assert_eq!(lake.decode_stats().0, 1);
     // ...v2's version file is a different decode, and the current version
-    // decodes its own file once (then caches).
+    // decodes its own file (nothing is cached between queries).
     assert_eq!(
         select_rows(&mut attached, "SELECT x FROM t AT (VERSION => 2);"),
         vec![vec![Value::Integer(1)]]
@@ -590,9 +590,9 @@ fn lean_time_travel_reads_old_versions_through_the_stats_blocks() {
     assert_eq!(
         select_rows(&mut attached, "SELECT x FROM t AT (VERSION => 2);"),
         vec![vec![Value::Integer(1)]],
-        "the version attachment caches"
+        "the version attachment is reused"
     );
-    assert_eq!(lake.decode_stats().0, 3);
+    assert_eq!(lake.decode_stats().0, 4, "its decode is not");
     // v1 has no table at all, and unknown versions are clean errors.
     let err = attached
         .execute("SELECT * FROM t AT (VERSION => 1);")

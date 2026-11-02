@@ -424,8 +424,9 @@ fn row_encoded_len(row: &[Value]) -> usize {
                 Value::Boolean(_) => 1,
                 Value::Integer(_) | Value::Date(_) => 4,
                 Value::Bigint(_) | Value::Double(_) | Value::Timestamp(_) => 8,
-                Value::Decimal(_, _) => 16 + 1,
+                Value::Decimal { .. } => 16 + 1,
                 Value::Interval { .. } => 16,
+                Value::Uuid(_) => 16,
                 Value::Varchar(s) => 4 + s.len(),
                 // A VARIANT's wire length is its encoding's length; encoding
                 // into a reused buffer keeps the frame-size estimate exact so
@@ -1532,7 +1533,9 @@ pub(crate) fn send_result<S: FrameSink + ?Sized>(
         QueryResult::DroppedView { name } => done(w, DoneKind::DroppedView, 0, name),
         QueryResult::CreatedDatabase { name } => done(w, DoneKind::CreatedDatabase, 0, name),
         QueryResult::DroppedDatabase { name } => done(w, DoneKind::DroppedDatabase, 0, name),
-        QueryResult::Used { db } => done(w, DoneKind::Used, 0, db),
+        QueryResult::CreatedSchema { name } => done(w, DoneKind::CreatedSchema, 0, name),
+        QueryResult::DroppedSchema { name } => done(w, DoneKind::DroppedSchema, 0, name),
+        QueryResult::Used { db, schema } => done(w, DoneKind::Used, 0, &format!("{db}\0{schema}")),
         QueryResult::SetVariable { name } => done(w, DoneKind::SetVariable, 0, name),
         QueryResult::LoadedExtension { name } => done(w, DoneKind::LoadedExtension, 0, name),
         QueryResult::Checkpointed => done(w, DoneKind::Checkpointed, 0, ""),

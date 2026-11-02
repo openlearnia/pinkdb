@@ -1055,6 +1055,7 @@ fn new_tables_and_empty_tables_commit() {
             2,
             &base,
             &current,
+            None,
             &CommitSettings {
                 retry_wait_ms: 1,
                 ..CommitSettings::default()

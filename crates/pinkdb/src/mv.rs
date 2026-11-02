@@ -99,7 +99,7 @@
 use std::collections::HashSet;
 
 use crate::plan::LogicalPlan;
-use crate::storage::{MaterializedViewDef, PinkDb};
+use crate::storage::{MaterializedViewDef, PinkDb, SchemaPath, TableRef};
 use crate::types::{PinkDbError, RefreshPolicy, Result};
 use crate::wal::FrameSets;
 
@@ -115,10 +115,13 @@ pub(crate) fn now_ms() -> i64 {
 /// The SQL text that logs (and re-runs) one view's refresh. Fully qualified and
 /// fully quoted, so the record is session-independent and reparseable for any
 /// view name.
-pub(crate) fn refresh_sql(db: &str, name: &str) -> String {
+pub(crate) fn refresh_sql(ns: &SchemaPath, name: &str) -> String {
+    // The grammar has no schema qualifier yet (wave 131b), so the logged
+    // statement names the database: a view outside `main` cannot exist until
+    // then.
     format!(
         "REFRESH MATERIALIZED VIEW {}.{}",
-        quote_ident(db),
+        quote_ident(ns.db()),
         quote_ident(name)
     )
 }
@@ -154,18 +157,20 @@ impl PinkDb {
     pub(crate) fn has_materialized_views(&self) -> bool {
         self.databases
             .values()
-            .any(|c| !c.materialized_views.is_empty())
+            .any(|c| c.schemas.values().any(|s| !s.materialized_views.is_empty()))
     }
 
-    /// Every materialized view of the store as `(db key, lowercased name)`, in
-    /// deterministic order: database key, then name. (Names only: the
-    /// definitions carry a bound plan, so the boundary hot path never clones
-    /// one.)
-    fn all_materialized_views(&self) -> Vec<(String, String)> {
+    /// Every materialized view of the store as `(namespace, lowercased name)`,
+    /// in deterministic order: database key, schema key, then name. (Names
+    /// only: the definitions carry a bound plan, so the boundary hot path
+    /// never clones one.)
+    fn all_materialized_views(&self) -> Vec<TableRef> {
         let mut out = Vec::new();
         for (db, cat) in &self.databases {
-            for key in cat.materialized_views.keys() {
-                out.push((db.clone(), key.clone()));
+            for (schema, s) in &cat.schemas {
+                for key in s.materialized_views.keys() {
+                    out.push((SchemaPath::new(db, schema), key.clone()));
+                }
             }
         }
         out.sort();
@@ -175,7 +180,7 @@ impl PinkDb {
     /// Record a committed unit's write set for the `ON COMMIT` trigger.
     /// Never called during WAL replay (replayed refreshes are logged
     /// statements; re-deriving triggers would double them).
-    pub(crate) fn mark_mv_writes(&mut self, writes: &HashSet<(String, String)>) {
+    pub(crate) fn mark_mv_writes(&mut self, writes: &HashSet<TableRef>) {
         if writes.is_empty() || self.replaying {
             return;
         }
@@ -185,49 +190,45 @@ impl PinkDb {
         self.mv_pending.extend(writes.iter().cloned());
     }
 
-    /// The `(db, table)` writes of a bound plan: the plan's own writes plus the
-    /// backing tables a `REFRESH MATERIALIZED VIEWS` names only by database.
-    /// `record_writes` already covers single-view statements.
+    /// The `(namespace, table)` writes of a bound plan: the plan's own writes
+    /// plus the backing tables a `REFRESH MATERIALIZED VIEWS` names only by
+    /// database. `record_writes` already covers single-view statements.
     pub(crate) fn plan_writes_of(
         &self,
         plan: &LogicalPlan,
-        default_db: &str,
-    ) -> HashSet<(String, String)> {
+        default_ns: &SchemaPath,
+    ) -> HashSet<TableRef> {
         let mut out = HashSet::new();
-        crate::db::record_writes(plan, default_db, &mut out, &mut HashSet::new());
+        crate::db::record_writes(plan, default_ns, &mut out, &mut HashSet::new());
         // Wave 44: a `CALL`'s writes are the ones its statements actually
         // performed, recorded by the executor (the plan cannot name them).
         // Wave 100: so are a trigger body's, which take the same path — the
         // guard is gone, and a plan that fired no triggers leaves the set
         // unchanged (the frame is reset per statement).
         out.extend(self.proc_frame.writes());
-        if let LogicalPlan::RefreshMaterializedViews { db } = plan {
-            let target = db.as_deref().unwrap_or(default_db);
-            for name in self.materialized_view_names_in(target) {
-                out.insert((target.to_ascii_lowercase(), name.to_ascii_lowercase()));
+        if let LogicalPlan::RefreshMaterializedViews { ns } = plan {
+            let target = ns.clone().unwrap_or_else(|| default_ns.clone());
+            for name in self.materialized_view_names_in(&target) {
+                out.insert((target.clone(), name.to_ascii_lowercase()));
             }
         }
         out
     }
 
-    /// The `(db, table)` *reads* a materialized-view statement performs on top
-    /// of what the plan itself names: a refresh re-evaluates the view's
+    /// The `(namespace, table)` *reads* a materialized-view statement performs
+    /// on top of what the plan itself names: a refresh re-evaluates the view's
     /// defining query, so it reads the query's base tables.
-    pub(crate) fn mv_reads_of(
-        &self,
-        plan: &LogicalPlan,
-        default_db: &str,
-    ) -> Vec<(String, String)> {
+    pub(crate) fn mv_reads_of(&self, plan: &LogicalPlan, default_ns: &SchemaPath) -> Vec<TableRef> {
         let mut out = Vec::new();
         match plan {
-            LogicalPlan::RefreshMaterializedView { db, name } => {
-                let target = db.as_deref().unwrap_or(default_db);
-                out.extend(self.materialized_view_deps(target, name));
+            LogicalPlan::RefreshMaterializedView { ns, name } => {
+                let target = ns.clone().unwrap_or_else(|| default_ns.clone());
+                out.extend(self.materialized_view_deps(&target, name));
             }
-            LogicalPlan::RefreshMaterializedViews { db } => {
-                let target = db.as_deref().unwrap_or(default_db);
-                for name in self.materialized_view_names_in(target) {
-                    out.extend(self.materialized_view_deps(target, &name));
+            LogicalPlan::RefreshMaterializedViews { ns } => {
+                let target = ns.clone().unwrap_or_else(|| default_ns.clone());
+                for name in self.materialized_view_names_in(&target) {
+                    out.extend(self.materialized_view_deps(&target, &name));
                 }
             }
             _ => {}
@@ -240,22 +241,22 @@ impl PinkDb {
     /// ordinary workloads pay one `has_materialized_views` scan). Inside a
     /// transaction nothing is committed yet: `PinkDb::commit` moves the
     /// transaction's writes here.
-    pub(crate) fn mark_committed_mv_writes(&mut self, plan: &LogicalPlan, default_db: &str) {
+    pub(crate) fn mark_committed_mv_writes(&mut self, plan: &LogicalPlan, default_ns: &SchemaPath) {
         if self.in_transaction() || !crate::plan::writes_tables(plan) {
             return;
         }
         if !self.has_materialized_views() {
             return;
         }
-        let writes = self.plan_writes_of(plan, default_db);
+        let writes = self.plan_writes_of(plan, default_ns);
         self.mark_mv_writes(&writes);
     }
 
     /// The plan's touched set for a WAL frame (wave 45o), store-aware: MV
     /// statements depend on objects the plan alone cannot name.
-    pub(crate) fn plan_sets_store(&self, plan: &LogicalPlan, default_db: &str) -> FrameSets {
+    pub(crate) fn plan_sets_store(&self, plan: &LogicalPlan, default_ns: &SchemaPath) -> FrameSets {
         let mut sets = FrameSets::default();
-        crate::plan::plan_sets(plan, default_db, &mut sets);
+        crate::plan::plan_sets(plan, default_ns, &mut sets);
         // Wave 44: a `CALL`'s body touches tables the plan cannot name
         // (`plan_sets` covers only its argument subqueries); the executor
         // recorded what actually ran. Read *after* the call, this is the
@@ -265,13 +266,13 @@ impl PinkDb {
         // Wave 100: likewise a trigger body's reads and writes; see
         // `plan_writes_of`.
         sets.extend(&self.proc_frame.touched());
-        for (db, table) in self.mv_reads_of(plan, default_db) {
-            sets.add_table(&db, &table);
+        for (ns, table) in self.mv_reads_of(plan, default_ns) {
+            sets.add_table(&ns, &table);
         }
-        if let LogicalPlan::RefreshMaterializedViews { db } = plan {
-            let target = db.as_deref().unwrap_or(default_db);
-            for name in self.materialized_view_names_in(target) {
-                sets.add_table(target, &name);
+        if let LogicalPlan::RefreshMaterializedViews { ns } = plan {
+            let target = ns.clone().unwrap_or_else(|| default_ns.clone());
+            for name in self.materialized_view_names_in(&target) {
+                sets.add_table(&target, &name);
             }
         }
         sets
@@ -283,8 +284,8 @@ impl PinkDb {
         if !self.has_materialized_views() {
             return false;
         }
-        for (db, key) in self.all_materialized_views() {
-            let Ok(def) = self.materialized_view_in(&db, &key) else {
+        for (ns, key) in self.all_materialized_views() {
+            let Ok(def) = self.materialized_view_in(&ns, &key) else {
                 continue;
             };
             match def.policy {
@@ -297,7 +298,7 @@ impl PinkDb {
                 RefreshPolicy::OnCommit => {
                     if !self.mv_pending.is_empty()
                         && !self
-                            .materialized_view_deps(&db, &def.name)
+                            .materialized_view_deps(&ns, &def.name)
                             .is_disjoint(&self.mv_pending)
                     {
                         return true;
@@ -316,49 +317,54 @@ impl PinkDb {
     /// definition, never returned. The pending dirty set is consumed.
     pub(crate) fn refresh_due_auto_views(&mut self, now: i64) -> AutoRefresh {
         let mut report = AutoRefresh::default();
-        let mut dirty: HashSet<(String, String)> = std::mem::take(&mut self.mv_pending);
+        let mut dirty: HashSet<TableRef> = std::mem::take(&mut self.mv_pending);
         if !self.has_materialized_views() {
             return report;
         }
-        let mut done: HashSet<(String, String)> = HashSet::new();
+        let mut done: HashSet<TableRef> = HashSet::new();
         loop {
             let mut progressed = false;
-            for (db, key) in self.all_materialized_views() {
-                if done.contains(&(db.clone(), key.clone())) {
+            for (ns, key) in self.all_materialized_views() {
+                if done.contains(&(ns.clone(), key.clone())) {
                     continue;
                 }
                 let trigger = {
-                    let Ok(def) = self.materialized_view_in(&db, &key) else {
+                    let Ok(def) = self.materialized_view_in(&ns, &key) else {
                         continue;
                     };
                     match def.policy {
                         RefreshPolicy::Manual => false,
                         RefreshPolicy::Every { .. } => def.is_due(now),
                         RefreshPolicy::OnCommit => !self
-                            .materialized_view_deps(&db, &def.name)
+                            .materialized_view_deps(&ns, &def.name)
                             .is_disjoint(&dirty),
                     }
                 };
                 if !trigger {
                     continue;
                 }
-                done.insert((db.clone(), key.clone()));
+                done.insert((ns.clone(), key.clone()));
                 progressed = true;
                 let name = key.clone();
-                match crate::exec::refresh_materialized_view(self, &db, &name) {
+                // The refresh executes the view's query here, outside the
+                // statement path, and its record logs the `REFRESH` texts:
+                // give it its own statement state, as a replayed `REFRESH`
+                // draws one too.
+                self.begin_volatile_write();
+                match crate::exec::refresh_materialized_view(self, &ns, &name) {
                     Ok(()) => {
                         // The fresh table is itself a base table for views
                         // built on this one.
-                        dirty.insert((db.to_ascii_lowercase(), key.clone()));
-                        report.sets.add_table(&db, &name);
-                        for (dep_db, dep_table) in self.materialized_view_deps(&db, &name) {
-                            report.sets.add_table(&dep_db, &dep_table);
+                        dirty.insert((ns.clone(), key.clone()));
+                        report.sets.add_table(&ns, &name);
+                        for (dep_ns, dep_table) in self.materialized_view_deps(&ns, &name) {
+                            report.sets.add_table(&dep_ns, &dep_table);
                         }
-                        report.stmts.push(refresh_sql(&db, &name));
+                        report.stmts.push(refresh_sql(&ns, &name));
                     }
                     Err(e) => {
                         let msg = e.to_string();
-                        self.record_auto_refresh_error(&db, &name, now, &msg);
+                        self.record_auto_refresh_error(&ns, &name, now, &msg);
                     }
                 }
             }
@@ -410,14 +416,24 @@ impl PinkDb {
     /// Append one boundary pass's refreshes as a single WAL record (the lease
     /// must be held by the caller for durable stores).
     pub(crate) fn log_auto_refresh(&mut self, report: &AutoRefresh) -> Result<()> {
-        let db = self.current_db.clone();
-        self.wal_append_session(&db, &db, &report.stmts, &[], &[], Some(&report.sets), &[])
+        let ns = self.current_ns.clone();
+        let memo = self.statement_memo(&[]);
+        self.wal_append_session(
+            &ns,
+            &ns,
+            &report.stmts,
+            &[],
+            &[],
+            Some(&report.sets),
+            None,
+            &memo,
+        )
     }
 
     /// Mark a successful refresh: the wall-clock stamp, the attempt stamp and
     /// the counter, clearing any recorded error.
-    pub(crate) fn mark_refreshed(&mut self, db: &str, name: &str, now: i64) -> Result<()> {
-        let def = self.materialized_view_mut_in(db, name)?;
+    pub(crate) fn mark_refreshed(&mut self, ns: &SchemaPath, name: &str, now: i64) -> Result<()> {
+        let def = self.materialized_view_mut_in(ns, name)?;
         def.last_refreshed_ms = now;
         def.last_attempt_ms = now;
         def.refresh_count = def.refresh_count.saturating_add(1);
@@ -426,17 +442,22 @@ impl PinkDb {
     }
 
     /// Record a failed *automatic* refresh without disturbing the data.
-    fn record_auto_refresh_error(&mut self, db: &str, name: &str, now: i64, error: &str) {
-        if let Ok(def) = self.materialized_view_mut_in(db, name) {
+    fn record_auto_refresh_error(&mut self, ns: &SchemaPath, name: &str, now: i64, error: &str) {
+        if let Ok(def) = self.materialized_view_mut_in(ns, name) {
             def.last_attempt_ms = now;
             def.last_error = Some(error.to_string());
         }
     }
 
     /// The `SHOW MATERIALIZED VIEWS` rows of `db`, sorted by name.
-    pub(crate) fn materialized_view_status_in(&self, db: &str, now: i64) -> Vec<MvStatus> {
+    pub(crate) fn materialized_view_status_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+        now: i64,
+    ) -> Vec<MvStatus> {
+        let ns = ns.into();
         let mut out: Vec<MvStatus> = self
-            .materialized_views_in(db)
+            .materialized_views_in(&ns)
             .into_iter()
             .map(|(_, def)| {
                 let stale = def.last_error.is_some()
@@ -444,7 +465,7 @@ impl PinkDb {
                         RefreshPolicy::Manual => false,
                         RefreshPolicy::Every { .. } => def.is_due(now),
                         RefreshPolicy::OnCommit => !self
-                            .materialized_view_deps(db, &def.name)
+                            .materialized_view_deps(&ns, &def.name)
                             .is_disjoint(&self.mv_pending),
                     };
                 MvStatus {
@@ -481,13 +502,16 @@ impl MaterializedViewDef {
 /// tables were missing at load time — and by the loader itself.
 pub(crate) fn rebind_query(
     db: &PinkDb,
-    db_name: &str,
+    ns: &crate::storage::SchemaPath,
     query_sql: &str,
 ) -> Result<Box<LogicalPlan>> {
     let stmts = crate::sql::parse_statements(query_sql)?;
     match stmts.into_iter().next() {
+        // A view's body resolves names in its own database; the schema
+        // qualifier arrives with the grammar (wave 131b), so unqualified
+        // references still mean schema `main` here.
         Some(crate::sql::ast::Statement::CreateMaterializedView { query, .. }) => Ok(Box::new(
-            crate::sql::bind_mv_query(db, db_name, &query, &db.session)?,
+            crate::sql::bind_mv_query(db, ns, &query, &db.session)?,
         )),
         _ => Err(PinkDbError::Catalog(format!(
             "the persisted definition of a materialized view is not a CREATE \
@@ -938,7 +962,10 @@ mod tests {
         db.execute("INSERT INTO t VALUES (3, 'z');").unwrap();
         assert_eq!(
             db.mv_pending,
-            std::collections::HashSet::from([("main".to_string(), "t".to_string())])
+            std::collections::HashSet::from([(
+                crate::storage::SchemaPath::main("main"),
+                "t".to_string(),
+            )])
         );
         let stale_now = db.materialized_view_status_in("main", crate::mv::now_ms());
         assert!(

@@ -17,6 +17,7 @@
 //! | DATE | INT32 + DATE |
 //! | TIMESTAMP | INT64 + TIMESTAMP(MICROS), `is_adjusted_to_utc = false` |
 //! | DECIMAL(p,s) | INT32 (p ≤ 9) / INT64 (p ≤ 18) / FIXED_LEN_BYTE_ARRAY(16) + DECIMAL(p,s) |
+//! | UUID | FIXED_LEN_BYTE_ARRAY(16) + UUID |
 //! | VARIANT | GROUP + `Variant` logical type: `metadata`, `value`, and a `typed_value` group with one typed column per shredded key ([`variant_shred`]) |
 //! | ARRAY | the three-level LIST group DuckDB 2.0 writes, whose length is only in the number of element slots per row (plus a `pinkdb.array.<name>` key-value entry) |
 //!
@@ -73,6 +74,8 @@ pub const DEFAULT_ROW_GROUP_ROWS: usize = 64 * 1024;
 /// The fixed byte width of a DECIMAL wider than INT64 (precision up to 38
 /// fits in 16 two's-complement bytes: 10^38 < 2^127).
 const DECIMAL_FIXED_LEN: i32 = 16;
+/// A UUID is always 16 bytes (`FIXED_LEN_BYTE_ARRAY(16)` + the UUID annotation).
+const UUID_FIXED_LEN: i32 = 16;
 
 /// A parquet write failure: an unsupported column, a value that does not
 /// match its column, or a parquet/integrity error.
@@ -211,6 +214,15 @@ pub fn read_identity(path: &Path) -> Result<Option<(String, String)>, WriteError
 /// pays a dictionary it cannot exploit.
 pub const DICTIONARY_PAGE_LIMIT: usize = 1024 * 1024;
 
+/// Rows per data page. Every column breaks at the same row, so a page index
+/// reader can drop a page and keep the rest aligned; 16 Ki rows keeps a page a
+/// few hundred KB even for wide strings.
+pub const PAGE_ROW_LIMIT: usize = 16 * 1024;
+
+/// The byte limit stays far above a page of `PAGE_ROW_LIMIT` rows so the row
+/// limit wins and pages stay row-aligned; it only bounds pathological columns.
+pub const PAGE_SIZE_LIMIT: usize = 8 * 1024 * 1024;
+
 /// The page codec. Snappy is DuckDB's Parquet default and is the reason a
 /// pinkdb-written file is comparable with a DuckDB one; a build without the
 /// codec feature (never the extension's default) writes plain pages.
@@ -255,9 +267,14 @@ fn write_table_with_key_values(
     }
     let root = build_schema(&schema, &policies, field_ids)?;
     let mut builder = WriterProperties::builder()
-        // Chunk statistics travel in the footer (min/max/NULL count), so the
-        // file is self-describing for other readers and for pruning.
-        .set_statistics_enabled(EnabledStatistics::Chunk)
+        // Statistics at page granularity: the column index travels in the
+        // footer, so a reader can skip a page whose min/max proves no match.
+        .set_statistics_enabled(EnabledStatistics::Page)
+        // A fixed row limit makes every column's pages break at the same rows,
+        // which is what lets a reader drop a page and keep the surviving
+        // pages' rows aligned across columns.
+        .set_data_page_row_count_limit(PAGE_ROW_LIMIT)
+        .set_data_page_size_limit(PAGE_SIZE_LIMIT)
         .set_compression(PAGE_COMPRESSION)
         .set_dictionary_enabled(true)
         .set_dictionary_page_size_limit(DICTIONARY_PAGE_LIMIT);
@@ -348,6 +365,7 @@ fn physical_type(dtype: DataType, column: &str) -> Result<PhysicalType, WriteErr
         DataType::Bigint | DataType::Timestamp => PhysicalType::INT64,
         DataType::Double => PhysicalType::DOUBLE,
         DataType::Varchar => PhysicalType::BYTE_ARRAY,
+        DataType::Uuid => PhysicalType::FIXED_LEN_BYTE_ARRAY,
         DataType::Decimal { precision, .. } => {
             if precision <= 9 {
                 PhysicalType::INT32
@@ -463,6 +481,11 @@ fn build_schema(
                     // Naive microseconds: `is_adjusted_to_utc = false`, so no
                     // reader shifts the value by a time zone.
                     .with_logical_type(Some(LogicalType::timestamp(false, TimeUnit::MICROS)));
+            }
+            DataType::Uuid => {
+                builder = builder
+                    .with_length(UUID_FIXED_LEN)
+                    .with_logical_type(Some(LogicalType::Uuid));
             }
             DataType::Decimal { precision, scale } => {
                 builder = builder
@@ -588,7 +611,11 @@ fn write_column(
                     cursor,
                     name,
                     |v| match v {
-                        Value::Decimal(unscaled, value_scale) => {
+                        Value::Decimal {
+                            value: unscaled,
+                            scale: value_scale,
+                            ..
+                        } => {
                             decimal_scale_check(*value_scale, scale)?;
                             i32::try_from(*unscaled).map_err(|_| {
                                 format!(
@@ -607,7 +634,11 @@ fn write_column(
                     cursor,
                     name,
                     |v| match v {
-                        Value::Decimal(unscaled, value_scale) => {
+                        Value::Decimal {
+                            value: unscaled,
+                            scale: value_scale,
+                            ..
+                        } => {
                             decimal_scale_check(*value_scale, scale)?;
                             i64::try_from(*unscaled).map_err(|_| {
                                 format!(
@@ -626,7 +657,11 @@ fn write_column(
                     cursor,
                     name,
                     |v| match v {
-                        Value::Decimal(unscaled, value_scale) => {
+                        Value::Decimal {
+                            value: unscaled,
+                            scale: value_scale,
+                            ..
+                        } => {
                             decimal_scale_check(*value_scale, scale)?;
                             // Big-endian two's complement, sign extended to
                             // the fixed width the schema declares.
@@ -637,6 +672,17 @@ fn write_column(
                 )?;
             }
         }
+        DataType::Uuid => write_typed(
+            column.typed::<FixedLenByteArrayType>(),
+            rows,
+            cursor,
+            name,
+            |v| match v {
+                // RFC 4122 byte order, the parquet UUID annotation's.
+                Value::Uuid(bits) => Ok(FixedLenByteArray::from(bits.to_be_bytes().to_vec())),
+                _ => Err(wrong_type(v, DataType::Uuid)),
+            },
+        )?,
         // Refused in `physical_type`/`build_schema` before any row is read.
         DataType::Interval => unreachable!("interval columns are refused before writing"),
         DataType::Variant => unreachable!("variant columns use write_variant_column"),

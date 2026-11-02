@@ -1960,9 +1960,11 @@ fn watermark_high(
 }
 
 /// Apply one snapshot CDC range: per version in order, deduplicated inserts
-/// by full-row match, then deletes by full-row match. A delete whose row is
-/// value-identical to an insert in the same version is a no-op update and is
-/// skipped (the change data does not pair update pre/post images).
+/// by full-row match, then deletes by full-row match. An update appears as a
+/// delete preimage and an insert postimage in one version; the postimage is
+/// inserted first and the preimage then removes the old row, so the version's
+/// net effect is the update. A delete whose row is value-identical to an
+/// insert in the same version is a no-op update and is skipped.
 fn apply_snapshot_changes(rows: &mut Vec<Vec<Value>>, changes: &[crate::cdc::ChangeRow]) {
     // Rows are matched bit-exactly (`exact_key`): replication must keep
     // `-0.0` and NaN payloads, so the engine's `-0.0 = 0.0` equality is the
@@ -1988,7 +1990,7 @@ fn apply_snapshot_changes(rows: &mut Vec<Vec<Value>>, changes: &[crate::cdc::Cha
         let batch = &changes[start..end];
         let mut inserted: HashSet<Vec<u8>> = HashSet::new();
         for change in batch {
-            if change.change_type == crate::cdc::ChangeKind::Insert {
+            if change.change_type.is_insertion() {
                 let columns: Vec<usize> = (0..change.values.len()).collect();
                 let key = exact_key(&change.values, &columns);
                 let slot = positions.entry(key.clone()).or_default();
@@ -2001,7 +2003,7 @@ fn apply_snapshot_changes(rows: &mut Vec<Vec<Value>>, changes: &[crate::cdc::Cha
             }
         }
         for change in batch {
-            if change.change_type != crate::cdc::ChangeKind::Delete {
+            if !change.change_type.is_deletion() {
                 continue;
             }
             let columns: Vec<usize> = (0..change.values.len()).collect();
@@ -2070,7 +2072,7 @@ fn extended_base(base: &DataTable, source: &DataTable) -> Result<DataTable> {
         columns.push(crate::schema::constant_column(
             &column.name,
             column.dtype,
-            column.default.as_ref(),
+            column.default.as_ref().and_then(|d| d.constant.as_ref()),
             base,
         )?);
     }
@@ -2115,7 +2117,13 @@ fn commit_content(
         None => Vec::new(),
     };
     let current = vec![(key.to_string(), Arc::new(content.clone()))];
-    dest.commit_from_tables(base_version, &base, &current, &CommitSettings::default())
+    dest.commit_from_tables(
+        base_version,
+        &base,
+        &current,
+        None,
+        &CommitSettings::default(),
+    )
 }
 
 /// Drop one destination table through an ordinary commit. A table that is
@@ -2568,7 +2576,18 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         (Value::Varchar(x), Value::Varchar(y)) => x.cmp(y),
-        (Value::Decimal(x, sx), Value::Decimal(y, sy)) => {
+        (
+            Value::Decimal {
+                value: x,
+                scale: sx,
+                ..
+            },
+            Value::Decimal {
+                value: y,
+                scale: sy,
+                ..
+            },
+        ) => {
             let scale = (*sx).max(*sy);
             let raise = |value: i128, from: u8| -> Option<i128> {
                 value.checked_mul(10i128.checked_pow(u32::from(scale - from))?)
@@ -2669,7 +2688,7 @@ fn encode_key(value: &Value, out: &mut Vec<u8>) {
             out.push(7);
             out.extend_from_slice(&value.to_le_bytes());
         }
-        Value::Decimal(value, scale) => {
+        Value::Decimal { value, scale, .. } => {
             out.push(8);
             out.extend_from_slice(&value.to_le_bytes());
             out.push(*scale);
@@ -2693,6 +2712,10 @@ fn encode_key(value: &Value, out: &mut Vec<u8>) {
         Value::Array(a) => {
             out.push(11);
             out.extend_from_slice(&pinkdb::array::encode_cell(a));
+        }
+        Value::Uuid(bits) => {
+            out.push(12);
+            out.extend_from_slice(&bits.to_le_bytes());
         }
     }
 }

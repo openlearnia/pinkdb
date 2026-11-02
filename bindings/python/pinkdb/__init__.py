@@ -117,6 +117,9 @@ _STMT_KINDS = {
     21: "dropped_role",
     22: "granted",
     23: "revoked",
+    24: "set_variable",
+    25: "created_schema",
+    26: "dropped_schema",
 }
 
 # ----- value / column type tags (PINKDB_TYPE_*) -----

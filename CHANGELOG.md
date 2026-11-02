@@ -9,6 +9,35 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-11-01
+### Wave 136 (steps a–b, through b-4) — a memory limit, a lazily opened store ✅
+
+Opening a saved store no longer decodes it, and a statement that would
+outgrow the process's memory budget fails with an out-of-memory error
+instead of being killed by the OS. Results are unchanged.
+
+- **`SET memory_limit = '2GB'`** (alias `max_memory`, `-1` = no limit) sets
+  one process-wide budget: 80 % of the memory the process may use — physical
+  RAM, or the tighter cgroup limit a container imposed — and no limit on
+  wasm32. Hash-join builds, hash aggregates, sorts and the other large
+  operators reserve the chunks they hold against it and release them on drop;
+  over the limit the statement fails with DuckDB's out-of-memory error. A
+  profile reports the limit and the statement's peak, on the wire protocol's
+  v16 `Profile` frame.
+- **Lazy open:** the footer now records every chunk's row count (footer
+  version 7), so opening a `.pink` file checksums the column chunks and
+  installs descriptors without decoding a page. A chunk is decoded on first
+  read, and a scan decodes only the columns the query asks for. A version-6
+  or older file is refused with the documented older-pinkdb error — there is
+  no v6 reader and no conversion.
+- **Eviction:** a decoded chunk is charged to the budget and can be dropped
+  again under pressure, least recently used first, so a store larger than the
+  budget still scans. Dirty and pinned chunks are never evicted.
+- **Copy-through `.save`:** a checkpoint re-encodes only the chunks changed
+  since the last save and copies the rest byte for byte.
+- **`COMMIT` that cannot take the store's lease** now aborts the transaction,
+  so the caller's retry can `BEGIN` again instead of tripping over "already
+  in a transaction".
+
 ### Wave 135 (steps a–d) — pipelines, string keys, big GROUP BYs ✅
 
 QuackLab's mart refresh SELECTs run 1.5–2.9× faster than after wave 140,
@@ -25,6 +54,46 @@ and the refresh's peak memory fell by about a third. Results are unchanged.
 - **GROUP BY with millions of groups** merges per-chunk partial tables
   without copying their keys and without a final sort: 17–21 % faster on
   QuackLab's 1.9M-group fact roll-up, 250 MB less memory.
+
+### Wave 132 — DuckLake interop ✅
+
+pinkdb opens the DuckLakes stock DuckDB writes and writes ones DuckDB reads,
+with QuackLab's own attach sequence.
+
+- **`ATTACH 'ducklake:…'`** with `sqlite:`, `postgres:<conninfo>` and
+  `postgres:postgresql://…` catalogs and DuckLake's options (`DATA_PATH`,
+  `READ_ONLY`, `SNAPSHOT_VERSION`, `CREATE_IF_NOT_EXISTS`,
+  `DATA_INLINING_ROW_LIMIT`); options pinkdb lacks are refused by name.
+- **Secrets:** `CREATE [OR REPLACE] [PERSISTENT | TEMPORARY] SECRET` for
+  `s3`, `r2`, `gcs` and `postgres`, `DROP SECRET`, `duckdb_secrets()`,
+  `which_secret()`. Lake data, `read_csv`/`read_parquet` over `s3://` and
+  Postgres catalogs use the matching secret. A password in an `ATTACH` string
+  is kept as a secret; no secret value reaches the WAL, statement history,
+  `SHOW` or errors.
+- **Reading DuckDB's lakes:** catalog versions `1.1-dev1` to `1.3`, DuckLake's
+  path rules (including absolute paths), Parquet delete files and inlined
+  deletes.
+- **Writing for DuckDB:** the catalog tables have DuckDB's exact columns and
+  types, and `ducklake:` lakes write Parquet data and delete files (server
+  feature `parquetlake`).
+- **DuckLake's functions in SQL:** `ducklake_snapshots`, `table_info`,
+  `list_files`, `table_changes` / `insertions` / `deletions`, `options`,
+  `settings`, `current_snapshot`, `last_committed_snapshot`, and `CALL`s for
+  flushing inlined data, expiring snapshots, compaction, cleanup,
+  `set_option` (including `CALL db.set_option(…)`) and commit messages. The
+  CLI's matching `.lake` dot-commands are gone.
+- **Formats:** `.pink` footer version 6 and WAL version 6; files from earlier
+  builds are refused.
+
+### Wave 126a — decimal literals typed like DuckDB ✅
+
+`1.5` is now `DECIMAL(2,1)`, as in DuckDB, instead of `DOUBLE`, so
+arithmetic with decimal columns keeps DuckDB's types and exact values:
+`x - 1.5` over a `DECIMAL(15,2)` column is `DECIMAL(16,2)`, `0.1 + 0.2` is
+`0.3`, and unaliased column names keep the literal as written (`(10 / 4.0)`).
+Literals with an exponent (`1e3`) or more than 38 digits stay `DOUBLE`;
+array literals keep `DOUBLE` elements. Filters against a column convert the
+literal once, so queries run as fast as before.
 
 ### Wave 140 — QuackLab's ETL hot spots ✅
 
@@ -48,6 +117,82 @@ correction. Results are unchanged.
   vectors instead of one row at a time (1.92M × 18 columns: 1.5 s → 0.06 s).
 - **Fixed:** `RETURNING`, a data-modifying CTE and a `REFERENCING`
   transition table failed with "vector overflow" past 2048 rows.
+
+### Wave 139 — QuackLab leftovers: defaults, uuid(), TEMP tables ✅
+
+QuackLab's golden fixtures now run with their column defaults as written
+(117 of 117, no workaround left in the harness).
+
+- **Column defaults are expressions**, evaluated for every row that takes
+  them: `DEFAULT now()`, `DEFAULT uuid()`, `DEFAULT 'now()'` (which, as in
+  DuckDB, creates fine and fails at insert), the `DEFAULT` keyword in
+  `VALUES` and `UPDATE … SET`, `INSERT … DEFAULT VALUES`, and `ADD COLUMN …
+  DEFAULT` per existing row. `information_schema.columns` shows the written
+  expression.
+- **`uuid()`, `gen_random_uuid()` and `random()` in writes**, replayed
+  exactly after a crash: each statement's values come from a seed recorded
+  in the WAL.
+- **A `UUID` type**, with DuckDB's text forms, ordering, Parquet encoding and
+  DuckLake type name.
+- **`CREATE TEMP TABLE`**: per-session, never persisted, found before
+  persistent tables of the same name, as in DuckDB. A durable local write
+  that reads one is refused; loading a lake from one is allowed.
+- **Fixed:** `now()` inside a procedure body, `DO` block or trigger action
+  did not replay with its original instant; `x IS NOT NULL` and similar
+  expressions are now named as in DuckDB.
+- **Formats:** `.pink` footer version 5, wire protocol 15.
+- LIST and STRUCT are scoped in `docs/nested-types-plan.md`, not built:
+  QuackLab's SQL uses neither.
+
+## 2026-10-31
+### Wave 131 — schemas and three-part names ✅
+
+Every database now holds schemas, as in DuckDB: `catalog.schema.table`
+works everywhere a table is named, and QuackLab's SQL runs as written —
+`r2_cat."master"."FACT"`, a `CREATE SCHEMA` per model — with no workaround
+(117 of 117 golden statements and setups DuckDB runs).
+
+- **SQL:** `CREATE SCHEMA [IF NOT EXISTS]`, `DROP SCHEMA [IF EXISTS] … [CASCADE
+  | RESTRICT]`, `USE db.schema` / `USE schema`, `current_database()`,
+  `current_schema()`, `current_schemas()`. Names take up to three parts and
+  column references up to four; `x.t` is database `x` or schema `x` by
+  DuckDB's rule, and an ambiguous `x` is an error naming both readings.
+  Macros can be called as `s.m()` and expand in the caller's schema, as in
+  DuckDB; views, materialized views, procedures and triggers bind in their
+  own. Cross-schema foreign keys are refused.
+- **Catalog functions:** `duckdb_databases()`, `duckdb_schemas()`,
+  `duckdb_tables()`, `duckdb_views()`, `duckdb_columns()`,
+  `information_schema.{schemata,tables,columns,views}`, a few `pg_catalog`
+  views and `SHOW ALL TABLES`, with DuckDB's columns; `pinkdb_catalog()`
+  gains a `schema` column.
+- **Access control:** `GRANT … ON SCHEMA s` covers every table of the
+  schema, including later ones; table grants name their schema.
+- **Lakes:** a lake database shows every DuckLake schema of its lake, and
+  `CREATE SCHEMA` / `DROP SCHEMA` reach the lake's catalog.
+- **Console:** a schema selector beside the database, schemas (empty ones
+  too) in the explorer, three-part names in generated SQL, schema grants.
+- **Formats:** `.pink` footer version 4, WAL frame sets format 2, lake image
+  format 2 and wire protocol 14; files from earlier builds are refused.
+- **Fixed:** an uncorrelated subquery in a join condition re-ran on every
+  probe chunk instead of once per join.
+- **Fixed:** the console's Preview of a table never finished (the new tab
+  lost its state when the explorer refreshed).
+
+### Wave 130 — the QuackLab benchmark ✅
+
+`bench/quacklab/run.py` measures QuackLab's own workload on pinkdb and DuckDB
+on the same machine: the NYC-taxi model compiled by QuackLab's compiler, its
+ETL plan per batch, a full refresh of its 55 materialized views, and 12
+dashboard widgets at 1, 4 and 16 concurrent clients, plus cold start and peak
+memory, on local storage and on a lake (Postgres catalog, S3 data).
+
+- pinkdb runs QuackLab's statements as emitted first and records what blocks
+  them (schemas: wave 131; DuckLake `ATTACH`: wave 132), then a labelled
+  workaround. Dialect gaps it works around are probed and listed with
+  pinkdb's error, and stop being shimmed once pinkdb accepts them.
+- Results agree between the engines (table counts, widget rows).
+- `crates/pinkdb-server/examples/chart_load.rs`: a concurrent chart-query
+  load client for pinkdb-server.
 
 ## 2026-10-30
 ### Wave 129 — QuackLab's DuckDB dialect ✅

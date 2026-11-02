@@ -85,7 +85,12 @@ use pinkdb::{DataType, Value};
 /// rides as `u32 byte length | encoded cell` (the same cell encoding a `.pink`
 /// page stores, so an ARRAY crosses the wire without a per-element tag); the
 /// dtype carries an element byte and a `u32` length.
-pub const PROTOCOL_VERSION: u32 = 14;
+/// v14: `CREATE/DROP SCHEMA` `Done` kinds (tags 27–28); `Used`'s `name` is
+/// `db\0schema` (wave 131b).
+/// v15: `UUID` value (tag 12) and dtype (tag 11) tags (wave 139b).
+/// v16: [`Response::Profile`] carries the process-wide memory limit and the
+/// statement's peak pool usage (wave 136a).
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -165,6 +170,8 @@ mod value_tag {
     /// encoding, which carries the element kind, the size and the NULL-element
     /// bitmap.
     pub const ARRAY: u8 = 11;
+    /// v15: `UUID(16 bytes)` — the unsigned 128-bit value, little endian.
+    pub const UUID: u8 = 12;
 }
 
 /// DataType tag bytes (one per [`DataType`] variant).
@@ -184,6 +191,8 @@ mod dtype_tag {
     pub const VARIANT: u8 = 9;
     /// v13: an element byte and a `u32` length ride after the tag.
     pub const ARRAY: u8 = 10;
+    /// v15: no parameters.
+    pub const UUID: u8 = 11;
 }
 
 // ---------- errors ----------
@@ -459,7 +468,7 @@ pub enum Response {
         columns: u32,
         kind: String,
         in_transaction: bool,
-        /// v14: the process-wide memory limit and the statement's peak pool
+        /// v16: the process-wide memory limit and the statement's peak pool
         /// usage, both in bytes.
         memory_limit: u64,
         memory_peak: u64,
@@ -488,7 +497,7 @@ pub enum DoneKind {
     DroppedView = 10,
     CreatedDatabase = 11,
     DroppedDatabase = 12,
-    /// `USE <db>`; `name` is the database.
+    /// `USE <db>[.<schema>]`; `name` is `db\0schema`.
     Used = 13,
     /// Reserved for statement outcomes a future protocol version may add;
     /// this version's server never emits it and the client rejects it.
@@ -521,12 +530,16 @@ pub enum DoneKind {
     /// `DROP ROLE` (v9); `name` is the role.
     DroppedRole = 23,
     /// `GRANT …` (v9); `name` is the human-readable grant
-    /// (`SELECT ON TABLE main.t TO alice`).
+    /// (`SELECT ON TABLE main.main.t TO alice`).
     Granted = 24,
     /// `REVOKE …` (v9); `name` names the grant that was removed.
     Revoked = 25,
     /// `SET VARIABLE x = …` (v12, wave 95c); `name` is the variable.
     SetVariable = 26,
+    /// `CREATE SCHEMA` (v14, wave 131b); `name` is the schema.
+    CreatedSchema = 27,
+    /// `DROP SCHEMA` (v14); `name` is the schema.
+    DroppedSchema = 28,
 }
 
 impl DoneKind {
@@ -559,6 +572,8 @@ impl DoneKind {
             24 => DoneKind::Granted,
             25 => DoneKind::Revoked,
             26 => DoneKind::SetVariable,
+            27 => DoneKind::CreatedSchema,
+            28 => DoneKind::DroppedSchema,
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown Done kind {other}"
@@ -975,7 +990,9 @@ fn put_value(buf: &mut Vec<u8>, value: &Value) -> Result<(), ProtocolError> {
             put_u8(buf, value_tag::TIMESTAMP);
             buf.extend_from_slice(&us.to_le_bytes());
         }
-        Value::Decimal(x, scale) => {
+        Value::Decimal {
+            value: x, scale, ..
+        } => {
             put_u8(buf, value_tag::DECIMAL);
             buf.extend_from_slice(&x.to_le_bytes());
             put_u8(buf, *scale);
@@ -1003,6 +1020,10 @@ fn put_value(buf: &mut Vec<u8>, value: &Value) -> Result<(), ProtocolError> {
             put_u32(buf, count_u32(bytes.len(), "ARRAY value")?);
             buf.extend_from_slice(&bytes);
         }
+        Value::Uuid(bits) => {
+            put_u8(buf, value_tag::UUID);
+            buf.extend_from_slice(&bits.to_le_bytes());
+        }
     }
     Ok(())
 }
@@ -1020,6 +1041,7 @@ fn dtype_byte(dtype: DataType) -> u8 {
         DataType::Interval => dtype_tag::INTERVAL,
         DataType::Variant => dtype_tag::VARIANT,
         DataType::Array { .. } => dtype_tag::ARRAY,
+        DataType::Uuid => dtype_tag::UUID,
     }
 }
 
@@ -1128,7 +1150,7 @@ impl<'a> Reader<'a> {
                 let mut x = [0u8; 16];
                 x.copy_from_slice(b);
                 let scale = self.u8(what)?;
-                Value::Decimal(i128::from_le_bytes(x), scale)
+                Value::decimal(i128::from_le_bytes(x), scale)
             }
             value_tag::INTERVAL => {
                 let b = self.take(16, what)?;
@@ -1155,6 +1177,12 @@ impl<'a> Reader<'a> {
                     pinkdb::array::decode_cell(bytes)
                         .map_err(|e| ProtocolError::Malformed(format!("bad ARRAY value: {e}")))?,
                 ))
+            }
+            value_tag::UUID => {
+                let b = self.take(16, what)?;
+                let mut x = [0u8; 16];
+                x.copy_from_slice(b);
+                Value::Uuid(u128::from_le_bytes(x))
             }
             other => {
                 return Err(ProtocolError::Malformed(format!(
@@ -1185,6 +1213,7 @@ impl<'a> Reader<'a> {
             }
             dtype_tag::INTERVAL => DataType::Interval,
             dtype_tag::VARIANT => DataType::Variant,
+            dtype_tag::UUID => DataType::Uuid,
             dtype_tag::ARRAY => {
                 let elem = self.u8(what)?;
                 let len = self.u32(what)?;

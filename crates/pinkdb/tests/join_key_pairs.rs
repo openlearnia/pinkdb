@@ -201,7 +201,10 @@ fn an_equality_class_joins_its_members_directly() {
                      JOIN c ON c.k = big.k WHERE a.f = 'hot';";
     // `a` and `c` join first, on the inferred key, and `big` comes last.
     let plan = rows(&mut db, &format!("EXPLAIN {sql}")).join("\n");
-    let (at_c, at_big) = (plan.find("Scan main.c"), plan.find("Scan main.big"));
+    let (at_c, at_big) = (
+        plan.find("Scan main.main.c"),
+        plan.find("Scan main.main.big"),
+    );
     assert!(at_c.is_some() && at_c < at_big, "{plan}");
     let got = rows(&mut db, sql);
     assert_eq!(got, rows(&mut db, reference));
