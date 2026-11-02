@@ -87,6 +87,9 @@ pub mod secret;
 /// Serving an extension's client (ABI minor 2; native targets only).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod serve;
+/// DuckDB's session settings (slt-2): the two that change ordering and the
+/// rest of the catalog accepted as stored no-ops.
+pub mod settings;
 pub mod sql;
 pub mod stats;
 pub mod storage;

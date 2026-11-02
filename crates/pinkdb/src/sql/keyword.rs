@@ -159,4 +159,16 @@ impl Keyword {
             _ => return None,
         })
     }
+
+    /// Must an identifier be quoted to spell this word? A rule that wants the
+    /// keyword still matches it with `kw()`; this only decides whether
+    /// [`crate::sql::peg_parser`]'s `ident` rule accepts it as a name.
+    pub(crate) fn is_reserved(self) -> bool {
+        // DuckDB's reserved list is short, and the corpus names columns after
+        // its types (`date`, `timestamp`) and after what `range(n)` outputs
+        // (`range`). The window-frame words (`OVER`, `PARTITION`, `ROWS`,
+        // `CURRENT`, …) stay reserved: un-reserving them makes
+        // `OVER (PARTITION BY …)` parse as `OVER <window name>` first.
+        !matches!(self, Keyword::Date | Keyword::Timestamp | Keyword::Range)
+    }
 }

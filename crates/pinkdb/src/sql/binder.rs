@@ -19,6 +19,7 @@ use std::sync::Arc;
 use super::ast::*;
 use crate::attached::AtSpec;
 use crate::plan::{AlterTablePlan, ColumnDefault, LogicalPlan, RecursiveStep};
+use crate::settings::OrderDefaults;
 use crate::storage::{
     DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, SchemaPath, Session,
     TableConstraints,
@@ -3203,7 +3204,7 @@ impl<'a> Binder<'a> {
             }
             WindowKind::Simple(wf)
         } else if let Some(f) = AggFunc::from_name(name) {
-            let is_star = args.len() == 1 && args[0] == Expr::Star;
+            let is_star = args.is_empty() || (args.len() == 1 && args[0] == Expr::Star);
             if args.iter().any(|a| a == &Expr::Star) && !is_star {
                 return Err(PinkDbError::Parse(
                     "`*` is only valid in COUNT(*)".to_string(),
@@ -3264,9 +3265,13 @@ impl<'a> Binder<'a> {
         for p in &over.partition {
             partition.push(self.bind_expr(p, aggs, allow_agg)?);
         }
+        let order_defaults = OrderDefaults::from_session(&self.session);
         let mut order = Vec::with_capacity(over.order.len());
         for o in &over.order {
-            order.push((self.bind_expr(&o.expr, aggs, allow_agg)?, SortSpec::of(o)));
+            order.push((
+                self.bind_expr(&o.expr, aggs, allow_agg)?,
+                SortSpec::of(o, &order_defaults),
+            ));
         }
         if let Some(f) = &over.frame
             && f.mode == FrameMode::Range
@@ -3726,6 +3731,18 @@ impl<'a> Binder<'a> {
                 ))),
             };
         }
+        // `current_setting(name)`: a setting is session state, so it splices
+        // in at bind time like a variable does.
+        if name.eq_ignore_ascii_case("current_setting") {
+            let [Expr::Literal(Value::Varchar(setting))] = args else {
+                return Err(PinkDbError::Type(
+                    "current_setting takes one constant name".to_string(),
+                ));
+            };
+            let canonical = crate::settings::resolve(setting)?;
+            let value = crate::settings::current(&self.session, canonical).unwrap_or(Value::Null);
+            return Ok(BoundExpr::Literal(value));
+        }
         // Session-position functions (wave 131b): DuckDB answers the current
         // database/schema. There is no LIST type yet, so `current_schemas`
         // returns the same `[...]` text `variant_keys()` uses for arrays.
@@ -3877,7 +3894,7 @@ impl<'a> Binder<'a> {
                     "DISTINCT is only supported in COUNT(DISTINCT x) in v1".to_string(),
                 ));
             }
-            let is_star = args.len() == 1 && args[0] == Expr::Star;
+            let is_star = args.is_empty() || (args.len() == 1 && args[0] == Expr::Star);
             if args.iter().any(|a| a == &Expr::Star) && !is_star {
                 return Err(PinkDbError::Parse(
                     "`*` is only valid in COUNT(*)".to_string(),
@@ -5513,7 +5530,7 @@ fn over_text(over: &OverSpec) -> String {
             .iter()
             .map(|item| {
                 let mut text = default_name(&item.expr);
-                if item.desc {
+                if item.desc == Some(true) {
                     text.push_str(" DESC");
                 }
                 match item.nulls_first {
@@ -5790,6 +5807,9 @@ fn group_set_indices(master: &[Expr], item: &GroupSet) -> Result<Vec<Vec<usize>>
         })
     };
     Ok(match item {
+        // Expanded into plain keys before this runs (see `GROUP BY ALL` in
+        // `bind_select_with`): an `All` here would name itself.
+        GroupSet::All => Vec::new(),
         GroupSet::Sets(list) => list
             .iter()
             .map(|set| set.iter().map(&resolve).collect::<Result<Vec<_>>>())
@@ -8532,10 +8552,10 @@ fn bind_tracked_plan(
                         .to_string(),
                 ));
             }
-            let (spec, secret) = bind_attach_options(name, location, options)?;
+            let (source, secret) = bind_attach_options(name, location, options)?;
             empty(LogicalPlan::Attach {
                 name: name.clone(),
-                spec,
+                source,
                 secret,
             })
         }
@@ -8588,6 +8608,17 @@ fn bind_tracked_plan(
             empty(bind_show_all_tables(db, &binder)?)
         }
         Statement::ShowDatabases => empty(LogicalPlan::ShowDatabases),
+        Statement::SetSetting { name, value } => {
+            bind_set_setting(db, default_ns, session, name, value)
+        }
+        Statement::ResetSetting { name } => {
+            let name = match name {
+                Some(name) => Some(crate::settings::resolve_settable(name)?.into()),
+                None => None,
+            };
+            empty(LogicalPlan::ResetSetting { name })
+        }
+        Statement::Pragma { name, args } => bind_pragma(db, default_ns, name, args, session),
         Statement::Describe { qual: qdb, name } => {
             bind_describe(db, default_ns, qdb, name, session)
         }
@@ -10507,8 +10538,9 @@ fn expand_pivot(db: &PinkDb, binder: &Binder, sel: &Select) -> Result<Option<Sel
             }]);
             probe.distinct = true;
             probe.order_by = vec![OrderItem {
+                all: false,
                 expr: Expr::Literal(Value::Integer(1)),
-                desc: false,
+                desc: Some(false),
                 nulls_first: None,
             }];
             let plan = bind_select_in(db, &mut binder.child(), &probe)?;
@@ -12088,6 +12120,19 @@ fn bind_describe(
     name: &str,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
+    let (_, columns) = catalog_columns(db, default_ns, qdb, name, session)?;
+    Ok((LogicalPlan::Describe { columns }, Vec::new()))
+}
+
+/// The columns `DESCRIBE` and `PRAGMA table_info` both report, plus the
+/// namespace the name resolved to.
+fn catalog_columns(
+    db: &PinkDb,
+    default_ns: &SchemaPath,
+    qdb: &Qualifier,
+    name: &str,
+    session: &Session,
+) -> Result<(SchemaPath, Vec<crate::plan::DescribeColumn>)> {
     if let Some(schema) = qdb
         .schema
         .as_deref()
@@ -12110,7 +12155,7 @@ fn bind_describe(
                 default: None,
             })
             .collect();
-        return Ok((LogicalPlan::Describe { columns }, Vec::new()));
+        return Ok((SchemaPath::new(&dbname, schema), columns));
     }
     let lookup = Binder::new(db, default_ns)
         .with_session(session.clone())
@@ -12126,7 +12171,7 @@ fn bind_describe(
                 default: c.default.as_ref().map(|d| d.text.clone()),
             });
         }
-        return Ok((LogicalPlan::Describe { columns }, Vec::new()));
+        return Ok((lookup, columns));
     }
     if let Ok(view) = db.view_in(&lookup, name) {
         let view = view.clone();
@@ -12150,7 +12195,7 @@ fn bind_describe(
                 default: None,
             })
             .collect();
-        return Ok((LogicalPlan::Describe { columns }, Vec::new()));
+        return Ok((lookup, columns));
     }
     // Attached lake tables are visible to queries (they are not in the store).
     let schema = db
@@ -12171,7 +12216,267 @@ fn bind_describe(
             default: None,
         })
         .collect();
-    Ok((LogicalPlan::Describe { columns }, Vec::new()))
+    Ok((lookup, columns))
+}
+
+/// `SET <setting> = <expr>`: the name must be one DuckDB's own catalog knows
+/// (see [`crate::settings`]) and the value must be constant, like any other
+/// statement without a FROM scope.
+fn bind_set_setting(
+    db: &PinkDb,
+    default_ns: &SchemaPath,
+    session: &Session,
+    name: &str,
+    value: &Expr,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let canonical = crate::settings::resolve_settable(name)?;
+    // DuckDB reads an unquoted word as the string the setting wants:
+    // `PRAGMA explain_output = PHYSICAL_ONLY`, `SET search_path = main`. A
+    // SET value is never a table column, so a bare name can only be this.
+    if let Expr::Column {
+        qual,
+        table: None,
+        name,
+    } = value
+        && qual.catalog.is_none()
+        && qual.schema.is_none()
+    {
+        return Ok((
+            LogicalPlan::SetSetting {
+                name: canonical.into(),
+                value: BoundExpr::Literal(Value::Varchar(name.clone())),
+            },
+            Vec::new(),
+        ));
+    }
+    let mut binder = Binder::new(db, default_ns).with_session(session.clone());
+    let mut aggs = Vec::new();
+    let bound = binder.bind_expr(value, &mut aggs, false)?;
+    if !aggs.is_empty() {
+        return Err(PinkDbError::Execution("SET takes no aggregate".to_string()));
+    }
+    Ok((
+        LogicalPlan::SetSetting {
+            name: canonical.into(),
+            value: bound,
+        },
+        Vec::new(),
+    ))
+}
+
+/// DuckDB's error for a pragma it does not have. The corpus' negative tests
+/// match its prefix.
+fn unknown_pragma(name: &str) -> PinkDbError {
+    PinkDbError::Catalog(format!("Pragma Function with name {name} does not exist!"))
+}
+
+/// The name argument of `PRAGMA table_info(...)`: a string (`'s.t'`) or a bare
+/// identifier (`t`) both spell a dotted path (DuckDB's rule).
+fn pragma_name_path(text: &str) -> (Qualifier, String) {
+    let parts: Vec<&str> = text.split('.').collect();
+    match parts.as_slice() {
+        [name] => (Qualifier::none(), (*name).to_string()),
+        [schema, name] => (Qualifier::part(schema), (*name).to_string()),
+        [catalog, schema, name] => (Qualifier::both(catalog, schema), (*name).to_string()),
+        _ => (Qualifier::none(), text.to_string()),
+    }
+}
+
+/// DuckDB's binder error for a pragma argument of the wrong kind.
+fn pragma_arg_error(pragma: &str) -> PinkDbError {
+    PinkDbError::Type(format!(
+        "No function matches the given name and argument types '{pragma}(...)'. You might need to add explicit type casts."
+    ))
+}
+
+fn pragma_table_ref(args: &[Expr], pragma: &str) -> Result<(Qualifier, String)> {
+    match args {
+        [Expr::Literal(Value::Varchar(path))] => Ok(pragma_name_path(path)),
+        [Expr::Column { name, .. }] => Ok(pragma_name_path(name)),
+        _ => Err(pragma_arg_error(pragma)),
+    }
+}
+
+fn pragma_table_ref_value(value: &Value, pragma: &str) -> Result<(Qualifier, String)> {
+    match value {
+        Value::Varchar(path) => Ok(pragma_name_path(path)),
+        _ => Err(pragma_arg_error(pragma)),
+    }
+}
+
+/// The `PRAGMA table_info` rows of one column list: DuckDB's `cid` counts from
+/// 0 and `pk` marks primary-key columns.
+fn table_info_rows(
+    columns: Vec<crate::plan::DescribeColumn>,
+) -> (Vec<String>, Vec<DataType>, Vec<Vec<BoundExpr>>) {
+    let names: Vec<String> = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let types = vec![
+        DataType::Integer,
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Boolean,
+        DataType::Varchar,
+        DataType::Boolean,
+    ];
+    let rows = columns
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            vec![
+                BoundExpr::Literal(Value::Integer(i as i32)),
+                BoundExpr::Literal(Value::Varchar(c.name)),
+                BoundExpr::Literal(Value::Varchar(c.dtype.name())),
+                // `not_null` already folds in a primary key, like DuckDB's
+                // catalog (which calls such a column NOT NULL too).
+                BoundExpr::Literal(Value::Boolean(c.not_null)),
+                c.default.map_or(BoundExpr::Literal(Value::Null), |d| {
+                    BoundExpr::Literal(Value::Varchar(d))
+                }),
+                BoundExpr::Literal(Value::Boolean(matches!(
+                    c.key,
+                    Some(crate::storage::KeyKind::Primary)
+                ))),
+            ]
+        })
+        .collect();
+    (names, types, rows)
+}
+
+/// The rows a pragma returns, and the catalog tables they read.
+struct PragmaTable {
+    names: Vec<String>,
+    types: Vec<DataType>,
+    rows: Vec<Vec<BoundExpr>>,
+    sources: Vec<(String, String)>,
+}
+
+/// The catalog pragmas pinkdb implements, as constant relations. Everything
+/// else is either a setting (with `=`) or a no-op (see
+/// [`crate::settings::PRAGMA_NOOPS`]).
+fn pragma_table(
+    db: &PinkDb,
+    default_ns: &SchemaPath,
+    name: &str,
+    table: Option<(Qualifier, String)>,
+    session: &Session,
+) -> Result<PragmaTable> {
+    let text = |v: &str| BoundExpr::Literal(Value::Varchar(v.to_string()));
+    match name {
+        "table_info" => {
+            let (qdb, table) = table.ok_or_else(|| pragma_arg_error(name))?;
+            let (ns, columns) = catalog_columns(db, default_ns, &qdb, &table, session)?;
+            let (names, types, rows) = table_info_rows(columns);
+            Ok(PragmaTable {
+                names,
+                types,
+                rows,
+                sources: vec![(ns.db().to_string(), table)],
+            })
+        }
+        // DuckDB's `seq` is the database oid; pinkdb has none, so the catalog
+        // order stands in for it. Local databases have no file (`NULL`).
+        "database_list" => {
+            let rows = db
+                .database_infos()
+                .into_iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vec![
+                        BoundExpr::Literal(Value::Bigint(i as i64)),
+                        text(&info.name),
+                        info.location
+                            .map_or(BoundExpr::Literal(Value::Null), |l| text(&l)),
+                    ]
+                })
+                .collect();
+            Ok(PragmaTable {
+                names: ["seq", "name", "file"].map(str::to_string).to_vec(),
+                types: vec![DataType::Bigint, DataType::Varchar, DataType::Varchar],
+                rows,
+                sources: Vec::new(),
+            })
+        }
+        "version" => Ok(PragmaTable {
+            names: ["library_version", "source_id", "codename"]
+                .map(str::to_string)
+                .to_vec(),
+            types: vec![DataType::Varchar; 3],
+            rows: vec![vec![
+                text(concat!("v", env!("CARGO_PKG_VERSION"))),
+                text(""),
+                text("pinkdb"),
+            ]],
+            sources: Vec::new(),
+        }),
+        "platform" => Ok(PragmaTable {
+            names: vec!["platform".to_string()],
+            types: vec![DataType::Varchar],
+            rows: vec![vec![text(&format!(
+                "{}_{}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ))]],
+            sources: Vec::new(),
+        }),
+        _ => Err(unknown_pragma(name)),
+    }
+}
+
+/// `PRAGMA <name>`: the catalog pragmas return their rows, DuckDB's test and
+/// tuning pragmas succeed with an empty `Success` column (that is what DuckDB
+/// returns for them), a setting name takes a `= value` and nothing else.
+fn bind_pragma(
+    db: &PinkDb,
+    default_ns: &SchemaPath,
+    name: &str,
+    args: &[Expr],
+    session: &Session,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let lower = name.to_ascii_lowercase();
+    if lower == "show_tables" {
+        return Ok((
+            LogicalPlan::ShowTables {
+                ns: default_ns.clone(),
+            },
+            Vec::new(),
+        ));
+    }
+    if crate::settings::canonical(&lower).is_some() {
+        // `PRAGMA threads(4)` is `PRAGMA threads = 4`; the bare name is not a
+        // pragma at all (DuckDB: Catalog Error, no such pragma function).
+        return match args {
+            [value] => bind_set_setting(db, default_ns, session, &lower, value),
+            _ => Err(unknown_pragma(name)),
+        };
+    }
+    if crate::settings::is_noop_pragma(&lower) {
+        return Ok((
+            LogicalPlan::Values {
+                rows: Vec::new(),
+                names: vec!["Success".to_string()],
+                types: vec![DataType::Boolean],
+                sources: Vec::new(),
+            },
+            Vec::new(),
+        ));
+    }
+    let table = match lower.as_str() {
+        "table_info" => Some(pragma_table_ref(args, &lower)?),
+        _ => None,
+    };
+    let table = pragma_table(db, default_ns, &lower, table, session)?;
+    Ok((
+        LogicalPlan::Values {
+            rows: table.rows,
+            names: table.names,
+            types: table.types,
+            sources: table.sources,
+        },
+        Vec::new(),
+    ))
 }
 
 /// Durable databases replay committed SQL text, and views are never
@@ -12516,6 +12821,9 @@ pub(crate) fn plan_schema(
         // Statements that produce no relation (or, for ANALYZE, its
         // DuckDB-shaped one-row Success result at execution time).
         LogicalPlan::Analyze { .. } => Ok(vec![("Success".to_string(), DataType::Boolean)]),
+        // `PRAGMA` answers with its own relation; a setting writes session
+        // state and produces nothing.
+        LogicalPlan::SetSetting { .. } | LogicalPlan::ResetSetting { .. } => Ok(Vec::new()),
         LogicalPlan::SingleRow => Ok(Vec::new()),
         LogicalPlan::Values { names, types, .. } => Ok(names
             .iter()
@@ -12826,6 +13134,43 @@ fn bind_table_function(
     }
     if name.eq_ignore_ascii_case("which_secret") {
         return bind_which_secret(db, binder, args, alias);
+    }
+    // `pragma_<name>()` is the table form of `PRAGMA <name>`, so the SELECT
+    // form answers from the same rows the statement form does.
+    if let Some(pragma) = lower.strip_prefix("pragma_") {
+        let table = match pragma {
+            "table_info" => match args {
+                [arg] => Some(pragma_table_ref_value(&arg.value, pragma)?),
+                _ => return Err(pragma_arg_error(pragma)),
+            },
+            _ => None,
+        };
+        let rows = pragma_table(db, &binder.default_ns, pragma, table, &binder.session)?;
+        let scope = ScopeTable {
+            name: alias
+                .clone()
+                .unwrap_or_else(|| name.to_string())
+                .to_ascii_lowercase(),
+            original: None,
+            ns: None,
+            is_alias: alias.is_some(),
+            qualified_only: false,
+            columns: rows
+                .names
+                .iter()
+                .cloned()
+                .zip(rows.types.iter().copied())
+                .collect(),
+        };
+        return Ok((
+            scope,
+            LogicalPlan::Values {
+                rows: rows.rows,
+                names: rows.names,
+                types: rows.types,
+                sources: rows.sources,
+            },
+        ));
     }
     if lower.starts_with("ducklake_") {
         let lake = crate::lake_db::LakeFunctionCall::from_table_call(&lower, args);
@@ -15535,6 +15880,8 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
             let exprs: Vec<&Expr> = match item {
                 GroupSet::Rollup(list) | GroupSet::Cube(list) => list.iter().collect(),
                 GroupSet::Sets(sets) => sets.iter().flatten().collect(),
+                // `GROUP BY ALL` picks the select list, which is not bound yet.
+                GroupSet::All => continue,
             };
             for e in exprs {
                 if !master_ast.contains(e) {
@@ -15697,12 +16044,31 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     }
     binder.alias = saved_alias;
 
+    // `GROUP BY ALL`: the keys are every select-list expression that names no
+    // aggregate or window (DuckDB's rule). Expanded here, once the select list
+    // is bound, so the keys bind as if they had been written out.
+    let mut group_by = sel.group_by.clone();
+    let mut rest_sets: Vec<GroupSet> = Vec::new();
+    for set in &sel.group_sets {
+        match set {
+            GroupSet::All => {
+                for ((ast, _), (bound, _)) in pending.iter().zip(select.iter()) {
+                    if !names_aggregate_or_window(bound) {
+                        group_by.push(ast.clone());
+                    }
+                }
+                master_ast.extend(group_by[sel.group_by.len()..].iter().cloned());
+            }
+            other => rest_sets.push(other.clone()),
+        }
+    }
+
     // GROUP BY keys (pre-agg scope, no aggregates, no windows). A bare name
     // binds a FROM column first and a select alias only when no column has
     // that name; anywhere inside an expression an alias is an error (DuckDB).
     let mut keys: Vec<BoundExpr> = Vec::new();
     binder.allow_win = false;
-    for g in &sel.group_by {
+    for g in &group_by {
         if let Expr::Literal(Value::Integer(n)) = g {
             let idx = (*n as usize).checked_sub(1).ok_or_else(|| {
                 PinkDbError::Execution("GROUP BY position must be >= 1".to_string())
@@ -15730,7 +16096,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         keys.push(binder.bind_expr(g, &mut no_aggs, false)?);
     }
     // Grouping-set expressions join the aggregate keys, in master order.
-    for g in &master_ast[sel.group_by.len()..] {
+    for g in &master_ast[group_by.len()..] {
         let mut no_aggs = Vec::new();
         binder.alias = if is_bare_name(g) {
             AliasMode::Fallback
@@ -15742,13 +16108,13 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     binder.alias = AliasMode::Prefer;
     binder.allow_win = true;
     sync_grouping_keys(&mut keys, binder);
-    let group_sets = if sel.group_sets.is_empty() {
+    let group_sets = if rest_sets.is_empty() {
         None
     } else {
         Some(expand_grouping_sets(
             &master_ast,
-            sel.group_by.len(),
-            &sel.group_sets,
+            group_by.len(),
+            &rest_sets,
         )?)
     };
 
@@ -15968,7 +16334,21 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     let mut proj_names = visible_names.clone();
     let mut hidden = 0usize;
     let mut sort_keys: Vec<(BoundExpr, SortSpec)> = Vec::new();
+    let order_defaults = OrderDefaults::from_session(&binder.session);
     for item in &sel.order_by {
+        // `ORDER BY ALL`: every visible column, in select-list order.
+        if item.all {
+            for (index, dtype) in visible_dtypes.iter().enumerate() {
+                sort_keys.push((
+                    BoundExpr::Column {
+                        index,
+                        dtype: *dtype,
+                    },
+                    SortSpec::of(item, &order_defaults),
+                ));
+            }
+            continue;
+        }
         // Positional `ORDER BY 2` → Nth visible output.
         if let Expr::Literal(Value::Integer(n)) = &item.expr {
             let idx = (*n as usize).checked_sub(1).ok_or_else(|| {
@@ -15984,7 +16364,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                     index: idx,
                     dtype: visible_dtypes[idx],
                 },
-                SortSpec::of(item),
+                SortSpec::of(item, &order_defaults),
             ));
             continue;
         }
@@ -16004,7 +16384,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                     index: pos,
                     dtype: visible_dtypes[pos],
                 },
-                SortSpec::of(item),
+                SortSpec::of(item, &order_defaults),
             ));
             continue;
         }
@@ -16038,7 +16418,10 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         match proj_exprs.iter().position(|p| p == &scoped) {
             Some(idx) => {
                 let dtype = proj_exprs[idx].dtype();
-                sort_keys.push((BoundExpr::Column { index: idx, dtype }, SortSpec::of(item)));
+                sort_keys.push((
+                    BoundExpr::Column { index: idx, dtype },
+                    SortSpec::of(item, &order_defaults),
+                ));
             }
             None => {
                 let dtype = scoped.dtype();
@@ -16050,7 +16433,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                         index: proj_exprs.len() - 1,
                         dtype,
                     },
-                    SortSpec::of(item),
+                    SortSpec::of(item, &order_defaults),
                 ));
             }
         }
@@ -16273,21 +16656,20 @@ fn bind_attach_options(
     database: &str,
     location: &str,
     options: &crate::sql::ast::DatabaseOptions,
-) -> Result<(crate::lake_db::LakeSpec, Option<crate::secret::Secret>)> {
+) -> Result<(crate::lake_db::AttachSource, Option<crate::secret::Secret>)> {
     let ducklake = location.strip_prefix("ducklake:");
     let catalog = match ducklake {
-        Some(rest) => ducklake_catalog(rest)?,
+        Some(rest) => Some(ducklake_catalog(rest)?),
         None => match location.strip_prefix("lake:") {
-            Some(rest) => rest.to_string(),
-            None if options.lake => location.to_string(),
-            None => {
-                return Err(PinkDbError::Catalog(format!(
-                    "ATTACH '{}' is not a lake: name a lake with the lake: or ducklake: prefix \
-                     or TYPE LAKE (attaching a .pink file is not supported yet)",
-                    crate::lake_db::redact_location(location)
-                )));
-            }
+            Some(rest) => Some(rest.to_string()),
+            None if options.lake => Some(location.to_string()),
+            // No scheme and no `TYPE LAKE`: a plain database, which DuckDB
+            // takes as a file path (or `:memory:`).
+            None => None,
         },
+    };
+    let Some(catalog) = catalog else {
+        return Ok((bind_plain_attach(location, options)?, None));
     };
     if catalog.trim().is_empty() {
         return Err(PinkDbError::Catalog(
@@ -16336,7 +16718,7 @@ fn bind_attach_options(
         None => None,
     };
     Ok((
-        crate::lake_db::LakeSpec {
+        crate::lake_db::AttachSource::Lake(crate::lake_db::LakeSpec {
             catalog: Some(catalog),
             data: options.data.clone(),
             read_only: options.read_only,
@@ -16346,9 +16728,55 @@ fn bind_attach_options(
             // empty; pinkdb's own `lake:` scheme keeps the explicit option.
             create_if_not_exists: ducklake.is_some() || options.create_if_not_exists,
             data_file_format: ducklake.map(|_| "parquet".to_string()),
-        },
+        }),
         secret,
     ))
+}
+
+/// `ATTACH` of something that is not a lake: `:memory:` only. A database
+/// file of its own would be a second durable store behind the same name —
+/// two processes could attach it and one `DETACH` would overwrite the other,
+/// and a durable session store would checkpoint the rows into its own file
+/// as well — so a path is refused and named as unsupported.
+fn bind_plain_attach(
+    location: &str,
+    options: &crate::sql::ast::DatabaseOptions,
+) -> Result<crate::lake_db::AttachSource> {
+    if options.catalog.is_some() {
+        return Err(PinkDbError::Catalog(
+            "ATTACH takes a plain database's path as its location, not as a CATALOG option"
+                .to_string(),
+        ));
+    }
+    if options.version.is_some() {
+        return Err(PinkDbError::Catalog(
+            "VERSION pins a lake attachment: a plain database file has one version".to_string(),
+        ));
+    }
+    if options.data.is_some() || options.data_inlining_row_limit.is_some() {
+        return Err(PinkDbError::Catalog(
+            "DATA and DATA_INLINING_ROW_LIMIT are lake options; a plain database keeps its rows \
+             in its own file"
+                .to_string(),
+        ));
+    }
+    refuse_unsupported_lake_options(options)?;
+    let memory = location == ":memory:" || location.is_empty();
+    if memory {
+        if options.read_only {
+            return Err(PinkDbError::Catalog(
+                "Cannot launch in-memory database in read-only mode!".to_string(),
+            ));
+        }
+        return Ok(crate::lake_db::AttachSource::Memory);
+    }
+    // A DuckDB file gets its own refusal: "not supported" would suggest the
+    // format could be read with a flag.
+    crate::lake_db::refuse_duckdb_file(std::path::Path::new(location))?;
+    Err(PinkDbError::Catalog(format!(
+        "ATTACH '{location}' is not a lake: pinkdb attaches \":memory:\" or a lake (a lake: or \
+         ducklake: catalog, or TYPE LAKE); attaching a plain database file is not supported"
+    )))
 }
 
 /// `pinkdb_lake_decodes()` (wave 124): the data-file decode counters of every
@@ -16749,12 +17177,16 @@ mod tests {
     fn attach_password_moves_into_a_scoped_secret() {
         use crate::secret::SecretType;
 
-        let (spec, secret) = bind_attach_options(
+        let (source, secret) = bind_attach_options(
             "warehouse",
             "ducklake:postgres:postgres://user:hunter2@127.0.0.1:55433/lake?sslmode=require",
             &crate::sql::ast::DatabaseOptions::default(),
         )
         .unwrap();
+        let spec = match source {
+            crate::lake_db::AttachSource::Lake(spec) => spec,
+            other => panic!("expected a lake: {other:?}"),
+        };
         assert_eq!(
             spec.catalog.as_deref(),
             Some("postgres://user@127.0.0.1:55433/lake?sslmode=require")
@@ -16766,17 +17198,50 @@ mod tests {
         assert_eq!(secret.scopes(), vec![spec.catalog.clone().unwrap()]);
         assert!(!format!("{spec:?}").contains("hunter2"));
 
-        let (spec, secret) = bind_attach_options(
+        let (source, secret) = bind_attach_options(
             "w",
             "ducklake:postgres:postgres:host=h user=u password='p w' dbname=d",
             &crate::sql::ast::DatabaseOptions::default(),
         )
         .unwrap();
+        let spec = match source {
+            crate::lake_db::AttachSource::Lake(spec) => spec,
+            other => panic!("expected a lake: {other:?}"),
+        };
         let catalog = spec.catalog.unwrap();
         assert!(
             !catalog.contains("password") && !catalog.contains("p w"),
             "{catalog}"
         );
         assert_eq!(secret.unwrap().field("PASSWORD"), Some("p w"));
+
+        // A path without a lake scheme is refused, naming the supported forms.
+        let err = bind_attach_options(
+            "plain",
+            "warehouse.db",
+            &crate::sql::ast::DatabaseOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("is not a lake"), "{err}");
+        assert!(err.contains(":memory:"), "{err}");
+        // `:memory:` is the one plain database.
+        let (source, secret) = bind_attach_options(
+            "memory",
+            ":memory:",
+            &crate::sql::ast::DatabaseOptions::default(),
+        )
+        .unwrap();
+        assert!(secret.is_none());
+        assert!(matches!(source, crate::lake_db::AttachSource::Memory));
+        // DuckDB refuses a read-only in-memory database.
+        let options = crate::sql::ast::DatabaseOptions {
+            read_only: true,
+            ..Default::default()
+        };
+        let err = bind_attach_options("memory", ":memory:", &options)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("read-only mode"), "{err}");
     }
 }

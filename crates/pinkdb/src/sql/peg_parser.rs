@@ -1586,6 +1586,7 @@ peg::parser! {
             / s:ident_raw() ws() {?
                   match Keyword::lookup(s) {
                       None => Ok(s.to_string()),
+                      Some(k) if !k.is_reserved() => Ok(s.to_string()),
                       Some(_) => Err("identifier"),
                   }
               }
@@ -1707,7 +1708,9 @@ peg::parser! {
             / describe_stmt()
             / explain_stmt()
             / merge_stmt()
-            / set_variable_stmt()
+            / pragma_stmt()
+            / reset_stmt()
+            / set_stmt()
             / select_statement()
 
         rule select_statement() -> Statement = s:query() { Statement::Select(s) }
@@ -2736,14 +2739,72 @@ peg::parser! {
                   MergeAction::Insert { columns, values }
               }
 
-        /// `SET VARIABLE name = expr`, and `SET name = expr` — the engine
-        /// switches (`join_filter_pushdown`) read like DuckDB's settings.
-        /// `SET`, `VARIABLE` and the name are words, so both stay usable as
-        /// identifiers elsewhere.
-        rule set_variable_stmt() -> Statement
-            = kw(Keyword::Set) word("variable")? name:ident() eq() value:expr() {
+        /// `SET VARIABLE name = expr`, and `SET [LOCAL|SESSION|GLOBAL] name
+        /// (=|TO) expr` — the engine's settings (wave slt-2; see
+        /// [`crate::settings`]). The scope keyword is accepted and dropped:
+        /// pinkdb has one setting scope per session. `SET`, `VARIABLE` and
+        /// the name are words, so both stay usable as identifiers elsewhere.
+        rule set_stmt() -> Statement
+            = kw(Keyword::Set) word("variable") name:ident() eq() value:expr() {
                   Statement::SetVariable { name, value }
               }
+            / kw(Keyword::Set) (word("local") / word("session") / word("global"))?
+              name:ident() (eq() / word("to")) value:setting_value() {
+                  Statement::SetSetting { name, value }
+              }
+
+        /// `RESET <setting>` / `RESET ALL`: back to the setting's default.
+        rule reset_stmt() -> Statement
+            = word("reset") kw_all() { Statement::ResetSetting { name: None } }
+            / word("reset") name:ident() { Statement::ResetSetting { name: Some(name) } }
+
+        /// `PRAGMA <name>`, `PRAGMA <name>(<args>)` and `PRAGMA <name> =
+        /// <value>` (wave slt-2). DuckDB spells a setting assignment as a
+        /// pragma too, so the `=` form becomes a [`Statement::SetSetting`];
+        /// which names are answered, accepted as no-ops or refused is the
+        /// binder's explicit lists.
+        rule pragma_stmt() -> Statement
+            = word("pragma") name:ident() args:pragma_args()? value:pragma_value()? {?
+                  match (args, value) {
+                      (Some(_), Some(_)) => Err("PRAGMA arguments or a value, not both"),
+                      (Some(args), None) => Ok(Statement::Pragma { name, args }),
+                      (None, Some(value)) => Ok(Statement::SetSetting { name, value }),
+                      (None, None) => Ok(Statement::Pragma { name, args: Vec::new() }),
+                  }
+              }
+
+        rule pragma_args() -> Vec<Expr>
+            = lparen() l:pragma_arg_list()? rparen() { l.unwrap_or_default() }
+
+        rule pragma_arg_list() -> Vec<Expr>
+            = first:setting_value() rest:(comma() e:setting_value() { e })* {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+
+        rule pragma_value() -> Expr = eq() v:setting_value() { v }
+
+        /// The right side of a setting: a `MAP {…}` literal or any
+        /// expression. DuckDB's MAP literal is kept as text — no setting
+        /// pinkdb acts on takes a map, and the corpus' renderer settings are
+        /// `MAP {'k': MAP {'k': v}}` only, so a `}` inside a quoted key would
+        /// need a real map value.
+        rule setting_value() -> Expr
+            = m:map_literal() { m }
+            / e:expr() { e }
+
+        /// `MAP {k: v, …}` → `MAP {{k: v, …}}` as a VARCHAR value.
+        rule map_literal() -> Expr
+            = word("map") lbrace() body:map_body() rbrace() {
+                  Expr::Literal(Value::Varchar(format!("MAP {{{body}}}")))
+              }
+
+        rule map_body() -> String = parts:map_body_part()* { parts.concat() }
+
+        rule map_body_part() -> String
+            = lbrace() inner:map_body() rbrace() { format!("{{{inner}}}") }
+            / s:$([^'}' | '{']+) { s.to_string() }
 
         /// `COPY <table> TO '<path>' [(FORMAT <name>)]` (wave 71).
         ///
@@ -3315,7 +3376,8 @@ peg::parser! {
               }
 
         rule group_item() -> GroupItem
-            = word("rollup") lparen() l:expr_list() rparen() { GroupItem::Set(GroupSet::Rollup(l)) }
+            = kw_all() { GroupItem::Set(GroupSet::All) }
+            / word("rollup") lparen() l:expr_list() rparen() { GroupItem::Set(GroupSet::Rollup(l)) }
             / word("cube") lparen() l:expr_list() rparen() { GroupItem::Set(GroupSet::Cube(l)) }
             / word("grouping") word("sets") lparen() s:grouping_sets() rparen() { GroupItem::Set(GroupSet::Sets(s)) }
             / e:expr() { GroupItem::Plain(e) }
@@ -3371,15 +3433,28 @@ peg::parser! {
                   out
               }
 
+        /// One order key: `ORDER BY ALL [ASC|DESC] [NULLS FIRST|LAST]`, or
+        /// an expression with the same optional suffixes. `ALL` must be tried
+        /// first — it is a plain identifier to the expression grammar.
         rule order_item() -> OrderItem
-            = e:expr() desc:order_direction() nulls:nulls_order() {
-                  OrderItem { expr: e, desc, nulls_first: nulls }
+            = kw_all() desc:order_direction() nulls:nulls_order() {
+                  OrderItem {
+                      all: true,
+                      expr: Expr::Literal(Value::Null),
+                      desc,
+                      nulls_first: nulls,
+                  }
+              }
+            / e:expr() desc:order_direction() nulls:nulls_order() {
+                  OrderItem { all: false, expr: e, desc, nulls_first: nulls }
               }
 
-        rule order_direction() -> bool
-            = kw(Keyword::Desc) { true }
-            / kw(Keyword::Asc) { false }
-            / { false }
+        /// `DESC` / `ASC`, or `None` when the session's `default_order`
+        /// decides.
+        rule order_direction() -> Option<bool>
+            = kw(Keyword::Desc) { Some(true) }
+            / kw(Keyword::Asc) { Some(false) }
+            / { None }
 
         /// `NULLS FIRST` / `NULLS LAST` (a non-reserved two-word suffix).
         rule nulls_order() -> Option<bool>
@@ -3967,12 +4042,33 @@ peg::parser! {
 
         /// The inside of `OVER (...)` and of a `WINDOW w AS (...)` definition.
         rule window_spec() -> OverClause
-            = base:ident()? partition:partition_clause()? order:order_by_clause()? frame:frame_clause()? {
+            = base:window_base()? partition:partition_clause()? order:order_by_clause()? frame:frame_clause()? {
                   OverClause {
                       base,
                       partition: partition.unwrap_or_default(),
                       order: order.unwrap_or_default(),
                       frame,
+                  }
+              }
+
+        /// The base window's name. Not a frame keyword: those spellings are
+        /// valid identifiers now (`RANGE` is not reserved), but in a window
+        /// specification `OVER (RANGE BETWEEN …)` names no base window.
+        rule window_base() -> String
+            = quoted_ident()
+            / s:ident_raw() ws() {?
+                  match Keyword::lookup(s) {
+                      Some(
+                          Keyword::Range
+                          | Keyword::Rows
+                          | Keyword::Row
+                          | Keyword::Unbounded
+                          | Keyword::Current
+                          | Keyword::Preceding
+                          | Keyword::Following,
+                      ) => Err("window name"),
+                      Some(k) if k.is_reserved() => Err("identifier"),
+                      _ => Ok(s.to_string()),
                   }
               }
 
@@ -5830,7 +5926,7 @@ mod tests {
                 };
                 assert_eq!(over.partition.len(), 1);
                 assert_eq!(over.order.len(), 1);
-                assert!(over.order[0].desc);
+                assert_eq!(over.order[0].desc, Some(true));
                 assert!(over.frame.is_none());
             }
             _ => panic!(),
@@ -7268,5 +7364,141 @@ mod tests {
         ] {
             parse_one(sql);
         }
+    }
+    /// `PRAGMA` in DuckDB's three forms, and the settings spellings next to
+    /// it: a bare pragma is a pragma, `= value` is a setting assignment, and
+    /// the paren form carries the pragma's arguments.
+    #[test]
+    fn pragma_and_setting_forms_parse() {
+        match parse_one("PRAGMA disable_checkpoint_on_shutdown;") {
+            Statement::Pragma { name, args } => {
+                assert_eq!(name, "disable_checkpoint_on_shutdown");
+                assert!(args.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_one("PRAGMA table_info('s.t');") {
+            Statement::Pragma { name, args } => {
+                assert_eq!(name, "table_info");
+                assert_eq!(args, vec![Expr::Literal(Value::Varchar("s.t".to_string()))]);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A bare identifier argument names the table, as in DuckDB.
+        match parse_one("PRAGMA table_info(t);") {
+            Statement::Pragma { args, .. } => {
+                assert!(matches!(&args[0], Expr::Column { name, .. } if name == "t"));
+            }
+            other => panic!("{other:?}"),
+        }
+        for sql in [
+            "PRAGMA threads = 4;",
+            "PRAGMA threads=4;",
+            "SET threads = 4;",
+            "SET SESSION threads = 4;",
+            "SET GLOBAL threads TO 4;",
+            "SET LOCAL threads = 4;",
+            "PRAGMA force_compression = 'zstd';",
+            "PRAGMA explain_output = PHYSICAL_ONLY;",
+        ] {
+            assert!(
+                matches!(parse_one(sql), Statement::SetSetting { .. }),
+                "{sql}"
+            );
+        }
+        // An unquoted value is the identifier it looks like; the binder turns
+        // it into text for the settings that want text.
+        match parse_one("PRAGMA explain_output = PHYSICAL_ONLY;") {
+            Statement::SetSetting { name, value } => {
+                assert_eq!(name, "explain_output");
+                assert!(matches!(value, Expr::Column { name, .. } if name == "PHYSICAL_ONLY"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // DuckDB's `MAP {…}` setting value is kept as text: no setting pinkdb
+        // acts on takes a map.
+        match parse_one("SET profiling_renderer_settings = MAP {'a': MAP {'b': 0}};") {
+            Statement::SetSetting { value, .. } => {
+                assert_eq!(
+                    value,
+                    Expr::Literal(Value::Varchar("MAP {'a': MAP {'b': 0}}".to_string()))
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // `SET VARIABLE` keeps its own statement.
+        assert!(matches!(
+            parse_one("SET VARIABLE x = 1;"),
+            Statement::SetVariable { .. }
+        ));
+        assert!(matches!(
+            parse_one("RESET threads;"),
+            Statement::ResetSetting { name: Some(_) }
+        ));
+        assert!(matches!(
+            parse_one("RESET ALL;"),
+            Statement::ResetSetting { name: None }
+        ));
+        // Arguments and a value in one pragma is a parse error.
+        assert!(matches!(
+            parse("PRAGMA table_info('t') = 1;"),
+            Err(PinkDbError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn group_and_order_by_all_parse() {
+        let Statement::Select(sel) = parse_one("SELECT a, sum(b) FROM t GROUP BY ALL;") else {
+            panic!()
+        };
+        assert!(matches!(sel.group_sets.as_slice(), [GroupSet::All]));
+        assert!(sel.group_by.is_empty());
+        let Statement::Select(sel) = parse_one("SELECT a FROM t GROUP BY a, ALL;") else {
+            panic!()
+        };
+        assert_eq!(sel.group_by.len(), 1);
+        assert!(matches!(sel.group_sets.as_slice(), [GroupSet::All]));
+        let Statement::Select(sel) = parse_one("SELECT a, b FROM t ORDER BY ALL DESC;") else {
+            panic!()
+        };
+        assert!(sel.order_by[0].all);
+        assert_eq!(sel.order_by[0].desc, Some(true));
+        let Statement::Select(sel) = parse_one("SELECT a FROM t ORDER BY ALL;") else {
+            panic!()
+        };
+        assert!(sel.order_by[0].all);
+        assert_eq!(sel.order_by[0].desc, None);
+    }
+
+    /// DuckDB's `CHAR(n)` family is VARCHAR, its type names are column names,
+    /// `count()` is `count(*)`, and a table function's name may name a column.
+    #[test]
+    fn duckdb_type_and_name_spellings_parse() {
+        let Statement::CreateTable { items, .. } =
+            parse_one("CREATE TABLE t (a CHAR(1), b CHARACTER(5), c BPCHAR, d VARCHAR(10));")
+        else {
+            panic!()
+        };
+        for item in &items {
+            let TableItem::Column(column) = item else {
+                panic!("{item:?}")
+            };
+            assert_eq!(column.dtype, crate::types::DataType::Varchar, "{column:?}");
+        }
+        assert!(matches!(
+            parse_one("CREATE TABLE t (date DATE, timestamp TIMESTAMP, range INTEGER);"),
+            Statement::CreateTable { .. }
+        ));
+        assert!(matches!(
+            parse_one("CREATE TABLE t AS SELECT range % 10 AS g FROM range(100);"),
+            Statement::CreateTableAs { .. }
+        ));
+        let Statement::Select(sel) = parse_one("SELECT count() FROM t;") else {
+            panic!()
+        };
+        assert!(matches!(
+            &sel.projections[0],
+            Projection::Expr { expr: Expr::Function { args, .. }, .. } if args.is_empty()
+        ));
     }
 }

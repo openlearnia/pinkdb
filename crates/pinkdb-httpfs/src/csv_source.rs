@@ -132,8 +132,8 @@ pub fn claims_path(path: &str) -> bool {
 }
 
 /// Parse a table-function call into a [`Call`], or `None` when this source
-/// does not serve it. `read_csv` is matched case-insensitively; the
-/// replacement scan follows [`claims_path`].
+/// does not serve it. `read_csv` (and DuckDB's `read_csv_auto` alias) is
+/// matched case-insensitively; the replacement scan follows [`claims_path`].
 pub fn parse_call(call: &TableFunctionCall) -> Result<Option<Call>> {
     match call {
         TableFunctionCall::Path(path) => {
@@ -143,7 +143,12 @@ pub fn parse_call(call: &TableFunctionCall) -> Result<Option<Call>> {
                 Ok(None)
             }
         }
-        TableFunctionCall::Function { name, args } if name.eq_ignore_ascii_case("read_csv") => {
+        // `read_csv_auto` is DuckDB's spelling of the same reader: its
+        // detection is what `read_csv` does here already.
+        TableFunctionCall::Function { name, args }
+            if name.eq_ignore_ascii_case("read_csv")
+                || name.eq_ignore_ascii_case("read_csv_auto") =>
+        {
             let path = positional_path(args)?;
             let options = parse_options(args)?;
             let compression = args

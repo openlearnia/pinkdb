@@ -2686,4 +2686,469 @@ mod tests {
             vec![vec![Value::Bigint(4)]]
         );
     }
+    /// One `Selected` result's names, types and rows.
+    fn selected(
+        mut results: Vec<QueryResult>,
+    ) -> (Vec<String>, Vec<crate::types::DataType>, Vec<Vec<Value>>) {
+        match results.pop().unwrap() {
+            QueryResult::Selected { names, types, rows } => (names, types, rows),
+            r => panic!("expected rows, got {r:?}"),
+        }
+    }
+
+    // ---------- slt-2: DuckDB settings, pragmas and dialect ----------
+
+    /// `SET`/`PRAGMA x = v`/`RESET`/`current_setting` over DuckDB's setting
+    /// catalog: the ones pinkdb acts on, the stored no-ops, and the names
+    /// DuckDB does not have (which keep its Catalog Error).
+    #[test]
+    fn duckdb_settings_round_trip() {
+        let db = Database::new();
+        let mut c = db.connect();
+        c.execute("SET threads = 3;").unwrap();
+        assert_eq!(
+            rows_of(c.execute("SELECT current_setting('threads');").unwrap()),
+            vec![vec![Value::Bigint(3)]]
+        );
+        // A pragma assignment is the same statement.
+        c.execute("PRAGMA threads = 5;").unwrap();
+        assert_eq!(
+            rows_of(c.execute("SELECT current_setting('threads');").unwrap()),
+            vec![vec![Value::Bigint(5)]]
+        );
+        // `RESET` goes back to the default (the machine's core count).
+        c.execute("RESET threads;").unwrap();
+        let (_, _, rows) = selected(c.execute("SELECT current_setting('threads') > 0;").unwrap());
+        assert_eq!(rows, vec![vec![Value::Boolean(true)]]);
+        // A stored no-op reads back what was set, and nothing else happens.
+        c.execute("SET wal_autocheckpoint = '1TB';").unwrap();
+        assert_eq!(
+            rows_of(
+                c.execute("SELECT current_setting('wal_autocheckpoint');")
+                    .unwrap()
+            ),
+            vec![vec![Value::Varchar("1TB".to_string())]]
+        );
+        // An unknown setting is DuckDB's Catalog Error.
+        let err = c.execute("SET nosuchsetting = 1;").unwrap_err().to_string();
+        assert!(
+            err.contains("unrecognized configuration parameter \"nosuchsetting\""),
+            "{err}"
+        );
+        let err = c
+            .execute("SELECT current_setting('nosuchsetting');")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unrecognized configuration parameter"),
+            "{err}"
+        );
+        // Settings are session state: another connection keeps the default.
+        let mut other = db.connect();
+        assert_eq!(
+            rows_of(
+                other
+                    .execute("SELECT current_setting('wal_autocheckpoint') IS NULL;")
+                    .unwrap()
+            ),
+            vec![vec![Value::Boolean(true)]]
+        );
+    }
+
+    // ---------- slt-2: ATTACH a plain (non-lake) database ----------
+
+    /// A scratch path no other test run shares.
+    fn scratch_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("pinkdb-attach-{tag}-{}.db", std::process::id()))
+    }
+
+    /// `ATTACH ':memory:' AS m` is DuckDB's in-memory database: a catalog of
+    /// its own for the session, reachable by name or after `USE`, and gone
+    /// from the store after `DETACH`.
+    #[test]
+    fn attach_memory_database_round_trip() {
+        let db = Database::new();
+        let mut c = db.connect();
+        c.execute("ATTACH ':memory:' AS m;").unwrap();
+        c.execute("CREATE TABLE m.t (a INTEGER);").unwrap();
+        c.execute("INSERT INTO m.t VALUES (7);").unwrap();
+        assert_eq!(
+            rows_of(c.execute("SELECT a FROM m.t;").unwrap()),
+            vec![vec![Value::Integer(7)]]
+        );
+        c.execute("USE m;").unwrap();
+        assert_eq!(
+            rows_of(c.execute("SELECT a FROM t;").unwrap()),
+            vec![vec![Value::Integer(7)]]
+        );
+        c.execute("USE main;").unwrap();
+        c.execute("DETACH m;").unwrap();
+        let err = c.execute("SELECT a FROM m.t;").unwrap_err().to_string();
+        assert!(err.contains("\"m\" not found"), "{err}");
+        // The name is free again, and a reserved one is still refused.
+        c.execute("ATTACH ':memory:' AS m;").unwrap();
+        let err = c
+            .execute("ATTACH ':memory:' AS system;")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reserved name"), "{err}");
+    }
+
+    /// A path is not a database pinkdb can attach: it is refused, and the
+    /// error names what an `ATTACH` does take.
+    #[test]
+    fn attach_refuses_a_plain_database_file() {
+        let path = scratch_path("refused");
+        let _ = std::fs::remove_file(&path);
+        let db = Database::new();
+        let mut c = db.connect();
+        let err = c
+            .execute(&format!("ATTACH '{}' AS f;", path.display()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a lake"), "{err}");
+        assert!(err.contains(":memory:"), "{err}");
+        assert!(!path.exists(), "a refused attach creates no file");
+        // In-memory is the supported form; DuckDB refuses it read-only.
+        let err = c
+            .execute("ATTACH ':memory:' AS r (READ_ONLY);")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Cannot launch in-memory database in read-only mode"),
+            "{err}"
+        );
+        c.execute("ATTACH ':memory:' AS r;").unwrap();
+        c.execute("CREATE TABLE r.t (a INTEGER);").unwrap();
+        c.execute("INSERT INTO r.t VALUES (1);").unwrap();
+        assert_eq!(
+            rows_of(c.execute("SELECT a FROM r.t;").unwrap()),
+            vec![vec![Value::Integer(1)]]
+        );
+    }
+
+    /// A file in DuckDB's format is refused by name, not opened as a pinkdb
+    /// file (its header cannot match).
+    #[test]
+    fn attach_refuses_a_duckdb_file() {
+        let path = scratch_path("duckdb");
+        let mut bytes = vec![0x03, 0x0f, 0xd7, 0x94, 0xad, 0xe6, 0x59, 0x5d];
+        bytes.extend_from_slice(b"DUCK");
+        bytes.extend_from_slice(&[0u8; 64]);
+        std::fs::write(&path, &bytes).unwrap();
+        let db = Database::new();
+        let mut c = db.connect();
+        let err = c
+            .execute(&format!("ATTACH '{}' AS d;", path.display()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("DuckDB database file"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The pragmas pinkdb answers: the catalog ones as DuckDB-shaped rows,
+    /// the engine-tuning ones as DuckDB's empty `Success` result.
+    #[test]
+    fn pragma_rows_are_duckdb_shaped() {
+        let db = Database::new();
+        let mut c = db.connect();
+        c.execute(
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b VARCHAR NOT NULL DEFAULT 'x', c DOUBLE);",
+        )
+        .unwrap();
+        let (names, _, rows) = selected(c.execute("PRAGMA table_info('t');").unwrap());
+        assert_eq!(
+            names,
+            ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+        );
+        assert_eq!(rows.len(), 3);
+        // `cid` counts from 0 and `type` is what DESCRIBE reports.
+        assert_eq!(rows[0][0], Value::Integer(0));
+        assert_eq!(rows[2][0], Value::Integer(2));
+        assert_eq!(rows[0][1], Value::Varchar("a".to_string()));
+        assert_eq!(rows[0][2], Value::Varchar("INTEGER".to_string()));
+        assert_eq!(rows[0][3], Value::Boolean(true));
+        assert_eq!(rows[0][4], Value::Null);
+        assert_eq!(rows[0][5], Value::Boolean(true));
+        assert_eq!(rows[1][3], Value::Boolean(true));
+        // DuckDB reports the default as written, quotes included.
+        assert_eq!(rows[1][4], Value::Varchar("'x'".to_string()));
+        assert_eq!(rows[1][5], Value::Boolean(false));
+        assert_eq!(rows[2][3], Value::Boolean(false));
+        // The table function answers the same rows.
+        assert_eq!(
+            rows_of(
+                c.execute("SELECT name, pk FROM pragma_table_info('t') ORDER BY cid;")
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::Varchar("a".to_string()), Value::Boolean(true)],
+                vec![Value::Varchar("b".to_string()), Value::Boolean(false)],
+                vec![Value::Varchar("c".to_string()), Value::Boolean(false)],
+            ]
+        );
+        // `PRAGMA table_info` on a missing table fails like `DESCRIBE` does
+        // (the wording is pinkdb's, not DuckDB's).
+        let err = c
+            .execute("PRAGMA table_info('nope');")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"nope\" not found"), "{err}");
+        // `PRAGMA show_tables` is `SHOW TABLES`.
+        assert_eq!(
+            rows_of(c.execute("PRAGMA show_tables;").unwrap()),
+            rows_of(c.execute("SHOW TABLES;").unwrap())
+        );
+        // `PRAGMA database_list` has DuckDB's three columns and lists the
+        // memory database named `main`.
+        let (names, _, rows) = selected(c.execute("PRAGMA database_list;").unwrap());
+        assert_eq!(names, ["seq", "name", "file"]);
+        assert_eq!(rows[0][1], Value::Varchar("main".to_string()));
+        assert_eq!(rows[0][2], Value::Null);
+        // `PRAGMA version` is one row of three strings.
+        let (names, _, rows) = selected(c.execute("PRAGMA version;").unwrap());
+        assert_eq!(names, ["library_version", "source_id", "codename"]);
+        assert_eq!(rows.len(), 1);
+        // The engine-tuning pragmas answer with an empty `Success` column.
+        let (names, types, rows) =
+            selected(c.execute("PRAGMA disable_checkpoint_on_shutdown;").unwrap());
+        assert_eq!(names, ["Success"]);
+        assert_eq!(types, [crate::types::DataType::Boolean]);
+        assert!(rows.is_empty());
+        c.execute("PRAGMA verify_parallelism;").unwrap();
+        c.execute("PRAGMA force_compression = 'zstd';").unwrap();
+        // An unknown pragma is DuckDB's Catalog Error, and a setting name
+        // without a value is not a pragma at all.
+        for sql in ["PRAGMA nosuchpragma;", "PRAGMA threads;"] {
+            let err = c.execute(sql).unwrap_err().to_string();
+            assert!(err.contains("Pragma Function with name"), "{sql}: {err}");
+        }
+    }
+
+    /// `count()` with no argument counts rows like `count(*)`, and the
+    /// dialect spellings DuckDB's corpus leans on parse and run.
+    #[test]
+    fn count_star_without_an_argument() {
+        let db = Database::new();
+        let mut c = db.connect();
+        c.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2), (NULL);")
+            .unwrap();
+        assert_eq!(
+            rows_of(
+                c.execute("SELECT count(), count(*), count(a) FROM t;")
+                    .unwrap()
+            ),
+            vec![vec![Value::Bigint(3), Value::Bigint(3), Value::Bigint(2)]]
+        );
+        assert_eq!(
+            rows_of(c.execute("SELECT count() FROM t WHERE a IS NULL;").unwrap()),
+            vec![vec![Value::Bigint(1)]]
+        );
+        assert_eq!(
+            rows_of(c.execute("SELECT count() OVER () FROM t LIMIT 1;").unwrap()),
+            vec![vec![Value::Bigint(3)]]
+        );
+        // CHAR(n)/CHARACTER(n)/BPCHAR are VARCHAR, and type names are column
+        // names (`range` is also what `range(n)` calls its column).
+        c.execute("CREATE TABLE q (a INTEGER, b CHAR(1), c CHARACTER(5));")
+            .unwrap();
+        let (names, types, _) = selected(c.execute("DESCRIBE q;").unwrap());
+        assert_eq!(
+            names,
+            [
+                "column_name",
+                "column_type",
+                "null",
+                "key",
+                "default",
+                "extra"
+            ]
+        );
+        assert_eq!(types.len(), 6);
+        assert_eq!(
+            selected(c.execute("SELECT count() AS n FROM q;").unwrap()).2,
+            vec![vec![Value::Bigint(0)]]
+        );
+        let (_, _, rows) = selected(c.execute("PRAGMA table_info('q');").unwrap());
+        assert_eq!(rows[1][2], Value::Varchar("VARCHAR".to_string()));
+        assert_eq!(rows[2][2], Value::Varchar("VARCHAR".to_string()));
+        c.execute("CREATE TABLE kw (date DATE, timestamp TIMESTAMP, range INTEGER);")
+            .unwrap();
+        c.execute("INSERT INTO kw VALUES (DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05', 7);")
+            .unwrap();
+        assert_eq!(
+            rows_of(c.execute("SELECT date, timestamp, range FROM kw;").unwrap()),
+            vec![vec![
+                Value::Date(19_724),
+                Value::Timestamp(1_704_164_645_000_000),
+                Value::Integer(7),
+            ]]
+        );
+        // `range` as the table function's column name.
+        assert_eq!(
+            rows_of(c.execute("SELECT range FROM range(4) ORDER BY 1;").unwrap()),
+            vec![
+                vec![Value::Bigint(0)],
+                vec![Value::Bigint(1)],
+                vec![Value::Bigint(2)],
+                vec![Value::Bigint(3)],
+            ]
+        );
+    }
+
+    /// `GROUP BY ALL` / `ORDER BY ALL`: every select-list expression that is
+    /// not an aggregate, in select-list order.
+    #[test]
+    fn group_by_all_and_order_by_all() {
+        let db = Database::new();
+        let mut c = db.connect();
+        c.execute("CREATE TABLE t (a INTEGER, b INTEGER); INSERT INTO t VALUES (2, 1), (1, 3), (2, 5), (1, 7);")
+            .unwrap();
+        assert_eq!(
+            rows_of(
+                c.execute("SELECT a, sum(b) AS s FROM t GROUP BY ALL ORDER BY ALL;")
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::Integer(1), Value::Bigint(10)],
+                vec![Value::Integer(2), Value::Bigint(6)],
+            ]
+        );
+        // Order by the select-list order, both directions.
+        assert_eq!(
+            rows_of(
+                c.execute("SELECT a, sum(b) AS s FROM t GROUP BY ALL ORDER BY ALL DESC;")
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::Integer(2), Value::Bigint(6)],
+                vec![Value::Integer(1), Value::Bigint(10)],
+            ]
+        );
+        // A plain select list groups by every column.
+        assert_eq!(
+            rows_of(c.execute("SELECT DISTINCT a FROM t ORDER BY ALL;").unwrap()),
+            vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+        );
+        // The expansion is the select list, so a two-column list orders by
+        // both in turn.
+        assert_eq!(
+            rows_of(c.execute("SELECT a, b FROM t ORDER BY ALL DESC;").unwrap()),
+            vec![
+                vec![Value::Integer(2), Value::Integer(5)],
+                vec![Value::Integer(2), Value::Integer(1)],
+                vec![Value::Integer(1), Value::Integer(7)],
+                vec![Value::Integer(1), Value::Integer(3)],
+            ]
+        );
+    }
+
+    /// `default_null_order` and `default_order` drive ORDER BY, window
+    /// ORDER BY and ordered aggregates, exactly as DuckDB.
+    #[test]
+    fn null_and_direction_defaults_reach_every_order() {
+        let db = Database::new();
+        let mut c = db.connect();
+        c.execute("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (2), (1), (NULL);")
+            .unwrap();
+        let ordered = |c: &mut crate::db::Connection, sql: &str| rows_of(c.execute(sql).unwrap());
+        // DuckDB's default: NULLs last, ascending.
+        assert_eq!(
+            ordered(&mut c, "SELECT x FROM t ORDER BY x;"),
+            vec![
+                vec![Value::Integer(1)],
+                vec![Value::Integer(2)],
+                vec![Value::Null],
+            ]
+        );
+        c.execute("SET default_null_order = 'NULLS FIRST';")
+            .unwrap();
+        assert_eq!(
+            ordered(&mut c, "SELECT x FROM t ORDER BY x;"),
+            vec![
+                vec![Value::Null],
+                vec![Value::Integer(1)],
+                vec![Value::Integer(2)],
+            ]
+        );
+        // An explicit NULLS LAST still wins over the setting.
+        assert_eq!(
+            ordered(&mut c, "SELECT x FROM t ORDER BY x NULLS LAST;"),
+            vec![
+                vec![Value::Integer(1)],
+                vec![Value::Integer(2)],
+                vec![Value::Null],
+            ]
+        );
+        // Window ORDER BY takes the same defaults: the NULL row ranks first
+        // (pinkdb keeps the input row order here, unlike DuckDB, so sort the
+        // probe by the rank it assigns).
+        assert_eq!(
+            ordered(
+                &mut c,
+                "SELECT x, row_number() OVER (ORDER BY x) AS rn FROM t ORDER BY 2;"
+            ),
+            vec![
+                vec![Value::Null, Value::Bigint(1)],
+                vec![Value::Integer(1), Value::Bigint(2)],
+                vec![Value::Integer(2), Value::Bigint(3)],
+            ]
+        );
+        // SQLite's mode: NULLs first on ASC, last on DESC.
+        c.execute("SET default_null_order = 'sqlite';").unwrap();
+        assert_eq!(
+            rows_of(
+                c.execute("SELECT current_setting('default_null_order');")
+                    .unwrap()
+            ),
+            vec![vec![Value::Varchar(
+                "NULLS_FIRST_ON_ASC_LAST_ON_DESC".to_string()
+            )]]
+        );
+        assert_eq!(
+            ordered(&mut c, "SELECT x FROM t ORDER BY x DESC;"),
+            vec![
+                vec![Value::Integer(2)],
+                vec![Value::Integer(1)],
+                vec![Value::Null],
+            ]
+        );
+        // `default_order = DESC` flips an ORDER BY with no direction.
+        c.execute("SET default_order = 'DESC';").unwrap();
+        assert_eq!(
+            ordered(&mut c, "SELECT x FROM t ORDER BY x;"),
+            vec![
+                vec![Value::Integer(2)],
+                vec![Value::Integer(1)],
+                vec![Value::Null],
+            ]
+        );
+        // A bad mode is DuckDB's Parser Error.
+        let err = c
+            .execute("SET default_null_order = 'bogus';")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Unrecognized parameter for option NULL_ORDER"),
+            "{err}"
+        );
+        let err = c
+            .execute("SET default_order = 'bogus';")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Unrecognized parameter for option DEFAULT_ORDER"),
+            "{err}"
+        );
+        // RESET returns to DuckDB's defaults.
+        c.execute("RESET ALL;").unwrap();
+        assert_eq!(
+            ordered(&mut c, "SELECT x FROM t ORDER BY x;"),
+            vec![
+                vec![Value::Integer(1)],
+                vec![Value::Integer(2)],
+                vec![Value::Null],
+            ]
+        );
+    }
 }

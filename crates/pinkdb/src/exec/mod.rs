@@ -998,11 +998,11 @@ impl<'a> Cx<'a> {
     }
 
     /// Whether this statement may prune probe scans with join filters. The
-    /// `join_filter_pushdown` session variable turns it off; kept as a
+    /// `join_filter_pushdown` setting turns it off; kept as a
     /// debugging and differential-testing switch, never as a hint that
     /// changes a result.
     pub(crate) fn join_filter_pushdown(&self) -> bool {
-        match self.session.get("join_filter_pushdown") {
+        match crate::settings::current(&self.session, "join_filter_pushdown") {
             None => true,
             Some(Value::Boolean(b)) => b,
             Some(Value::Bigint(n)) => n != 0,
@@ -1081,6 +1081,34 @@ fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
         ));
     }
     cx.session.set(name, v.get(0));
+    Ok(QueryResult::SetVariable {
+        name: name.to_string(),
+    })
+}
+
+/// `SET <setting> = <value>` / `RESET <setting>`: session state only, like
+/// `SET VARIABLE` — nothing is logged or persisted, and the value is checked
+/// against DuckDB's rules before it is stored. `RESET ALL` passes `"*"`.
+fn set_setting(cx: &Cx, name: &str, value: Option<&BoundExpr>) -> Result<QueryResult> {
+    match value {
+        Some(value) => {
+            let single = DataChunk {
+                columns: Vec::new(),
+                num_rows: 1,
+                ordinal: 0,
+            };
+            let v = eval_expr(value, &single, cx)?;
+            if v.len() != 1 {
+                return Err(PinkDbError::Execution(
+                    "a SET value did not evaluate to one value".to_string(),
+                ));
+            }
+            let v = crate::settings::validate(name, v.get(0))?;
+            cx.session.set_setting(name, v);
+        }
+        None if name == "*" => cx.session.reset_setting(None),
+        None => cx.session.reset_setting(Some(name)),
+    }
     Ok(QueryResult::SetVariable {
         name: name.to_string(),
     })
@@ -2304,16 +2332,29 @@ pub(crate) fn run_plain(
         }
         // Wave 124: `ATTACH` reports the database it created, `DETACH` the one
         // it removed (so a session on it falls back like after a DROP).
-        LogicalPlan::Attach { name, spec, secret } => {
-            if let Some(secret) = secret {
-                let session = db.session.clone();
-                db.put_secret(secret.clone(), true, true, false, &session)?;
+        LogicalPlan::Attach {
+            name,
+            source,
+            secret,
+        } => {
+            match source {
+                crate::lake_db::AttachSource::Memory => db.attach_memory_database(name)?,
+                crate::lake_db::AttachSource::Lake(spec) => {
+                    if let Some(secret) = secret {
+                        let session = db.session.clone();
+                        db.put_secret(secret.clone(), true, true, false, &session)?;
+                    }
+                    db.attach_lake_database(name, spec.clone())?;
+                }
             }
-            db.attach_lake_database(name, spec.clone())?;
             Ok(QueryResult::CreatedDatabase { name: name.clone() })
         }
         LogicalPlan::Detach { name, if_exists } => {
-            if db.detach_lake_database(name, *if_exists)? {
+            // An `:memory:` attachment is forgotten before the lake path,
+            // which refuses a local database.
+            let detached =
+                db.detach_attached_database(name)? || db.detach_lake_database(name, *if_exists)?;
+            if detached {
                 db.rbac_mut().remove_database(name);
             }
             Ok(QueryResult::DroppedDatabase { name: name.clone() })
@@ -2365,6 +2406,14 @@ pub(crate) fn run_plain(
         LogicalPlan::SetVariable { name, value } => {
             let cx = Cx::with_budget(db, budget.clone());
             set_variable(&cx, name, value)
+        }
+        LogicalPlan::SetSetting { name, value } => {
+            let cx = Cx::with_budget(db, budget.clone());
+            set_setting(&cx, name, Some(value))
+        }
+        LogicalPlan::ResetSetting { name } => {
+            let cx = Cx::with_budget(db, budget.clone());
+            set_setting(&cx, name.as_deref().unwrap_or("*"), None)
         }
         LogicalPlan::Checkpoint => {
             if db.is_durable() {
@@ -2762,6 +2811,12 @@ fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
     // (no lock upgrade, nothing logged) but must still run on the read path.
     if let LogicalPlan::SetVariable { name, value } = plan {
         return set_variable(cx, name, value);
+    }
+    if let LogicalPlan::SetSetting { name, value } = plan {
+        return set_setting(cx, name, Some(value));
+    }
+    if let LogicalPlan::ResetSetting { name } = plan {
+        return set_setting(cx, name.as_deref().unwrap_or("*"), None);
     }
     // `COPY … TO …` (wave 71) is read-only for the store (only an external
     // file is written) but produces DuckDB's `Count` result, not a row set —
@@ -3801,6 +3856,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::Analyze { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::SetSetting { .. }
+        | LogicalPlan::ResetSetting { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreateMaterializedView { .. }
@@ -3897,7 +3954,7 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     PinkDbError::Catalog(format!("vector index \"{index}\" not found"))
                 })?;
             let exact = matches!(
-                cx.session.get("hnsw_exact"),
+                crate::settings::current(&cx.session, "hnsw_exact"),
                 Some(Value::Boolean(true))
             );
             let rows = if exact {
@@ -3908,7 +3965,7 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     .as_ref()
                     .ok_or_else(|| def.pending_error(table))?;
                 let q = query_vector(query, *dim)?.0;
-                let ef = match cx.session.get("hnsw_ef_search") {
+                let ef = match crate::settings::current(&cx.session, "hnsw_ef_search") {
                     Some(Value::Integer(n)) => n.clamp(1, 16384) as usize,
                     Some(Value::Bigint(n)) => n.clamp(1, 16384) as usize,
                     _ => 0,
@@ -9085,6 +9142,13 @@ fn explain_into(
         LogicalPlan::SetVariable { name, value } => {
             format!("SetVariable {name} = {}", expr_text(value))
         }
+        LogicalPlan::SetSetting { name, value } => {
+            format!("SetSetting {name} = {}", expr_text(value))
+        }
+        LogicalPlan::ResetSetting { name } => match name {
+            Some(name) => format!("ResetSetting {name}"),
+            None => "ResetSetting".to_string(),
+        },
         LogicalPlan::LoadExtension { path } => format!("LoadExtension {path}"),
         LogicalPlan::InstallExtension { name, from, force } => {
             let force = if *force { " (force)" } else { "" };

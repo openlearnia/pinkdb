@@ -323,7 +323,10 @@ pub fn write_target(stmt: &Statement, current_db: Option<&str>) -> WriteTarget {
         | Begin
         | Commit
         | Rollback
-        | SetVariable { .. } => WriteTarget::Nothing,
+        | SetVariable { .. }
+        | SetSetting { .. }
+        | ResetSetting { .. }
+        | Pragma { .. } => WriteTarget::Nothing,
         // A `WITH` may carry data-modifying bodies (`WITH x AS (INSERT …)`).
         Select(sel) => sel
             .with
@@ -1445,6 +1448,7 @@ mod tests {
             match call {
                 TableFunctionCall::Function { name, args }
                     if name.eq_ignore_ascii_case("read_csv")
+                        || name.eq_ignore_ascii_case("read_csv_auto")
                         || name.eq_ignore_ascii_case("read_parquet") =>
                 {
                     match args.first().map(|arg| &arg.value) {

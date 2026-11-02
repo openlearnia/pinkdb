@@ -1812,6 +1812,10 @@ pub struct Session {
     /// committed there (`ducklake_last_committed_snapshot`). Per connection:
     /// another session's commits are not this session's last commit.
     last_lake_commits: Arc<Mutex<BTreeMap<String, u64>>>,
+    /// Lowercased DuckDB setting name -> value (`SET`, `RESET`,
+    /// `current_setting`). Separate from `vars`: a setting is a DuckDB
+    /// catalog name, a variable is pinkdb's `$name`.
+    settings: Arc<Mutex<BTreeMap<String, Value>>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -1844,6 +1848,7 @@ impl Session {
             principal: Arc::default(),
             roles: Arc::default(),
             last_lake_commits: Arc::default(),
+            settings: Arc::default(),
         }
     }
 
@@ -1884,6 +1889,35 @@ impl Session {
     /// Bind `name` for the rest of the session; a later `SET` replaces it.
     pub fn set(&self, name: &str, value: Value) {
         self.lock().insert(name.to_ascii_lowercase(), value);
+    }
+
+    /// A DuckDB setting this session set explicitly (not a default).
+    pub(crate) fn setting(&self, name: &str) -> Option<Value> {
+        self.settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+    }
+
+    /// Store a DuckDB setting: session scope, so never logged or persisted.
+    pub(crate) fn set_setting(&self, name: &str, value: Value) {
+        self.settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_ascii_lowercase(), value);
+    }
+
+    /// `RESET <name>`: forget the session's value, or with `None` every
+    /// setting (`RESET ALL`). A reset setting reports its default again.
+    pub(crate) fn reset_setting(&self, name: Option<&str>) {
+        let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        match name {
+            Some(name) => {
+                settings.remove(&name.to_ascii_lowercase());
+            }
+            None => settings.clear(),
+        }
     }
 
     /// How many variables the session holds.
@@ -2068,6 +2102,9 @@ impl RecordSeed {
 /// `wal == None` and are byte-for-byte unchanged.
 #[derive(Debug)]
 pub struct PinkDb {
+    /// Names of the databases attached `:memory:`, so `DETACH` may drop them.
+    /// Session state: never in the checkpoint footer.
+    pub(crate) attached_memory: HashSet<String>,
     /// Key = lowercased database name.
     pub(crate) databases: HashMap<String, DbCatalog>,
     /// Each session's `temp` catalog, keyed by [`Session::id`]. Never
@@ -2353,6 +2390,7 @@ impl Clone for PinkDb {
     /// another store's base.
     fn clone(&self) -> Self {
         Self {
+            attached_memory: self.attached_memory.clone(),
             databases: self.databases.clone(),
             temp: self.temp.clone(),
             dynamic_functions: self.dynamic_functions.clone(),
@@ -2462,6 +2500,7 @@ impl PinkDb {
             );
         }
         Self {
+            attached_memory: HashSet::new(),
             databases,
             temp: HashMap::new(),
             dynamic_functions: HashMap::new(),
@@ -2782,7 +2821,7 @@ impl PinkDb {
             .unwrap_or_else(|| "main".to_string())
     }
 
-    fn db_key(name: &str) -> String {
+    pub(crate) fn db_key(name: &str) -> String {
         name.to_ascii_lowercase()
     }
 
@@ -4556,8 +4595,9 @@ impl PinkDb {
         query: Select,
         cols: Option<Vec<String>>,
     ) -> Result<()> {
+        let ns = ns.into();
         let key = Self::key(name);
-        let cat = self.schema_mut(&ns.into())?;
+        let cat = self.schema_mut(&ns)?;
         if cat.tables.contains_key(&key) {
             return Err(PinkDbError::Catalog(format!(
                 "a table named \"{name}\" already exists"

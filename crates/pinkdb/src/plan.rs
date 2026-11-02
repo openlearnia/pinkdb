@@ -310,10 +310,11 @@ pub enum LogicalPlan {
         if_not_exists: bool,
         lake: Option<crate::lake_db::LakeSpec>,
     },
-    /// `ATTACH '<location>' AS <name> (…)` (wave 124; store-level).
+    /// `ATTACH '<location>' AS <name> (…)` (wave 124; store-level): a lake, or
+    /// `:memory:` for a database that lives in this store only.
     Attach {
         name: String,
-        spec: crate::lake_db::LakeSpec,
+        source: crate::lake_db::AttachSource,
         /// A password lifted out of the catalog location, installed as a
         /// persistent `postgres` secret before the lake opens.
         secret: Option<crate::secret::Secret>,
@@ -369,6 +370,18 @@ pub enum LogicalPlan {
     SetVariable {
         name: Box<str>,
         value: BoundExpr,
+    },
+    /// `SET <setting> = <expr>` / `PRAGMA <setting> = <expr>`: a DuckDB
+    /// setting (see [`crate::settings`]). Session state like
+    /// [`LogicalPlan::SetVariable`], but a separate map: a setting is a
+    /// catalog name, a variable is `$name`.
+    SetSetting {
+        name: Box<str>,
+        value: BoundExpr,
+    },
+    /// `RESET <setting>` / `RESET ALL`: back to the setting's default.
+    ResetSetting {
+        name: Option<Box<str>>,
     },
     /// `LOAD EXTENSION '<path>'`: load a native extension (ABI v1) and
     /// register its scalar functions. Process-level and not part of any
@@ -809,6 +822,8 @@ pub fn is_read_only(plan: &LogicalPlan) -> bool {
                 | LogicalPlan::SetOp { .. }
                 | LogicalPlan::Use { .. }
                 | LogicalPlan::SetVariable { .. }
+                | LogicalPlan::SetSetting { .. }
+                | LogicalPlan::ResetSetting { .. }
                 | LogicalPlan::ShowTables { .. }
                 | LogicalPlan::ShowDatabases
                 | LogicalPlan::ShowMaterializedViews { .. }
@@ -1209,6 +1224,8 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::DropSecret { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::SetSetting { .. }
+        | LogicalPlan::ResetSetting { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::InstallExtension { .. }
         | LogicalPlan::LoadInstalledExtension { .. }
@@ -1690,6 +1707,8 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
         | LogicalPlan::DropSecret { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::SetSetting { .. }
+        | LogicalPlan::ResetSetting { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::InstallExtension { .. }
         | LogicalPlan::LoadInstalledExtension { .. }
@@ -1936,6 +1955,8 @@ fn walk_scan_filters(
         | LogicalPlan::DropSecret { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
+                | LogicalPlan::SetSetting { .. }
+                | LogicalPlan::ResetSetting { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::InstallExtension { .. }
         | LogicalPlan::LoadInstalledExtension { .. }
@@ -2380,6 +2401,8 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut Vec<String>) {
         | LogicalPlan::DropSecret { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
+                | LogicalPlan::SetSetting { .. }
+                | LogicalPlan::ResetSetting { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::InstallExtension { .. }
         | LogicalPlan::LoadInstalledExtension { .. }
@@ -2851,6 +2874,8 @@ fn walk_scan_projections(
         | LogicalPlan::DropSecret { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
+                | LogicalPlan::SetSetting { .. }
+                | LogicalPlan::ResetSetting { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::InstallExtension { .. }
         | LogicalPlan::LoadInstalledExtension { .. }

@@ -229,6 +229,24 @@ pub enum Statement {
         name: String,
         value: Expr,
     },
+    /// `SET [LOCAL|SESSION|GLOBAL] <setting> = <value>` (wave slt-2): a
+    /// DuckDB setting, from pinkdb's point of view session state like a
+    /// variable — see [`crate::settings`].
+    SetSetting {
+        name: String,
+        value: Expr,
+    },
+    /// `RESET <setting>` / `RESET ALL`.
+    ResetSetting {
+        name: Option<String>,
+    },
+    /// `PRAGMA <name>` / `PRAGMA <name>(<args>)`: DuckDB's pragma statement.
+    /// Which names pinkdb answers (and which it accepts as no-ops) is
+    /// decided at bind time, by the explicit lists in the binder.
+    Pragma {
+        name: String,
+        args: Vec<Expr>,
+    },
     /// `LOAD EXTENSION '<path>'`: load a native loadable extension (ABI v1)
     /// and register its scalar functions. The path is a string literal kept
     /// exactly as written (never canonicalized by the parser).
@@ -656,6 +674,9 @@ pub enum GroupSet {
     Cube(Vec<Expr>),
     /// `GROUPING SETS ((a, b), (a), ())` exactly as written.
     Sets(Vec<Vec<Expr>>),
+    /// `GROUP BY ALL`: one set of every non-aggregate select-list
+    /// expression, in select-list order.
+    All,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -922,11 +943,14 @@ pub struct JoinClause {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderItem {
+    /// `ORDER BY ALL`: every visible column, in select-list order.
+    pub all: bool,
     pub expr: Expr,
-    /// `DESC` (default ASC).
-    pub desc: bool,
-    /// `NULLS FIRST` / `NULLS LAST`; `None` = the default (NULLS LAST, both
-    /// directions, matching DuckDB's `default_null_order`).
+    /// `DESC`/`ASC` as written; `None` means the session's `default_order`
+    /// decides (DuckDB's rule).
+    pub desc: Option<bool>,
+    /// `NULLS FIRST` / `NULLS LAST`; `None` = the session's
+    /// `default_null_order` decides.
     pub nulls_first: Option<bool>,
 }
 
@@ -934,16 +958,20 @@ pub struct OrderItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SortSpec {
     pub desc: bool,
-    /// `false` = NULLS LAST (DuckDB's default for ASC and DESC).
+    /// `false` = NULLS LAST.
     pub nulls_first: bool,
 }
 
 impl SortSpec {
-    /// Resolve an AST order item's explicit/default NULL placement.
-    pub fn of(item: &OrderItem) -> SortSpec {
+    /// Resolve an order item against the session's `default_order` and
+    /// `default_null_order`: an item that names neither inherits both.
+    pub fn of(item: &OrderItem, defaults: &crate::settings::OrderDefaults) -> SortSpec {
+        let desc = item.desc.unwrap_or(defaults.desc);
         SortSpec {
-            desc: item.desc,
-            nulls_first: item.nulls_first.unwrap_or(false),
+            desc,
+            nulls_first: item
+                .nulls_first
+                .unwrap_or_else(|| defaults.null_order.nulls_first(desc)),
         }
     }
 }

@@ -885,6 +885,8 @@ def run_small():
     run_three_part()
     run_catalog()
     run_defaults()
+    run_settings()
+    run_attach()
     run_arrow()
     run_parquet()
 
@@ -1395,6 +1397,159 @@ def run_defaults():
         pink_msg = pink_msg.split(": ", 1)[-1] if pink_msg else None
         check(f"default-refusal {want}", pink_msg == want and duck_msg == want,
               f"\npink={pink_msg!r}\nduck={duck_msg!r}")
+
+
+# ---- slt-2: DuckDB PRAGMAs, settings and the small dialect items ----
+#
+# The cheap wide features the sqllogictest corpus asked for: `PRAGMA` forms,
+# `SET`/`RESET`/`current_setting`, `default_null_order`/`default_order`,
+# `GROUP BY ALL`/`ORDER BY ALL`, `count()` with no argument, `CHAR(n)` as
+# VARCHAR, type names as column names, and a table function's own column name
+# (`range`) usable in an expression.
+SETTINGS_SETUP = """
+CREATE TABLE n (x INTEGER);
+INSERT INTO n VALUES (2), (1), (NULL);
+CREATE TABLE g (a INTEGER, b INTEGER);
+INSERT INTO g VALUES (1, 10), (2, 20), (1, 30);
+"""
+
+SETTINGS_QUERIES = [
+    # PRAGMA and SET reach the same setting; both answer `current_setting`.
+    ("set-threads", "SET threads = 3; SELECT current_setting('threads');", False, False),
+    ("pragma-threads", "PRAGMA threads = 3; SELECT current_setting('threads');", False, False),
+    # DuckDB refuses SET LOCAL/SESSION for global-only settings (threads,
+    # memory_limit); pinkdb takes the scope for every setting, so the probe
+    # uses a setting DuckDB accepts both scopes for.
+    ("set-scopes", "SET SESSION default_order = 'DESC'; SET GLOBAL default_order = 'DESC'; "
+                   "SELECT current_setting('default_order');", False, False),
+    ("reset-threads", "SET threads = 3; RESET threads; SELECT current_setting('threads') > 0;", False, False),
+    ("set-unknown", "SET nosuchsetting = 1;", False, True),
+    ("pragma-unknown", "PRAGMA random_unknown_pragma;", False, True),
+    # A tuning pragma prints nothing and the next statement still runs. (The
+    # bare statement form answers a `Success` row like DuckDB, which the
+    # runner compares as a result, so this probe uses the assignment form.)
+    ("pragma-noop", "PRAGMA force_compression = 'rle'; SELECT 42;", False, False),
+    # NULL order: the session default for ORDER BY, window ORDER BY.
+    ("null-order-default", "SELECT x FROM n ORDER BY x;", True, False),
+    ("null-order-nulls-first", "SET default_null_order = 'NULLS FIRST'; SELECT x FROM n ORDER BY x;", True, False),
+    ("null-order-nulls-first-desc", "SET default_null_order = 'NULLS FIRST'; SELECT x FROM n ORDER BY x DESC;", True, False),
+    ("null-order-sqlite", "SET default_null_order = 'sqlite'; SELECT x FROM n ORDER BY x DESC;", True, False),
+    ("null-order-postgres-desc", "SET default_null_order = 'postgres'; SELECT x FROM n ORDER BY x DESC;", True, False),
+    ("null-order-on-asc-last-on-desc", "SET default_null_order = 'NULLS_FIRST_ON_ASC_LAST_ON_DESC'; SELECT x FROM n ORDER BY x;", True, False),
+    ("null-order-explicit-wins", "SET default_null_order = 'NULLS FIRST'; SELECT x FROM n ORDER BY x NULLS LAST;", True, False),
+    ("null-order-canonical", "SET default_null_order = 'sqlite'; SELECT current_setting('default_null_order');", False, False),
+    ("null-order-bad-value", "SET default_null_order = 'bogus';", False, True),
+    ("default-order-desc", "SET default_order = 'DESC'; SELECT x FROM n ORDER BY x;", True, False),
+    ("default-order-canonical", "SET default_order = 'descending'; SELECT current_setting('default_order');", False, False),
+    ("default-order-bad-value", "SET default_order = 'bogus';", False, True),
+    ("null-order-window", "SET default_null_order = 'NULLS FIRST'; SELECT x, row_number() OVER (ORDER BY x) FROM n ORDER BY 2;", True, False),
+    # ORDER BY ALL / GROUP BY ALL.
+    ("order-by-all", "SELECT a, b FROM g ORDER BY ALL DESC;", True, False),
+    ("group-by-all", "SELECT a, sum(b) FROM g GROUP BY ALL ORDER BY ALL;", True, False),
+    ("group-by-all-expr", "SELECT a + 1 AS k, count(*) FROM g GROUP BY ALL ORDER BY ALL;", True, False),
+    # count() with no argument counts rows.
+    ("count-no-arg", "SELECT count() FROM g;", False, False),
+    ("count-no-arg-group", "SELECT a, count() FROM g GROUP BY a ORDER BY a;", True, False),
+    ("count-no-arg-over", "SELECT count() OVER () FROM g LIMIT 1;", False, False),
+    # CHAR(n)/CHARACTER(n)/BPCHAR are VARCHAR, length ignored.
+    ("char-types",
+     "CREATE TABLE c (a CHAR(1), b CHARACTER(5), c BPCHAR, d VARCHAR(10)); "
+     "INSERT INTO c VALUES ('ab', 'cd', 'ef', 'gh'); "
+     "SELECT a, b, c, d, CAST('xyz' AS CHAR(1)) FROM c;", False, False),
+    ("char-typeof", "CREATE TABLE c2 (a CHAR(1)); SELECT typeof(a) FROM c2;", False, False),
+    # Type names are column names; `range` is the table function's column.
+    ("keyword-columns",
+     "CREATE TABLE k (date DATE, timestamp TIMESTAMP, range INTEGER, text VARCHAR); "
+     "INSERT INTO k VALUES (DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05', 7, 'x'); "
+     "SELECT date, timestamp, range, text FROM k ORDER BY range;", True, False),
+    ("range-column-ctas",
+     "CREATE TABLE r AS SELECT range % 10 AS g FROM range(20); "
+     "SELECT g, count(*) FROM r GROUP BY ALL ORDER BY ALL;", True, False),
+    # PRAGMA rows are DuckDB-shaped: cid counts from 0, `pk` marks a key.
+    # `notnull` needs quoting: DuckDB's parser reads the bare word as NOT NULL.
+    ("pragma-table-info",
+     'SELECT cid, name, type, "notnull", dflt_value, pk FROM pragma_table_info(\'n\');',
+     True, False),
+    ("pragma-table-info-key",
+     "CREATE TABLE pk (id INTEGER PRIMARY KEY, v VARCHAR NOT NULL); "
+     'SELECT name, "notnull", dflt_value, pk FROM pragma_table_info(\'pk\');',
+     True, False),
+]
+
+# ---- slt-2: ATTACH a plain (non-lake) database ----
+#
+# Each engine attaches its own scratch file (the two cannot share one), and a
+# fresh session re-attaches it, so the probes check DuckDB's ATTACH
+# semantics: `:memory:`, a file written at DETACH and read back, READ_ONLY,
+# and the refusal of a DuckDB-format file.
+def run_attach():
+    print("== ATTACH a plain database battery ==")
+    dirs = (
+        tempfile.mkdtemp(prefix="duckdiff_attach_pink_"),
+        tempfile.mkdtemp(prefix="duckdiff_attach_duck_"),
+    )
+
+    def probe(engine, label, sql):
+        which = 0 if engine == "pink" else 1
+        text = sql.replace("{path}", os.path.join(dirs[which], label + ".db"))
+        return pink_query("", text) if engine == "pink" else duck_query("", text)
+
+    def same(label, sql, ordered=True):
+        got, d = probe("pink", label, sql), probe("duck", label, sql)
+        if got[0] == "error":
+            check(label, False, f"pinkdb error: {got[1]}")
+            return
+        if d[0] == "error":
+            check(label, False, f"duckdb error: {d[1]}")
+            return
+        _, types, prows = got
+        prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
+        ok = rows_equal(prows_n, d[1], ordered)
+        check(label, ok, "" if ok else f"\npink={prows_n}\nduck={d[1]}")
+
+    def both_error(label, sql):
+        got, d = probe("pink", label, sql), probe("duck", label, sql)
+        ok = got[0] == "error" and d[0] == "error"
+        check(label, ok, "" if ok else f"\npink={got}\nduck={d}")
+
+    same("attach-memory-round-trip",
+         "ATTACH ':memory:' AS m; CREATE TABLE m.t (a INTEGER, b VARCHAR); "
+         "INSERT INTO m.t VALUES (7, 'x'); SELECT a, b FROM m.t;")
+    same("attach-memory-use",
+         "ATTACH ':memory:' AS m; CREATE TABLE m.t (a INTEGER); INSERT INTO m.t VALUES (7); "
+         "USE m; SELECT a FROM t;")
+    same("attach-memory-listed",
+         "ATTACH ':memory:' AS m; SELECT database_name FROM duckdb_databases() "
+         "WHERE database_name = 'm';")
+    both_error("attach-detach-removes",
+               "ATTACH ':memory:' AS m; CREATE TABLE m.t (a INTEGER); DETACH m; "
+               "SELECT a FROM m.t;")
+    both_error("attach-memory-read-only-refused",
+               "ATTACH ':memory:' AS r (READ_ONLY);")
+
+    # A plain database file is not a second store pinkdb can own (see
+    # docs/sql-conformance.md); DuckDB attaches it, so this is pinkdb-only.
+    plain = os.path.join(dirs[0], "plain.db")
+    got = pink_query("", f"ATTACH ':memory:' AS ok; ATTACH '{plain}' AS f; SELECT 1;")
+    check("attach-file-refused",
+          got[0] == "error" and "is not a lake" in got[1] and ":memory:" in got[1],
+          f"pinkdb answered {got}")
+
+    # A file DuckDB wrote is refused by its header, never opened as pinkdb.
+    duck_file = os.path.join(dirs[1], "duckformat.db")
+    duck_query("", f"ATTACH '{duck_file}' AS d; CREATE TABLE d.t (a INTEGER);")
+    got = pink_query("", f"ATTACH '{duck_file}' AS d; SELECT 42;")
+    check("attach-refuses-duckdb-file",
+          got[0] == "error" and "DuckDB database file" in got[1],
+          f"pinkdb answered {got}")
+
+
+
+
+def run_settings():
+    print("== settings and dialect battery (slt-2) ==")
+    for label, sql, ordered, expect_error in SETTINGS_QUERIES:
+        run_case(label, sql, ordered, expect_error, SETTINGS_SETUP, SETTINGS_SETUP)
 
 
 # ---- unaliased expression names ----

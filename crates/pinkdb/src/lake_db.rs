@@ -84,6 +84,15 @@ impl DbStorage {
     }
 }
 
+/// What an `ATTACH` opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachSource {
+    /// A lake: the `lake:` / `ducklake:` forms and `TYPE LAKE`.
+    Lake(LakeSpec),
+    /// `ATTACH ':memory:'`: a database that lives in this store only.
+    Memory,
+}
+
 /// A lake database's location, as the statement that created or attached it
 /// gave it (persisted in the checkpoint footer).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1025,6 +1034,42 @@ impl PinkDb {
         Ok(())
     }
 
+    /// `ATTACH ':memory:'` (slt-2): install a database that exists only in
+    /// this store, and remember it so `DETACH` may drop it (a plain local
+    /// database is otherwise only removed by `DROP DATABASE`).
+    pub(crate) fn attach_memory_database(&mut self, name: &str) -> Result<()> {
+        let key = Self::db_key(name);
+        if self.databases.contains_key(&key) {
+            // A replayed ATTACH: the checkpoint already holds the rows.
+            if self.replaying {
+                self.attached_memory.insert(key);
+                return Ok(());
+            }
+            return Err(PinkDbError::Catalog(format!(
+                "database \"{name}\" already exists"
+            )));
+        }
+        self.create_database(name)?;
+        self.attached_memory.insert(key);
+        Ok(())
+    }
+
+    /// `DETACH name` for a database attached `:memory:`: forget it.
+    pub(crate) fn detach_attached_database(&mut self, name: &str) -> Result<bool> {
+        let key = Self::db_key(name);
+        if !self.attached_memory.contains(&key) {
+            return Ok(false);
+        }
+        if self.databases.len() == 1 {
+            return Err(PinkDbError::Catalog(format!(
+                "cannot detach the last database \"{name}\""
+            )));
+        }
+        self.attached_memory.remove(&key);
+        self.databases.remove(&key);
+        Ok(true)
+    }
+
     /// `DETACH name`: forget a lake database. The lake keeps its data.
     pub(crate) fn detach_lake_database(&mut self, name: &str, if_exists: bool) -> Result<bool> {
         let key = name.to_ascii_lowercase();
@@ -1761,6 +1806,29 @@ fn unavailable_slot(spec: &LakeSpec, reason: String) -> Arc<LakeSlot> {
 
 fn unavailable_error(db: &str, reason: &str) -> PinkDbError {
     PinkDbError::Catalog(format!("lake database \"{db}\" is unavailable: {reason}"))
+}
+
+/// Refuse a DuckDB database file by its header (DuckDB's version bytes, then
+/// `DUCK` at offset 8) instead of failing later with a bad-magic error.
+pub(crate) fn refuse_duckdb_file(path: &std::path::Path) -> Result<()> {
+    use std::io::Read;
+    // Nothing to inspect: the caller names the file as unsupported itself.
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut head = [0u8; 12];
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        PinkDbError::Catalog(format!("ATTACH: cannot open \"{}\": {e}", path.display()))
+    })?;
+    let read = file.read(&mut head).unwrap_or(0);
+    if read >= 12 && &head[8..12] == b"DUCK" {
+        return Err(PinkDbError::Catalog(format!(
+            "ATTACH: \"{}\" is a DuckDB database file; pinkdb cannot read DuckDB files \
+             (EXPORT the data from DuckDB as CSV or Parquet and read that instead)",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

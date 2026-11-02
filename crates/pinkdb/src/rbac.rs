@@ -1845,6 +1845,11 @@ fn quote_string(value: &str) -> String {
 /// kept so replay produces the same lake attachment. The declared data-file
 /// format rides in the location's prefix (`ducklake:` declares Parquet,
 /// `lake:` the build default), so replay keeps it too.
+/// The SQL an `ATTACH ':memory:'` logged, so replay attaches it the same way.
+fn render_attach_memory(name: &str) -> String {
+    format!("ATTACH ':memory:' AS {}", quote_ident(name))
+}
+
 fn render_attach(name: &str, spec: &crate::lake_db::LakeSpec) -> String {
     let Some(catalog) = &spec.catalog else {
         return format!("ATTACH {} AS {}", quote_string(name), quote_ident(name));
@@ -1892,7 +1897,10 @@ pub(crate) fn wal_statement_text(plan: &LogicalPlan, sql: &str) -> String {
         // A password given in an attach string is moved into the record's
         // secret section; the logged ATTACH is rebuilt from the redacted spec
         // so replay attaches the same lake without the credential in text.
-        LogicalPlan::Attach { name, spec, .. } => render_attach(name, spec),
+        LogicalPlan::Attach { name, source, .. } => match source {
+            crate::lake_db::AttachSource::Lake(spec) => render_attach(name, spec),
+            crate::lake_db::AttachSource::Memory => render_attach_memory(name),
+        },
         LogicalPlan::CreateSecret { secret, .. } => format!(
             "-- CREATE SECRET {} (values in the record section)",
             quote_ident(secret.name())
@@ -2329,7 +2337,7 @@ mod tests {
         use crate::plan::LogicalPlan;
         let plan = LogicalPlan::Attach {
             name: "warehouse".to_string(),
-            spec: LakeSpec {
+            source: crate::lake_db::AttachSource::Lake(LakeSpec {
                 catalog: Some("postgres://user@127.0.0.1:55433/lake".to_string()),
                 data: Some("s3://bucket/prefix/".to_string()),
                 read_only: true,
@@ -2337,7 +2345,7 @@ mod tests {
                 data_inlining_row_limit: None,
                 create_if_not_exists: false,
                 data_file_format: Some("parquet".to_string()),
-            },
+            }),
             secret: None,
         };
         let text = wal_statement_text(

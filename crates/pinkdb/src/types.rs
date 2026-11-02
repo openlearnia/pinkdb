@@ -298,7 +298,11 @@ impl DataType {
             "INTEGER" | "INT" => Some(DataType::Integer),
             "BIGINT" | "LONG" => Some(DataType::Bigint),
             "DOUBLE" | "FLOAT" | "REAL" => Some(DataType::Double),
-            "VARCHAR" | "TEXT" | "STRING" => Some(DataType::Varchar),
+            // DuckDB's CHAR/CHARACTER/BPCHAR are VARCHAR with the length
+            // ignored (measured: `char(1)` and `char(0)` both give VARCHAR).
+            "VARCHAR" | "TEXT" | "STRING" | "CHAR" | "CHARACTER" | "BPCHAR" => {
+                Some(DataType::Varchar)
+            }
             "DATE" => Some(DataType::Date),
             "TIMESTAMP" | "DATETIME" => Some(DataType::Timestamp),
             "DECIMAL" | "NUMERIC" | "DEC" => Some(DataType::Decimal {
@@ -313,9 +317,9 @@ impl DataType {
     }
 
     /// Parse a type name with optional parameters: `DECIMAL(p,s)`,
-    /// `DECIMAL(p)`, `NUMERIC(p,s)`, or a bare name (see [`Self::from_sql`]).
-    /// Parameterized names are only meaningful for DECIMAL; a parameter list
-    /// on any other type is rejected (`None`).
+    /// `DECIMAL(p)`, `NUMERIC(p,s)`, a character type's ignored length, or a
+    /// bare name (see [`Self::from_sql`]). A parameter list on any other type
+    /// is rejected (`None`).
     pub fn from_sql_params(name: &str, params: &[i64]) -> Option<DataType> {
         if params.is_empty() {
             return Self::from_sql(name);
@@ -333,6 +337,11 @@ impl DataType {
                 }
                 _ => None,
             },
+            // A length on a character type is display-only in DuckDB, so the
+            // parameter list changes nothing (and is not checked).
+            "CHAR" | "CHARACTER" | "BPCHAR" | "VARCHAR" | "TEXT" | "STRING" => {
+                Some(DataType::Varchar)
+            }
             _ => None,
         }
     }

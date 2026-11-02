@@ -9,11 +9,16 @@ Pass rate of pinkdb on DuckDB's own sqllogictest corpus, measured with
 - Corpus: `~/Desktop/projects/ducklake-vortex/ducklake/duckdb/test/sql`
 - Run: 2026-11-02, release build (`--jobs 8`), `.test` only (`.test_slow` is
   behind `--slow`)
-- 4,233 files: **344 pass**, 3,569 fail, 318 skip, 0 crash, 2 timeout.
-  File pass rate **8.1%** (8.8% of files that ran); record pass rate **76.3%**
+- 4,233 files: **444 pass**, 3,468 fail, 319 skip, 0 crash, 2 timeout.
+  File pass rate **10.5%** (11.3% of files that ran); record pass rate **83.6%**
   of non-skipped records.
-- Wall time: **62.6 s** (74.3 s including process startup/teardown).
-- Previous baseline: 301 pass. **43 files newly pass, 0 regressions.**
+- Wall time: **62.8 s**.
+- Previous baseline: 344 pass. **100 files newly pass, 0 regressions** — see
+  the slt-2 batch in `docs/sql-conformance.md`. Two files that only passed
+  through `ATTACH '<path>'` (`attach/attach_issue16122.test`,
+  `parallelism/interquery/concurrent_checkpoint_insert.test`) fail again now
+  that a plain database file is refused; they are listed there as expected
+  failures.
 
 `bench/sqllogictest/baseline.json` stores the per-file status and failure
 reason for exactly this run. `pinkdb-slt check` uses it to reject regressions:
@@ -48,105 +53,103 @@ reason. Files requiring a DuckDB extension or build feature pinkdb does not
 have (`autocomplete`, `icu`, `httpfs`, `tpch`, `block_size`, ...) are
 skipped for the same reason.
 
-## Results
+Overall: 4233 files, 446 pass, 3466 fail, 319 skip, 0 crash, 2 timeout; 10.5% of files pass (11.4% of files that ran).
 
-Overall: 4233 files, 344 pass, 3569 fail, 318 skip, 0 crash, 2 timeout; 8.1% of files pass (8.8% of files that ran).
-
-Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). Wall time: 62.6 s.
+Records: 22326 pass, 3458 fail, 1237 skip (86.6% of non-skipped records pass). Wall time: 62.8 s.
 
 ## Pass rate per area
 
 | area | files | pass | fail | skip | crash | timeout | files pass | run files pass | records pass | records fail | record pass |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| aggregate | 153 | 8 | 141 | 4 | 0 | 0 | 5.2% | 5.4% | 338 | 141 | 70.6% |
-| alter | 124 | 21 | 103 | 0 | 0 | 0 | 16.9% | 16.9% | 429 | 103 | 80.6% |
-| attach | 93 | 1 | 83 | 9 | 0 | 0 | 1.1% | 1.2% | 117 | 83 | 58.5% |
-| binder | 40 | 3 | 36 | 1 | 0 | 0 | 7.5% | 7.7% | 75 | 36 | 67.6% |
+| aggregate | 153 | 15 | 134 | 4 | 0 | 0 | 9.8% | 10.1% | 455 | 134 | 77.2% |
+| alter | 124 | 21 | 103 | 0 | 0 | 0 | 16.9% | 16.9% | 450 | 103 | 81.4% |
+| attach | 93 | 4 | 80 | 9 | 0 | 0 | 4.3% | 4.8% | 237 | 80 | 74.8% |
+| binder | 40 | 3 | 36 | 1 | 0 | 0 | 7.5% | 7.7% | 77 | 36 | 68.1% |
 | cast | 33 | 2 | 31 | 0 | 0 | 0 | 6.1% | 6.1% | 37 | 31 | 54.4% |
-| catalog | 160 | 13 | 145 | 1 | 0 | 1 | 8.1% | 8.2% | 397 | 145 | 73.2% |
-| collate | 28 | 0 | 23 | 5 | 0 | 0 | 0.0% | 0.0% | 21 | 23 | 47.7% |
+| catalog | 160 | 13 | 145 | 1 | 0 | 1 | 8.1% | 8.2% | 481 | 145 | 76.8% |
+| collate | 28 | 2 | 21 | 5 | 0 | 0 | 7.1% | 8.7% | 52 | 21 | 71.2% |
 | conjunction | 2 | 2 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 25 | 0 | 100.0% |
 | connect | 4 | 0 | 2 | 2 | 0 | 0 | 0.0% | 0.0% | 0 | 2 | 0.0% |
-| constraints | 62 | 8 | 54 | 0 | 0 | 0 | 12.9% | 12.9% | 174 | 54 | 76.3% |
-| copy | 532 | 36 | 472 | 24 | 0 | 0 | 6.8% | 7.1% | 586 | 472 | 55.4% |
-| copy_database | 10 | 1 | 9 | 0 | 0 | 0 | 10.0% | 10.0% | 0 | 9 | 0.0% |
+| constraints | 62 | 8 | 54 | 0 | 0 | 0 | 12.9% | 12.9% | 188 | 54 | 77.7% |
+| copy | 532 | 40 | 468 | 24 | 0 | 0 | 7.5% | 7.9% | 698 | 468 | 59.9% |
+| copy_database | 10 | 1 | 9 | 0 | 0 | 0 | 10.0% | 10.0% | 6 | 9 | 40.0% |
 | create | 14 | 0 | 13 | 1 | 0 | 0 | 0.0% | 0.0% | 25 | 13 | 65.8% |
-| cte | 76 | 6 | 68 | 2 | 0 | 0 | 7.9% | 8.1% | 115 | 68 | 62.8% |
-| delete | 20 | 6 | 13 | 1 | 0 | 0 | 30.0% | 31.6% | 201 | 13 | 93.9% |
-| detailed_profiler | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| cte | 76 | 6 | 67 | 3 | 0 | 0 | 7.9% | 8.2% | 130 | 67 | 66.0% |
+| delete | 20 | 7 | 12 | 1 | 0 | 0 | 35.0% | 36.8% | 221 | 12 | 94.8% |
+| detailed_profiler | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 13 | 1 | 92.9% |
 | error | 17 | 1 | 16 | 0 | 0 | 0 | 5.9% | 5.9% | 11 | 16 | 40.7% |
-| explain | 8 | 0 | 8 | 0 | 0 | 0 | 0.0% | 0.0% | 14 | 8 | 63.6% |
-| export | 24 | 1 | 22 | 1 | 0 | 0 | 4.2% | 4.3% | 29 | 22 | 56.9% |
+| explain | 8 | 0 | 8 | 0 | 0 | 0 | 0.0% | 0.0% | 18 | 8 | 69.2% |
+| export | 24 | 1 | 22 | 1 | 0 | 0 | 4.2% | 4.3% | 32 | 22 | 59.3% |
 | extensions | 13 | 0 | 7 | 6 | 0 | 0 | 0.0% | 0.0% | 6 | 7 | 46.2% |
-| filter | 16 | 3 | 12 | 1 | 0 | 0 | 18.8% | 20.0% | 106 | 12 | 89.8% |
-| function | 379 | 20 | 315 | 44 | 0 | 0 | 5.3% | 6.0% | 2093 | 315 | 86.9% |
+| filter | 16 | 3 | 12 | 1 | 0 | 0 | 18.8% | 20.0% | 119 | 12 | 90.8% |
+| function | 379 | 21 | 314 | 44 | 0 | 0 | 5.5% | 6.3% | 2187 | 314 | 87.4% |
 | generated_columns | 38 | 1 | 37 | 0 | 0 | 0 | 2.6% | 2.6% | 32 | 37 | 46.4% |
-| index | 120 | 16 | 103 | 1 | 0 | 0 | 13.3% | 13.4% | 545 | 103 | 84.1% |
-| insert | 11 | 6 | 5 | 0 | 0 | 0 | 54.5% | 54.5% | 95 | 5 | 95.0% |
-| join | 133 | 21 | 110 | 2 | 0 | 0 | 15.8% | 16.0% | 565 | 109 | 83.8% |
-| json | 106 | 4 | 101 | 1 | 0 | 0 | 3.8% | 3.8% | 154 | 100 | 60.6% |
+| index | 120 | 17 | 102 | 1 | 0 | 0 | 14.2% | 14.3% | 637 | 102 | 86.2% |
+| insert | 11 | 7 | 4 | 0 | 0 | 0 | 63.6% | 63.6% | 96 | 4 | 96.0% |
+| join | 133 | 28 | 103 | 2 | 0 | 0 | 21.1% | 21.4% | 754 | 102 | 88.1% |
+| json | 106 | 4 | 101 | 1 | 0 | 0 | 3.8% | 3.8% | 173 | 100 | 63.4% |
 | keywords | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 2 | 66.7% |
-| limit | 5 | 1 | 3 | 1 | 0 | 0 | 20.0% | 25.0% | 12 | 3 | 80.0% |
-| logging | 15 | 0 | 12 | 3 | 0 | 0 | 0.0% | 0.0% | 0 | 12 | 0.0% |
-| match_recognize | 29 | 0 | 29 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 29 | 0.0% |
-| merge | 24 | 1 | 23 | 0 | 0 | 0 | 4.2% | 4.2% | 82 | 23 | 78.1% |
+| limit | 5 | 1 | 3 | 1 | 0 | 0 | 20.0% | 25.0% | 14 | 3 | 82.4% |
+| logging | 15 | 0 | 12 | 3 | 0 | 0 | 0.0% | 0.0% | 3 | 12 | 20.0% |
+| match_recognize | 29 | 0 | 29 | 0 | 0 | 0 | 0.0% | 0.0% | 98 | 29 | 77.2% |
+| merge | 24 | 1 | 23 | 0 | 0 | 0 | 4.2% | 4.2% | 87 | 23 | 79.1% |
 | multi_file | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer | 113 | 6 | 101 | 5 | 0 | 1 | 5.3% | 5.6% | 192 | 102 | 65.3% |
-| order | 25 | 2 | 23 | 0 | 0 | 0 | 8.0% | 8.0% | 568 | 23 | 96.1% |
+| optimizer | 113 | 9 | 98 | 5 | 0 | 1 | 8.0% | 8.3% | 373 | 99 | 79.0% |
+| order | 25 | 4 | 21 | 0 | 0 | 0 | 16.0% | 16.0% | 594 | 21 | 96.6% |
 | ordinality | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 2 | 50.0% |
 | overflow | 7 | 0 | 7 | 0 | 0 | 0 | 0.0% | 0.0% | 10 | 7 | 58.8% |
-| parallelism | 16 | 2 | 13 | 1 | 0 | 0 | 12.5% | 13.3% | 542 | 13 | 97.7% |
-| parser | 38 | 2 | 36 | 0 | 0 | 0 | 5.3% | 5.3% | 48 | 35 | 57.8% |
-| peg_parser | 85 | 3 | 27 | 55 | 0 | 0 | 3.5% | 10.0% | 22 | 27 | 44.9% |
+| parallelism | 16 | 3 | 12 | 1 | 0 | 0 | 18.8% | 20.0% | 564 | 12 | 97.9% |
+| parser | 38 | 2 | 36 | 0 | 0 | 0 | 5.3% | 5.3% | 49 | 35 | 58.3% |
+| peg_parser | 85 | 3 | 27 | 55 | 0 | 0 | 3.5% | 10.0% | 31 | 27 | 53.4% |
 | pg_catalog | 17 | 0 | 17 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 17 | 15.0% |
 | pivot | 33 | 1 | 32 | 0 | 0 | 0 | 3.0% | 3.0% | 86 | 32 | 72.9% |
-| pragma | 49 | 0 | 48 | 1 | 0 | 0 | 0.0% | 0.0% | 34 | 48 | 41.5% |
-| prepared | 39 | 0 | 39 | 0 | 0 | 0 | 0.0% | 0.0% | 11 | 39 | 22.0% |
-| profiling | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 2 | 0.0% |
+| pragma | 49 | 0 | 48 | 1 | 0 | 0 | 0.0% | 0.0% | 140 | 48 | 74.5% |
+| prepared | 39 | 0 | 39 | 0 | 0 | 0 | 0.0% | 0.0% | 15 | 39 | 27.8% |
+| profiling | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 8 | 2 | 80.0% |
 | projection | 15 | 2 | 13 | 0 | 0 | 0 | 13.3% | 13.3% | 89 | 13 | 87.3% |
 | returning | 7 | 2 | 5 | 0 | 0 | 0 | 28.6% | 28.6% | 57 | 5 | 91.9% |
-| sample | 11 | 5 | 4 | 2 | 0 | 0 | 45.5% | 55.6% | 0 | 4 | 0.0% |
-| secrets | 10 | 0 | 9 | 1 | 0 | 0 | 0.0% | 0.0% | 3 | 9 | 25.0% |
-| select | 9 | 2 | 7 | 0 | 0 | 0 | 22.2% | 22.2% | 19 | 7 | 73.1% |
-| setops | 22 | 9 | 13 | 0 | 0 | 0 | 40.9% | 40.9% | 115 | 13 | 89.8% |
-| settings | 42 | 0 | 39 | 3 | 0 | 0 | 0.0% | 0.0% | 24 | 39 | 38.1% |
-| show_select | 12 | 1 | 10 | 1 | 0 | 0 | 8.3% | 9.1% | 30 | 10 | 75.0% |
-| storage | 496 | 44 | 354 | 98 | 0 | 0 | 8.9% | 11.1% | 1102 | 352 | 75.8% |
+| sample | 11 | 5 | 4 | 2 | 0 | 0 | 45.5% | 55.6% | 4 | 4 | 50.0% |
+| secrets | 10 | 0 | 9 | 1 | 0 | 0 | 0.0% | 0.0% | 4 | 9 | 30.8% |
+| select | 9 | 3 | 6 | 0 | 0 | 0 | 33.3% | 33.3% | 31 | 6 | 83.8% |
+| setops | 22 | 10 | 12 | 0 | 0 | 0 | 45.5% | 45.5% | 127 | 12 | 91.4% |
+| settings | 42 | 2 | 37 | 3 | 0 | 0 | 4.8% | 5.1% | 74 | 37 | 66.7% |
+| show_select | 12 | 1 | 10 | 1 | 0 | 0 | 8.3% | 9.1% | 31 | 10 | 75.6% |
+| storage | 496 | 91 | 307 | 98 | 0 | 0 | 18.3% | 22.9% | 2345 | 305 | 88.5% |
 | storage_version | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 2 | 0.0% |
-| subquery | 89 | 15 | 73 | 1 | 0 | 0 | 16.9% | 17.0% | 271 | 73 | 78.8% |
-| table_function | 54 | 3 | 49 | 2 | 0 | 0 | 5.6% | 5.8% | 58 | 49 | 54.2% |
+| subquery | 89 | 23 | 65 | 1 | 0 | 0 | 25.8% | 26.1% | 428 | 65 | 86.8% |
+| table_function | 54 | 4 | 48 | 2 | 0 | 0 | 7.4% | 7.7% | 70 | 48 | 59.3% |
 | test_waitfor.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | timezone | 18 | 0 | 1 | 17 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| topn | 18 | 3 | 15 | 0 | 0 | 0 | 16.7% | 16.7% | 39 | 15 | 72.2% |
+| topn | 18 | 6 | 12 | 0 | 0 | 0 | 33.3% | 33.3% | 107 | 12 | 89.9% |
 | tpcds | 4 | 0 | 0 | 4 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | tpch | 3 | 0 | 0 | 3 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
-| transactions | 75 | 16 | 59 | 0 | 0 | 0 | 21.3% | 21.3% | 561 | 59 | 90.5% |
-| trigger | 29 | 0 | 29 | 0 | 0 | 0 | 0.0% | 0.0% | 57 | 29 | 66.3% |
-| types | 440 | 12 | 418 | 10 | 0 | 0 | 2.7% | 2.8% | 514 | 418 | 55.2% |
-| update | 37 | 16 | 21 | 0 | 0 | 0 | 43.2% | 43.2% | 399 | 21 | 95.0% |
-| upsert | 46 | 10 | 36 | 0 | 0 | 0 | 21.7% | 21.7% | 134 | 32 | 80.7% |
+| transactions | 75 | 16 | 59 | 0 | 0 | 0 | 21.3% | 21.3% | 570 | 59 | 90.6% |
+| trigger | 29 | 0 | 29 | 0 | 0 | 0 | 0.0% | 0.0% | 60 | 29 | 67.4% |
+| types | 440 | 15 | 415 | 10 | 0 | 0 | 3.4% | 3.5% | 579 | 415 | 58.2% |
+| update | 37 | 16 | 21 | 0 | 0 | 0 | 43.2% | 43.2% | 3144 | 21 | 99.3% |
+| upsert | 46 | 10 | 36 | 0 | 0 | 0 | 21.7% | 21.7% | 139 | 32 | 81.3% |
 | vacuum | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 2 | 33.3% |
 | variables | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 11 | 2 | 84.6% |
 | variant | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 2 | 50.0% |
 | vector_types | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 2 | 0.0% |
-| window | 66 | 6 | 57 | 3 | 0 | 0 | 9.1% | 9.5% | 149 | 57 | 72.3% |
+| window | 66 | 7 | 56 | 3 | 0 | 0 | 10.6% | 11.1% | 581 | 56 | 91.2% |
 
 ### Second-level areas
 
 | area | files | pass | fail | skip | crash | timeout | files pass | run files pass | records pass | records fail | record pass |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| aggregate/aggregate_state_export | 26 | 0 | 25 | 1 | 0 | 0 | 0.0% | 0.0% | 20 | 25 | 44.4% |
-| aggregate/aggregates | 77 | 1 | 74 | 2 | 0 | 0 | 1.3% | 1.3% | 162 | 74 | 68.6% |
-| aggregate/distinct | 20 | 3 | 17 | 0 | 0 | 0 | 15.0% | 15.0% | 75 | 17 | 81.5% |
-| aggregate/group | 12 | 2 | 10 | 0 | 0 | 0 | 16.7% | 16.7% | 41 | 10 | 80.4% |
-| aggregate/grouping_sets | 7 | 1 | 6 | 0 | 0 | 0 | 14.3% | 14.3% | 21 | 6 | 77.8% |
-| aggregate/having | 4 | 1 | 3 | 0 | 0 | 0 | 25.0% | 25.0% | 13 | 3 | 81.2% |
-| aggregate/qualify | 4 | 0 | 4 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 4 | 42.9% |
+| aggregate/aggregate_state_export | 26 | 0 | 25 | 1 | 0 | 0 | 0.0% | 0.0% | 28 | 25 | 52.8% |
+| aggregate/aggregates | 77 | 4 | 71 | 2 | 0 | 0 | 5.2% | 5.3% | 192 | 71 | 73.0% |
+| aggregate/distinct | 20 | 4 | 16 | 0 | 0 | 0 | 20.0% | 20.0% | 92 | 16 | 85.2% |
+| aggregate/group | 12 | 3 | 9 | 0 | 0 | 0 | 25.0% | 25.0% | 48 | 9 | 84.2% |
+| aggregate/grouping_sets | 7 | 2 | 5 | 0 | 0 | 0 | 28.6% | 28.6% | 28 | 5 | 84.8% |
+| aggregate/having | 4 | 1 | 3 | 0 | 0 | 0 | 25.0% | 25.0% | 16 | 3 | 84.2% |
+| aggregate/qualify | 4 | 1 | 3 | 0 | 0 | 0 | 25.0% | 25.0% | 48 | 3 | 94.1% |
 | aggregate/quantile_fun.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | aggregate/variant | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 2 | 60.0% |
-| alter/add_col | 16 | 7 | 9 | 0 | 0 | 0 | 43.8% | 43.8% | 72 | 9 | 88.9% |
-| alter/add_pk | 19 | 0 | 19 | 0 | 0 | 0 | 0.0% | 0.0% | 31 | 19 | 62.0% |
-| alter/add_unique | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 2 | 50.0% |
+| alter/add_col | 16 | 7 | 9 | 0 | 0 | 0 | 43.8% | 43.8% | 73 | 9 | 89.0% |
+| alter/add_pk | 19 | 0 | 19 | 0 | 0 | 0 | 0.0% | 0.0% | 37 | 19 | 66.1% |
+| alter/add_unique | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 2 | 75.0% |
 | alter/alter_col | 6 | 0 | 6 | 0 | 0 | 0 | 0.0% | 0.0% | 25 | 6 | 80.6% |
 | alter/alter_table_set_partitioned_by.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | alter/alter_table_set_sorted_by.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
@@ -159,27 +162,27 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | alter/map | 3 | 0 | 3 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 3 | 0.0% |
 | alter/rename_col | 8 | 2 | 6 | 0 | 0 | 0 | 25.0% | 25.0% | 17 | 6 | 73.9% |
 | alter/rename_schema | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| alter/rename_table | 14 | 5 | 9 | 0 | 0 | 0 | 35.7% | 35.7% | 155 | 9 | 94.5% |
+| alter/rename_table | 14 | 5 | 9 | 0 | 0 | 0 | 35.7% | 35.7% | 162 | 9 | 94.7% |
 | alter/rename_view | 5 | 1 | 4 | 0 | 0 | 0 | 20.0% | 20.0% | 22 | 4 | 84.6% |
 | alter/struct | 7 | 0 | 7 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 7 | 0.0% |
-| alter/test_alter_database_rename.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| alter/test_alter_database_rename.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | alter/test_alter_if_exists.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_all_types.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_catalog_error_early_out.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | attach/attach_checkpoint_on_detach.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | attach/attach_checkpoint_vacuum.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_copy.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_create_index.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_cross_catalog.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_copy.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| attach/attach_create_index.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 3 | 0 | 100.0% |
+| attach/attach_cross_catalog.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | attach/attach_custom_block_size.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_database_options.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_database_size.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_dbname_quotes.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_default_database_case.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_dbname_quotes.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
+| attach/attach_default_database_case.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | attach/attach_default_table.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_defaults.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_defaults.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | attach/attach_dependencies.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
-| attach/attach_did_you_mean.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_did_you_mean.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | attach/attach_different_alias.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_duckdb_type.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_enable_external_access.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
@@ -188,11 +191,11 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | attach/attach_encryption_downgrade_prevention.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | attach/attach_encryption_fallback_readonly.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 0 | 0 | 0.0% |
 | attach/attach_enums.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_export_import.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_export_import.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 8 | 1 | 88.9% |
 | attach/attach_expr.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| attach/attach_external_access.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| attach/attach_external_access.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | attach/attach_filepath_roundtrip.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 101 | 1 | 99.0% |
-| attach/attach_foreign_key.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_foreign_key.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | attach/attach_foreign_key_external_catalog.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_fsspec.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_hidden.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
@@ -202,15 +205,15 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | attach/attach_if_not_exists.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_if_not_exists_detach.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_index.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_issue16122.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_issue7567.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_issue7711.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_issue16122.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| attach/attach_issue7567.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
+| attach/attach_issue7711.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | attach/attach_issue_21491.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_issue_7660.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_issue_7660.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | attach/attach_lambda_view.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_macros.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_macros.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 7 | 0 | 100.0% |
 | attach/attach_modify_multiple_databases.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_multi_identifiers.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_multi_identifiers.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 9 | 1 | 90.0% |
 | attach/attach_nested_types.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_new_compression.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_no_wal_writes_mode.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
@@ -220,41 +223,41 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | attach/attach_pragma_storage_info.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_prefetch_header.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_read_only.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_read_only_transaction.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_replay_with_no_wal_writes.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| attach/attach_read_only_transaction.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| attach/attach_replay_with_no_wal_writes.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | attach/attach_reserved.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_row_group_size.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_row_group_size_decreasing.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_same_db.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_schema.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_schema.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | attach/attach_sequence.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_serialize_dependency.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| attach/attach_show_all_tables.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_show_table.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_show_all_tables.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
+| attach/attach_show_table.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 14 | 1 | 93.3% |
 | attach/attach_storage_version.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/attach_table_constraints.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_table_ddl.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_table_info.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_table_ddl.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 12 | 1 | 92.3% |
+| attach/attach_table_info.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
 | attach/attach_to_external_resource.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | attach/attach_transactionality.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | attach/attach_use_rollback.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | attach/attach_view_search_path.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_views.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_views.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | attach/attach_wal_alter.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/attach_wal_alter_sequence.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/detach_keyword.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/detach_manager_default_database.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/attach_wal_alter_sequence.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| attach/detach_keyword.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 2 | 0 | 100.0% |
+| attach/detach_manager_default_database.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | attach/external_resource_attach_failure.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/external_resource_discovery.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/external_resource_lifecycle.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | attach/external_resource_logging.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | attach/external_resource_option_collision.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/external_resource_statements.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/in_memory_attach.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/in_memory_attach.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | attach/reattach_schema.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/remote_file_concurrently.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
-| attach/searchpath_fallback.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| attach/show_databases.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| attach/searchpath_fallback.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
+| attach/show_databases.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | attach/show_schemas.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | attach/system_catalog.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | binder/alias_error_10057.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
@@ -285,13 +288,13 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | binder/string_literal_binding.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | binder/table_alias_single_quotes.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | binder/table_view_alias.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
-| binder/test_alias.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| binder/test_alias.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | binder/test_alias_map_in_subquery.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | binder/test_case_insensitive_binding.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
 | binder/test_duplicate_in_set_operation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | binder/test_function_chaining_alias.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | binder/test_having_alias.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| binder/test_implicit_struct_pack.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| binder/test_implicit_struct_pack.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | binder/test_in_with_collate.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
 | binder/test_null_type_propagation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | binder/test_postitional_ref_order_binding.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
@@ -334,7 +337,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | catalog/case_insensitive_binder.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 14 | 0 | 100.0% |
 | catalog/case_insensitive_caps.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | catalog/case_insensitive_cte.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 2 | 0 | 100.0% |
-| catalog/case_insensitive_operations.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| catalog/case_insensitive_operations.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 19 | 1 | 95.0% |
 | catalog/case_insensitive_using.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | catalog/comment_on.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | catalog/comment_on_column.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
@@ -342,49 +345,49 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | catalog/comment_on_dependencies.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | catalog/comment_on_extended.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | catalog/comment_on_pg_description.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| catalog/comment_on_wal.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| catalog/comment_on_wal.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | catalog/dependencies | 24 | 5 | 19 | 0 | 0 | 0 | 20.8% | 20.8% | 56 | 19 | 74.7% |
 | catalog/dependency | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
 | catalog/did_you_mean.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| catalog/drop_create_rollback.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| catalog/function | 33 | 1 | 32 | 0 | 0 | 0 | 3.0% | 3.0% | 97 | 32 | 75.2% |
+| catalog/drop_create_rollback.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
+| catalog/function | 33 | 1 | 32 | 0 | 0 | 0 | 3.0% | 3.0% | 115 | 32 | 78.2% |
 | catalog/information_schema_read_only.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | catalog/issue_9459.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 2 | 0 | 100.0% |
 | catalog/materialized_view | 9 | 0 | 9 | 0 | 0 | 0 | 0.0% | 0.0% | 44 | 9 | 83.0% |
-| catalog/nested_schema | 19 | 0 | 19 | 0 | 0 | 0 | 0.0% | 0.0% | 13 | 19 | 40.6% |
+| catalog/nested_schema | 19 | 0 | 19 | 0 | 0 | 0 | 0.0% | 0.0% | 29 | 19 | 60.4% |
 | catalog/procedure.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | catalog/procedure_sql_api.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| catalog/sequence | 12 | 0 | 12 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 12 | 25.0% |
-| catalog/table | 8 | 2 | 5 | 0 | 0 | 1 | 25.0% | 25.0% | 32 | 5 | 86.5% |
+| catalog/sequence | 12 | 0 | 12 | 0 | 0 | 0 | 0.0% | 0.0% | 8 | 12 | 40.0% |
+| catalog/table | 8 | 2 | 5 | 0 | 0 | 1 | 25.0% | 25.0% | 34 | 5 | 87.2% |
 | catalog/test_alter_oid_stability.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | catalog/test_catalog_errors.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | catalog/test_create_from_select.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 9 | 0 | 100.0% |
 | catalog/test_extension_suggestion.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | catalog/test_if_not_exists.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | catalog/test_incorrect_table_creation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| catalog/test_querying_from_detached_catalog.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| catalog/test_querying_from_detached_catalog.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
 | catalog/test_quoted_column_name.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 9 | 1 | 90.0% |
 | catalog/test_schema.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | catalog/test_schema_conflict.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| catalog/test_set_schema.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| catalog/test_set_search_path.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 10 | 1 | 90.9% |
+| catalog/test_set_schema.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
+| catalog/test_set_search_path.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 16 | 1 | 94.1% |
 | catalog/test_standard_schema.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | catalog/test_temporary.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | catalog/test_temporary_index.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | catalog/test_temporary_schema.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | catalog/test_unicode_schema.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| catalog/view | 18 | 1 | 17 | 0 | 0 | 0 | 5.6% | 5.6% | 59 | 17 | 77.6% |
+| catalog/view | 18 | 1 | 17 | 0 | 0 | 0 | 5.6% | 5.6% | 65 | 17 | 79.3% |
 | collate/collate_filter_pushdown.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | collate/collate_in_subquery.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | collate/collate_like.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| collate/collate_non_varchar.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| collate/collate_non_varchar.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 2 | 0 | 100.0% |
 | collate/collate_order_by_alias.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | collate/collate_ordered_aggregate.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | collate/collate_string_col.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | collate/collate_subquery.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | collate/collation_sort_keys.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | collate/icu_collation_propagation.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 2 | 0 | 100.0% |
-| collate/nop_collation_join_filter_pushdown.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| collate/nop_collation_join_filter_pushdown.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
 | collate/test_collate_accent_insensitive.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | collate/test_collate_and_grouping_sets.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | collate/test_collate_between.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
@@ -394,10 +397,10 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | collate/test_collate_list_contains.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | collate/test_collate_null_constant.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | collate/test_collate_orderby_column_number.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| collate/test_collate_pivot.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| collate/test_collate_pivot.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 20 | 0 | 100.0% |
 | collate/test_collation_propagation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | collate/test_combined_collation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| collate/test_default_collations.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| collate/test_default_collations.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | collate/test_icu_collate.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | collate/test_pragma_collations.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | collate/test_strpos_collate.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
@@ -409,9 +412,9 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | connect/connect_string_ephemeral.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | connect/connect_syntax.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | constraints/check | 3 | 0 | 3 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 3 | 0.0% |
-| constraints/deferred | 12 | 0 | 12 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 12 | 36.8% |
-| constraints/foreignkey | 27 | 0 | 27 | 0 | 0 | 0 | 0.0% | 0.0% | 76 | 27 | 73.8% |
-| constraints/primarykey | 12 | 6 | 6 | 0 | 0 | 0 | 50.0% | 50.0% | 61 | 6 | 91.0% |
+| constraints/deferred | 12 | 0 | 12 | 0 | 0 | 0 | 0.0% | 0.0% | 8 | 12 | 40.0% |
+| constraints/foreignkey | 27 | 0 | 27 | 0 | 0 | 0 | 0.0% | 0.0% | 86 | 27 | 76.1% |
+| constraints/primarykey | 12 | 6 | 6 | 0 | 0 | 0 | 50.0% | 50.0% | 64 | 6 | 91.4% |
 | constraints/test_constraint_with_updates.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | constraints/test_not_null.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | constraints/unique | 6 | 2 | 4 | 0 | 0 | 0 | 33.3% | 33.3% | 28 | 4 | 87.5% |
@@ -419,30 +422,30 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | copy/async_file_lifecycle.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | copy/copy_blob.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | copy/copy_cte.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| copy/csv | 269 | 14 | 249 | 6 | 0 | 0 | 5.2% | 5.3% | 365 | 249 | 59.4% |
+| copy/csv | 269 | 14 | 249 | 6 | 0 | 0 | 5.2% | 5.3% | 403 | 249 | 61.8% |
 | copy/encryption | 9 | 0 | 0 | 9 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | copy/file_size_bytes.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | copy/file_size_bytes_csv_compression.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | copy/file_size_bytes_existing_target.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| copy/format_uuid.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| copy/format_uuid.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
 | copy/hive_partition_null_overwrite.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| copy/parquet | 213 | 22 | 184 | 7 | 0 | 0 | 10.3% | 10.7% | 206 | 184 | 52.8% |
-| copy/partitioned | 25 | 0 | 24 | 1 | 0 | 0 | 0.0% | 0.0% | 8 | 24 | 25.0% |
-| copy/per_thread_output.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| copy/return_files.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| copy/return_stats.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| copy/return_stats_extra_info.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| copy/parquet | 213 | 25 | 181 | 7 | 0 | 0 | 11.7% | 12.1% | 239 | 181 | 56.9% |
+| copy/partitioned | 25 | 1 | 23 | 1 | 0 | 0 | 4.0% | 4.2% | 29 | 23 | 55.8% |
+| copy/per_thread_output.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| copy/return_files.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| copy/return_stats.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
+| copy/return_stats_extra_info.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | copy/return_stats_truncate.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | copy/row_groups_per_file.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | copy/tmp_file.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | copy_database/copy_database_different_types.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| copy_database/copy_database_errors.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| copy_database/copy_database_errors.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | copy_database/copy_database_fk.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 0 | 0 | 0.0% |
 | copy_database/copy_database_gen_col.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | copy_database/copy_database_index.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| copy_database/copy_database_multiple.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| copy_database/copy_database_multiple.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | copy_database/copy_database_simple.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| copy_database/copy_database_with_index.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| copy_database/copy_database_with_index.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | copy_database/copy_database_with_unique_index.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | copy_database/copy_table_with_sequence.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | create/create_as.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 13 | 1 | 92.9% |
@@ -473,10 +476,10 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | cte/insert_cte_bug_3417.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | cte/lazy_cte_bind.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | cte/lazy_cte_bind_correlated.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 1 | 0 | 100.0% |
-| cte/materialized | 26 | 0 | 26 | 0 | 0 | 0 | 0.0% | 0.0% | 21 | 26 | 44.7% |
+| cte/materialized | 26 | 0 | 25 | 1 | 0 | 0 | 0.0% | 0.0% | 29 | 25 | 53.7% |
 | cte/recursive_array_slice.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | cte/recursive_cte_batch_index.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| cte/recursive_cte_column_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| cte/recursive_cte_column_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | cte/recursive_cte_complex_pipelines.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | cte/recursive_cte_correlated_bindings.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | cte/recursive_cte_correlated_complex.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
@@ -486,10 +489,10 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | cte/recursive_cte_key_aggregation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | cte/recursive_cte_key_final_drain.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | cte/recursive_cte_key_hll_aggregation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| cte/recursive_cte_key_probe.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| cte/recursive_cte_key_probe.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | cte/recursive_cte_key_snapshot.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | cte/recursive_cte_key_union.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| cte/recursive_cte_key_union_plan.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| cte/recursive_cte_key_union_plan.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | cte/recursive_cte_limit.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | cte/recursive_cte_logging.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | cte/recursive_cte_ordered_aggregate.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
@@ -508,8 +511,8 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | cte/test_outer_joins_recursive_cte.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | cte/test_recursive_cte_recurring.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | cte/test_recursive_cte_tutorial.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| cte/test_recursive_cte_union.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 10 | 1 | 90.9% |
-| cte/test_recursive_cte_union_all.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 9 | 1 | 90.0% |
+| cte/test_recursive_cte_union.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 11 | 1 | 91.7% |
+| cte/test_recursive_cte_union_all.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 10 | 1 | 90.9% |
 | delete/bulk_delete_version_info_memory.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | delete/cleanup_delete_on_conflict.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | delete/delete_compression_after_restart.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 10 | 0 | 100.0% |
@@ -523,14 +526,14 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | delete/masked_vector_rollback.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 11 | 0 | 100.0% |
 | delete/partial_delete_version_info_memory.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | delete/test_delete.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 12 | 0 | 100.0% |
-| delete/test_delete_indexed.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 64 | 1 | 98.5% |
+| delete/test_delete_indexed.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 78 | 1 | 98.7% |
 | delete/test_large_delete.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 4 | 0 | 100.0% |
-| delete/test_large_delete_parallel.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| delete/test_large_delete_parallel.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 6 | 0 | 100.0% |
 | delete/test_segment_deletes.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 22 | 1 | 95.7% |
 | delete/test_truncate.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | delete/test_using_delete.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 14 | 1 | 93.3% |
 | delete/test_using_delete_duplicates.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 13 | 1 | 92.9% |
-| detailed_profiler/test_detailed_profiler.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| detailed_profiler/test_detailed_profiler.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 13 | 1 | 92.9% |
 | error/aggregate_order_by.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | error/correlated_at_clause.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | error/error_location_multicaret.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
@@ -551,8 +554,8 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | explain/explain_all_statements.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | explain/explain_execute.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | explain/explain_formats.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| explain/order_by_topn_explain_fqn.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| explain/test_explain.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
+| explain/order_by_topn_explain_fqn.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| explain/test_explain.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
 | explain/test_explain_analyze.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | explain/test_explain_limit.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | explain/test_explain_table_scan.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
@@ -561,7 +564,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | export/export_database.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | export/export_external_access.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | export/export_functions.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
-| export/export_generated_columns.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| export/export_generated_columns.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | export/export_hive_path.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | export/export_indexes.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | export/export_macros.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
@@ -587,16 +590,16 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | extensions/sqlite_alter_table_add_pk.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | extensions/version_is_valid_sqlite.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | filter/filter_cache.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 4 | 0 | 100.0% |
-| filter/filter_cache_dictionary.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| filter/filter_cache_dictionary.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
 | filter/test_alias_filter.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | filter/test_columns_filter.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | filter/test_constant_comparisons.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 20 | 1 | 95.2% |
-| filter/test_expression_executor_select.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| filter/test_expression_executor_select.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | filter/test_illegal_filters.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | filter/test_last_option_corruption.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
-| filter/test_obsolete_filters.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| filter/test_or_pushdown.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| filter/test_struct_pushdown.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| filter/test_obsolete_filters.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
+| filter/test_or_pushdown.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| filter/test_struct_pushdown.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | filter/test_throwing_filter_pushdown.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | filter/test_transitive_filters.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 49 | 0 | 100.0% |
 | filter/test_try_filter_doesnt_mutate_columns.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
@@ -605,16 +608,16 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | function/array | 9 | 2 | 7 | 0 | 0 | 0 | 22.2% | 22.2% | 28 | 7 | 80.0% |
 | function/autocomplete | 23 | 1 | 0 | 22 | 0 | 0 | 4.3% | 100.0% | 0 | 0 | 0.0% |
 | function/blob | 6 | 0 | 6 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 6 | 25.0% |
-| function/date | 14 | 3 | 11 | 0 | 0 | 0 | 21.4% | 21.4% | 117 | 11 | 91.4% |
+| function/date | 14 | 3 | 11 | 0 | 0 | 0 | 21.4% | 21.4% | 123 | 11 | 91.8% |
 | function/enum | 4 | 0 | 4 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 4 | 0.0% |
-| function/generic | 30 | 3 | 26 | 1 | 0 | 0 | 10.0% | 10.3% | 61 | 26 | 70.1% |
+| function/generic | 30 | 3 | 26 | 1 | 0 | 0 | 10.0% | 10.3% | 121 | 26 | 82.3% |
 | function/index | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | function/interval | 4 | 0 | 4 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 4 | 60.0% |
-| function/list | 103 | 1 | 100 | 2 | 0 | 0 | 1.0% | 1.0% | 1269 | 100 | 92.7% |
+| function/list | 103 | 1 | 100 | 2 | 0 | 0 | 1.0% | 1.0% | 1275 | 100 | 92.7% |
 | function/nested | 4 | 0 | 4 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 4 | 0.0% |
 | function/numeric | 29 | 1 | 27 | 1 | 0 | 0 | 3.4% | 3.6% | 48 | 27 | 64.0% |
-| function/operator | 10 | 0 | 10 | 0 | 0 | 0 | 0.0% | 0.0% | 26 | 10 | 72.2% |
-| function/string | 83 | 8 | 73 | 2 | 0 | 0 | 9.6% | 9.9% | 467 | 73 | 86.5% |
+| function/operator | 10 | 0 | 10 | 0 | 0 | 0 | 0.0% | 0.0% | 37 | 10 | 78.7% |
+| function/string | 83 | 9 | 72 | 2 | 0 | 0 | 10.8% | 11.1% | 478 | 72 | 86.9% |
 | function/test_scalar_executor.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | function/time | 5 | 0 | 5 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 5 | 0.0% |
 | function/timestamp | 28 | 1 | 14 | 13 | 0 | 0 | 3.6% | 6.7% | 33 | 14 | 70.2% |
@@ -624,7 +627,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | function/variant | 18 | 0 | 18 | 0 | 0 | 0 | 0.0% | 0.0% | 24 | 18 | 57.1% |
 | generated_columns/stored | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | generated_columns/virtual | 37 | 1 | 36 | 0 | 0 | 0 | 2.7% | 2.7% | 32 | 36 | 47.1% |
-| index/art | 119 | 16 | 102 | 1 | 0 | 0 | 13.4% | 13.6% | 544 | 102 | 84.2% |
+| index/art | 119 | 17 | 101 | 1 | 0 | 0 | 14.3% | 14.4% | 636 | 101 | 86.3% |
 | index/create_index_options.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | insert/insert_by_name.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | insert/insert_from_many_grouping_sets.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 10 | 0 | 100.0% |
@@ -635,50 +638,50 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | insert/test_insert.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 8 | 0 | 100.0% |
 | insert/test_insert_invalid.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
 | insert/test_insert_query.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 4 | 0 | 100.0% |
-| insert/test_insert_type.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
+| insert/test_insert_type.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 8 | 0 | 100.0% |
 | insert/unaligned_interleaved_appends.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 19 | 0 | 100.0% |
-| join/asof | 17 | 0 | 17 | 0 | 0 | 0 | 0.0% | 0.0% | 17 | 17 | 50.0% |
-| join/comparison_operand_extraction.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| join/asof | 17 | 0 | 17 | 0 | 0 | 0 | 0.0% | 0.0% | 32 | 17 | 65.3% |
+| join/comparison_operand_extraction.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | join/cross_product | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 5 | 0 | 100.0% |
 | join/empty_joins.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| join/full_outer | 7 | 0 | 7 | 0 | 0 | 0 | 0.0% | 0.0% | 39 | 7 | 84.8% |
-| join/hash_join | 4 | 0 | 3 | 1 | 0 | 0 | 0.0% | 0.0% | 6 | 3 | 66.7% |
-| join/iejoin | 13 | 0 | 12 | 1 | 0 | 0 | 0.0% | 0.0% | 1 | 12 | 7.7% |
-| join/inner | 24 | 8 | 16 | 0 | 0 | 0 | 33.3% | 33.3% | 151 | 16 | 90.4% |
-| join/left_outer | 11 | 6 | 5 | 0 | 0 | 0 | 54.5% | 54.5% | 93 | 5 | 94.9% |
+| join/full_outer | 7 | 4 | 3 | 0 | 0 | 0 | 57.1% | 57.1% | 54 | 3 | 94.7% |
+| join/hash_join | 4 | 0 | 3 | 1 | 0 | 0 | 0.0% | 0.0% | 57 | 3 | 95.0% |
+| join/iejoin | 13 | 0 | 12 | 1 | 0 | 0 | 0.0% | 0.0% | 59 | 12 | 83.1% |
+| join/inner | 24 | 9 | 15 | 0 | 0 | 0 | 37.5% | 37.5% | 165 | 15 | 91.7% |
+| join/left_outer | 11 | 7 | 4 | 0 | 0 | 0 | 63.6% | 63.6% | 101 | 4 | 96.2% |
 | join/mark | 11 | 0 | 11 | 0 | 0 | 0 | 0.0% | 0.0% | 41 | 11 | 78.8% |
 | join/natural | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | join/nearest | 4 | 0 | 4 | 0 | 0 | 0 | 0.0% | 0.0% | 14 | 4 | 77.8% |
-| join/non_inner_decorrelation_regressions.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| join/non_inner_decorrelation_regressions.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | join/non_inner_join_subquery.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 17 | 0 | 100.0% |
 | join/non_inner_join_subquery_binding.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| join/pair_dependent_full_outer_join_subquery.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 17 | 1 | 94.4% |
-| join/pair_dependent_full_outer_join_subquery_bindings.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 8 | 1 | 88.9% |
+| join/pair_dependent_full_outer_join_subquery.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 18 | 1 | 94.7% |
+| join/pair_dependent_full_outer_join_subquery_bindings.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 13 | 1 | 92.9% |
 | join/pair_dependent_full_outer_join_subquery_cte.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
 | join/pair_dependent_join_subquery.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | join/pair_dependent_outer_reference_subquery.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 12 | 1 | 92.3% |
 | join/pair_dependent_volatile_subquery.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| join/positional | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 2 | 66.7% |
+| join/positional | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 9 | 2 | 81.8% |
 | join/pushdown | 3 | 1 | 2 | 0 | 0 | 0 | 33.3% | 33.3% | 12 | 2 | 85.7% |
 | join/right_outer | 3 | 2 | 1 | 0 | 0 | 0 | 66.7% | 66.7% | 36 | 1 | 97.3% |
-| join/semianti | 10 | 0 | 10 | 0 | 0 | 0 | 0.0% | 0.0% | 31 | 10 | 75.6% |
+| join/semianti | 10 | 0 | 10 | 0 | 0 | 0 | 0.0% | 0.0% | 38 | 10 | 79.2% |
 | join/set_operators | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | join/test_between_null_bound_join.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| join/test_complex_join_expr.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
-| join/test_complex_range_join.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| join/test_complex_join_expr.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 9 | 0 | 100.0% |
+| join/test_complex_range_join.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | join/test_join_always_true_conditions.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 9 | 1 | 90.0% |
 | join/test_join_by.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | join/test_join_on_aggregates.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 6 | 0 | 100.0% |
-| join/test_merge_join_predicate.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| join/test_merge_join_predicate.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | join/test_nested_inequality.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
 | join/test_predicate_binding.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | join/test_string_payload.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 6 | 0 | 100.0% |
 | json/copy_geojson.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | json/copy_json_null_options.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | json/copy_json_partition_by.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| json/issues | 41 | 1 | 40 | 0 | 0 | 0 | 2.4% | 2.4% | 8 | 40 | 16.7% |
-| json/scalar | 31 | 2 | 28 | 1 | 0 | 0 | 6.5% | 6.7% | 136 | 27 | 83.4% |
-| json/table | 19 | 0 | 19 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 19 | 5.0% |
+| json/issues | 41 | 1 | 40 | 0 | 0 | 0 | 2.4% | 2.4% | 10 | 40 | 20.0% |
+| json/scalar | 31 | 2 | 28 | 1 | 0 | 0 | 6.5% | 6.7% | 151 | 27 | 84.8% |
+| json/table | 19 | 0 | 19 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 19 | 9.5% |
 | json/test_json_bool.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 2 | 0 | 100.0% |
 | json/test_json_cast.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | json/test_json_copy_serialize_plan.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
@@ -686,7 +689,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | json/test_json_export.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | json/test_json_geometry_format.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | json/test_json_group_window_macro.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| json/test_json_macros.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| json/test_json_macros.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | json/test_json_persistence.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | json/test_json_serialize_plan.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | json/test_json_serialize_sql.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
@@ -696,7 +699,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | limit/streaming_limit_pipeline_flush.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | limit/streaming_limit_pipeline_flush2.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | limit/test_batch_limit_filters.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| limit/test_limit0.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| limit/test_limit0.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | limit/test_preserve_insertion_order.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 9 | 0 | 100.0% |
 | logging/enable_logging_file_no_path.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | logging/file_system_logging_attach.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
@@ -710,38 +713,38 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | logging/logging_file_bind_replace.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | logging/logging_file_persistence.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | logging/logging_file_truncate_rewrite.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| logging/logging_memory_after_truncate.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| logging/logging_memory_after_truncate.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | logging/logging_types.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | logging/test_logging_function.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_aggregate_idioms.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_aggregates.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_anchors.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_backtracking.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_backtracking_long.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_classifier.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_clauses.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_composition.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_cursors.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_errors.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_idioms.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_lambdas.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_limits.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_measures.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_names.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_navigation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_nulls.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_parallel.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_pattern.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_permute.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_scope.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_series.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_session_model.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_shapes.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_spec.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_standard.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_stock.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| match_recognize/test_match_recognize_vectors.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| match_recognize/test_match_recognize.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_aggregate_idioms.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| match_recognize/test_match_recognize_aggregates.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
+| match_recognize/test_match_recognize_anchors.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_backtracking.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 25 | 1 | 96.2% |
+| match_recognize/test_match_recognize_backtracking_long.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_classifier.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_clauses.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_composition.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_cursors.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| match_recognize/test_match_recognize_errors.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_idioms.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_lambdas.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| match_recognize/test_match_recognize_limits.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_measures.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_names.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| match_recognize/test_match_recognize_navigation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
+| match_recognize/test_match_recognize_nulls.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_parallel.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| match_recognize/test_match_recognize_pattern.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_permute.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_scope.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| match_recognize/test_match_recognize_series.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_session_model.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| match_recognize/test_match_recognize_shapes.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_spec.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| match_recognize/test_match_recognize_standard.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
+| match_recognize/test_match_recognize_stock.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| match_recognize/test_match_recognize_vectors.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | merge/merge_into.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | merge/merge_into_bind_matching_columns.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | merge/merge_into_by_source.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
@@ -751,11 +754,11 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | merge/merge_into_explain_analyze.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | merge/merge_into_index.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | merge/merge_into_insert_star.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| merge/merge_into_invalid_action.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| merge/merge_into_invalid_action.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | merge/merge_into_invalid_column.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | merge/merge_into_invalid_column_reference.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | merge/merge_into_join_as_filter.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| merge/merge_into_multiple_updates.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| merge/merge_into_multiple_updates.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | merge/merge_into_parenthesis_bug.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | merge/merge_into_pipelines.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | merge/merge_into_returning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
@@ -768,7 +771,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | merge/trigger_merge_into.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | multi_file/multi_file_open_options.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/aggregate_stats_propagation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/any_extremum_rewrite.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| optimizer/any_extremum_rewrite.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 17 | 1 | 94.4% |
 | optimizer/array_extract_row_group_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/barrier_row_group_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/bool_ref_row_group_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
@@ -783,92 +786,92 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | optimizer/distinct_sibling_column_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
 | optimizer/divide_zonemap_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/empty_string_concat_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| optimizer/expression | 20 | 1 | 18 | 1 | 0 | 0 | 5.0% | 5.3% | 51 | 18 | 73.9% |
-| optimizer/false_or_null_segment_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| optimizer/expression | 20 | 3 | 16 | 1 | 0 | 0 | 15.0% | 15.8% | 85 | 16 | 84.2% |
+| optimizer/false_or_null_segment_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | optimizer/in_list_row_group_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/instr_zonemap_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | optimizer/interval_column_stats_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/interval_row_group_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| optimizer/interval_row_group_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | optimizer/late_materialization_pushdown_extract.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| optimizer/late_materialization_table_filters.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| optimizer/late_materialization_table_filters.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | optimizer/left_zonemap_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/list_contains_row_group_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/map_extract_row_group_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/monotone_function_zonemap_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/monotone_preimage.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/multiple_column_stats_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| optimizer/monotone_function_zonemap_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| optimizer/monotone_preimage.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| optimizer/multiple_column_stats_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | optimizer/narrowing_cast_not_invertible.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | optimizer/nested_null_segment_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/not_conjunction_simplification.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| optimizer/not_conjunction_simplification.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | optimizer/nullable_row_group_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/or_null_simplification.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| optimizer/plan | 13 | 3 | 8 | 1 | 0 | 1 | 23.1% | 25.0% | 31 | 9 | 77.5% |
+| optimizer/or_null_simplification.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| optimizer/plan | 13 | 3 | 8 | 1 | 0 | 1 | 23.1% | 25.0% | 46 | 9 | 83.6% |
 | optimizer/power_zonemap_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| optimizer/predicate_factoring.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| optimizer/predicate_factoring.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | optimizer/prefix_zonemap_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/pushdown_extract_multiple_filters.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/pushdown_extract_reapplied.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| optimizer/rewrite_nan_null.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
-| optimizer/secure_view_explain.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/secure_view_pushdown.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| optimizer/rewrite_nan_null.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 38 | 0 | 100.0% |
+| optimizer/secure_view_explain.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| optimizer/secure_view_pushdown.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | optimizer/secure_view_pushdown_compression.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| optimizer/secure_view_statistics.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| optimizer/secure_view_statistics.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | optimizer/sign_row_group_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/string_row_group_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/string_stats_merge.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/struct_segment_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | optimizer/substring_zonemap_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| optimizer/sum_aggregate_stats_propagation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/table_filters.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| optimizer/sum_aggregate_stats_propagation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| optimizer/table_filters.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 18 | 1 | 94.7% |
 | optimizer/temporal_cast_dst.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
-| optimizer/temporal_cast_zonemap.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| optimizer/temporal_cast_zonemap.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | optimizer/test_common_subplan_cte_binding_order.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 8 | 0 | 100.0% |
 | optimizer/test_common_subplan_projection_maps.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| optimizer/test_common_subplan_table_filters.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
+| optimizer/test_common_subplan_table_filters.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
 | optimizer/test_duplicate_groups_optimizer.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
-| optimizer/test_fd_derived_groups.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| optimizer/test_fd_derived_groups.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
 | optimizer/test_glob_row_group_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/test_in_rewrite_rule.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| optimizer/test_negated_filter_cardinality.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
-| optimizer/test_no_pushdown_cast_into_cte.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/test_not_comparison_simplification.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/test_rollup_column_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| optimizer/test_rowid_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/test_rowid_pushdown.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| optimizer/test_negated_filter_cardinality.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
+| optimizer/test_no_pushdown_cast_into_cte.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| optimizer/test_not_comparison_simplification.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| optimizer/test_rollup_column_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| optimizer/test_rowid_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| optimizer/test_rowid_pushdown.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | optimizer/test_rowid_pushdown_deletes.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 31 | 1 | 96.9% |
 | optimizer/test_rowid_pushdown_plan.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
-| optimizer/test_window_self_join.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/tests_no_pushdown_under_samples.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| optimizer/test_window_self_join.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| optimizer/tests_no_pushdown_under_samples.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | optimizer/timestamp_tz_cast_zonemap_pruning.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | optimizer/timestamp_unit_cast_zonemap_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/topn_window_elimination_argument_order.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| optimizer/topn_window_elimination_late_materialization.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/topn_window_elimination_max_n.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| optimizer/topn_window_elimination_multiplicity.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
+| optimizer/topn_window_elimination_late_materialization.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| optimizer/topn_window_elimination_max_n.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
+| optimizer/topn_window_elimination_multiplicity.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 13 | 1 | 92.9% |
 | optimizer/topn_window_elimination_nullable_order.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 11 | 0 | 100.0% |
 | optimizer/topn_window_set_elimination.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/upper_lower_zonemap_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | optimizer/window_self_join_optimizer_csv.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | order/hugeint_order_by_extremes.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | order/issue_11936.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| order/limit_full_outer_join.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
+| order/limit_full_outer_join.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 6 | 0 | 100.0% |
 | order/limit_parameter.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | order/limit_percent_view.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | order/limit_union.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 2 | 0 | 100.0% |
 | order/negative_offset.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| order/order_by_all.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| order/order_by_all.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | order/order_by_internal_5293.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | order/order_overflow.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | order/test_limit.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | order/test_limit_cte.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | order/test_limit_parameter.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | order/test_limit_percent.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| order/test_nulls_first.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| order/test_nulls_first.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 20 | 1 | 95.2% |
 | order/test_order_by.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 22 | 1 | 95.7% |
 | order/test_order_by_exceptions.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | order/test_order_by_non_ordinal_literal.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| order/test_order_large.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| order/test_order_pragma.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| order/test_order_large.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 3 | 0 | 100.0% |
+| order/test_order_pragma.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
 | order/test_order_range_mapping.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | order/test_order_unnest.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | order/top_n_issue_21623.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
@@ -883,9 +886,9 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | overflow/table_overflow.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | overflow/test_numeric_overflow.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | overflow/test_overflow.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| parallelism/async_task_schedule_pool.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| parallelism/async_task_schedule_pool.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | parallelism/interquery | 7 | 1 | 6 | 0 | 0 | 0 | 14.3% | 14.3% | 498 | 6 | 98.8% |
-| parallelism/intraquery | 7 | 0 | 6 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 6 | 0.0% |
+| parallelism/intraquery | 7 | 1 | 5 | 1 | 0 | 0 | 14.3% | 16.7% | 19 | 5 | 79.2% |
 | parallelism/modify_thread_settings.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 44 | 0 | 100.0% |
 | parser/adjacent_string_literal.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | parser/columns_aliases.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
@@ -895,7 +898,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | parser/division_operator_precedence.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | parser/dollar_quotes_internal_issue2224.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | parser/empty_quoted_identifier.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| parser/expression_depth_limit.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| parser/expression_depth_limit.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | parser/external_resource_roundtrip.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | parser/fetch_first.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 8 | 1 | 88.9% |
 | parser/from_first.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
@@ -935,7 +938,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | peg_parser/parser | 47 | 0 | 1 | 46 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | peg_parser/peg_syntax_error.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | peg_parser/qualified_operator.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| peg_parser/transformer | 15 | 1 | 5 | 9 | 0 | 0 | 6.7% | 16.7% | 4 | 5 | 44.4% |
+| peg_parser/transformer | 15 | 1 | 5 | 9 | 0 | 0 | 6.7% | 16.7% | 13 | 5 | 72.2% |
 | peg_parser/unterminated_literals.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | pg_catalog/pg_attribute.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | pg_catalog/pg_constraint.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
@@ -988,27 +991,27 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | pivot/unpivot_unnamed_subquery.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | pivot/unpivot_view.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | pragma/pragma_database_size_readonly.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| pragma/profiling | 28 | 0 | 28 | 0 | 0 | 0 | 0.0% | 0.0% | 14 | 28 | 33.3% |
+| pragma/profiling | 28 | 0 | 28 | 0 | 0 | 0 | 0.0% | 0.0% | 62 | 28 | 68.9% |
 | pragma/test_db_invalidation_after_load.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| pragma/test_disabled_compression.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| pragma/test_disabled_compression.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | pragma/test_enable_profile.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| pragma/test_force_compression.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| pragma/test_memory_limit.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| pragma/test_force_compression.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 8 | 1 | 88.9% |
+| pragma/test_memory_limit.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 29 | 1 | 96.7% |
 | pragma/test_metadata_info.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| pragma/test_pragma_database_list.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| pragma/test_pragma_database_list.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | pragma/test_pragma_database_size.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | pragma/test_pragma_functions.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | pragma/test_pragma_parsing.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | pragma/test_pragma_sanitized_inputs.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | pragma/test_pragma_version.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
-| pragma/test_query_log.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| pragma/test_query_log.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
 | pragma/test_show_tables.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 13 | 1 | 92.9% |
 | pragma/test_show_tables_from.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | pragma/test_show_tables_temp_views.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | pragma/test_storage_info.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| pragma/test_table_info.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| pragma/test_table_info_quoted_names.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| pragma/test_various_pragmas.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| pragma/test_table_info.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| pragma/test_table_info_quoted_names.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| pragma/test_various_pragmas.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
 | prepared/invalid_prepare.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | prepared/parameter_order_subquery.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | prepared/parameter_variants.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
@@ -1027,8 +1030,8 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | prepared/prepared_named_param.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | prepared/prepared_null_binding.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | prepared/prepared_select.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| prepared/prepared_stale_statistics.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| prepared/prepared_statistics_optimization.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| prepared/prepared_stale_statistics.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| prepared/prepared_statistics_optimization.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | prepared/prepared_update.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | prepared/test_basic_prepare.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | prepared/test_issue_2079.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
@@ -1048,8 +1051,8 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | prepared/test_prepare_subquery.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | prepared/test_prepare_types.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | prepared/test_prepare_unused_cte.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| profiling/test_io_time_metrics.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| profiling/test_spilled_bytes_metric.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| profiling/test_io_time_metrics.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| profiling/test_spilled_bytes_metric.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
 | projection/coalesce_error.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | projection/coalesce_rowid.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | projection/select_star_exclude.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 9 | 1 | 90.0% |
@@ -1077,10 +1080,10 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | sample/same_seed_same_sample_vec_size_2.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | sample/table_samples | 5 | 5 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 0 | 0 | 0.0% |
 | sample/test_sample_too_big.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
-| sample/test_system_rows.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| sample/test_system_rows_pushdown.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| sample/test_system_rows.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| sample/test_system_rows_pushdown.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | secrets/connection_secret_storage.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| secrets/create_secret_expression.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| secrets/create_secret_expression.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | secrets/create_secret_filesystem_logging.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | secrets/create_secret_hffs_autoload.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | secrets/create_secret_persistence_no_client_context.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
@@ -1091,7 +1094,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | secrets/test_secret_type_parameters.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | select/test_multi_column_reference.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | select/test_positional_reference.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| select/test_projection_names.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| select/test_projection_names.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 14 | 0 | 100.0% |
 | select/test_schema_reference.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | select/test_select_alias_prefix_colon.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | select/test_select_empty_table.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 2 | 0 | 100.0% |
@@ -1115,48 +1118,48 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | setops/test_union_type_cast.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | setops/union_aggregate.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 7 | 0 | 100.0% |
 | setops/union_all_projection_pushdown.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 16 | 0 | 100.0% |
-| setops/union_limit.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| setops/union_limit.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
 | setops/union_pipeline.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 4 | 0 | 100.0% |
-| setops/union_shared_scan.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| setops/union_single_dedup.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| setops/union_shared_scan.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 4 | 0 | 100.0% |
+| setops/union_single_dedup.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | setops/value_union.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 10 | 0 | 100.0% |
 | settings/access_mode.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | settings/allowed_configs.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | settings/allowed_configs_extensions.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | settings/allowed_directories.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | settings/allowed_paths.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| settings/block_allocator_memory.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| settings/block_allocator_memory.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | settings/connection_local_settings.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | settings/debug_deprecated_settings.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| settings/default_null_order_extended.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| settings/default_null_order_extended.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
 | settings/deprecated_settings.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | settings/dialect_compatibility_mode.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | settings/drop_set_schema.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | settings/errors_as_json.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| settings/http_client_pool_capacity.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| settings/http_client_pool_capacity.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
 | settings/integer_division_setting.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| settings/lock_configuration_schema.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
-| settings/max_execution_time.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| settings/max_memory_percentage.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| settings/lock_configuration_schema.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 8 | 0 | 100.0% |
+| settings/max_execution_time.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
+| settings/max_memory_percentage.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
 | settings/max_streaming_buffer_size.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| settings/operator_memory_limit.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| settings/reset | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 2 | 0.0% |
+| settings/operator_memory_limit.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| settings/reset | 2 | 1 | 1 | 0 | 0 | 0 | 50.0% | 50.0% | 6 | 1 | 85.7% |
 | settings/set_local.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | settings/set_schema_temp_main.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | settings/setting_alias.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| settings/setting_collation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| settings/setting_disabled_optimizer.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| settings/setting_collation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| settings/setting_disabled_optimizer.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | settings/setting_exhaustive.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| settings/setting_null_order.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| settings/setting_order.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| settings/setting_null_order.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| settings/setting_order.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | settings/setting_preserve_identifier_case.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | settings/setting_profiling_mode.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | settings/setting_threads.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | settings/settings_icu.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | settings/test_disabled_file_systems.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| settings/test_disabled_local_filesystem_metadata.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| settings/test_disabled_local_filesystem_metadata.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | settings/test_disabled_local_filesystem_secrets.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
-| settings/test_external_access_metadata.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| settings/test_external_access_metadata.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | settings/test_external_access_secrets.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | settings/test_lock_configuration.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | settings/test_progress_bar_null.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
@@ -1165,7 +1168,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | show_select/describe_subquery.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | show_select/show_quote_identifier.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | show_select/show_select_constraints.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| show_select/show_settings.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| show_select/show_settings.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | show_select/show_settings_extension.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | show_select/summarize_subquery.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | show_select/test_describe_all.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
@@ -1174,26 +1177,26 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | show_select/test_summarize.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | show_select/test_summarize_quoted.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | storage/adaptive_segment_allocation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| storage/alter | 4 | 0 | 4 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 4 | 55.6% |
+| storage/alter | 4 | 0 | 4 | 0 | 0 | 0 | 0.0% | 0.0% | 8 | 4 | 66.7% |
 | storage/append_strings_to_persistent.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 7 | 0 | 100.0% |
-| storage/attach | 7 | 0 | 7 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 7 | 22.2% |
+| storage/attach | 7 | 0 | 7 | 0 | 0 | 0 | 0.0% | 0.0% | 23 | 7 | 76.7% |
 | storage/attach_mmap.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | storage/bc | 3 | 0 | 1 | 2 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| storage/buffer_manager_temp_dir.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| storage/catalog | 26 | 6 | 20 | 0 | 0 | 0 | 23.1% | 23.1% | 94 | 20 | 82.5% |
-| storage/checkpoint | 7 | 0 | 7 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 7 | 36.4% |
-| storage/checkpointed_self_append.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| storage/buffer_manager_temp_dir.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| storage/catalog | 26 | 6 | 20 | 0 | 0 | 0 | 23.1% | 23.1% | 129 | 20 | 86.6% |
+| storage/checkpoint | 7 | 0 | 7 | 0 | 0 | 0 | 0.0% | 0.0% | 9 | 7 | 56.2% |
+| storage/checkpointed_self_append.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 9 | 0 | 100.0% |
 | storage/checkpointed_self_append_tinyint.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | storage/commit_abort.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 16 | 0 | 100.0% |
 | storage/commit_abort_medium.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 15 | 0 | 100.0% |
 | storage/commit_index_deletes.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 9 | 0 | 100.0% |
-| storage/compact_block_size | 9 | 0 | 6 | 3 | 0 | 0 | 0.0% | 0.0% | 3 | 6 | 33.3% |
-| storage/compression | 159 | 1 | 98 | 60 | 0 | 0 | 0.6% | 1.0% | 36 | 96 | 27.3% |
+| storage/compact_block_size | 9 | 0 | 6 | 3 | 0 | 0 | 0.0% | 0.0% | 5 | 6 | 45.5% |
+| storage/compression | 159 | 17 | 82 | 60 | 0 | 0 | 10.7% | 17.2% | 402 | 80 | 83.4% |
 | storage/concurrent_attach_if_not_exists_create.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | storage/constraints | 2 | 1 | 1 | 0 | 0 | 0 | 50.0% | 50.0% | 4 | 1 | 80.0% |
 | storage/corrupt | 6 | 0 | 0 | 6 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | storage/delete | 5 | 4 | 1 | 0 | 0 | 0 | 80.0% | 80.0% | 81 | 1 | 98.8% |
-| storage/distinct_statistics_storage.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| storage/distinct_statistics_storage.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | storage/encryption | 7 | 0 | 0 | 7 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | storage/extended_string_stats.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | storage/extensions | 2 | 1 | 1 | 0 | 0 | 0 | 50.0% | 50.0% | 4 | 1 | 80.0% |
@@ -1212,19 +1215,19 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | storage/mix | 3 | 2 | 1 | 0 | 0 | 0 | 66.7% | 66.7% | 43 | 1 | 97.7% |
 | storage/multiple_clients_checkpoint_pending_updates.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | storage/nested | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| storage/null_byte_storage.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| storage/optimistic_write | 11 | 2 | 9 | 0 | 0 | 0 | 18.2% | 18.2% | 30 | 9 | 76.9% |
+| storage/null_byte_storage.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| storage/optimistic_write | 11 | 4 | 7 | 0 | 0 | 0 | 36.4% | 36.4% | 84 | 7 | 92.3% |
 | storage/overflow_strings | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
-| storage/partial_blocks | 5 | 0 | 5 | 0 | 0 | 0 | 0.0% | 0.0% | 414 | 5 | 98.8% |
+| storage/partial_blocks | 5 | 0 | 5 | 0 | 0 | 0 | 0.0% | 0.0% | 417 | 5 | 98.8% |
 | storage/partial_delete_checkpoint_mask.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | storage/partial_delete_pending_compress.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | storage/piecemeal_delete_checkpoint_compress.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 15 | 0 | 100.0% |
 | storage/pragma_storage_info_scan_type.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
-| storage/prefetch | 6 | 0 | 4 | 2 | 0 | 0 | 0.0% | 0.0% | 0 | 4 | 0.0% |
+| storage/prefetch | 6 | 0 | 4 | 2 | 0 | 0 | 0.0% | 0.0% | 99 | 4 | 96.1% |
 | storage/read_duckdb | 9 | 0 | 9 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 9 | 0.0% |
-| storage/reclaim_space | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 2 | 75.0% |
-| storage/row_group_fetch_bulk.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| storage/rowid_gaps | 19 | 0 | 18 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 18 | 0.0% |
+| storage/reclaim_space | 2 | 1 | 1 | 0 | 0 | 0 | 50.0% | 50.0% | 7 | 1 | 87.5% |
+| storage/row_group_fetch_bulk.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 31 | 0 | 100.0% |
+| storage/rowid_gaps | 19 | 0 | 18 | 1 | 0 | 0 | 0.0% | 0.0% | 3 | 18 | 14.3% |
 | storage/shutdown_create_index.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | storage/shutdown_running_transaction.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 5 | 0 | 100.0% |
 | storage/shutdown_running_transaction_updates.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 5 | 0 | 100.0% |
@@ -1237,38 +1240,38 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | storage/storage_types.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | storage/storage_version_65.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | storage/storage_versions.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| storage/store_group_order_all.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| storage/temp_directory | 10 | 1 | 6 | 3 | 0 | 0 | 10.0% | 14.3% | 6 | 6 | 50.0% |
+| storage/store_group_order_all.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 8 | 1 | 88.9% |
+| storage/temp_directory | 10 | 2 | 5 | 3 | 0 | 0 | 20.0% | 28.6% | 15 | 5 | 75.0% |
 | storage/test_empty_shutdown.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 0 | 0 | 0.0% |
 | storage/test_empty_table.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 6 | 0 | 100.0% |
-| storage/test_eviction_queue_dead_nodes_underflow.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| storage/test_eviction_queue_dead_nodes_underflow.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | storage/test_ignore_duplicate_deletes_unique_index.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 8 | 0 | 100.0% |
-| storage/test_index_checkpoint.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| storage/test_large_commits.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| storage/test_read_only_wal_replay.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| storage/test_index_checkpoint.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| storage/test_large_commits.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 7 | 0 | 100.0% |
+| storage/test_read_only_wal_replay.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | storage/test_restart_extension.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 5 | 0 | 100.0% |
 | storage/test_show_tables_persistent.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | storage/test_storage_scan.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 10 | 0 | 100.0% |
-| storage/test_store_integers.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| storage/test_store_nulls_strings.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| storage/test_store_integers.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 47 | 0 | 100.0% |
+| storage/test_store_nulls_strings.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 9 | 0 | 100.0% |
 | storage/test_truncate_persistent.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | storage/test_unaligned_scan.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 6 | 0 | 100.0% |
 | storage/test_unique_index_checkpoint.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | storage/total_string_length_nested_types.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | storage/total_string_length_repeated_insert.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| storage/types | 53 | 4 | 44 | 5 | 0 | 0 | 7.5% | 8.3% | 76 | 44 | 63.3% |
+| storage/types | 53 | 4 | 44 | 5 | 0 | 0 | 7.5% | 8.3% | 80 | 44 | 64.5% |
 | storage/unicode_filename.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 46 | 0 | 100.0% |
 | storage/unzip.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
-| storage/update | 4 | 2 | 2 | 0 | 0 | 0 | 50.0% | 50.0% | 20 | 2 | 90.9% |
-| storage/wal | 62 | 0 | 62 | 0 | 0 | 0 | 0.0% | 0.0% | 10 | 62 | 13.9% |
+| storage/update | 4 | 3 | 1 | 0 | 0 | 0 | 75.0% | 75.0% | 28 | 1 | 96.6% |
+| storage/wal | 62 | 21 | 41 | 0 | 0 | 0 | 33.9% | 33.9% | 520 | 41 | 92.7% |
 | storage_version/storage_hyperloglog.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | storage_version/storage_version_bump.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| subquery/any_all | 12 | 3 | 9 | 0 | 0 | 0 | 25.0% | 25.0% | 62 | 9 | 87.3% |
+| subquery/any_all | 12 | 6 | 6 | 0 | 0 | 0 | 50.0% | 50.0% | 126 | 6 | 95.5% |
 | subquery/any_all_variant_extremum.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 9 | 1 | 90.0% |
 | subquery/complex | 4 | 0 | 4 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 4 | 55.6% |
-| subquery/exists | 9 | 3 | 6 | 0 | 0 | 0 | 33.3% | 33.3% | 35 | 6 | 85.4% |
+| subquery/exists | 9 | 4 | 5 | 0 | 0 | 0 | 44.4% | 44.4% | 57 | 5 | 91.9% |
 | subquery/lateral | 18 | 0 | 18 | 0 | 0 | 0 | 0.0% | 0.0% | 22 | 18 | 55.0% |
-| subquery/scalar | 39 | 5 | 33 | 1 | 0 | 0 | 12.8% | 13.2% | 110 | 33 | 76.9% |
+| subquery/scalar | 39 | 9 | 29 | 1 | 0 | 0 | 23.1% | 23.7% | 181 | 29 | 86.2% |
 | subquery/table | 4 | 3 | 1 | 0 | 0 | 0 | 75.0% | 75.0% | 17 | 1 | 94.4% |
 | subquery/test_neumann.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 11 | 0 | 100.0% |
 | subquery/test_offset.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
@@ -1283,13 +1286,13 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | table_function/duckdb_databases.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | table_function/duckdb_dependencies.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | table_function/duckdb_dialects.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| table_function/duckdb_eviction_queues.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| table_function/duckdb_eviction_queues_transactions.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
+| table_function/duckdb_eviction_queues.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
+| table_function/duckdb_eviction_queues_transactions.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
 | table_function/duckdb_extensions.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | table_function/duckdb_functions_window.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | table_function/duckdb_indexes.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | table_function/duckdb_keywords.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| table_function/duckdb_memory_convert_to_persistent.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| table_function/duckdb_memory_convert_to_persistent.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | table_function/duckdb_optimizers.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | table_function/duckdb_prepared_statements.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | table_function/duckdb_schemas.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
@@ -1314,7 +1317,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | table_function/range_function_lateral.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | table_function/range_non_foldable.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | table_function/range_timestamp.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
-| table_function/range_timestamp_lateral_empty.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| table_function/range_timestamp_lateral_empty.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | table_function/read_text_and_blob.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | table_function/register_external_resource.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | table_function/sqlite_master.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
@@ -1324,7 +1327,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | table_function/test_range_function.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | table_function/test_repeat_function.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | table_function/test_repeat_row_function.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| table_function/test_table_function.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| table_function/test_table_function.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 8 | 0 | 100.0% |
 | table_function/warn_deprecated_identifier_conversion.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | timezone/disable_timestamptz_casts.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | timezone/icu_calendar_operations.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
@@ -1350,16 +1353,16 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | topn/test_top_n_medium.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 3 | 0 | 100.0% |
 | topn/test_top_n_nested_struct.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | topn/test_top_n_nulls_first.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 6 | 0 | 100.0% |
-| topn/test_top_n_nulls_first_row_group_reorderer_edge_cases.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| topn/test_top_n_nulls_row_group_pruner.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| topn/test_top_n_nulls_row_group_pruner_extensive.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| topn/test_top_n_nulls_small.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| topn/test_top_n_offset_no_limit_pruner.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| topn/test_top_n_nulls_first_row_group_reorderer_edge_cases.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| topn/test_top_n_nulls_row_group_pruner.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 2 | 0 | 100.0% |
+| topn/test_top_n_nulls_row_group_pruner_extensive.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| topn/test_top_n_nulls_small.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 46 | 0 | 100.0% |
+| topn/test_top_n_offset_no_limit_pruner.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 5 | 0 | 100.0% |
 | topn/test_top_n_structs.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| topn/top_n_materialization.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| topn/top_n_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| topn/topn_dynamic_filter_cast.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| topn/topn_nulls_first.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| topn/top_n_materialization.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| topn/top_n_pruning.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| topn/topn_dynamic_filter_cast.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| topn/topn_nulls_first.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | topn/tpcds_q14_topn.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | topn/tpcds_q59_topn.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | tpcds/dsdgen_readonly.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
@@ -1372,12 +1375,12 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | transactions/aborted_transaction_commit.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | transactions/commit_revert_failure.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
 | transactions/concurrent_drop_index.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
-| transactions/concurrent_drop_table.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| transactions/concurrent_drop_table.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
 | transactions/conflict_drop_then_delete.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | transactions/conflict_rename_append.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | transactions/count_star_transactions.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | transactions/delete_and_drop_in_same_transaction.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 5 | 0 | 100.0% |
-| transactions/delete_index_lookup_transactions.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
+| transactions/delete_index_lookup_transactions.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 9 | 1 | 90.0% |
 | transactions/min_max_deletes.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | transactions/min_max_updates.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | transactions/revert_commit_index_corruption_drop_table.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 12 | 1 | 92.3% |
@@ -1394,7 +1397,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | transactions/test_alter_sequence_ownership_conflict2.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | transactions/test_alter_sequence_ownership_conflict3.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | transactions/test_basic_transactions.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
-| transactions/test_cardinality_estimation_uncommitted.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| transactions/test_cardinality_estimation_uncommitted.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | transactions/test_create_drop_conflict.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | transactions/test_create_drop_conflict_variation1.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | transactions/test_create_drop_conflict_variation2.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
@@ -1409,7 +1412,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | transactions/test_index_pending_delete_rollback.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | transactions/test_index_pending_insert.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | transactions/test_index_pending_update.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
-| transactions/test_index_rollback_flushed_data.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
+| transactions/test_index_rollback_flushed_data.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
 | transactions/test_index_transaction_local.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 30 | 0 | 100.0% |
 | transactions/test_index_versioned_deletes.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 28 | 0 | 100.0% |
 | transactions/test_index_versioned_updates.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 9 | 0 | 100.0% |
@@ -1436,10 +1439,10 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | transactions/types | 3 | 1 | 2 | 0 | 0 | 0 | 33.3% | 33.3% | 14 | 2 | 87.5% |
 | trigger/create_trigger_catalog.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | trigger/create_trigger_parse.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| trigger/create_trigger_wal.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| trigger/create_trigger_wal.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | trigger/drop_trigger.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | trigger/drop_trigger_parse.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| trigger/drop_trigger_wal.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| trigger/drop_trigger_wal.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | trigger/temporary_trigger.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | trigger/trigger_after_delete.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | trigger/trigger_after_delete_referencing.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
@@ -1447,7 +1450,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | trigger/trigger_after_insert_referencing.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | trigger/trigger_after_update.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | trigger/trigger_after_update_old_new.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| trigger/trigger_after_update_old_new_wal.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| trigger/trigger_after_update_old_new_wal.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | trigger/trigger_after_update_referencing.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | trigger/trigger_alter_table.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | trigger/trigger_before_after_mixed.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
@@ -1464,24 +1467,24 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | trigger/trigger_returning_binder_parity.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | trigger/trigger_update_from_multi_match.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | types/alias | 9 | 0 | 9 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 9 | 10.0% |
-| types/bignum | 16 | 0 | 16 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 16 | 0.0% |
+| types/bignum | 16 | 0 | 16 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 16 | 5.9% |
 | types/bit | 8 | 0 | 8 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 8 | 20.0% |
 | types/blob | 7 | 0 | 7 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 7 | 12.5% |
 | types/cast_expression_storage_version.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| types/date | 8 | 0 | 8 | 0 | 0 | 0 | 0.0% | 0.0% | 47 | 8 | 85.5% |
+| types/date | 8 | 1 | 7 | 0 | 0 | 0 | 12.5% | 12.5% | 51 | 7 | 87.9% |
 | types/decimal | 25 | 2 | 23 | 0 | 0 | 0 | 8.0% | 8.0% | 91 | 23 | 79.8% |
 | types/enum | 19 | 1 | 17 | 1 | 0 | 0 | 5.3% | 5.6% | 4 | 17 | 19.0% |
-| types/float | 12 | 3 | 9 | 0 | 0 | 0 | 25.0% | 25.0% | 130 | 9 | 93.5% |
-| types/geo | 29 | 0 | 29 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 29 | 17.1% |
+| types/float | 12 | 4 | 8 | 0 | 0 | 0 | 33.3% | 33.3% | 156 | 8 | 95.1% |
+| types/geo | 29 | 0 | 29 | 0 | 0 | 0 | 0.0% | 0.0% | 19 | 29 | 39.6% |
 | types/hugeint | 12 | 0 | 12 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 12 | 29.4% |
 | types/interval | 11 | 0 | 11 | 0 | 0 | 0 | 0.0% | 0.0% | 59 | 11 | 84.3% |
 | types/list | 37 | 1 | 36 | 0 | 0 | 0 | 2.7% | 2.7% | 36 | 36 | 50.0% |
 | types/map | 5 | 0 | 5 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 5 | 28.6% |
-| types/nested | 83 | 2 | 80 | 1 | 0 | 0 | 2.4% | 2.4% | 59 | 80 | 42.4% |
-| types/null | 5 | 0 | 5 | 0 | 0 | 0 | 0.0% | 0.0% | 16 | 5 | 76.2% |
+| types/nested | 83 | 2 | 80 | 1 | 0 | 0 | 2.4% | 2.4% | 71 | 80 | 47.0% |
+| types/null | 5 | 1 | 4 | 0 | 0 | 0 | 20.0% | 20.0% | 19 | 4 | 82.6% |
 | types/numeric | 18 | 0 | 18 | 0 | 0 | 0 | 0.0% | 0.0% | 8 | 18 | 30.8% |
 | types/string | 2 | 1 | 1 | 0 | 0 | 0 | 50.0% | 50.0% | 10 | 1 | 90.9% |
-| types/struct | 47 | 0 | 46 | 1 | 0 | 0 | 0.0% | 0.0% | 7 | 46 | 13.2% |
+| types/struct | 47 | 0 | 46 | 1 | 0 | 0 | 0.0% | 0.0% | 8 | 46 | 14.8% |
 | types/test_date_cast.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | types/test_interval_negation_overflow.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | types/test_null_type.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
@@ -1490,7 +1493,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | types/test_typeof.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 1 | 0 | 100.0% |
 | types/test_user_type_errors_18452.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | types/time | 9 | 0 | 8 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 8 | 0.0% |
-| types/timestamp | 18 | 1 | 14 | 3 | 0 | 0 | 5.6% | 6.7% | 18 | 14 | 56.2% |
+| types/timestamp | 18 | 1 | 14 | 3 | 0 | 0 | 5.6% | 6.7% | 22 | 14 | 61.1% |
 | types/type | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 2 | 0.0% |
 | types/type_constructor_error_location.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | types/type_constructors.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
@@ -1500,20 +1503,20 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | types/union | 17 | 0 | 17 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 17 | 26.1% |
 | types/unsigned | 4 | 0 | 4 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 4 | 0.0% |
 | types/uuid | 2 | 0 | 2 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 2 | 0.0% |
-| types/variant | 12 | 0 | 9 | 3 | 0 | 0 | 0.0% | 0.0% | 0 | 9 | 0.0% |
+| types/variant | 12 | 0 | 9 | 3 | 0 | 0 | 0.0% | 0.0% | 1 | 9 | 10.0% |
 | update/compact_update_allocation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | update/force_update_to_del_and_insert.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | update/issue_22392.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 7 | 0 | 100.0% |
 | update/null_update_merge.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 23 | 0 | 100.0% |
 | update/null_update_merge_transaction.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 22 | 0 | 100.0% |
 | update/string_update_null_heap.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 4 | 0 | 100.0% |
-| update/string_update_transaction_local_7348.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| update/string_update_transaction_local_7348.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
 | update/test_big_string_update.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 20 | 0 | 100.0% |
-| update/test_cascading_updates.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
+| update/test_cascading_updates.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 13 | 1 | 92.9% |
 | update/test_multiple_assignment.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | update/test_null_update.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | update/test_repeated_string_update.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 12 | 0 | 100.0% |
-| update/test_stress_update_issue_19688.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| update/test_stress_update_issue_19688.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2731 | 1 | 100.0% |
 | update/test_string_update.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 13 | 0 | 100.0% |
 | update/test_string_update_many_strings.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 11 | 1 | 91.7% |
 | update/test_string_update_null.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 6 | 1 | 85.7% |
@@ -1537,7 +1540,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | update/update_join_nulls.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | update/update_null_integers.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 8 | 0 | 100.0% |
 | update/update_query_node.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 11 | 1 | 91.7% |
-| update/update_string_null_merge_dict_fsst.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| update/update_string_null_merge_dict_fsst.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | upsert/concurrent_insert_or_replace.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | upsert/insert_or_replace | 10 | 2 | 8 | 0 | 0 | 0 | 20.0% | 20.0% | 36 | 8 | 81.8% |
 | upsert/minimal_reproducable_example.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 5 | 0 | 100.0% |
@@ -1548,10 +1551,10 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | upsert/test_generated_column.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | upsert/test_problematic_conditional_do_update.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 1 | 0 | 100.0% |
 | upsert/upsert_aliased.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| upsert/upsert_basic.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| upsert/upsert_basic.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
 | upsert/upsert_conflict_target.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | upsert/upsert_conflict_target_index.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| upsert/upsert_coverage.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
+| upsert/upsert_coverage.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
 | upsert/upsert_default.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
 | upsert/upsert_default_expressions.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | upsert/upsert_default_value_causes_conflict.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
@@ -1584,12 +1587,12 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | window/test_boundary_expr.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_constant_orderby.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | window/test_cume_dist_orderby.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| window/test_dense_rank.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| window/test_dense_rank.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | window/test_duplicate_partition.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 10 | 0 | 100.0% |
-| window/test_empty_frames.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| window/test_empty_frames.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 5 | 1 | 83.3% |
 | window/test_evil_window.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 8 | 1 | 88.9% |
 | window/test_fill_orderby.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| window/test_frame_analysis.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| window/test_frame_analysis.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | window/test_ignore_nulls.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | window/test_invalid_window.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
 | window/test_lead_lag.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
@@ -1598,7 +1601,7 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | window/test_mad_window.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | window/test_mode_window.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | window/test_mode_window_varlen.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| window/test_naive_aggregation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| window/test_naive_aggregation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
 | window/test_negative_range.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | window/test_no_default_window_spec.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_nthvalue.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
@@ -1607,40 +1610,40 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | window/test_partition_constant_arguments.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_quantile_window.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | window/test_range_optimisation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
-| window/test_rank.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| window/test_rank.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | window/test_rank_orderby.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_rownumber_orderby.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_scalar_window.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | window/test_split_partition_heap.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 2 | 0 | 100.0% |
-| window/test_streaming_lead_lag.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| window/test_streaming_nthvalue.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| window/test_streaming_window.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| window/test_streaming_window_distinct.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| window/test_streaming_lead_lag.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| window/test_streaming_nthvalue.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
+| window/test_streaming_window.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 4 | 1 | 80.0% |
+| window/test_streaming_window_distinct.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
 | window/test_thread_count.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_tpcc_results.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_tpcds_q49.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 5 | 0 | 100.0% |
 | window/test_value_exclude.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_value_orderby.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_volatile_independence.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
-| window/test_wide_orderby.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| window/test_wide_orderby.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | window/test_window_agg_stats_propagation.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | window/test_window_aggregate_macro.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_window_binding.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 7 | 1 | 87.5% |
 | window/test_window_binding_ctes.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 10 | 0 | 100.0% |
 | window/test_window_bool.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| window/test_window_clause.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
-| window/test_window_constant_aggregate.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| window/test_window_clause.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
+| window/test_window_constant_aggregate.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | window/test_window_constant_allocator.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_window_cse.test | 1 | 0 | 0 | 1 | 0 | 0 | 0.0% | 0.0% | 0 | 0 | 0.0% |
 | window/test_window_dbplyr.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 5 | 0 | 100.0% |
 | window/test_window_distinct.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_window_filter.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 3 | 1 | 75.0% |
-| window/test_window_finalize_race.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| window/test_window_finalize_race.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 403 | 0 | 100.0% |
 | window/test_window_fusion.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | window/test_window_interval.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_window_order_collate.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_window_rows.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 2 | 1 | 66.7% |
-| window/test_window_string_agg.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
+| window/test_window_string_agg.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
 | window/test_window_tpcds.test | 1 | 1 | 0 | 0 | 0 | 0 | 100.0% | 100.0% | 16 | 0 | 100.0% |
 | window/test_window_types.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 0 | 1 | 0.0% |
 | window/test_window_unnest_error.test | 1 | 0 | 1 | 0 | 0 | 0 | 0.0% | 0.0% | 1 | 1 | 50.0% |
@@ -1651,36 +1654,36 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 
 | files | reason |
 |---:|---|
-| 471 | statement failed: parse error: error at N:N: expected one of alter, analyze, attach, call, copy, describe, detach, do, explain, force, grant, install, keyword, … |
-| 122 | statement failed: parse error: error at N:N: expected one of "\"", ['a'..='z' \| 'A'..='Z' \| '_'], alter, analyze, attach, call, describe, detach, do, explain, f… |
-| 109 | statement failed: parse error: error at N:N: expected one of keyword, macro, materialized, or, persistent, procedure, role, schema, secret, temp, temporary, tri… |
-| 104 | statement failed: parse error: error at N:N: expected one of "(", "[", ['a'..='z' \| 'A'..='Z' \| 'N'..='N' \| '_'], keyword, known column type |
-| 79 | statement failed: parse error: error at N:N: expected one of automatic_migration, catalog, create_if_not_exists, data, data_inlining_row_limit, data_path, encry… |
-| 72 | statement failed: parse error: error at N:N: expected T[] is a variable-length LIST; pinkdb has fixed-size ARRAY only (wave NaN) |
-| 67 | statement failed: parse error: error at N:N: expected one of "!=", "%", "(", "*", "+", "-", ".", "/", "::", ";", "<", "<=", "<>", "=", ">", ">=", "[", "\|\|", COA… |
-| 65 | query failed: parse error: error at N:N: expected one of alter, analyze, attach, call, copy, describe, detach, do, explain, force, grant, install, keyword, merg… |
-| 58 | statement failed: parse error: error at N:N: expected ['N'..='N'] |
-| 57 | statement failed: parse error: error at N:N: expected one of CURRENT_TIMESTAMP, EXTRACT, INTERVAL, identifier, keyword, substring, try_cast |
-| 52 | statement failed: parse error: error at N:N: expected ['a'..='z' \| 'A'..='Z' \| '_'] |
-| 49 | query failed: parse error: error at N:N: expected one of "(", "[", ['a'..='z' \| 'A'..='Z' \| 'N'..='N' \| '_'], keyword, known column type |
-| 45 | statement failed: parse error: error at N:N: expected keyword |
-| 43 | statement failed: ATTACH ':memory:' is not a lake: name a lake with the lake: or ducklake: prefix or TYPE LAKE (attaching a .pink file is not supported yet) |
-| 40 | value N differs: expected "NULL", got "N" |
-| 33 | query failed: parse error: error at N:N: expected one of "$", "$$", "'", "(", "*", "+", "-", ".", "?", "[", "\"", ['N'..='N'], ['a'..='z' \| 'A'..='Z' \| '_'] |
-| 28 | statement failed: parse error: error at N:N: expected one of identifier, keyword |
-| 26 | statement failed: parse error: error at N:N: expected one of "[", known column type |
-| 26 | statement failed: parse error: error at N:N: expected one of ['a'..='z' \| 'A'..='Z' \| 'N'..='N' \| '_'], identifier, keyword |
-| 25 | query failed: parse error: error at N:N: expected one of "(", "[", keyword, known column type |
-| 25 | statement failed: parse error: error at N:N: expected one of "(", "[", keyword, known column type |
-| 25 | statement failed: parse error: error at N:N: expected one of add, keyword, rename |
-| 24 | query failed: parse error: error at N:N: expected one of at, ilike, keyword, similar |
-| 24 | statement failed: parse error: error at N:N: expected one of "$", "$$", "'", "(", "*", "+", "-", ".", "?", "[", "\"", ['N'..='N'], ['a'..='z' \| 'A'..='Z' \| '_'] |
-| 24 | statement failed: parse error: error at N:N: expected one of constraint, default, keyword, primary, references, unique |
-| 22 | query failed: no column "ALL" |
-| 22 | query failed: parse error: error at N:N: expected "(" |
-| 22 | statement failed: parse error: error at N:N: expected one of "$", "$$", "'", "(", "*", "+", "-", ".", "?", "[", "\"", ['N'..='N'], ['a'..='z' \| 'A'..='Z' \| '_']… |
-| 21 | expected an error containing "" |
-| 20 | statement failed: parse error: error at N:N: expected one of ")", ['a'..='z' \| 'A'..='Z' \| 'N'..='N' \| '_'] |
+| 134 | statement failed: parse error: error at N:N: expected one of "\"", ['a'..='z' \| 'A'..='Z' \| '_'], alter, analyze, attach, call, describe, detach, do, explain, f… |
+| 132 | statement failed: parse error: error at N:N: expected one of keyword, macro, materialized, or, persistent, procedure, role, schema, secret, temp, temporary, tri… |
+| 113 | statement failed: parse error: error at N:N: expected one of "(", "[", ['a'..='z' \| 'A'..='Z' \| 'N'..='N' \| '_'], keyword, known column type |
+| 88 | statement failed: parse error: error at N:N: expected one of automatic_migration, catalog, create_if_not_exists, data, data_inlining_row_limit, data_path, encry… |
+| 86 | statement failed: parse error: error at N:N: expected one of alter, analyze, attach, call, copy, describe, detach, do, explain, force, grant, install, keyword, … |
+| 78 | statement failed: parse error: error at N:N: expected T[] is a variable-length LIST; pinkdb has fixed-size ARRAY only (wave NaN) |
+| 67 | query failed: parse error: error at N:N: expected one of alter, analyze, attach, call, copy, describe, detach, do, explain, force, grant, install, keyword, merg… |
+| 65 | statement failed: parse error: error at N:N: expected ['N'..='N'] |
+| 62 | statement failed: parse error: error at N:N: expected ['a'..='z' \| 'A'..='Z' \| '_'] |
+| 61 | statement failed: parse error: error at N:N: expected keyword |
+| 51 | query failed: parse error: error at N:N: expected one of "(", "[", ['a'..='z' \| 'A'..='Z' \| 'N'..='N' \| '_'], keyword, known column type |
+| 49 | query failed: parse error: error at N:N: expected one of "$", "$$", "'", "(", "*", "+", "-", ".", "?", "[", "\"", ['N'..='N'], ['a'..='z' \| 'A'..='Z' \| '_'] |
+| 38 | expected N rows, got N |
+| 38 | query failed: Pragma Function with name storage_info does not exist! |
+| 35 | statement failed: parse error: error at N:N: expected one of "$", "$$", "'", "(", "*", "+", "-", ".", "?", "[", "\"", ['N'..='N'], ['a'..='z' \| 'A'..='Z' \| '_'] |
+| 32 | statement failed: parse error: error at N:N: expected one of ['a'..='z' \| 'A'..='Z' \| 'N'..='N' \| '_'], identifier, keyword |
+| 30 | query failed: parse error: error at N:N: expected one of identifier, table |
+| 30 | statement failed: parse error: error at N:N: expected one of add, keyword, rename |
+| 30 | statement failed: parse error: error at N:N: expected one of constraint, default, keyword, primary, references, unique |
+| 29 | statement failed: parse error: error at N:N: expected one of identifier, keyword |
+| 28 | query failed: parse error: error at N:N: expected one of at, ilike, keyword, similar |
+| 27 | statement failed: parse error: error at N:N: expected one of "(", "[", keyword, known column type |
+| 26 | query failed: parse error: error at N:N: expected one of "(", "[", keyword, known column type |
+| 25 | expected an error containing "" |
+| 24 | statement failed: parse error: error at N:N: expected one of ")", ['a'..='z' \| 'A'..='Z' \| 'N'..='N' \| '_'] |
+| 23 | query failed: parse error: error at N:N: expected "(" |
+| 23 | query failed: parse error: error at N:N: expected to |
+| 23 | statement failed: parse error: error at N:N: expected one of "$", "$$", "'", "(", "*", "+", "-", ".", "?", "[", "\"", ['N'..='N'], ['a'..='z' \| 'A'..='Z' \| '_']… |
+| 21 | statement failed: ARRAY elements must be INTEGER, BIGINT or DOUBLE, not VARCHAR |
+| 20 | query failed: parse error: error at N:N: expected one of "$", "$$", "'", "(", ")", "*", "+", "-", ".", "?", "[", "\"", ['N'..='N'], ['a'..='z' \| 'A'..='Z' \| '_'… |
 
 ## Top skip reasons
 
@@ -1694,8 +1697,8 @@ Records: 11442 pass, 3561 fail, 1110 skip (76.3% of non-skipped records pass). W
 | 15 | unsupported directive: include |
 | 13 | require tpch |
 | 9 | unsupported directive: set seed |
+| 7 | require tpcds |
 | 6 | require quack |
-| 6 | require tpcds |
 | 3 | require allow_unsigned_extensions |
 | 3 | require windows |
 | 2 | require debug_fs |

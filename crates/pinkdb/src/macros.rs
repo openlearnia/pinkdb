@@ -308,6 +308,7 @@ pub(crate) fn substitute_expr(
                             .iter()
                             .map(|item| {
                                 Ok(crate::sql::ast::OrderItem {
+                                    all: item.all,
                                     expr: substitute_expr(&item.expr, args, used)?,
                                     desc: item.desc,
                                     nulls_first: item.nulls_first,
@@ -503,6 +504,7 @@ pub(crate) fn substitute_select(
                             .iter()
                             .map(|item| {
                                 Ok(crate::sql::ast::OrderItem {
+                                    all: item.all,
                                     expr: substitute_expr(&item.expr, args, used)?,
                                     desc: item.desc,
                                     nulls_first: item.nulls_first,
@@ -519,6 +521,7 @@ pub(crate) fn substitute_select(
             .iter()
             .map(|item| {
                 Ok(crate::sql::ast::OrderItem {
+                    all: item.all,
                     expr: substitute_expr(&item.expr, args, used)?,
                     desc: item.desc,
                     nulls_first: item.nulls_first,
@@ -627,6 +630,8 @@ fn substitute_group_set(
         GroupSet::Rollup(items) => GroupSet::Rollup(map(items)?),
         GroupSet::Cube(items) => GroupSet::Cube(map(items)?),
         GroupSet::Sets(sets) => GroupSet::Sets(sets.iter().map(map).collect::<Result<Vec<_>>>()?),
+        // No expressions of its own: the select list supplies them.
+        GroupSet::All => GroupSet::All,
     })
 }
 
