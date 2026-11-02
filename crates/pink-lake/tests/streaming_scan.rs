@@ -1,10 +1,12 @@
-//! Wave 98c: an aggregate over an attached lake table streams data files into
-//! the fold instead of materializing the table. The table below is 60 files of
-//! 3000 rows (well over the 131 072-row bound under which a table is
-//! materialized and cached); the fold runs on a pinned worker count and the
-//! executor's counter must stay within that many chunks in flight, while the
-//! fold sees every row, and the answers must be the ones a materialized read
-//! gives.
+//! Wave 133b: a lake scan hands morsels to the pipeline on demand — a worker
+//! claims a morsel index and decodes it itself — instead of a producer thread
+//! pushing chunks at workers that may be parked.
+//!
+//! The regression below is the shape that deadlocked: eight `.pink` files of
+//! four row groups each (491 520 rows a file at `persist::ROW_GROUP_ROWS`),
+//! scanned through an aggregate with only two pool threads. The old pushing
+//! source left both threads waiting inside `next_morsel` while the producer
+//! needed one of them to decode a file, so the query never finished.
 
 #[path = "common/local_lake.rs"]
 mod local_lake;
@@ -13,14 +15,18 @@ use local_lake::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use pink_lake::{Commit, Lake};
-use pinkdb::{PinkDb, Value};
+use pinkdb::{DataTable, DataType, PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-const FILES: i32 = 60;
-const ROWS_PER_FILE: i32 = 3000;
+/// Rows in four `.pink` row groups: the smallest file with four of them.
+const ROWS_PER_GROUPED_FILE: i64 = 491_520;
+/// Files in the deadlock regression: a scan that needs the pool for real work.
+const GROUPED_FILES: i64 = 8;
 
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -33,11 +39,6 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// The bright catalog entry of `main.t` (data-file list included).
-fn entry(lake_dir: &Path, key: &str) -> serde_json::Value {
-    catalog_json(lake_dir)["tables"][key].clone()
-}
-
 fn query(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
     let mut results = db.execute(sql).unwrap();
     match results.pop().unwrap() {
@@ -46,21 +47,24 @@ fn query(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
     }
 }
 
-/// One `t(i INTEGER, g BIGINT)` data file per commit (`i` in
-/// `[first, first + ROWS_PER_FILE)`), committed with inlining off so every
-/// commit writes a real file.
-fn append_file(lake: &mut Lake, first: i32) {
-    let mut table = pinkdb::DataTable::new(
+fn lake_table() -> DataTable {
+    DataTable::new(
         "t".to_string(),
         vec![
-            ("i".to_string(), pinkdb::DataType::Integer),
-            ("g".to_string(), pinkdb::DataType::Bigint),
+            ("i".to_string(), DataType::Bigint),
+            ("g".to_string(), DataType::Bigint),
         ],
     )
-    .unwrap();
-    for i in first..first + ROWS_PER_FILE {
+    .unwrap()
+}
+
+/// One `t(i BIGINT, g BIGINT)` data file per commit, `i` in `[first, first +
+/// rows)`, committed with inlining off so every commit writes a real file.
+fn append_file(lake: &mut Lake, first: i64, rows: i64) {
+    let mut table = lake_table();
+    for i in first..first + rows {
         table
-            .append_row(vec![Value::Integer(i), Value::Bigint(i as i64 * 2)])
+            .append_row(vec![Value::Bigint(i), Value::Bigint(i * 2)])
             .unwrap();
     }
     let mut commit = Commit::new();
@@ -68,89 +72,145 @@ fn append_file(lake: &mut Lake, first: i32) {
     lake.commit(&commit).unwrap();
 }
 
-fn lake_with_files(tag: &str) -> (PathBuf, Lake) {
+fn lake_with_files(tag: &str, files: i64, rows: i64) -> (PathBuf, Lake, PinkDb) {
     let dir = scratch(tag);
-    let lake_dir = dir.join("lake");
-    let mut lake = create_lake(&lake_dir).unwrap();
+    let mut lake = create_lake(dir.join("lake")).unwrap();
     lake.set_data_inlining_row_limit(0);
-    for file in 0..FILES {
-        append_file(&mut lake, file * ROWS_PER_FILE);
+    for file in 0..files {
+        append_file(&mut lake, file * rows, rows);
     }
-    (dir, lake)
-}
-
-#[test]
-fn an_aggregate_over_a_lake_streams_data_files_into_the_fold() {
-    let (dir, _lake) = lake_with_files("aggregate");
-    let files = entry(&dir.join("lake"), "main.t")["files"]
-        .as_array()
-        .unwrap()
-        .len();
-    assert_eq!(files, FILES as usize, "one data file per commit");
-
     let report = open_lake(dir.join("lake")).unwrap().attach(None).unwrap();
     let mut db = PinkDb::new();
     db.attach_lake(report.lake).unwrap();
+    (dir, lake, db)
+}
 
-    // Pin the fold's parallelism so the bound below is exact: the fold holds
-    // one chunk per worker being folded plus `workers` queued and one blocked
-    // on the hand-off. Nothing in the bound depends on the table's size.
-    // SAFETY: this test binary has a single test.
-    unsafe { std::env::set_var("PINKDB_STREAM_WORKERS", "2") };
-    let bound = (2 * PinkDb::stream_fold_workers() + 1) * pinkdb::CHUNK_SIZE;
+/// Run `work` on a two-thread rayon pool — the pool the pipeline draws its
+/// workers from — and fail the test if it does not finish in time.
+fn on_two_threads<T: Send + 'static>(
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        tx.send(pool.install(work)).ok();
+    });
+    match rx.recv_timeout(limit) {
+        Ok(value) => value,
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+            "the streamed lake scan did not finish within {limit:?}: a worker is \
+             waiting on a source that needs the pool"
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("the scan thread died"),
+    }
+}
 
-    db.reset_stream_stats();
-    let rows = query(&mut db, "SELECT count(*), sum(g) FROM t WHERE i % 5 <> 0;");
-    let (peak, folded) = db.stream_stats();
-    let total = (FILES * ROWS_PER_FILE) as u64;
-    let kept = (0..total).filter(|i| i % 5 != 0).count() as u64;
+/// The lake scan the previous statement ran, as `pinkdb_scan_io()` reports it:
+/// `(files read, files pruned, peak morsels in flight)`.
+fn lake_io(db: &mut PinkDb) -> (u64, u64, u64) {
+    let rows = query(
+        db,
+        "SELECT source, unit, read, pruned, in_flight FROM pinkdb_scan_io();",
+    );
+    let (mut files, mut pruned, mut peak) = (None, 0, 0);
+    for row in &rows {
+        let [
+            Value::Varchar(source),
+            unit,
+            Value::Bigint(read),
+            Value::Bigint(pruned_rows),
+            Value::Bigint(in_flight),
+        ] = row.as_slice()
+        else {
+            panic!("unexpected scan_io row {row:?}");
+        };
+        assert!(
+            source.contains("lake"),
+            "the scan came from the lake: {source}"
+        );
+        peak = peak.max(*in_flight as u64);
+        if let Value::Varchar(unit) = unit
+            && unit == "files"
+        {
+            files = Some(*read as u64);
+            pruned = *pruned_rows as u64;
+        }
+    }
+    (
+        files.expect("the lake scan reported its files"),
+        pruned,
+        peak,
+    )
+}
+
+#[test]
+fn two_pool_threads_stream_a_multi_row_group_lake() {
+    let (dir, _lake, mut db) = lake_with_files("grouped", GROUPED_FILES, ROWS_PER_GROUPED_FILE);
+    let total = GROUPED_FILES * ROWS_PER_GROUPED_FILE;
+    let (rows, io) = on_two_threads(Duration::from_secs(180), move || {
+        let rows = query(&mut db, "SELECT sum(i) FROM t;");
+        (rows, lake_io(&mut db))
+    });
     assert_eq!(
         rows,
-        vec![vec![
-            Value::Bigint(kept as i64),
-            Value::Bigint(
-                (0..total)
-                    .filter(|i| i % 5 != 0)
-                    .map(|i| i as i64 * 2)
-                    .sum()
-            ),
-        ]]
+        vec![vec![Value::Bigint(total * (total - 1) / 2)]],
+        "every row of every row group reached the aggregate"
     );
-    // The counter counts what the scan handed to the fold (the filter runs
-    // inside the fold workers, so it is the pre-filter row count).
-    assert_eq!(
-        folded, total,
-        "the fold did not see every row the scan pushed"
-    );
-    assert!(
-        peak <= bound,
-        "the fold held {peak} rows at once (bound {bound}): the lake was \
-         materialized, not streamed"
-    );
+    let (files_read, files_pruned, peak) = io;
+    assert_eq!(files_read, GROUPED_FILES as u64, "every file was read");
+    assert_eq!(files_pruned, 0, "no predicate, nothing pruned");
+    assert_eq!(peak, 2, "both pool workers decode a morsel at once");
+    let _ = std::fs::remove_dir_all(Path::new(&dir));
+}
 
-    // Zone-map pruning still applies to the streaming path: an `i <` bound
-    // skips whole files, and the count is still exact.
-    db.reset_stream_stats();
-    let rows = query(&mut db, "SELECT count(*), sum(g) FROM t WHERE i < 700;");
-    let (peak, folded) = db.stream_stats();
-    assert_eq!(
-        rows,
-        vec![vec![Value::Bigint(700), Value::Bigint(700 * 699)]]
-    );
-    // Only the first file (rows 0..2999) survives the zone-map prune, so the
-    // fold sees that file whole and the filter keeps 700 of its rows.
-    assert_eq!(folded, ROWS_PER_FILE as u64);
-    assert!(peak <= bound, "the pruned fold held {peak} rows at once");
+#[test]
+fn an_aggregate_over_a_lake_reports_the_files_it_read_and_pruned() {
+    const FILES: i64 = 8;
+    const ROWS_PER_FILE: i64 = 3000;
+    let (dir, _lake, mut db) = lake_with_files("prune", FILES, ROWS_PER_FILE);
 
-    // A full read (not an aggregate) still materializes the same table.
-    let rows = query(&mut db, "SELECT count(*), sum(g) FROM t;");
+    let (answer, io) = on_two_threads(Duration::from_secs(120), move || {
+        let answer = query(&mut db, "SELECT count(*), sum(g) FROM t WHERE i < 700;");
+        (answer, lake_io(&mut db))
+    });
     assert_eq!(
-        rows,
-        vec![vec![
-            Value::Bigint(total as i64),
-            Value::Bigint((0..total).map(|i| i as i64 * 2).sum()),
-        ]]
+        answer,
+        vec![vec![Value::Bigint(700), Value::Bigint(700 * 699)]],
+        "the pruned scan kept exactly the matching rows"
     );
-    drop(db);
+    let (files_read, files_pruned, _peak) = io;
+    // Only the first file holds rows below 700; the zone maps of the other
+    // seven prune them before any byte is read.
+    assert_eq!(files_read, 1, "one file survived the zone-map prune");
+    assert_eq!(files_pruned, FILES as u64 - 1, "seven files pruned");
+    let _ = std::fs::remove_dir_all(Path::new(&dir));
+}
+
+#[test]
+fn a_join_build_side_prunes_the_lake_probe_before_it_reads() {
+    const FILES: i64 = 8;
+    const ROWS_PER_FILE: i64 = 3000;
+    let (dir, _lake, mut db) = lake_with_files("join", FILES, ROWS_PER_FILE);
+
+    let (answer, io) = on_two_threads(Duration::from_secs(120), move || {
+        db.execute("CREATE TABLE keys (i BIGINT); INSERT INTO keys VALUES (750);")
+            .unwrap();
+        let answer = query(&mut db, "SELECT count(*) FROM t JOIN keys ON keys.i = t.i;");
+        (answer, lake_io(&mut db))
+    });
+    assert_eq!(
+        answer,
+        vec![vec![Value::Bigint(1)]],
+        "the join matched the one row of `keys`"
+    );
+    let (files_read, files_pruned, _peak) = io;
+    // Wave 122's build-side bounds reach the lake scan: row 750 lives in the
+    // first file, so the other seven are pruned before their footer is used.
+    assert_eq!(files_read, 1, "the key bounds kept one file");
+    assert_eq!(files_pruned, FILES as u64 - 1, "seven files pruned");
     let _ = std::fs::remove_dir_all(Path::new(&dir));
 }

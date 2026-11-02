@@ -34,6 +34,16 @@
 //! set operation, CTE materialization or the statement root reads a pipeline's
 //! result without noticing it.
 //!
+//! # The source
+//!
+//! A scan is a [`MorselSource`]: the workers pull the next morsel and decode
+//! it themselves — a store table's chunk, a Parquet row group or page range —
+//! push it through the same steps and fold it, so the scan's memory is the
+//! morsels in flight (one per worker), not the table. Partials are kept by
+//! morsel index, so a streamed scan merges in exactly the order the
+//! materialized one would have. Every other source is a subtree `eval`
+//! materializes first, and its chunks are the morsels.
+//!
 //! Every shape this module does not compile — a full join, a semi/anti/mark
 //! join the materialized path decides to build the preserved side for, an
 //! unsupported input, an aggregate in an outer context — is declined with
@@ -41,9 +51,11 @@
 //! pipeline_execution = false` forces that path, which is how the two are
 //! compared.
 
-/// How many chunks of a store scan pass between deadline checks.
+/// How many morsels pass between deadline checks.
 const CHECK_DEADLINE_EVERY: usize = 64;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rayon::prelude::*;
 
@@ -54,6 +66,7 @@ use super::{
     derive_join_filters, estimate_rows, eval, expr, filter_pays, mark_probe_chunk, project_chunk,
     project_mask, scan_targets, selection, swap_join_space,
 };
+use crate::morsel::{MorselCursor, MorselSource, ScanIo};
 use crate::plan::LogicalPlan;
 use crate::sql::ast::JoinKind;
 use crate::sql::binder::{BoundAgg, BoundExpr};
@@ -407,13 +420,19 @@ pub(crate) fn aggregate(
     let Some(compiled) = compile(cx, input)? else {
         return Ok(None);
     };
+    let streamed = compiled.source.streamed();
     let chunks = match FlatSink::new(keys, aggs, compiled.rows, compiled.types.len()) {
         Some(flat) => match run(cx, &compiled, &flat)? {
             Some(items) => flat.finish(items, cx)?,
             // A key column whose payload is not the one its type promises:
             // the flat table declines, as it does for the materialized path.
+            // A streamed source has already been read, so the caller's
+            // materialized path re-reads it once.
+            None if streamed => return Ok(None),
             None => general(cx, &compiled, keys, aggs)?,
         },
+        // An aggregate the flat table cannot hold runs the general sink over
+        // the one source read: a streamed source cannot be re-read.
         None => general(cx, &compiled, keys, aggs)?,
     };
     let (names, types) = crate::plan::agg_output_schema(keys, aggs);
@@ -491,8 +510,45 @@ impl Sink for CollectSink {
     }
 }
 
-/// A compiled pipeline: the materialized source, every join's completed build
-/// side, and the operators a morsel passes through, bottom-up.
+/// Where a pipeline's morsels come from: a [`MorselSource`] pulled on demand
+/// (a store scan, an attached-lake scan), or an `Output` a subtree `eval`
+/// materialized first.
+enum Source<'a> {
+    Chunks(Output),
+    Streamed(Box<dyn MorselSource + 'a>),
+}
+
+impl Source<'_> {
+    fn types(&self) -> &[DataType] {
+        match self {
+            Source::Chunks(output) => &output.types,
+            Source::Streamed(source) => source.types(),
+        }
+    }
+
+    fn names(&self) -> &[String] {
+        match self {
+            Source::Chunks(output) => &output.names,
+            Source::Streamed(source) => source.names(),
+        }
+    }
+
+    fn rows(&self) -> usize {
+        match self {
+            Source::Chunks(output) => output.chunks.iter().map(DataChunk::num_rows).sum(),
+            // A source that knows its rows without reading (a store scan's
+            // footer) offers them; a lake scan has to run to count.
+            Source::Streamed(source) => source.rows().unwrap_or(0),
+        }
+    }
+
+    fn streamed(&self) -> bool {
+        matches!(self, Source::Streamed(_))
+    }
+}
+
+/// A compiled pipeline: the source, every join's completed build side, and the
+/// operators a morsel passes through, bottom-up.
 struct Compiled<'a> {
     source: Source<'a>,
     builds: Vec<Output>,
@@ -503,32 +559,6 @@ struct Compiled<'a> {
     names: Vec<String>,
     /// Source rows, the flat table's bucket-count hint (never a result).
     rows: usize,
-}
-
-/// Where a pipeline reads its morsels: a store scan produces them as the run
-/// asks, anything else is a subtree `eval` materializes first.
-enum Source<'a> {
-    Materialized(Output),
-    Store(super::StoreScan<'a>),
-}
-
-impl Source<'_> {
-    fn schema(&self) -> (Vec<DataType>, Vec<String>) {
-        match self {
-            Source::Materialized(out) => (out.types.clone(), out.names.clone()),
-            Source::Store(scan) => {
-                let (names, types) = scan.schema();
-                (types, names)
-            }
-        }
-    }
-
-    fn rows(&self) -> usize {
-        match self {
-            Source::Materialized(out) => out.chunks.iter().map(DataChunk::num_rows).sum(),
-            Source::Store(scan) => scan.rows(),
-        }
-    }
 }
 
 /// The materialized shape's own fallback for a shape the flat table declined
@@ -550,8 +580,8 @@ fn general(
 }
 
 /// Walk `input` top-down, compiling its operators and evaluating each join's
-/// build side. Returns the source plan the operators sit on, or `None` when
-/// nothing above the source compiles.
+/// build side. Returns the source plan the operators sit on; the caller
+/// decides whether the walk found anything worth pipelining.
 ///
 /// The join filters pushed for a probe side are left in `frames` for the caller
 /// to pop: the source under them is evaluated by the caller, and it must see
@@ -725,7 +755,7 @@ fn compile<'a>(cx: &'a Cx, input: &'a LogicalPlan) -> Result<Option<Compiled<'a>
         // The source sits inside the join-filter frames, so it is evaluated
         // before they are popped.
         match source {
-            Some(plan) => source_of(cx, plan),
+            Some(plan) => source_of(cx, plan, !nodes.is_empty()),
             None => Ok(None),
         }
     });
@@ -736,7 +766,8 @@ fn compile<'a>(cx: &'a Cx, input: &'a LogicalPlan) -> Result<Option<Compiled<'a>
         return Ok(None);
     };
     // Bottom-up: each node's output dtypes are its input's, transformed.
-    let (mut types, mut names) = source.schema();
+    let mut types: Vec<DataType> = source.types().to_vec();
+    let mut names: Vec<String> = source.names().to_vec();
     let mut ops: Vec<RunOp<'a>> = Vec::with_capacity(nodes.len());
     for node in nodes.into_iter().rev() {
         match node {
@@ -845,13 +876,83 @@ fn compile<'a>(cx: &'a Cx, input: &'a LogicalPlan) -> Result<Option<Compiled<'a>
     }))
 }
 
-/// The pipeline's source: a store scan is streamed, everything else `eval`
-/// materializes (and must never come back here for the same plan).
-fn source_of<'a>(cx: &'a Cx, plan: &'a LogicalPlan) -> Result<Option<Source<'a>>> {
+/// The pipeline's source: a store scan and an attached-lake scan are both
+/// pulled morsel by morsel; everything else `eval` materializes (and must
+/// never come back here for the same plan).
+fn source_of<'a>(cx: &'a Cx, plan: &'a LogicalPlan, fused: bool) -> Result<Option<Source<'a>>> {
     if let Some(scan) = super::store_scan(cx, plan)? {
-        return Ok(Some(Source::Store(scan)));
+        return Ok(Some(Source::Streamed(Box::new(StoreSource::new(scan)))));
     }
-    eval(cx, plan).map(|out| Some(Source::Materialized(out)))
+    if let Some(source) = super::lake_source(cx, plan)? {
+        return Ok(Some(Source::Streamed(source)));
+    }
+    // Nothing above the source is fused, so a materialized source is handed
+    // back to the caller's own path rather than read here and read again
+    // there.
+    if !fused {
+        return Ok(None);
+    }
+    eval(cx, plan).map(|out| Some(Source::Chunks(out)))
+}
+
+/// A store scan as a [`MorselSource`]: the worker that claims a chunk decodes
+/// it itself, so no pool thread waits for another thread's chunk.
+#[derive(Debug)]
+struct StoreSource<'a> {
+    scan: super::StoreScan<'a>,
+    names: Vec<String>,
+    types: Vec<DataType>,
+    cursor: MorselCursor,
+}
+
+impl<'a> StoreSource<'a> {
+    fn new(scan: super::StoreScan<'a>) -> Self {
+        let (names, types) = scan.schema();
+        let cursor = MorselCursor::new(scan.len() as u64);
+        StoreSource {
+            scan,
+            names,
+            types,
+            cursor,
+        }
+    }
+}
+
+impl MorselSource for StoreSource<'_> {
+    fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    fn types(&self) -> &[DataType] {
+        &self.types
+    }
+
+    fn label(&self) -> &str {
+        "store"
+    }
+
+    fn rows(&self) -> Option<usize> {
+        Some(self.scan.rows())
+    }
+
+    fn next_morsel(&self) -> Result<Option<u64>> {
+        Ok(self.cursor.claim())
+    }
+
+    fn decode(&self, morsel: u64, sink: &mut dyn FnMut(DataChunk) -> Result<()>) -> Result<()> {
+        if let Some(chunk) = self.scan.chunk(morsel as usize)? {
+            sink(chunk)?;
+        }
+        Ok(())
+    }
+
+    fn io(&self) -> ScanIo {
+        ScanIo::default()
+    }
+
+    fn reports_io(&self) -> bool {
+        false
+    }
 }
 
 /// One worker per morsel, order preserved: each morsel's partials come back in
@@ -865,31 +966,134 @@ where
     S::Partial: Send,
 {
     let steps = steps(cx, &compiled.builds, &compiled.ops)?;
-    let folded: Vec<Result<Option<Vec<S::Partial>>>> = match &compiled.source {
-        Source::Materialized(source) => source
-            .chunks
-            .par_iter()
-            .map(|chunk| flow(cx, &steps, sink, chunk))
-            .collect(),
-        Source::Store(scan) => scan
-            .par_chunks(|i, chunk| {
-                // The deadline is a runaway guard, not a per-row check: a
-                // batch of chunks between checks keeps a long scan abortable
-                // without an `Instant::now()` in every chunk's fold.
-                if i % CHECK_DEADLINE_EVERY == 0 {
-                    cx.check_deadline()?;
-                }
-                match chunk {
-                    Some(chunk) => flow(cx, &steps, sink, &chunk),
-                    None => Ok(Some(Vec::new())),
-                }
-            })?
-            .into_iter()
-            .map(Ok)
-            .collect(),
-    };
+    match &compiled.source {
+        Source::Chunks(output) => run_chunks(cx, &steps, sink, &output.chunks),
+        Source::Streamed(source) => run_streamed(cx, &steps, sink, source.as_ref()),
+    }
+}
+
+fn run_chunks<S: Sink + Sync>(
+    cx: &Cx,
+    steps: &[Step<'_>],
+    sink: &S,
+    chunks: &[DataChunk],
+) -> Result<Option<Vec<S::Partial>>>
+where
+    S::Partial: Send,
+{
+    let folded: Vec<Result<Option<Vec<S::Partial>>>> = chunks
+        .par_iter()
+        .map(|chunk| flow(cx, steps, sink, chunk))
+        .collect();
     let mut items = Vec::new();
     for partials in folded {
+        match partials? {
+            Some(mut partials) => items.append(&mut partials),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(items))
+}
+
+/// Pull morsels from a shared source state until it is empty: one worker per
+/// pool thread claims the next morsel and decodes it itself, so at most one
+/// morsel per worker is in flight and nothing waits on another thread for
+/// rows. Partials are sorted by morsel index before they merge, which is what
+/// keeps first-seen group order, float accumulation order and collected row
+/// order identical to the materialized path's.
+fn run_streamed<S: Sink + Sync>(
+    cx: &Cx,
+    steps: &[Step<'_>],
+    sink: &S,
+    source: &dyn MorselSource,
+) -> Result<Option<Vec<S::Partial>>>
+where
+    S::Partial: Send,
+{
+    let workers = rayon::current_num_threads().max(1);
+    // A failed morsel stops every worker: the statement fails anyway, and a
+    // scan must not keep decoding for an answer nobody will read.
+    let stop = AtomicBool::new(false);
+    let in_flight = AtomicU64::new(0);
+    let peak = AtomicU64::new(0);
+    // A morsel's partials, or `None` when the sink declined the chunk.
+    type Folded<P> = Result<Option<Vec<P>>>;
+    let folded: Mutex<Vec<(u64, Folded<S::Partial>)>> = Mutex::new(Vec::new());
+    (0..workers).into_par_iter().for_each(|_| {
+        while !stop.load(Ordering::Relaxed) {
+            let morsel = match source.next_morsel() {
+                Ok(Some(morsel)) => morsel,
+                Ok(None) => return,
+                Err(error) => {
+                    stop.store(true, Ordering::Relaxed);
+                    // `u64::MAX` sorts after every morsel, so a source error
+                    // surfaces only when no morsel failed first.
+                    folded
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((u64::MAX, Err(error)));
+                    return;
+                }
+            };
+            // The deadline is a runaway guard, not a per-row check: a batch
+            // of morsels between checks keeps a long scan abortable without
+            // an `Instant::now()` in every fold.
+            if morsel % CHECK_DEADLINE_EVERY as u64 == 0
+                && let Err(error) = cx.check_deadline()
+            {
+                stop.store(true, Ordering::Relaxed);
+                folded
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((u64::MAX, Err(error)));
+                return;
+            }
+            let now = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+            peak.fetch_max(now, Ordering::Relaxed);
+            // The claiming worker decodes its own morsel. It is the only
+            // thread that ever waits for morsels, so a decode is free to use
+            // the pool it runs on (a provider's own parallel reads, the fold
+            // below): no other thread waits on this one.
+            let mut partials = Vec::new();
+            let mut declined = false;
+            let decoded = source.decode(morsel, &mut |chunk| {
+                if declined {
+                    return Ok(());
+                }
+                match flow(cx, steps, sink, &chunk) {
+                    Ok(Some(mut folded)) => {
+                        partials.append(&mut folded);
+                        Ok(())
+                    }
+                    // The sink does not know this shape: stop, and let the
+                    // caller run a plan it does know.
+                    Ok(None) => {
+                        declined = true;
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            });
+            in_flight.fetch_sub(1, Ordering::Relaxed);
+            let folded_morsel = decoded.map(|()| (!declined).then_some(partials));
+            if declined || folded_morsel.is_err() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            folded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((morsel, folded_morsel));
+        }
+    });
+    if source.reports_io() {
+        let mut io = source.io();
+        io.in_flight_peak = peak.load(Ordering::Relaxed);
+        cx.db.record_scan(source.label(), io);
+    }
+    let mut folded = folded.into_inner().unwrap_or_else(|e| e.into_inner());
+    folded.sort_unstable_by_key(|(index, _)| *index);
+    let mut items = Vec::new();
+    for (_, partials) in folded {
         match partials? {
             Some(mut partials) => items.append(&mut partials),
             None => return Ok(None),

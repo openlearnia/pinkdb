@@ -139,11 +139,11 @@ fn attach_answers_from_the_parquet_lake_statistics() {
     let out = run(&format!(
         "ATTACH 'lake:{lake}' AS lk (READ_ONLY);\nUSE lk;\n\
          SELECT COUNT(*), COUNT(s), MIN(i), MAX(i), MIN(s), MAX(s) FROM t;\n\
-         SELECT 'decodes: ' || files || ' files' AS d FROM pinkdb_lake_decodes();\n\
+         SELECT 'scan rows: ' || COUNT(*) AS d FROM pinkdb_scan_io();\n\
          .quit\n",
         lake = lake.display()
     ));
-    assert!(out.contains("decodes: 0 files"), "statistics-only: {out}");
+    assert!(out.contains("scan rows: 0"), "statistics-only: {out}");
     assert!(
         out.contains("│ 3            │ 2        │ 1       │ 3       │ x       │ z       │"),
         "{out}"

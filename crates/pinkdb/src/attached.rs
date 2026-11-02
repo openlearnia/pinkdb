@@ -5,8 +5,9 @@
 //! (wave 124, `ATTACH … (READ_ONLY)`, see [`crate::lake_db`]) or a session
 //! attachment made through [`PinkDb::attach_lake`]: the engine answers exact
 //! `COUNT`/`MIN`/`MAX` aggregates from the lake's stored statistics when the
-//! lake layer can prove the answer, and otherwise materializes the one table
-//! a query touches through the same data-file decode `.lake open` uses.
+//! lake layer can prove the answer, and otherwise streams the one table a
+//! query touches through [`AttachedLake::scan_source`]: the lake hands out
+//! morsels on demand and the pipeline executor folds them.
 //!
 //! Nothing here touches the store's tables, the WAL, or any save/persist
 //! path: an attached table is not part of `.save`, `.lake save`, or a durable
@@ -17,12 +18,13 @@
 //!
 //! The lake side implements [`AttachedLake`]: [`AttachedLake::tables`]
 //! returns the descriptors the attach read from the data files' footers
-//! (no column data touched), and [`AttachedLake::load`] decodes one table on
-//! first use and caches it for the rest of the session.
+//! (no column data touched), and [`AttachedLake::scan_source`] is the
+//! streaming scan every read of an attached table goes through.
 
 use std::fmt;
 use std::sync::Arc;
 
+use crate::morsel::MorselSource;
 use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::DataChunk;
@@ -67,8 +69,8 @@ impl fmt::Display for AtSpec {
 ///
 /// Every field is `None` when the lake cannot answer *exactly* from stored
 /// statistics — a truncated or inexact statistic, a NaN count it cannot
-/// prove, an absent statistic. The executor falls back to materializing the
-/// table for anything `None`; it never approximates.
+/// prove, an absent statistic. The executor falls back to scanning the table
+/// for anything `None`; it never approximates.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnStats {
     /// The exact number of NULLs in the column, when provable (a
@@ -289,92 +291,33 @@ pub trait AttachedLake: fmt::Debug + Send + Sync {
     /// The tables this lake offers, pinned to the version attached.
     fn tables(&self) -> &[AttachedTable];
 
-    /// Materialize one table: exactly the decode `.lake open` performs,
-    /// cached by the implementation (a second call is cheap and returns the
-    /// same data). `db`/`table` are matched case-insensitively.
-    fn load(&self, db: &str, table: &str) -> Result<Arc<DataTable>>;
-
-    /// Materialize only `columns` (table column indices; `None` = every
-    /// column) of one table, reusing everything already decoded and caching
-    /// the result per table — a later call naming other columns decodes just
-    /// those. `columns` need not be sorted or deduplicated; an out-of-range
-    /// index falls back to every column.
+    /// The streaming source of one table's scan (wave 133b): morsels handed
+    /// out on demand, so the pipeline decodes one at a time instead of
+    /// materializing the table.
     ///
-    /// The default implementation ignores the projection and materializes in
-    /// full (always correct; the engine reads every column).
-    fn load_projected(
-        &self,
-        db: &str,
-        table: &str,
-        columns: Option<&[usize]>,
-    ) -> Result<AttachedScan> {
-        let _ = columns;
-        Ok(AttachedScan::complete(self.load(db, table)?))
-    }
-
-    /// [`AttachedLake::load_projected`] with pruning predicates: the lake
-    /// layer may skip whole data files whose zone maps prove no row can match
-    /// any predicate, decoding only the files that may. The result is exactly
-    /// the rows a full scan plus the predicates' *filter* would keep, minus
-    /// nothing — a file may only be skipped when every predicate's zone-map
-    /// test proves it cannot match. A lake that cannot prune (or whose files
-    /// have no zone maps) must decode the file anyway.
-    ///
-    /// The default implementation ignores the predicates and falls back to
-    /// [`AttachedLake::load_projected`], which is always correct.
-    fn load_filtered(
-        &self,
+    /// `columns` is the plan's projection (table column indices, `None` =
+    /// every column) and `predicates` are the pushed `WHERE` conjuncts plus
+    /// the wave-122 join-filter bounds. A source may skip a file, row group or
+    /// page only when every predicate's zone-map test proves no row in it can
+    /// match, so the rows are exactly a full scan plus the predicates'
+    /// *filter* would keep, in scan order. What it read and pruned is
+    /// reported through [`crate::morsel::ScanIo`], which `EXPLAIN ANALYZE`
+    /// and `pinkdb_scan_io()` print. `db`/`table` are matched
+    /// case-insensitively.
+    fn scan_source(
+        self: Arc<Self>,
         db: &str,
         table: &str,
         columns: Option<&[usize]>,
         predicates: &[PrunePredicate],
-    ) -> Result<AttachedScan> {
-        let _ = predicates;
-        self.load_projected(db, table, columns)
-    }
+    ) -> Result<Box<dyn MorselSource>>;
 
     /// Data-file decode counters `(decodes, columns decoded, files decoded)`
     /// for diagnostics: `COUNT(*)`/`MIN`/`MAX` fast paths leave all three at
-    /// zero, a projected materialization counts only the columns it decoded,
-    /// and a pruned scan counts only the data files it actually decoded.
+    /// zero, a projected scan counts only the columns it decoded, and a pruned
+    /// scan counts only the data files it actually decoded.
     fn decode_stats(&self) -> (u64, u64, u64) {
         (0, 0, 0)
-    }
-
-    /// Stream one table's chunks into `sink` instead of materializing it
-    /// (wave 98c): `columns` and `predicates` mean exactly what they do in
-    /// [`AttachedLake::load_filtered`], and the same rows arrive in the same
-    /// order. Returns the rows streamed.
-    ///
-    /// The default loads the table (through `load_filtered`) and pushes its
-    /// chunks. A lake that reads data files decodes one file, pushes its
-    /// chunks, and drops it, so a scan's memory is one file's decode however
-    /// large the table is. The sink must consume the chunk before returning.
-    fn scan_streamed(
-        &self,
-        db: &str,
-        table: &str,
-        columns: Option<&[usize]>,
-        predicates: &[PrunePredicate],
-        sink: &mut dyn FnMut(DataChunk) -> Result<()>,
-    ) -> Result<u64> {
-        let scan = self.load_filtered(db, table, columns, predicates)?;
-        let mut rows = 0u64;
-        for chunk in scan.chunks()? {
-            rows += chunk.num_rows() as u64;
-            sink(chunk)?;
-        }
-        Ok(rows)
-    }
-
-    /// Whether [`AttachedLake::scan_streamed`] pays off for a table (wave
-    /// 98c): the executor fuses an aggregate over the table into a fold only
-    /// when it does. The same rule as the lake's own: a table that fits the
-    /// materializing bound keeps its cached, one-decode-per-column read; a
-    /// bigger one streams. The default says no.
-    fn streams_scan(&self, db: &str, table: &str) -> bool {
-        let _ = (db, table);
-        false
     }
 
     /// The descriptor of one table as of a time-travel target (`AT`), for the
@@ -393,46 +336,25 @@ pub trait AttachedLake: fmt::Debug + Send + Sync {
         )))
     }
 
-    /// Materialize one table exactly as of a time-travel target (`AT`), cached
-    /// by the implementation like [`AttachedLake::load`]. The default
-    /// implementation refuses; see [`AttachedLake::table_at`].
-    fn load_at(&self, db: &str, table: &str, at: AtSpec) -> Result<Arc<DataTable>> {
-        let _ = (db, table, at);
-        Err(PinkDbError::Catalog(format!(
-            "lake {} does not support time travel; rebuild it with a lake layer that \
-             serves `AT (VERSION => …)`",
-            self.location()
-        )))
-    }
-
-    /// Materialize only `columns` of one table exactly as of a time-travel
-    /// target; the time-travel twin of [`AttachedLake::load_projected`].
-    fn load_projected_at(
-        &self,
-        db: &str,
-        table: &str,
-        at: AtSpec,
-        columns: Option<&[usize]>,
-    ) -> Result<AttachedScan> {
-        let _ = columns;
-        Ok(AttachedScan::complete(self.load_at(db, table, at)?))
-    }
-
-    /// [`AttachedLake::load_filtered`] as of a time-travel target: pruning
-    /// reads **that version's** zone maps and file layout, so a pruned
+    /// [`AttachedLake::scan_source`] as of a time-travel target (`AT`):
+    /// pruning reads **that version's** zone maps and file layout, so a pruned
     /// `AT (VERSION => n)` scan sees exactly the older version's matching
-    /// files. The default implementation ignores the predicates and falls
-    /// back to [`AttachedLake::load_projected_at`].
-    fn load_filtered_at(
-        &self,
+    /// files. The default implementation refuses; see
+    /// [`AttachedLake::table_at`].
+    fn scan_source_at(
+        self: Arc<Self>,
         db: &str,
         table: &str,
         at: AtSpec,
         columns: Option<&[usize]>,
         predicates: &[PrunePredicate],
-    ) -> Result<AttachedScan> {
-        let _ = predicates;
-        self.load_projected_at(db, table, at, columns)
+    ) -> Result<Box<dyn MorselSource>> {
+        let _ = (db, table, at, columns, predicates);
+        Err(PinkDbError::Catalog(format!(
+            "lake {} does not support time travel; rebuild it with a lake layer that \
+             serves `AT (VERSION => …)`",
+            self.location()
+        )))
     }
 }
 
@@ -517,19 +439,6 @@ impl PinkDb {
         self.attached_lakes
             .iter()
             .flat_map(|l| l.tables().iter().cloned())
-            .collect()
-    }
-
-    /// Per attached lake, the location and its data-file decode counters
-    /// `(decodes, columns decoded, files decoded)` so far (see
-    /// [`AttachedLake::decode_stats`]).
-    pub fn attached_decode_stats(&self) -> Vec<(String, u64, u64, u64)> {
-        self.attached_lakes
-            .iter()
-            .map(|l| {
-                let (loads, columns, files) = l.decode_stats();
-                (l.location().to_string(), loads, columns, files)
-            })
             .collect()
     }
 
@@ -676,6 +585,7 @@ impl PinkDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::morsel::{MorselCursor, ScanIo, ScanUnit};
     use crate::types::PinkDbError;
     use crate::vector::Vector;
     use std::sync::Mutex;
@@ -803,13 +713,91 @@ mod tests {
             .collect()
     }
 
-    impl AttachedLake for FakeLake {
-        fn location(&self) -> &str {
-            &self.location
+    /// A pull source over already-decoded chunks: one chunk per morsel, the
+    /// shape a fake lake's scan has.
+    #[derive(Debug)]
+    struct ChunkSource {
+        names: Vec<String>,
+        types: Vec<DataType>,
+        label: String,
+        chunks: Vec<DataChunk>,
+        cursor: MorselCursor,
+        io: ScanIo,
+    }
+
+    impl ChunkSource {
+        fn boxed(
+            names: Vec<String>,
+            types: Vec<DataType>,
+            label: String,
+            chunks: Vec<DataChunk>,
+            io: ScanIo,
+        ) -> Box<dyn MorselSource> {
+            Box::new(ChunkSource {
+                names,
+                types,
+                label,
+                cursor: MorselCursor::new(chunks.len() as u64),
+                chunks,
+                io,
+            })
         }
-        fn tables(&self) -> &[AttachedTable] {
-            &self.tables
+    }
+
+    impl MorselSource for ChunkSource {
+        fn names(&self) -> &[String] {
+            &self.names
         }
+
+        fn types(&self) -> &[DataType] {
+            &self.types
+        }
+
+        fn label(&self) -> &str {
+            &self.label
+        }
+
+        fn next_morsel(&self) -> Result<Option<u64>> {
+            Ok(self.cursor.claim())
+        }
+
+        fn decode(&self, morsel: u64, sink: &mut dyn FnMut(DataChunk) -> Result<()>) -> Result<()> {
+            sink(self.chunks[morsel as usize].clone())
+        }
+
+        fn io(&self) -> ScanIo {
+            self.io.clone()
+        }
+    }
+
+    /// A fake scan source over a materialized table: one chunk per morsel,
+    /// reporting one data file read and no pruning.
+    fn fake_source(scan: AttachedScan, label: &str) -> Box<dyn MorselSource> {
+        let names: Vec<String> = scan.table.columns.iter().map(|c| c.name.clone()).collect();
+        let types: Vec<DataType> = scan.table.columns.iter().map(|c| c.dtype).collect();
+        let chunks = scan
+            .chunks()
+            .expect("the fake lake's chunks decode in memory");
+        let rows: u64 = chunks.iter().map(|c| c.num_rows() as u64).sum();
+        ChunkSource::boxed(
+            names,
+            types,
+            label.to_string(),
+            chunks,
+            ScanIo {
+                units: vec![ScanUnit {
+                    unit: "files",
+                    read: 1,
+                    pruned: 0,
+                }],
+                requests: 1,
+                bytes: rows * 8,
+                in_flight_peak: 0,
+            },
+        )
+    }
+
+    impl FakeLake {
         fn load(&self, db: &str, table: &str) -> Result<Arc<DataTable>> {
             let t = self
                 .tables
@@ -828,6 +816,28 @@ mod tests {
             let arc = Arc::new(table_data);
             *loaded = Some(Arc::clone(&arc));
             Ok(arc)
+        }
+    }
+
+    impl AttachedLake for FakeLake {
+        fn location(&self) -> &str {
+            &self.location
+        }
+        fn tables(&self) -> &[AttachedTable] {
+            &self.tables
+        }
+        fn scan_source(
+            self: Arc<Self>,
+            db: &str,
+            table: &str,
+            _columns: Option<&[usize]>,
+            _predicates: &[PrunePredicate],
+        ) -> Result<Box<dyn MorselSource>> {
+            let table = self.load(db, table)?;
+            Ok(fake_source(
+                AttachedScan::complete(table),
+                &format!("lake {}", self.location),
+            ))
         }
     }
 
@@ -854,6 +864,179 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A lake that decodes `chunks` morsels of `rows` rows each on demand, the
+    /// shape a Parquet table has. Values are chosen so a float sum depends on
+    /// the accumulation order: `d = 1 / (i + 1)` rounds at every step.
+    #[derive(Debug)]
+    struct MorselLake {
+        location: String,
+        tables: Vec<AttachedTable>,
+        table: String,
+        chunks: usize,
+        rows: usize,
+    }
+
+    impl MorselLake {
+        fn new(location: &str, table: &str, chunks: usize, rows: usize) -> Self {
+            let schema = vec![
+                ("i".to_string(), DataType::Bigint),
+                ("d".to_string(), DataType::Double),
+            ];
+            let stats = stats_for(&schema, &[]);
+            Self {
+                location: location.to_string(),
+                tables: vec![AttachedTable {
+                    db: "main".to_string(),
+                    schema_name: "main".to_string(),
+                    table: table.to_string(),
+                    rows: (chunks * rows) as u64,
+                    schema,
+                    stats,
+                }],
+                table: table.to_string(),
+                chunks,
+                rows,
+            }
+        }
+    }
+
+    impl AttachedLake for MorselLake {
+        fn location(&self) -> &str {
+            &self.location
+        }
+        fn tables(&self) -> &[AttachedTable] {
+            &self.tables
+        }
+        fn scan_source(
+            self: Arc<Self>,
+            _db: &str,
+            _table: &str,
+            _columns: Option<&[usize]>,
+            _predicates: &[PrunePredicate],
+        ) -> Result<Box<dyn MorselSource>> {
+            let names = vec!["i".to_string(), "d".to_string()];
+            let types = vec![DataType::Bigint, DataType::Double];
+            let label = format!("lake {} table \"main.{}\"", self.location, self.table);
+            let mut chunks = Vec::with_capacity(self.chunks);
+            for chunk in 0..self.chunks {
+                let mut i = Vector::new_empty(DataType::Bigint);
+                let mut d = Vector::new_empty(DataType::Double);
+                for row in 0..self.rows {
+                    let n = (chunk * self.rows + row) as i64;
+                    i.push_valid(Value::Bigint(n))?;
+                    d.push_valid(Value::Double(1.0 / (n as f64 + 1.0)))?;
+                }
+                chunks.push(DataChunk::new(vec![i, d])?);
+            }
+            Ok(ChunkSource::boxed(
+                names,
+                types,
+                label,
+                chunks,
+                ScanIo {
+                    units: vec![ScanUnit {
+                        unit: "files",
+                        read: self.chunks as u64,
+                        pruned: 0,
+                    }],
+                    requests: self.chunks as u64,
+                    bytes: (self.chunks * self.rows * 8) as u64,
+                    in_flight_peak: 0,
+                },
+            ))
+        }
+    }
+
+    /// The peak morsels in flight and the units read, over every source of the
+    /// statement that just ran (`pinkdb_scan_io()`).
+    fn scan_accounting(db: &mut PinkDb) -> Vec<(i64, i64)> {
+        query(
+            db,
+            "SELECT MAX(in_flight), MAX(read) FROM pinkdb_scan_io() GROUP BY source;",
+        )
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [Value::Bigint(peak), Value::Bigint(read)] => (*peak, *read),
+            other => panic!("unexpected accounting row {other:?}"),
+        })
+        .collect()
+    }
+
+    /// Wave 133b: a lake scan hands morsels to the pipeline on demand for
+    /// every root kind, holding at most one morsel per worker, and produces
+    /// exactly the materialized path's group order and float sums.
+    #[test]
+    fn lake_scans_stream_bounded_morsels_into_every_root_kind() {
+        let chunks = 200;
+        let rows = 64;
+        let total = (chunks * rows) as i64;
+        let sum: i64 = (0..total).sum();
+        let workers = rayon::current_num_threads() as i64;
+        let mut db = PinkDb::new();
+        db.attach_lake(
+            Arc::new(MorselLake::new("/tmp/lake", "big", chunks, rows)) as Arc<dyn AttachedLake>
+        )
+        .unwrap();
+        db.attach_lake(
+            Arc::new(MorselLake::new("/tmp/lake2", "big2", chunks, rows)) as Arc<dyn AttachedLake>,
+        )
+        .unwrap();
+
+        // Aggregate root.
+        assert_eq!(
+            query(&mut db, "SELECT SUM(i), COUNT(*) FROM big;"),
+            vec![vec![Value::Bigint(sum), Value::Bigint(total)]]
+        );
+        let (peak, read) = scan_accounting(&mut db)[0];
+        assert_eq!(read, chunks as i64, "every morsel is read");
+        assert!(
+            peak > 0 && peak <= workers,
+            "{peak} in flight, {workers} workers"
+        );
+
+        // Collect root with ORDER BY.
+        assert_eq!(
+            query(&mut db, "SELECT i FROM big ORDER BY i DESC LIMIT 2;"),
+            vec![
+                vec![Value::Bigint(total - 1)],
+                vec![Value::Bigint(total - 2)],
+            ]
+        );
+        let (peak, read) = scan_accounting(&mut db)[0];
+        assert_eq!(read, chunks as i64);
+        assert!(
+            peak > 0 && peak <= workers,
+            "{peak} in flight, {workers} workers"
+        );
+
+        // A join whose build side is a lake table (both sides are lakes here).
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT COUNT(*) FROM big JOIN big2 ON big.i = big2.i;"
+            ),
+            vec![vec![Value::Bigint(total)]]
+        );
+        let accounting = scan_accounting(&mut db);
+        assert_eq!(accounting.len(), 2, "both sides stream: {accounting:?}");
+        for (peak, read) in accounting {
+            assert_eq!(read, chunks as i64);
+            assert!(
+                peak > 0 && peak <= workers,
+                "{peak} in flight, {workers} workers"
+            );
+        }
+
+        // First-seen group order and float sums are the materialized path's.
+        let sql = "SELECT i % 5 AS g, COUNT(*), SUM(d) FROM big GROUP BY g;";
+        let streamed = query(&mut db, sql);
+        db.execute("SET pipeline_execution = false;").unwrap();
+        let materialized = query(&mut db, sql);
+        db.execute("SET pipeline_execution = true;").unwrap();
+        assert_eq!(streamed.len(), 5);
+        assert_rows_same(&streamed, &materialized, "group order and float sums");
     }
 
     fn lake() -> Arc<FakeLake> {
@@ -888,11 +1071,11 @@ mod tests {
         location: String,
         tables: Vec<AttachedTable>,
         rows: Vec<Vec<Value>>,
-        /// One entry per `load_projected` call: the analysis's bound (`None`
-        /// = unbounded, every column).
+        /// One entry per `scan_source` call: the analysis's bound (`None` =
+        /// unbounded, every column).
         requests: Mutex<Vec<Option<Vec<usize>>>>,
-        /// One entry per `load_filtered` call: the pruning predicates the
-        /// analysis pushed to the lake.
+        /// One entry per scan: the pruning predicates the analysis pushed to
+        /// the lake.
         filters: Mutex<Vec<Vec<PrunePredicate>>>,
     }
 
@@ -924,17 +1107,10 @@ mod tests {
         }
     }
 
-    impl AttachedLake for RecordingLake {
-        fn location(&self) -> &str {
-            &self.location
-        }
-        fn tables(&self) -> &[AttachedTable] {
-            &self.tables
-        }
-        fn load(&self, db: &str, table: &str) -> Result<Arc<DataTable>> {
-            self.load_projected(db, table, None).map(|scan| scan.table)
-        }
-        fn load_projected(
+    impl RecordingLake {
+        /// The projected table: `present` columns decoded, the rest NULL
+        /// placeholders with the same chunk lengths.
+        fn projected(
             &self,
             db: &str,
             table: &str,
@@ -945,10 +1121,6 @@ mod tests {
                 .iter()
                 .find(|t| t.db.eq_ignore_ascii_case(db) && t.table.eq_ignore_ascii_case(table))
                 .ok_or_else(|| PinkDbError::Catalog(format!("no table {db}.{table}")))?;
-            self.requests
-                .lock()
-                .unwrap()
-                .push(columns.map(|c| c.to_vec()));
             // The full table (this fake's "decode").
             let mut full = DataTable::new(t.table.clone(), t.schema.clone())?;
             for row in &self.rows {
@@ -998,15 +1170,32 @@ mod tests {
                 present,
             })
         }
-        fn load_filtered(
-            &self,
+    }
+
+    impl AttachedLake for RecordingLake {
+        fn location(&self) -> &str {
+            &self.location
+        }
+        fn tables(&self) -> &[AttachedTable] {
+            &self.tables
+        }
+        fn scan_source(
+            self: Arc<Self>,
             db: &str,
             table: &str,
             columns: Option<&[usize]>,
             predicates: &[PrunePredicate],
-        ) -> Result<AttachedScan> {
+        ) -> Result<Box<dyn MorselSource>> {
+            // A later query that references an absent column fails loudly
+            // rather than reading a placeholder, so this log proves exactly
+            // what the analysis asked for.
+            self.requests
+                .lock()
+                .unwrap()
+                .push(columns.map(<[usize]>::to_vec));
             self.filters.lock().unwrap().push(predicates.to_vec());
-            self.load_projected(db, table, columns)
+            let scan = self.projected(db, table, columns)?;
+            Ok(fake_source(scan, &format!("lake {}", self.location)))
         }
     }
 
@@ -1752,7 +1941,7 @@ mod tests {
     type VersionData = (Vec<(String, DataType)>, Vec<Vec<Value>>);
 
     /// A fake lake with a version history: each version holds one table's
-    /// data plus a publish time; `table_at`/`load_projected_at` resolve
+    /// data plus a publish time; `table_at`/`scan_source_at` resolve
     /// exactly like `pink-lake`'s attachment (version equality, inclusive
     /// timestamp, table-missing and no-snapshot errors), so the engine's
     /// binder/executor plumbing is pinned against the real semantics.
@@ -1765,7 +1954,7 @@ mod tests {
         /// entry means the table did not exist there (like the empty v1
         /// lake).
         data: Vec<(u64, VersionData)>,
-        /// One entry per `load_projected_at` call: `(version, bound columns)`.
+        /// One entry per `scan_source_at` call: `(version, bound columns)`.
         requests: Mutex<Vec<(u64, Option<Vec<usize>>)>>,
         loads: AtomicU64,
     }
@@ -1844,8 +2033,14 @@ mod tests {
         fn tables(&self) -> &[AttachedTable] {
             unreachable!("VersionedLake serves descriptors through table_at")
         }
-        fn load(&self, _db: &str, _table: &str) -> Result<Arc<DataTable>> {
-            unreachable!("VersionedLake serves data through load_projected_at")
+        fn scan_source(
+            self: Arc<Self>,
+            _db: &str,
+            _table: &str,
+            _columns: Option<&[usize]>,
+            _predicates: &[PrunePredicate],
+        ) -> Result<Box<dyn MorselSource>> {
+            unreachable!("VersionedLake serves data through scan_source_at")
         }
         fn table_at(&self, db: &str, table: &str, at: AtSpec) -> Result<AttachedTable> {
             assert!(db.eq_ignore_ascii_case("main") && table.eq_ignore_ascii_case("t"));
@@ -1857,13 +2052,14 @@ mod tests {
                 ))
             })
         }
-        fn load_projected_at(
-            &self,
+        fn scan_source_at(
+            self: Arc<Self>,
             db: &str,
             table: &str,
             at: AtSpec,
             columns: Option<&[usize]>,
-        ) -> Result<AttachedScan> {
+            _predicates: &[PrunePredicate],
+        ) -> Result<Box<dyn MorselSource>> {
             self.table_at(db, table, at)?;
             let version = self.resolve(at)?;
             self.requests
@@ -1876,7 +2072,10 @@ mod tests {
             for row in rows {
                 table_data.append_row(row.clone()).unwrap();
             }
-            Ok(AttachedScan::complete(Arc::new(table_data)))
+            Ok(fake_source(
+                AttachedScan::complete(Arc::new(table_data)),
+                &format!("lake {} at version {version}", self.location),
+            ))
         }
     }
 
@@ -1924,20 +2123,27 @@ mod tests {
         fn tables(&self) -> &[AttachedTable] {
             self.pinned.tables()
         }
-        fn load(&self, db: &str, table: &str) -> Result<Arc<DataTable>> {
-            self.pinned.load(db, table)
+        fn scan_source(
+            self: Arc<Self>,
+            db: &str,
+            table: &str,
+            columns: Option<&[usize]>,
+            predicates: &[PrunePredicate],
+        ) -> Result<Box<dyn MorselSource>> {
+            Arc::clone(&self.pinned).scan_source(db, table, columns, predicates)
         }
         fn table_at(&self, db: &str, table: &str, at: AtSpec) -> Result<AttachedTable> {
             self.inner.table_at(db, table, at)
         }
-        fn load_projected_at(
-            &self,
+        fn scan_source_at(
+            self: Arc<Self>,
             db: &str,
             table: &str,
             at: AtSpec,
             columns: Option<&[usize]>,
-        ) -> Result<AttachedScan> {
-            self.inner.load_projected_at(db, table, at, columns)
+            predicates: &[PrunePredicate],
+        ) -> Result<Box<dyn MorselSource>> {
+            Arc::clone(&self.inner).scan_source_at(db, table, at, columns, predicates)
         }
     }
 

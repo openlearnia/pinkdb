@@ -1458,7 +1458,14 @@ fn attach_refusals_are_clean_errors() {
         .unwrap();
     let first_rows = files.len() as u64; // one file per original table
     assert_eq!(table.rows, original * 2, "both files are listed");
-    let union_rows = attached.load(&table.db, &table.table).unwrap();
+    let union_rows = pinkdb::materialize(
+        Arc::clone(&attached)
+            .scan_source(&table.db, &table.table, None, &[])
+            .unwrap()
+            .as_ref(),
+        "t",
+    )
+    .unwrap();
     assert_eq!(union_rows.num_rows() as u64, original * 2);
     let _ = first_rows;
 }

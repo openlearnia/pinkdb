@@ -310,6 +310,30 @@ def build_pink_store(pq: Path, store: Path, scale: float) -> dict:
     return {"seconds": elapsed, "bytes": store.stat().st_size if store.exists() else 0}
 
 
+def build_pink_lake(pq: Path, lake: Path, scale: float) -> dict:
+    """Load the TPC-H Parquet into a Parquet-format pinkdb lake.
+
+    The tables are read from the generated Parquet and saved back as a lake
+    whose data files are Parquet, so the lake scan (wave 133b: streamed
+    through the pipeline executor, pruned by footer and page statistics) is
+    what answers every query.
+    """
+    lake.unlink(missing_ok=True)
+    shutil.rmtree(f"{lake}.files", ignore_errors=True)
+    lines = [".timer on", ".lake format parquet"]
+    for t in TPCH_TABLES:
+        lines.append(f"CREATE TABLE {t} AS SELECT * FROM read_parquet('{pq / (t + '.parquet')}');")
+    lines.append(f".lake save {lake}")
+    t0 = now()
+    r = pink("\n".join(lines) + "\n", timeout=3600)
+    elapsed = now() - t0
+    if r.returncode != 0:
+        raise SystemExit(f"pinkdb lake build failed: {r.stderr[-2000:]}")
+    data = Path(f"{lake}.files")
+    size = sum(f.stat().st_size for f in data.rglob("*") if f.is_file())
+    return {"seconds": elapsed, "bytes": size}
+
+
 def build_duck_store(pq: Path, db: Path, threads: int) -> dict:
     db.unlink(missing_ok=True)
     lines = [f"SET threads={threads};"]
@@ -367,9 +391,18 @@ class Suite:
     def tpch(self):
         scale = self.args.scale
         pq = ensure_tpch(self.work, scale, force=self.args.regen)
-        store = tpch_dir(self.work, scale) / "store.pink"
+        lake_mode = self.args.storage == "lake"
+        store = tpch_dir(self.work, scale) / ("lake.pink" if lake_mode else "store.pink")
         db = tpch_dir(self.work, scale) / "store.duckdb"
-        if not store.exists() or self.args.rebuild:
+        if lake_mode:
+            if not store.exists() or self.args.rebuild:
+                print("  building the pinkdb lake ...", flush=True)
+                info = build_pink_lake(pq, store, scale)
+                print(
+                    f"  pinkdb lake: {info['seconds']:.1f}s, {info['bytes'] / 1e6:.1f} MB",
+                    flush=True,
+                )
+        elif not store.exists() or self.args.rebuild:
             print("  building the pinkdb store ...", flush=True)
             info = build_pink_store(pq, store, scale)
             print(f"  pinkdb store: {info['seconds']:.1f}s, {info['bytes'] / 1e6:.1f} MB", flush=True)
@@ -380,12 +413,17 @@ class Suite:
 
         queries = tpch_queries()
         timeout = 900 if scale >= 1 else 300
+        # A lake arm attaches the lake read-only and answers from it; the store
+        # arm opens the store's tables (the long-standing benchmark).
+        pink_prefix = (
+            f"ATTACH 'lake:{store}' AS lake (READ_ONLY);\nUSE lake;\n" if lake_mode else None
+        )
         rows = []
         for nr in sorted(queries):
             q = queries[nr]
             self.note_load(f"tpch q{nr}")
             duck_rows = self._output_rows("duck", q, db, timeout)
-            pink_rows = self._output_rows("pink", q, store, timeout)
+            pink_rows = self._output_rows("pink", q, store, timeout, pink_prefix)
             ok, why = rows_equal(pink_rows, duck_rows)
             if not ok:
                 rows.append(
@@ -401,7 +439,9 @@ class Suite:
                 )
                 print(f"  q{nr:<2} MISMATCH: {why}", flush=True)
                 continue
-            ptimes, perr = self._timed("pink", q, store, self.args.runs, self.args.warmup, timeout)
+            ptimes, perr = self._timed(
+                "pink", q, store, self.args.runs, self.args.warmup, timeout, pink_prefix
+            )
             dtimes, derr = self._timed("duck", q, db, self.args.runs, self.args.warmup, timeout)
             both = median(ptimes)
             dmed = median(dtimes)
@@ -428,6 +468,7 @@ class Suite:
             )
         self.results["tpch"] = {
             "scale": scale,
+            "storage": self.args.storage,
             "threads": {"pinkdb": self.threads, "duckdb": self.threads},
             "warmup": self.args.warmup,
             "runs": self.args.runs,
@@ -437,25 +478,38 @@ class Suite:
             "queries": rows,
         }
 
-    def _output_rows(self, engine: str, sql: str, where, timeout: float) -> list[list[str]]:
+    def _output_rows(
+        self, engine: str, sql: str, where, timeout: float, prefix: str | None = None
+    ) -> list[list[str]]:
         if engine == "pink":
             # Agent mode has no 10k-row display cap (the box renderer's
             # DISPLAY_CAP), but it does cap a statement at 1M materialized
             # rows; `.agent budget 0` lifts that too, so large TPC-H joins
             # can be checked row for row.
-            script = f".open {where}\n.agent rows 0\n.agent budget 0\n{sql}\n"
+            open_ = prefix if prefix is not None else f".open {where}\n"
+            script = f"{open_}.agent rows 0\n.agent budget 0\n{sql}\n"
             r = pink(script, timeout=timeout, agent=True)
             return parse_md(r.stdout + "\n" + r.stderr)
         script = f"{self.duck_script}.maxrows 1000000\n{sql}\n"
         r = duck(script, where, timeout=timeout)
         return parse_box(r.stdout + "\n" + r.stderr)
 
-    def _timed(self, engine: str, sql: str, where, runs: int, warmup: int, timeout: float):
+    def _timed(
+        self,
+        engine: str,
+        sql: str,
+        where,
+        runs: int,
+        warmup: int,
+        timeout: float,
+        prefix: str | None = None,
+    ):
         if runs <= 0:
             return [], None
         body = "\n".join([sql] * (runs + warmup))
         if engine == "pink":
-            script = f".open {where}\n.timer on\n{body}\n"
+            open_ = prefix if prefix is not None else f".open {where}\n"
+            script = f"{open_}.timer on\n{body}\n"
             r = pink(script, timeout=timeout)
         else:
             script = f"{self.duck_script}.timer on\n{body}\n"
@@ -1421,6 +1475,12 @@ def main(argv=None):
     p.add_argument("--work-dir", default=os.environ.get("PINKDB_BENCH_DIR", str(Path(tempfile.gettempdir()) / "pinkdb_bench_suite")))
     p.add_argument("--durable-rows", type=int, default=2000)
     p.add_argument("--skip-build", action="store_true")
+    p.add_argument(
+        "--storage",
+        choices=["store", "lake"],
+        default="store",
+        help="TPC-H storage: the engine stores (default) or a Parquet pinkdb lake",
+    )
     p.add_argument("--regen", action="store_true", help="regenerate TPC-H data")
     p.add_argument("--rebuild", action="store_true", help="rebuild the engine stores")
     p.add_argument("--update-baseline", action="store_true", help="rewrite bench/suite/baseline-ci.json")

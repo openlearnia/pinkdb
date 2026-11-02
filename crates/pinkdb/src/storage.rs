@@ -3273,6 +3273,12 @@ pub struct PinkDb {
     pub(crate) stream_peak_rows: std::sync::atomic::AtomicUsize,
     /// Rows folded through that path so far.
     pub(crate) stream_folded_rows: std::sync::atomic::AtomicU64,
+    /// One record per scan source of the statement now running (wave 133b).
+    /// The executor holds `&PinkDb`, so both scan logs are behind a `Mutex`.
+    pub(crate) scan_records: std::sync::Mutex<Vec<crate::morsel::ScanRecord>>,
+    /// The log the last finished statement left: what `EXPLAIN ANALYZE` and
+    /// `pinkdb_scan_io()` report until the running statement replaces it.
+    pub(crate) finished_scans: std::sync::Mutex<Vec<crate::morsel::ScanRecord>>,
 }
 
 impl Default for PinkDb {
@@ -3378,6 +3384,18 @@ impl Clone for PinkDb {
                 self.stream_folded_rows
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
+            scan_records: std::sync::Mutex::new(
+                self.scan_records
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
+            finished_scans: std::sync::Mutex::new(
+                self.finished_scans
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
         }
     }
 }
@@ -3472,6 +3490,8 @@ impl PinkDb {
             stream_buffered_rows: std::sync::atomic::AtomicUsize::new(0),
             stream_peak_rows: std::sync::atomic::AtomicUsize::new(0),
             stream_folded_rows: std::sync::atomic::AtomicU64::new(0),
+            scan_records: std::sync::Mutex::new(Vec::new()),
+            finished_scans: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -3937,6 +3957,47 @@ impl PinkDb {
     pub fn table_version(&self, name: &str) -> Result<u64> {
         let db = self.current_db.clone();
         self.table_version_in(&db, name)
+    }
+
+    /// Record one completed scan source for the statement now running
+    /// (wave 133b).
+    pub fn record_scan(&self, source: &str, io: crate::morsel::ScanIo) {
+        self.scan_records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(crate::morsel::ScanRecord {
+                source: source.to_string(),
+                io,
+            });
+    }
+
+    /// The scan sources of the last finished statement, in completion order.
+    pub fn scan_records(&self) -> Vec<crate::morsel::ScanRecord> {
+        self.finished_scans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The scan sources of the statement now running, in completion order
+    /// (`EXPLAIN ANALYZE` reports its own statement's scans).
+    pub(crate) fn running_scan_records(&self) -> Vec<crate::morsel::ScanRecord> {
+        self.scan_records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Start a statement's scan log (the statement boundary calls this): the
+    /// previous statement's log becomes what `pinkdb_scan_io()` reports, and
+    /// this statement's scans start from empty.
+    pub(crate) fn finish_scan_records(&self) {
+        let done =
+            std::mem::take(&mut *self.scan_records.lock().unwrap_or_else(|e| e.into_inner()));
+        *self
+            .finished_scans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = done;
     }
 
     /// Process-unique identity of this store, shared by its snapshots. An

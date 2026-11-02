@@ -26,6 +26,7 @@ use rayon::prelude::*;
 use window::eval_window;
 
 use crate::attached::{AttachedTable, PruneOp, PrunePredicate};
+use crate::morsel::MorselSource;
 use crate::optimizer::columns_in;
 use crate::plan::{
     AlterTablePlan, LogicalPlan, MAX_RECURSIVE_ITERATIONS, MAX_RECURSIVE_ROWS, agg_output_schema,
@@ -936,8 +937,8 @@ impl<'a> Cx<'a> {
             db,
             ctes,
             memo: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            // No projection bound: every attached-lake scan materializes in
-            // full (the pre-projection behavior).
+            // No projection bound: every attached-lake scan decodes every
+            // column (the pre-projection behavior).
             projections: std::sync::Arc::new(crate::plan::ScanProjections::default()),
             // No pruning bound: every attached-lake scan decodes every file.
             prunes: std::sync::Arc::new(crate::plan::ScanFilters::default()),
@@ -3056,7 +3057,7 @@ fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
 /// A store table's chunks, read one at a time (wave 136b-4): `keep` is the
 /// chunks the zone maps left, `cols` the projection, and every consumer decodes
 /// a chunk when it starts on it instead of pinning the whole table first.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoreScan<'a> {
     table: &'a DataTable,
     keep: Option<Vec<usize>>,
@@ -3246,17 +3247,78 @@ fn scan_candidates(
     Some(keep)
 }
 
+/// The streaming source of an attached-lake scan, or `None` when `plan` is not
+/// one (wave 133b). Every lake read — the pipeline's source, a join's build
+/// side, the materialized path's drain — comes through here, so the plan's
+/// projection, the pushed `WHERE` conjuncts and the wave-122 join-filter
+/// bounds all reach the lake's pruning and decode.
+pub(crate) fn lake_source(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Box<dyn MorselSource>>> {
+    let LogicalPlan::Scan { ns, table, at } = plan else {
+        return Ok(None);
+    };
+    let lookup = ns
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| cx.db.current_ns().clone());
+    let Some((_, lake)) = cx.db.attached_lookup(lookup.db(), lookup.schema(), table) else {
+        return Ok(None);
+    };
+    let lake = std::sync::Arc::clone(lake);
+    let columns = cx.projections.for_scan(plan);
+    let mut prunes = cx.prunes.for_scan(plan).to_vec();
+    // A build side's key bounds prune files exactly like a literal range.
+    // Parquet has no bloom filter here, so only the bounds go.
+    for (col, f) in &cx.dynamic.for_scan(plan) {
+        if let Some(min) = &f.min {
+            prunes.push(PrunePredicate::compare(*col, PruneOp::GtEq, min.clone()));
+        }
+        if let Some(max) = &f.max {
+            prunes.push(PrunePredicate::compare(*col, PruneOp::LtEq, max.clone()));
+        }
+    }
+    let source = match at {
+        None => lake.scan_source(lookup.db(), table, columns, &prunes)?,
+        Some(at) => lake.scan_source_at(lookup.db(), table, *at, columns, &prunes)?,
+    };
+    Ok(Some(source))
+}
+
+/// Read a streamed source to the end, one morsel at a time: the `Output` a
+/// plan above the scan consumes when it is evaluated node by node (a sort, a
+/// DDL, `EXPLAIN ANALYZE`). The rows are the streaming path's, in the same
+/// order, so only the memory differs.
+pub(crate) fn drain_source(cx: &Cx, source: Box<dyn MorselSource>) -> Result<Output> {
+    let names = source.names().to_vec();
+    let types = source.types().to_vec();
+    let mut chunks = Vec::new();
+    let mut morsels = 0u64;
+    while let Some(morsel) = source.next_morsel()? {
+        morsels += 1;
+        source.decode(morsel, &mut |chunk| {
+            chunks.push(chunk);
+            Ok(())
+        })?;
+    }
+    let mut io = source.io();
+    io.in_flight_peak = morsels.min(1);
+    cx.db.record_scan(source.label(), io);
+    cx.check_deadline()?;
+    Ok(Output {
+        chunks,
+        names,
+        types,
+    })
+}
+
 /// Evaluate one `Scan` plan node.
 ///
 /// Unqualified scans name CTEs (binder-resolved); qualified scans are catalog
-/// tables in their database. An attached lake table is not in the store:
-/// materialize the columns this plan references (the exact decode `.lake
-/// open` performs, projected) and scan the result like any other table for
-/// the rest of the session. A projection the analysis could not bound leaves
-/// every column decoded. A time-travel scan (`at`) reads the attached lake at
-/// the target version instead of the pinned one.
+/// tables in their database. A scan of an attached lake table streams from the
+/// lake (wave 133b): the pipeline pulls one row group or page range at a time,
+/// and a plan above the scan that reads node by node drains the same source.
+/// A time-travel scan (`at`) reads the attached lake at the target version.
 fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
-    let LogicalPlan::Scan { ns: qdb, table, at } = plan else {
+    let LogicalPlan::Scan { ns: qdb, table, .. } = plan else {
         unreachable!("scan_output needs a Scan node");
     };
     if qdb.is_none()
@@ -3264,39 +3326,15 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     {
         return Ok(out.clone());
     }
+    if let Some(source) = lake_source(cx, plan)? {
+        return drain_source(cx, source);
+    }
     let lookup = qdb
         .as_ref()
         .cloned()
         .unwrap_or_else(|| cx.db.current_ns().clone());
     let projected = cx.projections.for_scan(plan);
-    // Join filters a completed build side registered for this scan (wave 122).
     let dynamic = cx.dynamic.for_scan(plan);
-    if let Some((_, lake)) = cx.db.attached_lookup(lookup.db(), lookup.schema(), table) {
-        // The simple `WHERE` conjuncts this scan may be pruned by (analyzed
-        // with the projections). The lake decodes only the files whose zone
-        // maps leave the predicate satisfiable.
-        let mut prunes = cx.prunes.for_scan(plan).to_vec();
-        // A build side's key bounds prune files exactly like a literal range.
-        // Parquet has no bloom filter here, so only the bounds go.
-        for (col, f) in &dynamic {
-            if let Some(min) = &f.min {
-                prunes.push(PrunePredicate::compare(*col, PruneOp::GtEq, min.clone()));
-            }
-            if let Some(max) = &f.max {
-                prunes.push(PrunePredicate::compare(*col, PruneOp::LtEq, max.clone()));
-            }
-        }
-        let scan = match at {
-            None => lake.load_filtered(lookup.db(), table, projected, &prunes)?,
-            Some(at) => lake.load_filtered_at(lookup.db(), table, *at, projected, &prunes)?,
-        };
-        let (names, types) = scan.table.schema().into_iter().unzip();
-        return Ok(Output {
-            chunks: scan.chunks()?,
-            names,
-            types,
-        });
-    }
     let t = cx.db.table_in(&lookup, table)?;
     let (names, types) = t.schema().into_iter().unzip();
     let keep = scan_candidates(t, cx.prunes.for_scan(plan), &dynamic);
@@ -4468,13 +4506,27 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 types: vec![DataType::Varchar; 6],
             })
         }
-        LogicalPlan::Explain { plan } => {
+        LogicalPlan::Explain { plan, analyze } => {
+            if *analyze {
+                // Run it first: the scan sources then report into the store's
+                // per-statement log, which the lines below add to the plan.
+                eval(cx, plan)?;
+            }
             let mut chunk = Vector::with_capacity(DataType::Varchar, 0);
             // The projected width is computed over the *explained* plan, not
             // the EXPLAIN wrapper (wave 98a): `(4 of 16 columns)`.
             let projections = crate::plan::ScanProjections::of(plan);
             for line in explain_lines(plan, Some(&cx.prunes), Some(&projections)) {
                 chunk.push_valid(Value::Varchar(line))?;
+            }
+            if *analyze {
+                for record in cx.db.running_scan_records() {
+                    chunk.push_valid(Value::Varchar(format!(
+                        "Scan io  {}: {}",
+                        record.source,
+                        record.io.describe()
+                    )))?;
+                }
             }
             let chunks = if chunk.is_empty() {
                 Vec::new()
@@ -7746,29 +7798,40 @@ fn fused_scan_aggregate(
         leaf = inner;
     }
     filters.reverse();
-    let streams = match leaf {
-        LogicalPlan::TableFunction { source, call, .. } => cx
-            .db
-            .table_source(source)
-            .is_some_and(|src| src.streams_scan(call)),
-        // A time-travel scan has no streaming loader.
-        LogicalPlan::Scan { at: Some(_), .. } => return Ok(None),
-        LogicalPlan::Scan { ns, table, .. } => {
-            let lookup = ns.as_ref().unwrap_or(cx.db.current_ns());
-            cx.db
-                .attached_lookup(lookup.db(), lookup.schema(), table)
-                .is_some_and(|(_, lake)| lake.streams_scan(lookup.db(), table))
-        }
-        _ => return Ok(None),
+    // Only a table function's own streaming scan fuses here; an attached lake
+    // table reaches the pipeline as a streamed source (wave 133b), and a
+    // store table has no streaming scan.
+    let LogicalPlan::TableFunction {
+        source,
+        call,
+        schema,
+    } = leaf
+    else {
+        return Ok(None);
     };
-    if !streams {
+    let Some(src) = cx.db.table_source(source) else {
+        return Ok(None);
+    };
+    if !src.streams_scan(call) {
         return Ok(None);
     }
-    // Fold in parallel with the workers the materialized path uses; the fold
-    // pulls chunks from the scan through a bounded hand-off, so it holds
-    // `2 * workers` chunks, not the file.
+    // When the source streams, every row can be folded in straight from it and
+    // dropped, with the workers pulling through a bounded hand-off.
     let partials = fold_stream(cx, &filters, keys, aggs, &mut |sink| {
-        stream_leaf_chunks(cx, leaf, &mut |chunk| sink(chunk))
+        let projection = cx.projections.for_scan(leaf);
+        let prunes = cx.prunes.for_scan(leaf);
+        let mut push = |chunk: DataChunk| {
+            check_source_chunk(source, schema, &chunk)?;
+            sink(chunk)
+        };
+        let secrets: Vec<_> = cx
+            .db
+            .visible_secrets(&cx.session)
+            .into_iter()
+            .map(|entry| entry.secret)
+            .collect();
+        src.scan_stream_with(call, projection, prunes, &secrets, &mut push)?;
+        cx.check_deadline()
     })?;
     // Merge and emit through the shared post-partial phase, exactly like
     // `aggregate()`.
@@ -7780,63 +7843,6 @@ fn fused_scan_aggregate(
         names,
         types,
     }))
-}
-
-/// Push a streaming leaf's chunks into `sink` in scan order: a table function
-/// through the source's own streaming scan, an attached lake table through the
-/// lake's. The plan must be a leaf [`fused_scan_aggregate`] accepted, i.e. one
-/// its source agreed to stream.
-fn stream_leaf_chunks(
-    cx: &Cx,
-    plan: &LogicalPlan,
-    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
-) -> Result<()> {
-    match plan {
-        LogicalPlan::TableFunction {
-            source,
-            call,
-            schema,
-        } => {
-            let Some(src) = cx.db.table_source(source) else {
-                return Err(PinkDbError::Execution(format!(
-                    "the table source \"{source}\" is not registered in this session (it was \
-                     unregistered after the statement was bound); re-register it and run the \
-                     statement again"
-                )));
-            };
-            let projection = cx.projections.for_scan(plan);
-            let prunes = cx.prunes.for_scan(plan);
-            let mut push = |chunk: DataChunk| {
-                check_source_chunk(source, schema, &chunk)?;
-                sink(chunk)
-            };
-            let secrets: Vec<_> = cx
-                .db
-                .visible_secrets(&cx.session)
-                .into_iter()
-                .map(|entry| entry.secret)
-                .collect();
-            src.scan_stream_with(call, projection, prunes, &secrets, &mut push)?;
-            cx.check_deadline()
-        }
-        LogicalPlan::Scan { ns, table, .. } => {
-            let lookup = ns
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| cx.db.current_ns().clone());
-            let Some((_, lake)) = cx.db.attached_lookup(lookup.db(), lookup.schema(), table) else {
-                return Err(PinkDbError::Execution(format!(
-                    "the attached table \"{lookup}.{table}\" is no longer loaded in this session; \
-                     run the statement again"
-                )));
-            };
-            let projected = cx.projections.for_scan(plan);
-            let prunes = cx.prunes.for_scan(plan);
-            lake.scan_streamed(lookup.db(), table, projected, prunes, sink)?;
-            cx.check_deadline()
-        }
-        _ => unreachable!("stream_leaf_chunks needs a leaf the fusion accepted"),
-    }
 }
 
 /// `DISTINCT`: GROUP BY every column with no aggregates — the parallel
@@ -9191,7 +9197,7 @@ fn explain_into(
         LogicalPlan::ShowTables { ns } => format!("ShowTables {ns}"),
         LogicalPlan::ShowDatabases => "ShowDatabases".to_string(),
         LogicalPlan::Describe { columns } => format!("Describe ({} cols)", columns.len()),
-        LogicalPlan::Explain { plan } => {
+        LogicalPlan::Explain { plan, .. } => {
             children.push(plan);
             "Explain".to_string()
         }

@@ -1047,18 +1047,47 @@ def agreement_prefix(ctx, engine, storage, mode):
     return duck_prefix(ctx, storage)
 
 
+def scan_io_query(name: str) -> str:
+    """What the statement that just ran read, as one `io:<name>:…` cell.
+
+    `pinkdb_scan_io()` reports the last statement's scan sources (wave 133b):
+    bytes and requests from object storage per source, and the pruning units
+    the source reports (`files` for a Parquet-backed lake).
+    """
+    return (
+        f"SELECT 'io:' || {lit(name)} || ':' || COALESCE(SUM(bytes), 0) || ':' || "
+        "COALESCE(SUM(requests), 0) || ':' || COALESCE(SUM(read), 0) || ':' || "
+        "COALESCE(SUM(pruned), 0) AS io FROM pinkdb_scan_io() WHERE unit = 'files';"
+    )
+
+
 def chart_rows(ctx, engine, storage, mode):
     """Run the widget statements in one fresh process; rows by widget.
 
     A `SELECT '<name>'` marker precedes each widget so a statement pinkdb
-    cannot parse does not shift the result boxes of the widgets after it.
+    cannot parse does not shift the result boxes of the widgets after it. A
+    pinkdb run appends the statement's read report after each widget.
+
+    An emitted lake is probed through a read-only attach of the lake catalog,
+    not through the store the batch phases wrote: the store still holds the
+    catalog image it published in memory, so a widget answered from it reads
+    no data files and its read report would be empty.
     """
+    lake_probe = engine == "pinkdb" and storage == "lake" and mode == "emitted"
     prefix = agreement_prefix(ctx, engine, storage, mode)
+    if lake_probe:
+        prefix = [
+            f"ATTACH '{PINK_LAKE_URI}' AS r2_cat "
+            "(DATA_PATH 's3://lake/pink/', READ_ONLY);"
+        ]
     names = sorted(PLAN["chartSql"])
     body = []
     for name in names:
+        sql = qualify_catalog(PLAN["chartSql"][name]) if lake_probe else PLAN["chartSql"][name]
         body.append(f"SELECT {lit(name)} AS \"widget\";")
-        body.append(terminate(PLAN["chartSql"][name]))
+        body.append(terminate(sql))
+        if engine == "pinkdb":
+            body.append(terminate(scan_io_query(name)))
     script = "\n".join(prefix + body + [".quit"]) + "\n"
     env = os.environ.copy()
     env["PINKDB_AGENT_MODE"] = "0"
@@ -1070,21 +1099,32 @@ def chart_rows(ctx, engine, storage, mode):
         cmd = [ctx["bin"]["duckdb"], "-no-agent", ":memory:"]
     r = run_plain(cmd, script, env, timeout=1800)
     boxes = all_boxes(r["stdout"])
-    out, current = {}, None
+    out, io, current = {}, {}, None
     for box in boxes:
-        if len(box) == 1 and len(box[0]) == 1 and box[0][0] in PLAN["chartSql"]:
-            current = box[0][0]
+        cell = box[0][0] if len(box) == 1 and len(box[0]) == 1 else None
+        if cell in PLAN["chartSql"]:
+            current = cell
+        elif cell is not None and cell.startswith("io:") and cell.count(":") == 5:
+            _, widget, nbytes, requests, read, pruned = cell.split(":")
+            io[widget] = {
+                "bytes": int(nbytes),
+                "requests": int(requests),
+                "units_read": int(read),
+                "units_pruned": int(pruned),
+            }
         elif current is not None:
             out[current] = box
     missing = [name for name in names if name not in out]
     errors = {}
     for name in missing:
-        single = "\n".join(prefix + [terminate(PLAN["chartSql"][name]), ".quit"]) + "\n"
+        sql = qualify_catalog(PLAN["chartSql"][name]) if lake_probe else PLAN["chartSql"][name]
+        single = "\n".join(prefix + [terminate(sql), ".quit"]) + "\n"
         r1 = run_plain(cmd, single, env, timeout=600)
         errors[name] = first_error(r1["stdout"] + r1["stderr"]) or "no result box"
     return {
         "status": "ok" if not errors else "partial",
         "rows": out,
+        "io": io,
         "errors": errors,
         "error": first_error(r["stdout"] + r["stderr"]) if r["rc"] else "",
     }
@@ -1240,6 +1280,46 @@ def latency_record(clients, requests, wall_s, peak_rss_kb):
 def chart_server_failure(clients, exc):
     """A server that never listened fails that phase; it does not abort the run."""
     return [{"clients": n, "status": "failed", "error": f"server: {exc}"} for n in clients]
+
+
+def startup(ctx, engine, storage, mode):
+    """Fresh-process startup cost: opening the store/lake, then one widget.
+
+    `attach` is the open/attach alone; `first_query` is open/attach plus the
+    alphabetically first chart query — what a chart server pays on its first
+    request (wave 133b records it next to the steady-state latencies).
+    """
+    prefix = agreement_prefix(ctx, engine, storage, mode)
+    name = sorted(PLAN["chartSql"])[0]
+    if engine == "pinkdb":
+        cmd = [ctx["bin"]["pink"], "-no-agent"]
+        env = os.environ.copy()
+        env["PINKDB_AGENT_MODE"] = "0"
+        if storage == "lake":
+            env.update(ctx["lake"].pink_env())
+    else:
+        cmd = [ctx["bin"]["duckdb"], "-no-agent", ":memory:"]
+        env = os.environ.copy()
+
+    def measure(extra):
+        script = "\n".join(prefix + extra + [".quit"]) + "\n"
+        times = []
+        for _ in range(3):
+            start = time.monotonic()
+            r = run_plain(cmd, script, env, timeout=900)
+            if r["rc"]:
+                return {"status": "failed", "error": first_error(r["stdout"] + r["stderr"])}
+            times.append(round(time.monotonic() - start, 3))
+        return {
+            "status": "ok",
+            "s": times,
+            "median_s": round(statistics.median(times), 3),
+        }
+
+    return {
+        "attach": measure([]),
+        "first_query": {**measure([terminate(PLAN["chartSql"][name])]), "widget": name},
+    }
 
 
 def run_pink_charts(ctx, storage, clients, rounds, widgets):
@@ -1528,6 +1608,9 @@ def compare_charts(ctx, storage, engines):
     rows = {}
     for engine, e in engines.items():
         rows[engine] = chart_rows(ctx, engine, storage, e["mode"])
+        e["startup"] = startup(ctx, engine, storage, e["mode"])
+        if engine == "pinkdb":
+            e["chart_io"] = rows[engine].get("io") or {}
     a, b = rows.get("pinkdb"), rows.get("duckdb")
     rec = {"checked": len(PLAN["chartSql"])}
     if a and b:
@@ -2095,6 +2178,50 @@ def render_markdown(results) -> str:
             pv = (p.get("per_widget_p50_ms") or {}).get(name) if p.get("status") == "ok" else None
             dv = (d.get("per_widget_p50_ms") or {}).get(name) if d.get("status") == "ok" else None
             out.append(f"| {storage} | {name} | {fmt(pv)} | {fmt(dv)} |")
+    out.append("")
+
+    out.append("## Startup and first query (fresh process, median of 3)")
+    out.append("")
+    out.append(
+        "`attach` is opening the store/lake alone; `first query` adds the "
+        "alphabetically first chart widget in the same process (wave 133b)."
+    )
+    out.append("")
+    out.append("| storage | engine | attach s | first query s | widget |")
+    out.append("|---|---|---|---|---|")
+    for storage, st in results["storages"].items():
+        for engine, e in st["engines"].items():
+            start = e.get("startup") or {}
+            attach = start.get("attach") or {}
+            first = start.get("first_query") or {}
+            out.append(
+                f"| {storage} | {engine} | {fmt(attach.get('median_s'), 3)} | "
+                f"{fmt(first.get('median_s'), 3)} | {first.get('widget') or '—'} |"
+            )
+    out.append("")
+
+    out.append("## Lake read report per widget (pinkdb, one process per widget run)")
+    out.append("")
+    out.append(
+        "`pinkdb_scan_io()` after each widget: object-storage bytes and "
+        "requests, and the Parquet files read vs pruned by the scan "
+        "(wave 133b). DuckDB's `EXPLAIN ANALYZE` does not report these, so "
+        "its column is `n/a`."
+    )
+    out.append("")
+    out.append("| storage | widget | bytes | requests | files read | files pruned |")
+    out.append("|---|---|---|---|---|---|")
+    for storage, st in results["storages"].items():
+        io = ((st["engines"].get("pinkdb") or {}).get("chart_io") or {})
+        for name in sorted(PLAN["chartSql"]):
+            rec = io.get(name)
+            if rec is None:
+                out.append(f"| {storage} | {name} | n/a | n/a | n/a | n/a |")
+                continue
+            out.append(
+                f"| {storage} | {name} | {rec['bytes']} | {rec['requests']} | "
+                f"{rec['units_read']} | {rec['units_pruned']} |"
+            )
     out.append("")
 
     out.append("## Cold start (`kpi_totals`, fresh process, median of 5)")

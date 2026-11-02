@@ -1001,11 +1001,12 @@ fn materialize_tables(
         if unavailable.contains(&key) {
             continue;
         }
-        let table = attachment
-            .load(&t.db, &t.table)
-            .map_err(|e| LakeError::Engine {
-                context: format!("materializing table \"{key}\" for writing"),
-                source: e,
+        let table =
+            crate::attach::load_table(Arc::clone(&attachment), &t.db, &t.table).map_err(|e| {
+                LakeError::Engine {
+                    context: format!("materializing table \"{key}\" for writing"),
+                    source: e,
+                }
             })?;
         base.insert(key, table);
     }

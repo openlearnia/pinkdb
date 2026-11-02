@@ -336,7 +336,7 @@ pub fn write_target(stmt: &Statement, current_db: Option<&str>) -> WriteTarget {
                 crate::sql::ast::CteBody::Query(_) => None,
             })
             .fold(WriteTarget::Nothing, WriteTarget::merge),
-        Explain(inner) => write_target(inner, current_db),
+        Explain { statement, .. } => write_target(statement, current_db),
         // A trigger writes wherever its action does each time it fires, not
         // only the database of the table it is attached to.
         CreateTrigger { qual, action, .. } => {
@@ -418,8 +418,8 @@ pub fn statement_allowed(stmt: &Statement, allow_writes: bool) -> bool {
     }
     // `EXPLAIN` is as allowed as what it explains: `EXPLAIN SELECT` stays
     // readable, `EXPLAIN INSERT …` is a write path.
-    if let Statement::Explain(inner) = stmt {
-        return statement_allowed(inner, allow_writes);
+    if let Statement::Explain { statement, .. } = stmt {
+        return statement_allowed(statement, allow_writes);
     }
     matches!(
         stmt,
@@ -951,7 +951,7 @@ fn external_reason(
 fn ast_scans_files(statement: &Statement) -> bool {
     match statement {
         Statement::Select(select) => select_scans_files(select),
-        Statement::Explain(inner) => ast_scans_files(inner),
+        Statement::Explain { statement, .. } => ast_scans_files(statement),
         _ => false,
     }
 }
@@ -994,7 +994,7 @@ fn render<R: Session + ?Sized>(
 ) -> std::result::Result<String, String> {
     // The cost hint belongs to `EXPLAIN` alone (wave 99): it describes the
     // plan the client just asked for, not a following statement's.
-    let explained = matches!(statements, [Statement::Explain(_)]);
+    let explained = matches!(statements, [Statement::Explain { .. }]);
     match session.run_statement(sql, policy.limits) {
         Ok(results) => {
             let mut text = render_results(&results, policy.display);

@@ -232,7 +232,11 @@ fn tables_at(lake: &Lake, version: u64) -> pinkdb::Result<Vec<(String, String, A
     let reader = report.lake;
     let mut out = Vec::new();
     for t in reader.tables() {
-        out.push((t.db.clone(), t.table.clone(), reader.load(&t.db, &t.table)?));
+        out.push((
+            t.db.clone(),
+            t.table.clone(),
+            crate::attach::load_table(Arc::clone(&reader), &t.db, &t.table)?,
+        ));
     }
     Ok(out)
 }

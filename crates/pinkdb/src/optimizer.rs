@@ -212,8 +212,9 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
             body: Box::new(apply_indexes(db, *body)),
             recursive: recursive.map(|r| Box::new(r.map(&|p: LogicalPlan| apply_indexes(db, p)))),
         },
-        LogicalPlan::Explain { plan } => LogicalPlan::Explain {
+        LogicalPlan::Explain { plan, analyze } => LogicalPlan::Explain {
             plan: Box::new(apply_indexes(db, *plan)),
+            analyze,
         },
         other => other,
     }
@@ -382,8 +383,9 @@ fn drop_count_star_projections(plan: LogicalPlan) -> LogicalPlan {
             right: Box::new(drop_count_star_projections(*right)),
             types,
         },
-        LogicalPlan::Explain { plan } => LogicalPlan::Explain {
+        LogicalPlan::Explain { plan, analyze } => LogicalPlan::Explain {
             plan: Box::new(drop_count_star_projections(*plan)),
+            analyze,
         },
         other => other,
     }
@@ -726,8 +728,9 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             right: Box::new(fold_plan(db, *right)),
             types,
         },
-        LogicalPlan::Explain { plan } => LogicalPlan::Explain {
+        LogicalPlan::Explain { plan, analyze } => LogicalPlan::Explain {
             plan: Box::new(fold_plan(db, *plan)),
+            analyze,
         },
         LogicalPlan::CreateTableAs {
             ns: qdb,
@@ -2173,8 +2176,9 @@ fn order_chains(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
                 recursive,
             }
         }
-        P::Explain { plan } => P::Explain {
+        P::Explain { plan, analyze } => P::Explain {
             plan: Box::new(order_chains(db, *plan)),
+            analyze,
         },
         other => other,
     }
@@ -3365,8 +3369,9 @@ fn pushdown_inner(plan: LogicalPlan, pdb: Option<&crate::storage::PinkDb>) -> Lo
             if_not_exists,
             or_replace,
         },
-        LogicalPlan::Explain { plan } => LogicalPlan::Explain {
+        LogicalPlan::Explain { plan, analyze } => LogicalPlan::Explain {
             plan: Box::new(pushdown_inner(*plan, pdb)),
+            analyze,
         },
         // Filters push within the body and within the query independently —
         // never across the CTE boundary (different scopes).
@@ -3990,8 +3995,9 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
             if_not_exists,
             or_replace,
         },
-        LogicalPlan::Explain { plan } => LogicalPlan::Explain {
+        LogicalPlan::Explain { plan, analyze } => LogicalPlan::Explain {
             plan: Box::new(elim(db, *plan, &Live::All)),
+            analyze,
         },
         // Leaves (scans, DML without a query child, DDL, ...) carry no joins.
         other => other,
@@ -4007,8 +4013,9 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
 /// silently returning fewer than `k` rows.
 fn apply_vector_topk(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
     match plan {
-        LogicalPlan::Explain { plan } => LogicalPlan::Explain {
+        LogicalPlan::Explain { plan, analyze } => LogicalPlan::Explain {
             plan: Box::new(apply_vector_topk(db, *plan)),
+            analyze,
         },
         LogicalPlan::Limit { input, limit } => {
             let Some(new_input) = rewrite_limit_input(db, (*input).clone(), limit) else {

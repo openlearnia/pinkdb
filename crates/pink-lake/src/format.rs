@@ -460,10 +460,9 @@ pub trait LakeFormat: fmt::Debug + Send + Sync {
 
     /// Whether this format can prune **row groups** from a query's pushed-down
     /// predicates (Parquet's column-chunk statistics). The default is `false`.
-    /// A provider that answers `true` makes [`LakeAttachment::load_filtered`]
-    /// decode an uncached, pruned row-group set even when no whole file was
-    /// pruned; the engine re-applies the full predicate, so the answer is
-    /// unchanged.
+    /// A provider that answers `true` makes [`LakeAttachment::scan_source`]
+    /// decode a pruned row-group set even when no whole file was pruned; the
+    /// engine re-applies the full predicate, so the answer is unchanged.
     fn prunes_row_groups(&self) -> bool {
         false
     }
@@ -488,32 +487,55 @@ pub trait LakeFormat: fmt::Debug + Send + Sync {
         Ok(None)
     }
 
-    /// Stream one data file's projected columns, one morsel at a time.
+    /// Plan one data file's morsels: the pieces a scan decodes one at a time
+    /// (a Parquet row group, a page range), with the row groups and pages the
+    /// pushed-down filters leave alive already pruned.
     ///
-    /// `sink` receives `(row offset of the morsel inside the file, chunk)`;
-    /// the chunk holds the file's full physical schema, with unrequested (and
-    /// absent) columns as NULL placeholders. A provider that can read page
-    /// ranges overrides this so a scan never holds more than the in-flight
-    /// morsel and reads only the pages the predicates leave alive; the
-    /// default decodes the whole file with [`LakeFormat::read_projected`] and
-    /// pushes its chunks, which is what a `.pink` file does.
+    /// Building a plan reads the file's metadata only, so the scan prunes and
+    /// reports before it reads any data. [`FileMorsels::decode`] then runs on
+    /// the pipeline worker that claimed the morsel and hands the sink the
+    /// file's full physical schema with unrequested columns as NULL
+    /// placeholders — the chunk shape [`LakeFormat::read_projected`] produces.
+    /// `None` (the default) makes the whole file one morsel, which is what a
+    /// `.pink` file is; a provider that can plan row groups overrides this.
     ///
-    /// Pruning may shrink the pushed rows; a provider that prunes must say so
-    /// through [`LakeFormat::prunes_row_groups`], and only when the file has
-    /// no positional deletes (delete positions address the file's rows).
-    /// Returns the rows pushed and the scan's pruning counters.
-    fn scan(
+    /// A decode may use the thread pool it runs on, but must not wait on that
+    /// pool for another morsel's data: every worker can be inside a decode of
+    /// its own at the same time.
+    fn morsels(
         &self,
-        file: &DataFile<'_>,
-        columns: &[usize],
-        filters: &[pinkdb::PrunePredicate],
-        sink: &mut dyn FnMut(u64, pinkdb::DataChunk) -> Result<()>,
-    ) -> Result<(u64, ScanCounters)> {
-        scan_whole_file(self, file, columns, filters, sink)
+        _file: &DataFile<'_>,
+        _columns: &[usize],
+        _filters: &[pinkdb::PrunePredicate],
+    ) -> Result<Option<Box<dyn FileMorsels>>> {
+        Ok(None)
     }
 }
 
-/// Per-file pruning counters a [`LakeFormat::scan`] reports.
+/// One data file's morsel plan, as [`LakeFormat::morsels`] returns it.
+///
+/// The plan owns what a decode needs — the file's metadata, the projection and
+/// the filters — so it outlives the scan that built it and several pipeline
+/// workers can decode different morsels of the same file at once.
+pub trait FileMorsels: Send + Sync {
+    /// How many morsels the plan hands out.
+    fn count(&self) -> usize;
+    /// The rows morsel `index` decodes to (fewer than its row group when the
+    /// page index proved pages cannot match).
+    fn rows(&self, index: usize) -> u64;
+    /// Decode morsel `index`, handing `sink` its chunks. A sink error is the
+    /// engine's (the scan is being torn down) and must come back unchanged;
+    /// a decode error is the file's.
+    fn decode(
+        &self,
+        index: usize,
+        sink: &mut dyn FnMut(pinkdb::DataChunk) -> pinkdb::Result<()>,
+    ) -> pinkdb::Result<()>;
+    /// What the plan pruned, and how many row groups and pages it will read.
+    fn counters(&self) -> ScanCounters;
+}
+
+/// One file's pruning counters, as a morsel plan reports them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanCounters {
     /// Row groups decoded and row groups whose statistics proved no match.
@@ -525,40 +547,14 @@ pub struct ScanCounters {
     pub pages_pruned: u64,
 }
 
-/// The default [`LakeFormat::scan`]: decode the whole file through the
-/// provider's projected reader (or its full reader) and push the chunks in
-/// file order.
-pub fn scan_whole_file<F: LakeFormat + ?Sized>(
-    format: &F,
-    file: &DataFile<'_>,
-    columns: &[usize],
-    filters: &[pinkdb::PrunePredicate],
-    sink: &mut dyn FnMut(u64, pinkdb::DataChunk) -> Result<()>,
-) -> Result<(u64, ScanCounters)> {
-    let store = match format.read_projected(file, columns, filters)? {
-        Some((store, _present)) => store,
-        None => format.read(file)?,
-    };
-    let (_db, table) = crate::only_table(&store, file.rel(), file.path())?;
-    let mut offset = 0u64;
-    for index in 0..table.num_chunks() {
-        let chunk = table
-            .scan_chunk(index)
-            .map_err(|source| LakeError::Engine {
-                context: format!("scan of \"{}\"", file.rel()),
-                source,
-            })?
-            .ok_or_else(|| LakeError::Internal {
-                message: format!(
-                    "chunk {index} of \"{}\" disappeared while scanning",
-                    file.rel()
-                ),
-            })?;
-        let rows = chunk.num_rows() as u64;
-        sink(offset, chunk)?;
-        offset += rows;
+impl ScanCounters {
+    /// Count `other`'s work in with this file's.
+    pub fn add(&mut self, other: &ScanCounters) {
+        self.row_groups += other.row_groups;
+        self.row_groups_pruned += other.row_groups_pruned;
+        self.pages += other.pages;
+        self.pages_pruned += other.pages_pruned;
     }
-    Ok((offset, ScanCounters::default()))
 }
 
 /// The process-global registry, seeded lazily with the built-in providers.

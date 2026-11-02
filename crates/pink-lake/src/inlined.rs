@@ -180,9 +180,9 @@ pub(crate) fn decode_row(
 ///
 /// `wanted` marks the requested logical columns (`None` = all): a column
 /// outside the request is filled with NULLs and reported `present = false`,
-/// chunk-aligned with the decoded ones — exactly the placeholder contract
-/// `AttachedLake::load_projected` gives a projected data-file decode, so a
-/// later per-column decode can merge over it.
+/// chunk-aligned with the decoded ones — the placeholder contract a
+/// projected data-file decode gives the streamed scan, so columns decoded
+/// on demand can be merged into the same chunk.
 pub(crate) fn materialize_live(
     live: &[InlinedRow],
     record: &TableSchema,
