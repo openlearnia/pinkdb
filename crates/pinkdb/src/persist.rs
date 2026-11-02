@@ -50,7 +50,7 @@
 //! as before) but decodes the column chunks **in parallel**.
 //!
 //! `free_ranges` is a sorted `(offset, len)` list of data-region ranges no row
-//! group references — the holes an append-only checkpoint leaves behind. The
+//! group references — the holes an incremental checkpoint leaves behind. The
 //! full rewrite writes it empty; a reader range-checks it (inside the data
 //! region, sorted, non-overlapping, clear of every row group) and otherwise
 //! ignores it.
@@ -68,18 +68,24 @@
 //! still seal the whole image in memory: the `PINKENC1` container seals the
 //! plain image whole.
 //!
-//! An **append-only checkpoint** (136w3, not implemented yet) extends the file
-//! instead of rewriting it:
+//! An **incremental checkpoint** (136w3) keeps every clean row group where it
+//! is: its footer entry is reused and none of its bytes move. A row group with
+//! a dirty chunk (or a changed schema, or a new table) is re-encoded into a
+//! hole from the current footer's `free_ranges`, else after `file_len`. The
+//! superseded groups and the old footer become holes in the new footer. The
+//! commit order is:
 //!
-//! 1. append the new data and the new footer at `file_len`;
+//! 1. write the new groups and footer;
 //! 2. fsync;
-//! 3. write the *other* header slot with `iteration + 1` and the new
-//!    `file_len`;
-//! 4. fsync.
+//! 3. write a marker naming the checkpoint, then the *other* header slot with
+//!    `iteration + 1`, the new footer location and the new `file_len`;
+//! 4. fsync;
+//! 5. roll the WAL.
 //!
-//! Until step 3 is on disk the other slot still names the old footer, which the
-//! file still holds; that is what makes the append crash-safe. [`write_slot`]
-//! and [`read_slots`] are the two primitives it needs.
+//! Until step 3 is on disk the current slot still names the old footer, which
+//! the file still holds: only ranges free in that footer are overwritten. The
+//! marker lets recovery finish a checkpoint whose slot landed but whose WAL
+//! roll did not, without replaying the folded records twice.
 //!
 //! ## Row groups and statistics
 //!
@@ -251,9 +257,8 @@ impl Slot {
 /// range past the slot's `file_len` all make a slot invalid; if neither slot
 /// is valid there is nothing to read.
 ///
-/// The full rewrite writes slot 0 only; an append-only checkpoint writes the
+/// The full rewrite writes slot 0 only; an incremental checkpoint writes the
 /// *other* slot with `iteration + 1` once the bytes it names are on disk.
-#[allow(dead_code)] // 136w3's append path reads both slots before it writes one.
 pub(crate) fn read_slots(header: &[u8]) -> Option<(usize, Slot)> {
     pick_slot(header, u64::MAX)
 }
@@ -3162,6 +3167,9 @@ struct StoreFooter {
     databases: Vec<DbDir>,
     rbac: Option<crate::rbac::RbacCatalog>,
     secrets: Vec<crate::secret::Secret>,
+    /// The data-region holes no row group references. An incremental
+    /// checkpoint allocates from these; a full rewrite always writes empty.
+    free_ranges: Vec<(u64, u64)>,
 }
 
 /// One encoded page (one engine chunk): its framed bytes and its statistics.
@@ -3711,36 +3719,132 @@ impl PinkDb {
             .flat_map(|db| self.all_tables_of(db))
             .map(|(_, _, t)| t)
             .collect();
-        let with_constraints = all_tables.iter().any(|t| !t.constraints.is_empty());
-        let with_defaults = all_tables
-            .iter()
-            .any(|t| t.columns.iter().any(|c| c.default.is_some()));
-        let with_indexes = all_tables.iter().any(|t| !t.indexes.is_empty());
-        let with_vectors = all_tables.iter().any(|t| !t.vector_indexes.is_empty());
-        let with_mvs = self.has_materialized_views();
-        let with_procedures = self.has_procedures();
-        let with_triggers = self.has_triggers();
-        let with_macros = self.has_macros();
-        let with_rbac = self.has_rbac_data();
-        let flags = if with_constraints {
-            FLAG_CONSTRAINTS
-        } else {
-            0
-        } | if with_defaults { FLAG_DEFAULTS } else { 0 }
-            | if with_mvs { FLAG_MATERIALIZED_VIEWS } else { 0 }
-            | if with_indexes { FLAG_INDEXES } else { 0 }
-            | if with_vectors { FLAG_VECTOR_INDEXES } else { 0 }
-            | if with_procedures { FLAG_PROCEDURES } else { 0 }
-            | if with_triggers { FLAG_TRIGGERS } else { 0 }
-            | if with_macros { FLAG_MACROS } else { 0 }
-            | if with_rbac { FLAG_RBAC } else { 0 };
+        let flags = self.image_flags(&all_tables);
 
-        // The data region.
+        // The data region. Every table this pass wrote, with the new home of
+        // each chunk it re-encoded (see `write_table`).
         let mut saved: Vec<SavedTableStats> = Vec::new();
-        // Every table this pass wrote, with the new home of each chunk it
-        // re-encoded (see `write_table`).
         let mut carry: Vec<u8> = Vec::new();
         let mut repoints: Vec<(&DataTable, TableCarry)> = Vec::new();
+        let db_dirs = self.catalog_dirs(flags, |ns, name, t| {
+            if omit_rows {
+                Ok(TableDir {
+                    name: name.to_string(),
+                    schema: t.schema(),
+                    constraints: t.constraints.clone(),
+                    defaults: t
+                        .columns
+                        .iter()
+                        .map(|c| c.default.as_ref().map(|d| d.text.clone()))
+                        .collect(),
+                    indexes: index_defs_without_rows(t),
+                    // A rows-free catalog image cannot carry a graph whose nodes
+                    // are row ids; vector indexes are only built on native
+                    // tables, whose rows are omitted too.
+                    vector_indexes: Vec::new(),
+                    row_count: 0,
+                    row_groups: Vec::new(),
+                    // No rows, no statistics: readers treat the column facts as
+                    // unknown until the rows arrive.
+                    stats: crate::stats::TableStats::unknown(t.columns.len(), 0),
+                    zones: vec![Vec::new(); t.columns.len()],
+                })
+            } else {
+                let (dir, carried) = write_table(
+                    data,
+                    &mut carry,
+                    ns,
+                    name,
+                    t,
+                    parallel,
+                    collect_stats,
+                    &mut saved,
+                )?;
+                repoints.push((t, carried));
+                Ok(dir)
+            }
+        })?;
+
+        // The footer. A full rewrite leaves no free ranges; the incremental
+        // checkpoint path builds its own footer from the same function.
+        let free_ranges: &[(u64, u64)] = {
+            #[cfg(test)]
+            {
+                &hooks.free_ranges
+            }
+            #[cfg(not(test))]
+            {
+                let _ = hooks;
+                &[]
+            }
+        };
+        let footer = self.build_footer(flags, free_ranges, &db_dirs)?;
+        // The footer, then slot 0: the footer is on disk before any slot
+        // names it, and slot 1 stays zero, so a torn write leaves no valid
+        // slot that names a missing footer.
+        let footer_offset = data.offset();
+        let crc = crc32c(&footer);
+        data.bytes(&footer)?;
+        let slot = Slot {
+            iteration: 1,
+            footer_offset,
+            footer_len: footer.len() as u64,
+            footer_crc32c: crc,
+            file_len: data.offset(),
+        };
+        data.write_slot(0, &slot)?;
+        #[cfg(test)]
+        if hooks.second_slot {
+            data.write_slot(
+                1,
+                &Slot {
+                    iteration: 2,
+                    ..slot
+                },
+            )?;
+        }
+        // The handles of the chunks this pass wrote point at the carried
+        // column bytes: a saved write's chunk is stored (and evictable)
+        // without a reopen, whether it was re-encoded or copied through.
+        // An encrypted store's plaintext image is overwritten when its last
+        // handle drops it, exactly like the image a keyed open decrypts.
+        Self::repoint_carried(carry, repoints, self.encryption_key.is_some());
+        Ok(saved)
+    }
+
+    /// Point re-encoded chunks at the retained image built from `carry`.
+    ///
+    /// `carry` holds only the data region, while chunk offsets (and the
+    /// footer's) are absolute file offsets: prefix the two header slots so
+    /// [`copy_through`] sees the same coordinate space after a reopen and
+    /// after an in-process save.
+    fn repoint_carried(carry: Vec<u8>, repoints: Vec<(&DataTable, TableCarry)>, encrypted: bool) {
+        if carry.is_empty() {
+            return;
+        }
+        let mut bytes = vec![0u8; DATA_START as usize];
+        bytes.extend_from_slice(&carry);
+        let image = crate::storage::StoreImage::new(bytes, encrypted);
+        for (t, carried) in repoints {
+            for (column, chunks) in t.columns.iter().zip(carried) {
+                for (i, offset, length, rows) in chunks {
+                    column.repoint_chunk(i, &image, DATA_START + offset, length, rows);
+                }
+            }
+        }
+    }
+
+    /// Build the footer's database/schema/table directories in sorted name
+    /// order, letting `table_dir` decide each table's row-group entry (a full
+    /// rewrite writes it, an incremental checkpoint may reuse it).
+    fn catalog_dirs<'a, F>(&'a self, flags: u32, mut table_dir: F) -> Result<Vec<DbDir>>
+    where
+        F: FnMut(&SchemaPath, &str, &'a DataTable) -> Result<TableDir>,
+    {
+        let with_mvs = flags & FLAG_MATERIALIZED_VIEWS != 0;
+        let with_procedures = flags & FLAG_PROCEDURES != 0;
+        let with_triggers = flags & FLAG_TRIGGERS != 0;
+        let with_macros = flags & FLAG_MACROS != 0;
         let mut dbs = self.list_databases();
         dbs.sort();
         let mut db_dirs: Vec<DbDir> = Vec::with_capacity(dbs.len());
@@ -3766,47 +3870,7 @@ impl PinkDb {
                     let mut tables: Vec<TableDir> = Vec::with_capacity(names.len());
                     for name in &names {
                         let t = self.table_in(&ns, name)?;
-                        // Wave 96b: the engine catalog image carries schemas
-                        // and table metadata only; the rows live in the lake.
-                        let dir = if omit_rows {
-                            TableDir {
-                                name: name.clone(),
-                                schema: t.schema(),
-                                constraints: t.constraints.clone(),
-                                defaults: t
-                                    .columns
-                                    .iter()
-                                    .map(|c| c.default.as_ref().map(|d| d.text.clone()))
-                                    .collect(),
-                                indexes: index_defs_without_rows(t),
-                                // A rows-free catalog image cannot carry a
-                                // graph whose nodes are row ids; vector
-                                // indexes are only built on native tables,
-                                // whose rows are omitted too.
-                                vector_indexes: Vec::new(),
-                                row_count: 0,
-                                row_groups: Vec::new(),
-                                // No rows, no statistics: readers treat the
-                                // column facts as unknown until the rows
-                                // arrive.
-                                stats: crate::stats::TableStats::unknown(t.columns.len(), 0),
-                                zones: vec![Vec::new(); t.columns.len()],
-                            }
-                        } else {
-                            let (dir, carried) = write_table(
-                                data,
-                                &mut carry,
-                                &ns,
-                                name,
-                                t,
-                                parallel,
-                                collect_stats,
-                                &mut saved,
-                            )?;
-                            repoints.push((t, carried));
-                            dir
-                        };
-                        tables.push(dir);
+                        tables.push(table_dir(&ns, name, t)?);
                     }
                     schemas.push(SchemaDir {
                         name: scat.name.clone(),
@@ -3850,31 +3914,71 @@ impl PinkDb {
                 schemas,
             });
         }
+        Ok(db_dirs)
+    }
 
-        // The footer.
+    /// The footer's flags word, from the tables the image will carry.
+    fn image_flags(&self, all_tables: &[&DataTable]) -> u32 {
+        let with_constraints = all_tables.iter().any(|t| !t.constraints.is_empty());
+        let with_defaults = all_tables
+            .iter()
+            .any(|t| t.columns.iter().any(|c| c.default.is_some()));
+        let with_indexes = all_tables.iter().any(|t| !t.indexes.is_empty());
+        let with_vectors = all_tables.iter().any(|t| !t.vector_indexes.is_empty());
+        (if with_constraints {
+            FLAG_CONSTRAINTS
+        } else {
+            0
+        }) | if with_defaults { FLAG_DEFAULTS } else { 0 }
+            | if self.has_materialized_views() {
+                FLAG_MATERIALIZED_VIEWS
+            } else {
+                0
+            }
+            | if with_indexes { FLAG_INDEXES } else { 0 }
+            | if with_vectors { FLAG_VECTOR_INDEXES } else { 0 }
+            | if self.has_procedures() {
+                FLAG_PROCEDURES
+            } else {
+                0
+            }
+            | if self.has_triggers() {
+                FLAG_TRIGGERS
+            } else {
+                0
+            }
+            | if self.has_macros() { FLAG_MACROS } else { 0 }
+            | if self.has_rbac_data() { FLAG_RBAC } else { 0 }
+    }
+
+    /// Build the footer bytes for `db_dirs`, including the free-range section:
+    /// the one footer writer shared by the full rewrite and the incremental
+    /// checkpoint.
+    fn build_footer(
+        &self,
+        flags: u32,
+        free_ranges: &[(u64, u64)],
+        db_dirs: &[DbDir],
+    ) -> Result<Vec<u8>> {
+        let with_constraints = flags & FLAG_CONSTRAINTS != 0;
+        let with_defaults = flags & FLAG_DEFAULTS != 0;
+        let with_indexes = flags & FLAG_INDEXES != 0;
+        let with_vectors = flags & FLAG_VECTOR_INDEXES != 0;
+        let with_macros = flags & FLAG_MACROS != 0;
+        let with_mvs = flags & FLAG_MATERIALIZED_VIEWS != 0;
+        let with_procedures = flags & FLAG_PROCEDURES != 0;
+        let with_triggers = flags & FLAG_TRIGGERS != 0;
+        let with_rbac = flags & FLAG_RBAC != 0;
         let mut fw = Writer::new();
         fw.u32(FOOTER_VERSION);
         fw.u32(flags);
-        // The data-region holes no row group references: the full rewrite
-        // leaves none, an append-only checkpoint (136w3) fills them in.
-        let free_ranges: &[(u64, u64)] = {
-            #[cfg(test)]
-            {
-                &hooks.free_ranges
-            }
-            #[cfg(not(test))]
-            {
-                let _ = hooks;
-                &[]
-            }
-        };
         fw.u32(free_ranges.len() as u32);
         for &(offset, len) in free_ranges {
             fw.u64(offset);
             fw.u64(len);
         }
         fw.u32(db_dirs.len() as u32);
-        for dbdir in &db_dirs {
+        for dbdir in db_dirs {
             fw.str(&dbdir.name);
             write_storage(&mut fw, &dbdir.storage);
             fw.u32(dbdir.schemas.len() as u32);
@@ -3951,49 +4055,7 @@ impl PinkDb {
         // is what lets a load replace the checkpoint's secrets instead of
         // keeping stale ones.
         write_secrets(&mut fw, self);
-        let footer = fw.buf;
-        // The footer, then slot 0: the footer is on disk before any slot
-        // names it, and slot 1 stays zero, so a torn write leaves no valid
-        // slot that names a missing footer.
-        let footer_offset = data.offset();
-        let crc = crc32c(&footer);
-        data.bytes(&footer)?;
-        let slot = Slot {
-            iteration: 1,
-            footer_offset,
-            footer_len: footer.len() as u64,
-            footer_crc32c: crc,
-            file_len: data.offset(),
-        };
-        data.write_slot(0, &slot)?;
-        #[cfg(test)]
-        if hooks.second_slot {
-            data.write_slot(
-                1,
-                &Slot {
-                    iteration: 2,
-                    ..slot
-                },
-            )?;
-        }
-        // The handles of the chunks this pass re-encoded point at the bytes it
-        // wrote (the carried column chunks): a saved write's chunk is stored
-        // (and evictable) without a reopen. A copied-through chunk already
-        // points at the old image, whose bytes are exactly these.
-        if !carry.is_empty() {
-            // An encrypted store's plaintext image is overwritten when its
-            // last handle drops it, exactly like the image a keyed open
-            // decrypts.
-            let image = crate::storage::StoreImage::new(carry, self.encryption_key.is_some());
-            for (t, carried) in repoints {
-                for (column, chunks) in t.columns.iter().zip(carried) {
-                    for (i, offset, length, rows) in chunks {
-                        column.repoint_chunk(i, &image, offset, length, rows);
-                    }
-                }
-            }
-        }
-        Ok(saved)
+        Ok(fw.buf)
     }
 
     /// The bytes [`PinkDb::save`] would write: every database in the `.pink`
@@ -4086,6 +4148,273 @@ impl PinkDb {
         Self::write_sync(path, |sink| {
             self.write_image(sink, true, false, false).map(|_| ())
         })
+    }
+
+    /// The checkpoint primitive: refresh the target in place when it is a
+    /// plaintext v7 file with room, otherwise write a full image to `tmp`.
+    /// `tmp` is what the WAL publishes in the full-rewrite case; the in-place
+    /// case commits through the other header slot and leaves `tmp` untouched.
+    pub(crate) fn save_checkpoint_sync(
+        &self,
+        tmp: &std::path::Path,
+        target: &std::path::Path,
+        wal_generation: u64,
+        next_generation: u64,
+    ) -> Result<CheckpointSave> {
+        if self.encryption_key.is_some() {
+            return Err(PinkDbError::Execution(
+                "an encrypted store cannot take an in-place checkpoint".to_string(),
+            ));
+        }
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(target);
+        let file = match opened {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.save_sync(tmp)?;
+                return Ok(CheckpointSave::Full);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let physical_len = file.metadata()?.len();
+        let Some((slot_idx, slot, footer)) = read_checkpoint_file(&file, physical_len)? else {
+            drop(file);
+            self.save_sync(tmp)?;
+            return Ok(CheckpointSave::Full);
+        };
+        let free_bytes: u64 = footer.free_ranges.iter().map(|&(_, len)| len).sum();
+        if free_bytes.saturating_mul(100) > slot.file_len.saturating_mul(COMPACT_FREE_PERCENT) {
+            drop(file);
+            self.save_sync(tmp)?;
+            return Ok(CheckpointSave::Full);
+        }
+        let Some(iteration) = slot.iteration.checked_add(1) else {
+            drop(file);
+            self.save_sync(tmp)?;
+            return Ok(CheckpointSave::Full);
+        };
+        self.checkpoint_in_place(
+            file,
+            target,
+            slot_idx,
+            slot,
+            footer,
+            iteration,
+            wal_generation,
+            next_generation,
+        )?;
+        Ok(CheckpointSave::Incremental)
+    }
+
+    /// Rewrite `file` in place: clean row groups keep their footer entries,
+    /// dirty ones are re-encoded into the old footer's free ranges (or the
+    /// end of the file), and the new footer is written after every row group
+    /// before the other slot names it.
+    #[allow(clippy::too_many_arguments)]
+    fn checkpoint_in_place(
+        &self,
+        file: std::fs::File,
+        target: &std::path::Path,
+        slot_idx: usize,
+        old_slot: Slot,
+        old_footer: StoreFooter,
+        iteration: u64,
+        wal_generation: u64,
+        next_generation: u64,
+    ) -> Result<()> {
+        let mut old_tables: HashMap<(String, String, String), &TableDir> = HashMap::new();
+        for db in &old_footer.databases {
+            for schema in &db.schemas {
+                for table in &schema.tables {
+                    old_tables.insert(
+                        (
+                            db.name.to_ascii_lowercase(),
+                            schema.name.to_ascii_lowercase(),
+                            table.name.to_ascii_lowercase(),
+                        ),
+                        table,
+                    );
+                }
+            }
+        }
+        let all_tables: Vec<&DataTable> = self
+            .list_databases()
+            .iter()
+            .flat_map(|db| self.all_tables_of(db))
+            .map(|(_, _, t)| t)
+            .collect();
+        let flags = self.image_flags(&all_tables);
+        let mut writer = CheckpointWriter {
+            file,
+            cursor: old_slot.file_len,
+            free: old_footer.free_ranges.clone(),
+        };
+        let mut carry: Vec<u8> = Vec::new();
+        let mut repoints: Vec<(&DataTable, TableCarry)> = Vec::new();
+        let mut freed: Vec<(u64, u64)> = Vec::new();
+        let mut seen_old: std::collections::HashSet<(String, String, String)> =
+            std::collections::HashSet::new();
+        let mut saved: Vec<SavedTableStats> = Vec::new();
+        let db_dirs = self.catalog_dirs(flags, |ns, name, t| {
+            let key = (
+                ns.db().to_ascii_lowercase(),
+                ns.schema().to_ascii_lowercase(),
+                name.to_ascii_lowercase(),
+            );
+            let old = old_tables.get(&key).copied();
+            if old.is_some() {
+                seen_old.insert(key.clone());
+            }
+            let schema = t.schema();
+            let mut row_groups = Vec::new();
+            let mut accs: Vec<ChunkColumnStats> =
+                schema.iter().map(|_| ChunkColumnStats::empty()).collect();
+            let n_chunks = t.num_chunks();
+            let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
+            let mut reused = vec![false; old.map_or(0, |o| o.row_groups.len()).max(n_groups)];
+            for (g, reused_group) in reused.iter_mut().enumerate().take(n_groups) {
+                let first = g * CHUNKS_PER_ROW_GROUP;
+                let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
+                if let Some(old) = old
+                    && let Some(old_group) = old.row_groups.get(g)
+                    && old.schema == schema
+                    && reusable_group(t, old_group, first, last)
+                {
+                    *reused_group = true;
+                    for (ci, column) in old_group.columns.iter().enumerate() {
+                        let mut acc = ChunkColumnStats::empty();
+                        acc.null_count = column.null_count;
+                        acc.nan_count = column.nan_count;
+                        acc.min = column.min.clone();
+                        acc.max = column.max.clone();
+                        accs[ci].merge(&acc);
+                    }
+                    row_groups.push(old_group.clone());
+                    continue;
+                }
+                let group = encode_row_group(ns, name, t, first, last, true)?;
+                let (group, table_carry) = write_group(&mut writer, group, &mut carry)?;
+                for (ci, acc) in group.accs.iter().enumerate() {
+                    accs[ci].merge(acc);
+                }
+                row_groups.push(RowGroupDir {
+                    rows: group.rows,
+                    chunk_rows: group.chunk_rows,
+                    columns: group.columns,
+                });
+                repoints.push((t, table_carry));
+            }
+            if let Some(old) = old {
+                for (g, group) in old.row_groups.iter().enumerate() {
+                    if reused.get(g).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    for column in &group.columns {
+                        freed.push((column.offset, column.length));
+                    }
+                }
+            }
+            finish_table_dir(ns, name, t, row_groups, &accs, false, &mut saved)
+        })?;
+        // A table that disappeared takes all of its row groups with it.
+        for db in &old_footer.databases {
+            for schema in &db.schemas {
+                for table in &schema.tables {
+                    let key = (
+                        db.name.to_ascii_lowercase(),
+                        schema.name.to_ascii_lowercase(),
+                        table.name.to_ascii_lowercase(),
+                    );
+                    if seen_old.contains(&key) {
+                        continue;
+                    }
+                    for group in &table.row_groups {
+                        for column in &group.columns {
+                            freed.push((column.offset, column.length));
+                        }
+                    }
+                }
+            }
+        }
+        // The old footer is free once the new one replaces it, and so is every
+        // row group this pass superseded. Old `free_ranges` were already
+        // allocatable; these join the new footer's list.
+        freed.push((old_slot.footer_offset, old_slot.footer_len));
+        let freed = merge_ranges(freed);
+        let mut footer_free = writer.free.clone();
+        footer_free.extend_from_slice(&freed);
+        footer_free = merge_ranges(footer_free);
+        let max_group_end = max_group_end(&db_dirs);
+        let footer = self.build_footer(flags, &footer_free, &db_dirs)?;
+        let estimate = footer.len() as u64;
+        // Only ranges free in the *current* footer are safe to overwrite
+        // before the new slot lands; the old footer and superseded groups
+        // still belong to the checkpoint the other slot names.
+        let allocatable = writer.free.clone();
+        let (footer_offset, mut final_free) =
+            alloc_footer(&mut writer, &allocatable, estimate, max_group_end);
+        final_free.extend_from_slice(&freed);
+        final_free.retain(|&(offset, len)| offset.saturating_add(len) <= footer_offset);
+        final_free = merge_ranges(final_free);
+        let footer = self.build_footer(flags, &final_free, &db_dirs)?;
+        debug_assert!(footer.len() as u64 <= estimate);
+        writer.write(footer_offset, &footer)?;
+        let file_len = footer_offset + footer.len() as u64;
+        writer.cursor = writer.cursor.max(file_len);
+        #[cfg(test)]
+        if checkpoint_fault() == Some(CheckpointFault::AfterData) {
+            return Err(PinkDbError::Execution(
+                "injected checkpoint fault after data".to_string(),
+            ));
+        }
+        writer.file.sync_all()?;
+        #[cfg(test)]
+        if checkpoint_fault() == Some(CheckpointFault::AfterFirstSync) {
+            return Err(PinkDbError::Execution(
+                "injected checkpoint fault after first sync".to_string(),
+            ));
+        }
+        let marker = crate::wal::CheckpointMarker {
+            iteration,
+            wal_generation,
+            next_generation,
+        };
+        crate::wal::write_checkpoint_marker(target, marker)?;
+        let new_slot = Slot {
+            iteration,
+            footer_offset,
+            footer_len: footer.len() as u64,
+            footer_crc32c: crc32c(&footer),
+            file_len,
+        };
+        let other = 1 - slot_idx;
+        #[cfg(test)]
+        if checkpoint_fault() == Some(CheckpointFault::TornSlot) {
+            let mut buf = [0u8; HEADER_SLOT_LEN];
+            buf[..SLOT_LEN].copy_from_slice(&new_slot.encode());
+            pwrite_all(&writer.file, (other * HEADER_SLOT_LEN) as u64, &buf[..20])?;
+            writer.file.sync_all()?;
+            return Err(PinkDbError::Execution(
+                "injected torn slot write".to_string(),
+            ));
+        }
+        write_slot(&mut writer.file, other, &new_slot)?;
+        writer.file.sync_all()?;
+        #[cfg(test)]
+        if checkpoint_fault() == Some(CheckpointFault::AfterSlot) {
+            return Err(PinkDbError::Execution(
+                "injected checkpoint fault after slot".to_string(),
+            ));
+        }
+        // The new slot names `file_len`; the old one would now be invalid if
+        // the file were shorter, so truncate only after the slot is durable.
+        if writer.file.metadata()?.len() > file_len {
+            writer.file.set_len(file_len)?;
+        }
+        Self::repoint_carried(carry, repoints, false);
+        Ok(())
     }
 
     /// [`PinkDb::save_sync`] with at-rest encryption (checkpoint primitive for
@@ -4421,6 +4750,205 @@ struct Hooks {
 #[derive(Default)]
 struct Hooks;
 
+/// One column chunk's bytes in a freshly encoded row group: either copied
+/// from the retained image or built by the encoder.
+enum GroupPieceSource {
+    Borrowed {
+        image: Arc<crate::storage::StoreImage>,
+        start: u64,
+        end: u64,
+    },
+    Owned(Vec<u8>),
+}
+
+struct GroupPiece {
+    source: GroupPieceSource,
+}
+
+/// One row group encoded but not yet placed: its column offsets are relative
+/// to the group start, so the incremental checkpoint can move the whole group
+/// into a free range.
+struct GroupBuild {
+    rows: u64,
+    chunk_rows: Vec<u32>,
+    columns: Vec<ColumnChunkDir>,
+    pieces: Vec<GroupPiece>,
+    /// Per column: `(chunk index, offset relative to the piece, length, rows)`
+    /// for every chunk the save will repoint at the carried image.
+    carry: Vec<Vec<(usize, u64, u64, usize)>>,
+    accs: Vec<ChunkColumnStats>,
+}
+
+/// Encode chunks `first..last` of one table into a [`GroupBuild`], copying a
+/// clean column's bytes through instead of decoding it.
+fn encode_row_group(
+    ns: &crate::storage::SchemaPath,
+    name: &str,
+    t: &DataTable,
+    first: usize,
+    last: usize,
+    parallel: bool,
+) -> Result<GroupBuild> {
+    let chunk_rows: Vec<u32> = (first..last).map(|i| t.chunk_rows(i) as u32).collect();
+    let rows: u64 = chunk_rows.iter().map(|&r| r as u64).sum();
+    let copies: Vec<Option<CopyThrough>> = t
+        .columns
+        .iter()
+        .map(|column| copy_through(column, first, last))
+        .collect();
+    let work: Vec<(usize, usize)> = copies
+        .iter()
+        .enumerate()
+        .filter(|(_, copy)| copy.is_none())
+        .flat_map(|(ci, _)| (first..last).map(move |i| (ci, i)))
+        .collect();
+    // The string layout stores offsets as `u32`; a chunk whose total VARCHAR
+    // bytes exceed that cannot be encoded faithfully (the offsets would wrap
+    // and the reader would reject the file). Refuse before writing instead of
+    // emitting a corrupt file.
+    let encode = |ci: usize, i: usize| -> Result<EncodedPage> {
+        let v = t.columns[ci].chunk(i)?;
+        if let VectorData::VarChar(strs) = v.data() {
+            let total: u64 = strs.iter().map(|s| s.len() as u64).sum();
+            if !varchar_offsets_fit(total) {
+                return Err(PinkDbError::Execution(format!(
+                    "table \"{ns}.{name}\" has a VARCHAR chunk of {total} \
+                     bytes, over the .pink format's u32 string-offset limit"
+                )));
+            }
+        }
+        Ok(encode_page(&v))
+    };
+    // Encode the pages that cannot be copied in parallel; the order-preserving
+    // collect keeps the bytes identical to a serial pass.
+    let encoded: Vec<EncodedPage> = if parallel && work.len() >= PARALLEL_SAVE_MIN_CHUNKS {
+        work.par_iter()
+            .map(|&(ci, i)| encode(ci, i))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        work.iter()
+            .map(|&(ci, i)| encode(ci, i))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut encoded = encoded.into_iter();
+    let mut columns: Vec<ColumnChunkDir> = Vec::with_capacity(t.columns.len());
+    let mut pieces = Vec::with_capacity(t.columns.len());
+    let mut carry: Vec<Vec<(usize, u64, u64, usize)>> = Vec::with_capacity(t.columns.len());
+    let mut accs: Vec<ChunkColumnStats> = t
+        .columns
+        .iter()
+        .map(|_| ChunkColumnStats::empty())
+        .collect();
+    let mut running = 0u64;
+    for (ci, copy) in copies.into_iter().enumerate() {
+        let Some(copy) = copy else {
+            let pages: Vec<EncodedPage> = encoded.by_ref().take(last - first).collect();
+            debug_assert_eq!(pages.len(), last - first);
+            // The column chunk: the page index, then the pages.
+            let page_count = pages.len() as u32;
+            let index_len = 4 + page_count as usize * 8;
+            let mut chunk = Writer::new();
+            chunk.u32(page_count);
+            let mut rel = index_len as u32;
+            for page in &pages {
+                let len = page.frame.len() as u32;
+                chunk.u32(rel);
+                chunk.u32(len);
+                rel += len;
+            }
+            for page in &pages {
+                chunk.bytes(&page.frame);
+            }
+            let bytes = chunk.buf;
+            let length = bytes.len() as u64;
+            // The column chunk's exact statistics and encoding summary.
+            let mut acc = ChunkColumnStats::empty();
+            let mut encodings = 0u32;
+            for page in &pages {
+                acc.merge(&page.stats);
+                encodings |= 1u32 << page.frame[0];
+            }
+            accs[ci].merge(&acc);
+            columns.push(ColumnChunkDir {
+                offset: running,
+                length,
+                page_count,
+                encodings,
+                crc32c: crc32c(&bytes),
+                null_count: acc.null_count,
+                nan_count: acc.nan_count,
+                min: acc.min,
+                max: acc.max,
+            });
+            running += length;
+            // Keep every encoded column in the retained image, including
+            // chunks built in memory: the next checkpoint can then copy this
+            // row group through instead of re-encoding it. Repointing drops
+            // the decoded payload, so this does not double the resident data.
+            let mut carried = Vec::new();
+            let mut page_offset = index_len as u64;
+            for (i, page) in pages.iter().enumerate() {
+                carried.push((
+                    first + i,
+                    page_offset,
+                    page.frame.len() as u64,
+                    chunk_rows[i] as usize,
+                ));
+                page_offset += page.frame.len() as u64;
+            }
+            carry.push(carried);
+            pieces.push(GroupPiece {
+                source: GroupPieceSource::Owned(bytes),
+            });
+            continue;
+        };
+        let bytes = &copy.image.bytes()[copy.start as usize..copy.end as usize];
+        let mut acc = ChunkColumnStats::empty();
+        let mut encodings = 0u32;
+        for (i, &(rel, _)) in copy.pages.iter().enumerate() {
+            acc.merge(t.zone(ci, first + i));
+            encodings |= 1u32 << bytes[rel as usize];
+        }
+        accs[ci].merge(&acc);
+        columns.push(ColumnChunkDir {
+            offset: running,
+            length: bytes.len() as u64,
+            page_count: copy.pages.len() as u32,
+            encodings,
+            crc32c: crc32c(bytes),
+            null_count: acc.null_count,
+            nan_count: acc.nan_count,
+            min: acc.min,
+            max: acc.max,
+        });
+        running += bytes.len() as u64;
+        // The group is copied to a new offset; its clean chunks move with it,
+        // so they need the same repointing as the encoded ones.
+        carry.push(
+            copy.pages
+                .iter()
+                .enumerate()
+                .map(|(i, &(rel, len))| (first + i, rel as u64, len as u64, chunk_rows[i] as usize))
+                .collect(),
+        );
+        pieces.push(GroupPiece {
+            source: GroupPieceSource::Borrowed {
+                image: copy.image,
+                start: copy.start,
+                end: copy.end,
+            },
+        });
+    }
+    Ok(GroupBuild {
+        rows,
+        chunk_rows,
+        columns,
+        pieces,
+        carry,
+        accs,
+    })
+}
+
 /// Write one table's data region (its column chunks) and collect its footer
 /// entry.
 ///
@@ -4463,146 +4991,52 @@ fn write_table<S: Sink>(
     // The row groups: 60 engine chunks each.
     let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
     let mut row_groups: Vec<RowGroupDir> = Vec::with_capacity(n_groups);
-    let mut table_carry: TableCarry = Vec::with_capacity(schema.len());
+    let mut table_carry: TableCarry = vec![Vec::new(); schema.len()];
     for g in 0..n_groups {
         let first = g * CHUNKS_PER_ROW_GROUP;
         let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
-        let chunk_rows: Vec<u32> = (first..last).map(|i| t.chunk_rows(i) as u32).collect();
-        let rows: u64 = chunk_rows.iter().map(|&r| r as u64).sum();
-        // A clean group is already encoded exactly as the encoder would: its
-        // bytes are copied from the image the handles point at, and its
-        // statistics and encoding summary come from what the footer says
-        // about them, so no page is decoded.
-        let copies: Vec<Option<CopyThrough>> = t
-            .columns
-            .iter()
-            .map(|column| copy_through(column, first, last))
-            .collect();
-        let work: Vec<(usize, usize)> = copies
-            .iter()
-            .enumerate()
-            .filter(|(_, copy)| copy.is_none())
-            .flat_map(|(ci, _)| (first..last).map(move |i| (ci, i)))
-            .collect();
-        // The string layout stores offsets as `u32`; a chunk whose total
-        // VARCHAR bytes exceed that cannot be encoded faithfully (the offsets
-        // would wrap and the reader would reject the file). Refuse before
-        // writing instead of emitting a corrupt file.
-        let encode = |ci: usize, i: usize| -> Result<EncodedPage> {
-            let v = t.columns[ci].chunk(i)?;
-            if let VectorData::VarChar(strs) = v.data() {
-                let total: u64 = strs.iter().map(|s| s.len() as u64).sum();
-                if !varchar_offsets_fit(total) {
-                    return Err(PinkDbError::Execution(format!(
-                        "table \"{ns}.{name}\" has a VARCHAR chunk of {total} \
-                         bytes, over the .pink format's u32 string-offset limit"
-                    )));
-                }
-            }
-            Ok(encode_page(&v))
-        };
-        // Encode the pages that cannot be copied in parallel; the
-        // order-preserving collect keeps the bytes identical to a serial pass.
-        let encoded: Vec<EncodedPage> = if parallel && work.len() >= PARALLEL_SAVE_MIN_CHUNKS {
-            work.par_iter()
-                .map(|&(ci, i)| encode(ci, i))
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            work.iter()
-                .map(|&(ci, i)| encode(ci, i))
-                .collect::<Result<Vec<_>>>()?
-        };
-        let mut encoded = encoded.into_iter();
-        let mut columns: Vec<ColumnChunkDir> = Vec::with_capacity(schema.len());
-        for (ci, copy) in copies.into_iter().enumerate() {
-            let Some(copy) = copy else {
-                let pages: Vec<EncodedPage> = encoded.by_ref().take(last - first).collect();
-                debug_assert_eq!(pages.len(), last - first);
-                // The column chunk: the page index, then the pages.
-                let page_count = pages.len() as u32;
-                let index_len = 4 + page_count as usize * 8;
-                let mut chunk = Writer::new();
-                chunk.u32(page_count);
-                let mut rel = index_len as u32;
-                for page in &pages {
-                    let len = page.frame.len() as u32;
-                    chunk.u32(rel);
-                    chunk.u32(len);
-                    rel += len;
-                }
-                for page in &pages {
-                    chunk.bytes(&page.frame);
-                }
-                let bytes = chunk.buf;
-                let offset = data.offset();
-                let length = bytes.len() as u64;
-                data.bytes(&bytes)?;
-                // The column chunk's exact statistics and encoding summary.
-                let mut acc = ChunkColumnStats::empty();
-                let mut encodings = 0u32;
-                for page in &pages {
-                    acc.merge(&page.stats);
-                    encodings |= 1u32 << page.frame[0];
-                }
-                accs[ci].merge(&acc);
-                columns.push(ColumnChunkDir {
-                    offset,
-                    length,
-                    page_count,
-                    encodings,
-                    crc32c: crc32c(&bytes),
-                    null_count: acc.null_count,
-                    nan_count: acc.nan_count,
-                    min: acc.min,
-                    max: acc.max,
-                });
-                // Chunks that have a stored form came from an image: keep them
-                // in one, so a saved write stays evictable without a reopen. A
-                // chunk built in memory has nothing worth holding (and a bulk
-                // load would hold its whole data region), so it stays dirty and
-                // the next save re-encodes it identically.
-                if !(first..last).any(|i| t.columns[ci].has_stored_form(i)) {
-                    table_carry.push(Vec::new());
-                    continue;
-                }
-                let base = carry.len() as u64;
-                let mut carried = Vec::with_capacity(pages.len());
-                let mut page_offset = index_len as u64;
-                for (i, page) in pages.iter().enumerate() {
-                    carried.push((
-                        first + i,
-                        base + page_offset,
-                        page.frame.len() as u64,
-                        chunk_rows[i] as usize,
-                    ));
-                    page_offset += page.frame.len() as u64;
-                }
-                carry.extend_from_slice(&bytes);
-                table_carry.push(carried);
-                continue;
-            };
-            let bytes = &copy.image.bytes()[copy.start as usize..copy.end as usize];
+        let group = encode_row_group(ns, name, t, first, last, parallel)?;
+        let GroupBuild {
+            rows,
+            chunk_rows,
+            columns: relative,
+            pieces,
+            carry: group_carry,
+            accs: group_accs,
+        } = group;
+        let mut columns = Vec::with_capacity(relative.len());
+        for (ci, piece) in pieces.into_iter().enumerate() {
             let offset = data.offset();
-            data.bytes(bytes)?;
-            let mut acc = ChunkColumnStats::empty();
-            let mut encodings = 0u32;
-            for (i, &(rel, _)) in copy.pages.iter().enumerate() {
-                acc.merge(t.zone(ci, first + i));
-                encodings |= 1u32 << bytes[rel as usize];
+            match &piece.source {
+                GroupPieceSource::Borrowed { image, start, end } => {
+                    let bytes = &image.bytes()[*start as usize..*end as usize];
+                    data.bytes(bytes)?;
+                    let base = carry.len() as u64;
+                    carry.extend_from_slice(bytes);
+                    table_carry[ci].extend(
+                        group_carry[ci]
+                            .iter()
+                            .map(|&(i, rel, len, rows)| (i, base + rel, len, rows)),
+                    );
+                }
+                GroupPieceSource::Owned(bytes) => {
+                    data.bytes(bytes)?;
+                    let base = carry.len() as u64;
+                    carry.extend_from_slice(bytes);
+                    table_carry[ci].extend(
+                        group_carry[ci]
+                            .iter()
+                            .map(|&(i, rel, len, rows)| (i, base + rel, len, rows)),
+                    );
+                }
             }
-            accs[ci].merge(&acc);
             columns.push(ColumnChunkDir {
                 offset,
-                length: bytes.len() as u64,
-                page_count: copy.pages.len() as u32,
-                encodings,
-                crc32c: crc32c(bytes),
-                null_count: acc.null_count,
-                nan_count: acc.nan_count,
-                min: acc.min,
-                max: acc.max,
+                ..relative[ci].clone()
             });
-            table_carry.push(Vec::new());
+        }
+        for (ci, acc) in group_accs.iter().enumerate() {
+            accs[ci].merge(acc);
         }
         row_groups.push(RowGroupDir {
             rows,
@@ -4610,8 +5044,23 @@ fn write_table<S: Sink>(
             columns,
         });
     }
-    // The footer's index statistics come from the exact per-column NULL counts
-    // the write pass just observed, so they need no second read of the rows.
+    Ok((
+        finish_table_dir(ns, name, t, row_groups, &accs, collect_stats, saved)?,
+        table_carry,
+    ))
+}
+
+/// The footer table directory for an already-built row-group list.
+fn finish_table_dir(
+    ns: &SchemaPath,
+    name: &str,
+    t: &DataTable,
+    row_groups: Vec<RowGroupDir>,
+    accs: &[ChunkColumnStats],
+    collect_stats: bool,
+    saved: &mut Vec<SavedTableStats>,
+) -> Result<TableDir> {
+    let schema = t.schema();
     let null_counts: Vec<u64> = accs.iter().map(|acc| acc.null_count).collect();
     if collect_stats {
         let mut entry = SavedTableStats {
@@ -4626,8 +5075,8 @@ fn write_table<S: Sink>(
                     name: col.clone(),
                     dtype: *dtype,
                     null_count: acc.null_count,
-                    min: acc.min,
-                    max: acc.max,
+                    min: acc.min.clone(),
+                    max: acc.max.clone(),
                     nan_count: acc.nan_count,
                     paths: Vec::new(),
                 })
@@ -4636,25 +5085,332 @@ fn write_table<S: Sink>(
         variant_path_stats(t, &mut entry);
         saved.push(entry);
     }
+    Ok(TableDir {
+        name: name.to_string(),
+        schema,
+        constraints: t.constraints.clone(),
+        defaults: t
+            .columns
+            .iter()
+            .map(|c| c.default.as_ref().map(|d| d.text.clone()))
+            .collect(),
+        indexes: index_defs(t, &null_counts),
+        vector_indexes: vector_index_defs(t)?,
+        row_count: t.num_rows() as u64,
+        row_groups,
+        stats: t.stats().clone(),
+        zones: t.zones().to_vec(),
+    })
+}
+
+/// What a checkpoint wrote: a full image in the staging file, or an in-place
+/// commit through the other header slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointSave {
+    Full,
+    Incremental,
+}
+
+/// A full rewrite takes over once the current footer's holes are this much of
+/// the file; an incremental checkpoint would otherwise leave most of it
+/// sparse. Fifty percent is the default and is deliberately not a setting:
+/// a smaller file is the only reason to rewrite.
+const COMPACT_FREE_PERCENT: u64 = 50;
+
+/// The fault-injection points the checkpoint crash tests stop at.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointFault {
+    AfterData,
+    AfterFirstSync,
+    AfterSlot,
+    TornSlot,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHECKPOINT_FAULT: std::cell::Cell<Option<CheckpointFault>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_checkpoint_fault(fault: Option<CheckpointFault>) {
+    CHECKPOINT_FAULT.with(|f| f.set(fault));
+}
+
+#[cfg(test)]
+fn checkpoint_fault() -> Option<CheckpointFault> {
+    CHECKPOINT_FAULT.with(|f| f.get())
+}
+
+/// A file opened for an in-place checkpoint: writes go at explicit offsets,
+/// and `free` is the old footer's hole list, the only space an encoded row
+/// group may take without growing the file.
+struct CheckpointWriter {
+    file: std::fs::File,
+    cursor: u64,
+    free: Vec<(u64, u64)>,
+}
+
+impl CheckpointWriter {
+    /// First-fit allocation from the old holes; `cursor` is the end of the
+    /// old logical file, so an append never reuses a superseded range in the
+    /// same pass (those become free for the next checkpoint).
+    fn alloc(&mut self, len: u64) -> u64 {
+        if let Some(at) = first_fit(&mut self.free, len, 0) {
+            return at;
+        }
+        let at = self.cursor;
+        self.cursor += len;
+        at
+    }
+
+    fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        pwrite_all(&self.file, offset, bytes)?;
+        Ok(())
+    }
+}
+
+/// Write an encoded row group at its allocated offset and remember where its
+/// image-backed chunks landed, so their handles can be repointed on success.
+fn write_group(
+    writer: &mut CheckpointWriter,
+    group: GroupBuild,
+    carry: &mut Vec<u8>,
+) -> Result<(GroupBuild, TableCarry)> {
+    let GroupBuild {
+        rows,
+        chunk_rows,
+        columns: relative,
+        pieces,
+        carry: specs,
+        accs,
+    } = group;
+    let len = relative
+        .last()
+        .map_or(0, |column| column.offset + column.length);
+    let base = writer.alloc(len);
+    let mut columns = Vec::with_capacity(relative.len());
+    let mut table_carry = Vec::with_capacity(relative.len());
+    for (ci, piece) in pieces.into_iter().enumerate() {
+        let offset = base + relative[ci].offset;
+        match &piece.source {
+            GroupPieceSource::Borrowed { image, start, end } => {
+                let bytes = &image.bytes()[*start as usize..*end as usize];
+                writer.write(offset, bytes)?;
+                let base = carry.len() as u64;
+                carry.extend_from_slice(bytes);
+                table_carry.push(
+                    specs[ci]
+                        .iter()
+                        .map(|&(i, rel, len, rows)| (i, base + rel, len, rows))
+                        .collect(),
+                );
+            }
+            GroupPieceSource::Owned(bytes) => {
+                writer.write(offset, bytes)?;
+                let base = carry.len() as u64;
+                carry.extend_from_slice(bytes);
+                table_carry.push(
+                    specs[ci]
+                        .iter()
+                        .map(|&(i, rel, len, rows)| (i, base + rel, len, rows))
+                        .collect(),
+                );
+            }
+        }
+        columns.push(ColumnChunkDir {
+            offset,
+            ..relative[ci].clone()
+        });
+    }
     Ok((
-        TableDir {
-            name: name.to_string(),
-            schema,
-            constraints: t.constraints.clone(),
-            defaults: t
-                .columns
-                .iter()
-                .map(|c| c.default.as_ref().map(|d| d.text.clone()))
-                .collect(),
-            indexes: index_defs(t, &null_counts),
-            vector_indexes: vector_index_defs(t)?,
-            row_count: t.num_rows() as u64,
-            row_groups,
-            stats: t.stats().clone(),
-            zones: t.zones().to_vec(),
+        GroupBuild {
+            rows,
+            chunk_rows,
+            columns,
+            pieces: Vec::new(),
+            carry: Vec::new(),
+            accs,
         },
         table_carry,
     ))
+}
+
+/// A row group can stay where it is when the table's schema is unchanged, its
+/// chunk boundaries still match, and every column's stored bytes are exactly
+/// what the old footer says this group occupies.
+fn reusable_group(t: &DataTable, old: &RowGroupDir, first: usize, last: usize) -> bool {
+    let expected = last - first;
+    if old.chunk_rows.len() != expected || old.columns.len() != t.columns.len() {
+        return false;
+    }
+    let mut rows = 0u64;
+    for (i, &chunk_rows) in old.chunk_rows.iter().enumerate() {
+        if chunk_rows as usize != t.chunk_rows(first + i) {
+            return false;
+        }
+        rows += chunk_rows as u64;
+    }
+    if rows != old.rows {
+        return false;
+    }
+    for (ci, column) in t.columns.iter().enumerate() {
+        let Some(copy) = copy_through(column, first, last) else {
+            return false;
+        };
+        let dir = &old.columns[ci];
+        if copy.start != dir.offset
+            || copy.end != dir.offset.saturating_add(dir.length)
+            || copy.pages.len() != dir.page_count as usize
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn first_fit(free: &mut Vec<(u64, u64)>, len: u64, min_offset: u64) -> Option<u64> {
+    let mut i = 0;
+    while i < free.len() {
+        let (offset, available) = free[i];
+        if offset >= min_offset && available >= len {
+            if available == len {
+                free.remove(i);
+            } else {
+                free[i] = (offset + len, available - len);
+            }
+            return Some(offset);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn alloc_footer(
+    writer: &mut CheckpointWriter,
+    free: &[(u64, u64)],
+    len: u64,
+    min_offset: u64,
+) -> (u64, Vec<(u64, u64)>) {
+    for (i, &(offset, available)) in free.iter().enumerate() {
+        if offset >= min_offset && available >= len {
+            // Everything at or after the footer is outside the data region;
+            // only the holes before it can stay in the new free list.
+            return (offset, free[..i].to_vec());
+        }
+    }
+    let offset = writer.cursor.max(min_offset);
+    writer.cursor = offset + len;
+    (offset, free.to_vec())
+}
+
+fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.retain(|&(_, len)| len > 0);
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (offset, len) in ranges {
+        if let Some(last) = merged.last_mut() {
+            let end = last.0 + last.1;
+            if offset <= end {
+                last.1 = last.1.max(offset + len - last.0);
+                continue;
+            }
+        }
+        merged.push((offset, len));
+    }
+    merged
+}
+
+/// The end of the last row group, which the footer must not precede.
+fn max_group_end(db_dirs: &[DbDir]) -> u64 {
+    db_dirs
+        .iter()
+        .flat_map(|db| &db.schemas)
+        .flat_map(|schema| &schema.tables)
+        .flat_map(|table| &table.row_groups)
+        .flat_map(|group| &group.columns)
+        .map(|column| column.offset + column.length)
+        .max()
+        .unwrap_or(DATA_START)
+}
+
+/// Read the header and the footer a checkpoint is about to replace. `None`
+/// means the target is not a valid v7 file (including an empty/missing one),
+/// which makes the caller take the full-rewrite path.
+fn read_checkpoint_file(
+    file: &std::fs::File,
+    physical_len: u64,
+) -> Result<Option<(usize, Slot, StoreFooter)>> {
+    if physical_len < (2 * HEADER_SLOT_LEN) as u64 {
+        return Ok(None);
+    }
+    let mut header = [0u8; 2 * HEADER_SLOT_LEN];
+    pread_exact(file, 0, &mut header)?;
+    let Some((idx, slot)) = valid_slot(&header, physical_len) else {
+        return Ok(None);
+    };
+    let len = usize::try_from(slot.footer_len)
+        .map_err(|_| PinkDbError::Execution("corrupt file: footer too large".to_string()))?;
+    let mut footer = vec![0u8; len];
+    pread_exact(file, slot.footer_offset, &mut footer)?;
+    if crc32c(&footer) != slot.footer_crc32c {
+        return Err(PinkDbError::Execution(
+            "corrupt file: footer checksum mismatch".to_string(),
+        ));
+    }
+    let footer = parse_store_footer(&footer, slot.footer_offset)?;
+    Ok(Some((idx, slot, footer)))
+}
+
+fn pread_exact(file: &std::fs::File, mut offset: u64, mut buf: &mut [u8]) -> Result<()> {
+    while !buf.is_empty() {
+        #[cfg(unix)]
+        let read = std::os::unix::fs::FileExt::read_at(file, buf, offset);
+        #[cfg(windows)]
+        let read = std::os::windows::fs::FileExt::seek_read(file, buf, offset);
+        #[cfg(not(any(unix, windows)))]
+        let read: std::io::Result<usize> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "positioned reads are not supported on this platform",
+        ));
+        let read = read?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "checkpoint target ended before its footer",
+            )
+            .into());
+        }
+        offset += read as u64;
+        buf = &mut buf[read..];
+    }
+    Ok(())
+}
+
+fn pwrite_all(file: &std::fs::File, mut offset: u64, mut buf: &[u8]) -> Result<()> {
+    while !buf.is_empty() {
+        #[cfg(unix)]
+        let written = std::os::unix::fs::FileExt::write_at(file, buf, offset);
+        #[cfg(windows)]
+        let written = std::os::windows::fs::FileExt::seek_write(file, buf, offset);
+        #[cfg(not(any(unix, windows)))]
+        let written: std::io::Result<usize> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "positioned writes are not supported on this platform",
+        ));
+        let written = written?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "checkpoint target accepted no bytes",
+            )
+            .into());
+        }
+        offset += written as u64;
+        buf = &buf[written..];
+    }
+    Ok(())
 }
 
 /// A row group's column chunk as it sits in the retained store image: the
@@ -5314,6 +6070,12 @@ fn null_vector(dtype: DataType, rows: usize) -> Vector {
 }
 
 /// Read (and verify) the footer of a `PINKDB07` image.
+#[cfg(test)]
+pub(crate) fn footer_free_ranges_for_test(path: &std::path::Path) -> Result<Vec<(u64, u64)>> {
+    let data = std::fs::read(path)?;
+    Ok(read_store_footer(&data)?.free_ranges)
+}
+
 fn read_store_footer(data: &[u8]) -> Result<StoreFooter> {
     let (offset, len, crc) = footer_location(data, data.len() as u64)?;
     let start = offset as usize;
@@ -5613,12 +6375,13 @@ fn parse_store_footer(footer: &[u8], data_end: u64) -> Result<StoreFooter> {
         databases,
         rbac,
         secrets,
+        free_ranges,
     })
 }
 
 /// Refuse a `free_ranges` list a reader cannot trust.
 ///
-/// The list is only a hint for an append-only checkpoint, so the full rewrite
+/// The list is only a hint for an incremental checkpoint, so the full rewrite
 /// writes it empty and a reader ignores it — but a corrupted one is a damaged
 /// footer, not something to guess at: it must be sorted, disjoint, inside the
 /// data region and clear of every row group.

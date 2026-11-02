@@ -407,15 +407,6 @@ impl ChunkHandle {
         state.encoded.clone()
     }
 
-    /// Whether the chunk has a stored form to point at after a save.
-    ///
-    /// A chunk that came from an image keeps one when a save re-encodes it; a
-    /// chunk built in memory has none, so a save leaves it dirty (holding its
-    /// bytes would hold the whole data region of a bulk load).
-    fn has_stored_form(&self) -> bool {
-        self.lock().encoded.is_some()
-    }
-
     /// Point the chunk at the image a save just wrote, at bytes that are its
     /// stored form. Returns whether the chunk was dirty: a saved write is
     /// stored now, so the cache may evict it.
@@ -794,11 +785,6 @@ impl Column {
         if handle.repoint(image, offset, length, rows) {
             register(&Arc::downgrade(handle));
         }
-    }
-
-    /// Whether chunk `i` has a stored form to point at after a save.
-    pub(crate) fn has_stored_form(&self, i: usize) -> bool {
-        self.chunks[i].has_stored_form()
     }
 }
 
