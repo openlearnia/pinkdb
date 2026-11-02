@@ -1,4 +1,4 @@
-//! DECIMAL storage in `PINKDB06` (wave 102): precision <= 18 is stored with
+//! DECIMAL storage in `PINKDB07` (wave 102): precision <= 18 is stored with
 //! the BIGINT encodings (exact i64 unscaled values), precision > 18 keeps the
 //! 16-byte path. Both must round-trip exactly, NULLs included.
 

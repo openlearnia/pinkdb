@@ -193,11 +193,25 @@ fn statement_deadline_is_enforced_and_the_connection_stays_usable() {
             .expect_err("a 6.25M-row join must hit the 5 ms deadline")
             .to_string();
         assert!(e.contains("statement timeout"), "{flavor:?}: {e}");
-        // The connection is still usable after a statement timeout.
-        assert_eq!(
-            rows(client.execute("SELECT 1;").unwrap()),
-            vec![vec![Value::Integer(1)]]
-        );
+        // The connection is still usable after a statement timeout. The 5 ms
+        // budget is wall-clock time, so on a loaded machine a descheduled
+        // thread can spend it even on `SELECT 1` (about 1 % of statements
+        // there, on every tree measured): allow a few attempts, and require
+        // that each failure is that timeout, never a broken connection.
+        let mut answer = None;
+        for _ in 0..5 {
+            match client.execute("SELECT 1;") {
+                Ok(result) => {
+                    answer = Some(rows(result));
+                    break;
+                }
+                Err(e) => assert!(
+                    e.to_string().contains("statement timeout"),
+                    "{flavor:?}: {e}"
+                ),
+            }
+        }
+        assert_eq!(answer, Some(vec![vec![Value::Integer(1)]]), "{flavor:?}");
     }
 }
 

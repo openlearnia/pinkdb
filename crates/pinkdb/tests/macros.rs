@@ -712,27 +712,24 @@ fn newer_formats_and_unknown_flags_are_refused() {
     db.save(s.path()).unwrap();
     let good = std::fs::read(s.path()).unwrap();
 
-    // The format's magic lives in the trailer: a file from a newer pinkdb
-    // is refused there.
+    // The format's magic starts the file, in header slot 0: a file from a
+    // newer pinkdb is refused there.
     let mut newer = good.clone();
-    let n = newer.len();
-    newer[n - 8..].copy_from_slice(b"PINKDB07");
+    newer[..8].copy_from_slice(b"PINKDB09");
     std::fs::write(s.path(), &newer).unwrap();
     let e = PinkDb::open(s.path())
         .expect_err("newer format")
         .to_string();
-    assert!(e.contains("newer pinkdb") && e.contains("format v7"), "{e}");
+    assert!(e.contains("newer pinkdb") && e.contains("format v9"), "{e}");
 
     // An as-yet-unknown footer flag bit (bit 9) is refused even with a
     // valid footer CRC.
     let mut flagged = good;
-    let (footer_at, footer_len) = pinkdb::persist::footer_span(&flagged).unwrap();
+    let (footer_at, _) = pinkdb::persist::footer_span(&flagged).unwrap();
     let flags_at = footer_at as usize + 4;
     let flags = u32::from_le_bytes(flagged[flags_at..flags_at + 4].try_into().unwrap()) | 0x200;
     flagged[flags_at..flags_at + 4].copy_from_slice(&flags.to_le_bytes());
-    let footer = flagged[footer_at as usize..(footer_at + footer_len) as usize].to_vec();
-    let n = flagged.len();
-    flagged[n - 20..n - 16].copy_from_slice(&pinkdb::persist::crc32c(&footer).to_le_bytes());
+    pinkdb::persist::reseal_footer(&mut flagged).unwrap();
     std::fs::write(s.path(), &flagged).unwrap();
     let e = PinkDb::open(s.path())
         .expect_err("unknown flags")

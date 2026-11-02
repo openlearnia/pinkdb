@@ -195,11 +195,11 @@ fn scan_rows(lake_dir: &Path, version: Option<u64>) -> Vec<(i32, String)> {
     let t = db.table("t").unwrap();
     (0..t.num_rows())
         .map(|r| {
-            let id = match t.get(r, 0).unwrap() {
+            let id = match t.get(r, 0).unwrap().unwrap() {
                 Value::Integer(i) => i,
                 other => panic!("{other:?}"),
             };
-            let s = match t.get(r, 1).unwrap() {
+            let s = match t.get(r, 1).unwrap().unwrap() {
                 Value::Varchar(s) => s,
                 other => panic!("{other:?}"),
             };
@@ -655,7 +655,7 @@ fn materialize(wa: &pink_lake::WritableAttachment) -> PinkDb {
             col.default = src.default.clone();
         }
         for c in 0..base.num_chunks() {
-            let chunk = base.scan_chunk(c).unwrap();
+            let chunk = base.scan_chunk(c).unwrap().unwrap();
             t.append_shared_chunk(&chunk.columns).unwrap();
         }
     }

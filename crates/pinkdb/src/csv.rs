@@ -2624,7 +2624,7 @@ mod tests {
         (0..table.num_rows())
             .map(|r| {
                 (0..width)
-                    .map(|c| table.get(r, c).unwrap_or(Value::Null))
+                    .map(|c| table.get(r, c).unwrap().unwrap_or(Value::Null))
                     .collect()
             })
             .collect()

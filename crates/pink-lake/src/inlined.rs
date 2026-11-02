@@ -104,7 +104,7 @@ pub(crate) fn records_for_append(
     let mut values = vec![Value::Null; columns.len()];
     for r in 0..rows.num_rows() {
         for (c, slot) in values.iter_mut().enumerate() {
-            *slot = rows.get(r, c).unwrap_or(Value::Null);
+            *slot = rows.get(r, c).unwrap().unwrap_or(Value::Null);
         }
         out.push(InlinedRow {
             row_id: first_row_id.checked_add(out.len() as u64).ok_or_else(|| {
@@ -222,18 +222,29 @@ pub(crate) fn materialize_live(
                 })?;
             }
         }
-        columns.push(pinkdb::storage::Column {
-            name: col.name.clone(),
-            dtype: col.dtype,
-            default: col
-                .default
-                .clone()
-                .map(pinkdb::plan::ColumnDefault::constant),
-            chunks: vec![Arc::new(vector)],
-        });
+        columns.push(
+            pinkdb::storage::Column::from_chunks(
+                col.name.clone(),
+                col.dtype,
+                col.default
+                    .clone()
+                    .map(pinkdb::plan::ColumnDefault::constant),
+                vec![Arc::new(vector)],
+            )
+            .map_err(|e| LakeError::Engine {
+                context: format!("building column \"{}\"", col.name),
+                source: e,
+            })?,
+        );
         present.push(wanted[i]);
     }
-    let table = DataTable::from_columns(table_name.to_string(), columns, decoded.len());
+    let table =
+        DataTable::from_columns(table_name.to_string(), columns, decoded.len()).map_err(|e| {
+            LakeError::Engine {
+                context: format!("building table \"{table_name}\""),
+                source: e,
+            }
+        })?;
     Ok((table, present))
 }
 

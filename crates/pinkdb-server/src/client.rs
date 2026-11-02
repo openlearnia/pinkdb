@@ -535,6 +535,8 @@ impl Client {
                     columns,
                     kind,
                     in_transaction,
+                    memory_limit,
+                    memory_peak,
                     engine_version,
                 } => {
                     if current.is_some() {
@@ -556,6 +558,8 @@ impl Client {
                                 columns,
                                 kind,
                                 in_transaction,
+                                memory_limit,
+                                memory_peak,
                                 engine_version: engine_version_static(engine_version),
                             });
                         }

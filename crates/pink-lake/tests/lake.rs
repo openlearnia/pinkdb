@@ -145,7 +145,10 @@ fn assert_same_store(a: &PinkDb, b: &PinkDb) {
             assert_eq!(ta.num_rows(), tb.num_rows(), "{dbname}.{table} rows");
             for r in 0..ta.num_rows() {
                 for c in 0..ta.num_cols() {
-                    let (va, vb) = (ta.get(r, c).unwrap(), tb.get(r, c).unwrap());
+                    let (va, vb) = (
+                        ta.get(r, c).unwrap().unwrap(),
+                        tb.get(r, c).unwrap().unwrap(),
+                    );
                     match (&va, &vb) {
                         (Value::Double(x), Value::Double(y)) => assert_eq!(
                             x.to_bits(),
@@ -310,7 +313,7 @@ fn empty_databases_and_dropped_main_are_documented_v1_limits() {
     assert!(loaded.list_tables_in("empty").is_empty());
     assert!(!loaded.database_exists("empty"));
     assert_eq!(
-        loaded.table_in("only", "t").unwrap().get(0, 0),
+        loaded.table_in("only", "t").unwrap().get(0, 0).unwrap(),
         Some(Value::Integer(5))
     );
 }
@@ -417,7 +420,7 @@ fn pink_roundtrip_preserves_every_bit_pattern() {
     // naive writer would canonicalize.
     let fid = loaded.table("fid").unwrap();
     let codes: Vec<u64> = (0..fid.num_rows())
-        .filter_map(|r| match fid.get(r, 3) {
+        .filter_map(|r| match fid.get(r, 3).unwrap() {
             Some(Value::Double(x)) => Some(x.to_bits()),
             _ => None,
         })
@@ -435,18 +438,36 @@ fn pink_roundtrip_preserves_every_bit_pattern() {
     assert!(codes.contains(&f64::INFINITY.to_bits()));
 
     // DATE/TIMESTAMP extremes, i32/i64 extremes, NULLs, strings.
-    assert!(matches!(fid.get(0, 5), Some(Value::Date(i32::MIN))));
-    assert!(matches!(fid.get(1, 5), Some(Value::Date(i32::MAX))));
-    assert!(matches!(fid.get(0, 6), Some(Value::Timestamp(i64::MIN))));
-    assert!(matches!(fid.get(1, 6), Some(Value::Timestamp(i64::MAX))));
-    assert!(matches!(fid.get(0, 2), Some(Value::Bigint(i64::MIN))));
-    assert!(matches!(fid.get(1, 2), Some(Value::Bigint(i64::MAX))));
-    assert_eq!(fid.get(2, 0), Some(Value::Null));
+    assert!(matches!(
+        fid.get(0, 5).unwrap(),
+        Some(Value::Date(i32::MIN))
+    ));
+    assert!(matches!(
+        fid.get(1, 5).unwrap(),
+        Some(Value::Date(i32::MAX))
+    ));
+    assert!(matches!(
+        fid.get(0, 6).unwrap(),
+        Some(Value::Timestamp(i64::MIN))
+    ));
+    assert!(matches!(
+        fid.get(1, 6).unwrap(),
+        Some(Value::Timestamp(i64::MAX))
+    ));
+    assert!(matches!(
+        fid.get(0, 2).unwrap(),
+        Some(Value::Bigint(i64::MIN))
+    ));
+    assert!(matches!(
+        fid.get(1, 2).unwrap(),
+        Some(Value::Bigint(i64::MAX))
+    ));
+    assert_eq!(fid.get(2, 0).unwrap(), Some(Value::Null));
     assert_eq!(
-        fid.get(1, 4),
+        fid.get(1, 4).unwrap(),
         Some(Value::Varchar("héllo wörld 🌍\0embedded".into()))
     );
-    assert_eq!(fid.get(5, 4), Some(Value::Varchar(String::new())));
+    assert_eq!(fid.get(5, 4).unwrap(), Some(Value::Varchar(String::new())));
 }
 
 #[test]
@@ -551,7 +572,7 @@ fn extreme_values_and_chunk_shapes_roundtrip() {
     // The 1 MiB string came back byte for byte, and the signaling-NaN and
     // f64::MIN bits survived.
     let m = loaded.table("m").unwrap();
-    match m.get(8, 1) {
+    match m.get(8, 1).unwrap() {
         Some(Value::Varchar(s)) => {
             assert_eq!(s.len(), 1 << 20);
             assert!(s.bytes().all(|b| b == b'x'));
@@ -559,11 +580,11 @@ fn extreme_values_and_chunk_shapes_roundtrip() {
         other => panic!("expected the 1 MiB string, got {other:?}"),
     }
     assert!(matches!(
-        m.get(6, 0),
+        m.get(6, 0).unwrap(),
         Some(Value::Double(x)) if x.to_bits() == 0x7ff0_0000_0000_0001
     ));
     assert!(matches!(
-        m.get(5, 0),
+        m.get(5, 0).unwrap(),
         Some(Value::Double(x)) if x.to_bits() == f64::MIN.to_bits()
     ));
 
@@ -571,7 +592,7 @@ fn extreme_values_and_chunk_shapes_roundtrip() {
     // path, 2 all-NULL.
     let sizes = |t: &DataTable| -> Vec<usize> {
         (0..t.num_chunks())
-            .map(|i| t.scan_chunk(i).unwrap().num_rows())
+            .map(|i| t.scan_chunk(i).unwrap().unwrap().num_rows())
             .collect()
     };
     assert_eq!(loaded.table("zero").unwrap().num_rows(), 0);
@@ -582,7 +603,12 @@ fn extreme_values_and_chunk_shapes_roundtrip() {
     assert_eq!(loaded.table("one").unwrap().num_rows(), 1);
     assert_eq!(sizes(loaded.table("many").unwrap()), vec![2048, 1001]);
     assert_eq!(sizes(loaded.table("nulls").unwrap()), vec![CHUNK_SIZE; 2]);
-    let null_chunk = loaded.table("nulls").unwrap().scan_chunk(0).unwrap();
+    let null_chunk = loaded
+        .table("nulls")
+        .unwrap()
+        .scan_chunk(0)
+        .unwrap()
+        .unwrap();
     assert!(
         (0..null_chunk.num_rows)
             .all(|r| (0..null_chunk.columns.len()).all(|c| null_chunk.columns[c].is_null(r))),
@@ -609,7 +635,7 @@ fn csv_import_chunk_boundaries_roundtrip() {
 
     let sizes = |t: &DataTable| -> Vec<usize> {
         (0..t.num_chunks())
-            .map(|i| t.scan_chunk(i).unwrap().num_rows())
+            .map(|i| t.scan_chunk(i).unwrap().unwrap().num_rows())
             .collect()
     };
     assert_eq!(sizes(db.table("t").unwrap()), vec![CHUNK_SIZE, 123]);
@@ -686,7 +712,7 @@ fn attach_of_the_fidelity_store_matches_the_loaded_store() {
             let mut nulls = 0u64;
             let (mut min, mut max): (Option<Value>, Option<Value>) = (None, None);
             for row in 0..decoded.num_rows() {
-                let v = decoded.get(row, i).unwrap();
+                let v = decoded.get(row, i).unwrap().unwrap();
                 if v.is_null() {
                     nulls += 1;
                     continue;
@@ -1191,7 +1217,7 @@ fn a_table_entry_can_list_several_data_files() {
     let loaded = lake.load(None).unwrap();
     assert_eq!(loaded.table("t").unwrap().num_rows(), 6);
     assert_eq!(
-        loaded.table("t").unwrap().get(4, 1),
+        loaded.table("t").unwrap().get(4, 1).unwrap(),
         Some(Value::Varchar("v4".into()))
     );
 }

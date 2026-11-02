@@ -5638,8 +5638,8 @@ mod tests {
             c.execute("checkpoint;").unwrap();
             let bytes = std::fs::read(&ckpt).unwrap();
             assert!(
-                crate::persist::is_pinkdb06(&bytes),
-                "the checkpoint publishes PINKDB06"
+                crate::persist::is_pinkdb(&bytes),
+                "the checkpoint publishes PINKDB07"
             );
             // A commit after the checkpoint: the WAL record must survive.
             c.execute("INSERT INTO t VALUES (3, 'three');").unwrap();
@@ -6643,6 +6643,42 @@ mod tests {
         back.execute("INSERT INTO t VALUES (1);").unwrap();
         assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![1]);
         drop(back);
+        cleanup(&p);
+    }
+
+    /// A COMMIT that cannot take the lease publishes nothing, so it aborts
+    /// the transaction: the caller's retry (the lake's commit loop treats a
+    /// busy lease as a conflict) must be able to `BEGIN` again instead of
+    /// tripping over "already in a transaction".
+    #[test]
+    fn a_commit_that_cannot_take_the_lease_aborts_the_transaction() {
+        let p = tmp_ckpt("commit_busy");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        // Statements inside a transaction defer their write to COMMIT, so the
+        // foreign holder only blocks the commit.
+        db.execute("BEGIN; INSERT INTO t VALUES (1);").unwrap();
+        let foreign = {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("{}.lock", p.display()))
+                .unwrap();
+            f.try_lock().unwrap();
+            f
+        };
+        db.set_busy_timeout(Duration::from_millis(30));
+        let msg = db.execute("COMMIT;").unwrap_err().to_string();
+        assert!(msg.contains("is busy"), "{msg}");
+        drop(foreign);
+        db.set_busy_timeout(Duration::from_secs(5));
+        // The aborted transaction is gone: no row from it, and the handle can
+        // begin and commit a fresh one.
+        db.execute("BEGIN;").unwrap();
+        db.execute("INSERT INTO t VALUES (2);").unwrap();
+        db.execute("COMMIT;").unwrap();
+        assert_eq!(ints(&mut db, "SELECT a FROM t;"), vec![2]);
+        drop(db);
         cleanup(&p);
     }
 
@@ -9822,7 +9858,7 @@ mod tests {
         db.execute("CREATE INDEX a ON db1.t(a);").unwrap();
         db.checkpoint().unwrap();
         assert!(records_of(&wal_path(&p)).is_empty(), "no index re-log");
-        let flags = u32::from_le_bytes(std::fs::read(&p).unwrap()[8..12].try_into().unwrap());
+        let flags = crate::persist::footer_flags(&std::fs::read(&p).unwrap()).unwrap();
         assert_eq!(flags & 0x8, 0x8, "the checkpoint carries the index section");
         db.checkpoint().unwrap();
         assert!(records_of(&wal_path(&p)).is_empty());

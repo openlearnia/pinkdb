@@ -89,6 +89,77 @@ impl StrView {
         b[4..].copy_from_slice(&self.data);
         u128::from_le_bytes(b)
     }
+
+    /// An inline view's key: with the padding zero it is the string's content
+    /// and nothing else, so equal keys ⇔ equal strings anywhere.
+    #[inline]
+    fn inline_key(&self) -> u128 {
+        debug_assert!(self.is_inline(), "inline_key on a long view");
+        debug_assert!(
+            self.data[self.len as usize..].iter().all(|&b| b == 0),
+            "inline views zero their padding: their key must be the content"
+        );
+        self.key()
+    }
+}
+
+/// MurmurHash3's finalizer (`fmix64`, DuckDB's `MurmurHash64`), the crate's
+/// one 64-bit mix (`exec::mix64` and `stats::mix` are this function).
+#[inline]
+pub(crate) fn mix(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^ (h >> 33)
+}
+
+/// Eight bytes at a time, then mixed (`exec::hash_bytes_key` is this
+/// function): the crate's one hash over string content.
+#[inline]
+pub(crate) fn word_hash(key: &[u8]) -> u64 {
+    let mut h = 0x9e37_79b9_7f4a_7c15u64 ^ key.len() as u64;
+    let (words, rest) = key.as_chunks::<8>();
+    for w in words {
+        let x = u64::from_le_bytes(*w);
+        h = (h ^ x).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(31);
+    }
+    let mut tail = [0u8; 8];
+    tail[..rest.len()].copy_from_slice(rest);
+    h ^= u64::from_le_bytes(tail);
+    mix(h)
+}
+
+/// Hash of cell `i` as a key: a short string hashes its two view words (no
+/// byte access, no buffer), a long one its bytes. Equal strings hash alike
+/// whichever vector, chunk or buffer they came from — the build and probe
+/// sides of a join hash the same content twice.
+#[inline]
+pub(crate) fn view_hash(v: &StrVec, i: usize) -> u64 {
+    let view = v.views[i];
+    if view.is_inline() {
+        let k = view.inline_key();
+        mix(
+            (k as u64 ^ 0x9e37_79b9_7f4a_7c15).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                ^ (k >> 64) as u64,
+        )
+    } else {
+        word_hash(v.bytes_of(&view))
+    }
+}
+
+/// Whether cells `i` of `a` and `j` of `b` are the same string, views first:
+/// two inline views decide it without touching a byte, a long string compares
+/// its bytes (its view carries a location, not the content).
+#[inline]
+pub(crate) fn views_eq(a: &StrVec, i: usize, b: &StrVec, j: usize) -> bool {
+    let (x, y) = (a.views[i], b.views[j]);
+    match (x.is_inline(), y.is_inline()) {
+        (true, true) => x.inline_key() == y.inline_key(),
+        // A short string is at most 12 bytes, a long one more.
+        (true, false) | (false, true) => false,
+        (false, false) => a.bytes_of(&x) == b.bytes_of(&y),
+    }
 }
 
 /// A vector's shared buffers: one list behind one `Arc` (copying the
@@ -109,6 +180,15 @@ impl SharedList {
 
     fn iter(&self) -> impl Iterator<Item = &Arc<[u8]>> {
         self.0.iter().flat_map(|l| l.iter())
+    }
+
+    /// The list's own bytes plus every buffer it holds, each counted in full
+    /// even when another vector's list shares the buffer.
+    fn memory_size(&self) -> usize {
+        self.0.as_ref().map_or(0, |list| {
+            list.capacity() * std::mem::size_of::<Arc<[u8]>>()
+                + list.iter().map(|b| b.len()).sum::<usize>()
+        })
     }
 
     /// Append `buffer`, returning its index.
@@ -154,6 +234,16 @@ impl StrVec {
             own: Vec::new(),
             shared: SharedList::default(),
         }
+    }
+
+    /// The bytes this vector holds: its view array, its owned buffer, and the
+    /// shared buffers it reads through. A shared buffer is counted once per
+    /// vector, so two vectors over one buffer each charge it: the pool's
+    /// budget errs high, never low.
+    pub fn memory_size(&self) -> usize {
+        self.views.capacity() * std::mem::size_of::<StrView>()
+            + self.own.capacity()
+            + self.shared.memory_size()
     }
 
     /// `n` copies of `s`, sharing one buffer.
@@ -455,6 +545,25 @@ impl<S: AsRef<str>> FromIterator<S> for StrVec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_size_counts_a_shared_buffer_once_per_vector() {
+        let buffer: Arc<[u8]> = Arc::from("a string long enough to live in the buffer".as_bytes());
+        let ranges = [(0usize, 40usize), (0, 40)];
+        let a = StrVec::over_buffer(Arc::clone(&buffer), ranges.into_iter());
+        let b = StrVec::over_buffer(Arc::clone(&buffer), ranges.into_iter());
+        let views = 2 * std::mem::size_of::<StrView>();
+        // Both views read the one buffer, counted once: the vector's charge is
+        // the views plus the bytes, not twice the bytes.
+        let list = std::mem::size_of::<Arc<[u8]>>() + buffer.len();
+        assert_eq!(a.memory_size(), views + list);
+        // Two vectors over the same buffer each count it, so the pool errs
+        // high: see `StrVec::memory_size`.
+        assert_eq!(b.memory_size(), views + list);
+        // Short strings are inlined, so there is no buffer to count.
+        let short = StrVec::over_buffer(Arc::clone(&buffer), [(0usize, 4usize)].into_iter());
+        assert_eq!(short.memory_size(), std::mem::size_of::<StrView>());
+    }
 
     #[test]
     fn short_and_long_strings_round_trip_through_every_copy() {

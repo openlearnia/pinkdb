@@ -37,6 +37,15 @@ impl ArrayElems {
         }
     }
 
+    /// The bytes the element buffer holds (its capacity, not its length).
+    pub fn memory_size(&self) -> usize {
+        match self {
+            ArrayElems::Ints(v) => v.capacity() * 8,
+            ArrayElems::Floats(v) => v.capacity() * 8,
+            ArrayElems::Floats32(v) => v.capacity() * 4,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

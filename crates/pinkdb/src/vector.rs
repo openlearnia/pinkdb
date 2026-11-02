@@ -484,6 +484,37 @@ impl Vector {
         }
     }
 
+    /// The bytes this vector holds: payload capacity, validity bitmap, the
+    /// buffers its payload points into, and the vector itself.
+    ///
+    /// Capacity, not length, because that is what is allocated: a decoded
+    /// chunk reserves its full width before its rows arrive. A shared payload
+    /// (VARCHAR and VARIANT strings, ARRAY element buffers) counts whatever it
+    /// points at, so two vectors sharing one buffer each count it (see
+    /// [`crate::strings::StrVec::memory_size`]).
+    pub fn memory_size(&self) -> usize {
+        let payload = match &self.data {
+            // `Vec<bool>` is bit-packed: capacity is in bits.
+            VectorData::Boolean(v) => v.capacity().div_ceil(8),
+            VectorData::Int32(v) | VectorData::Date32(v) => v.capacity() * 4,
+            VectorData::Int64(v) | VectorData::TimestampMicros(v) => v.capacity() * 8,
+            VectorData::Float64(v) => v.capacity() * 8,
+            VectorData::Decimal { values, .. } => values.capacity() * 16,
+            VectorData::Interval(v) => v.capacity() * std::mem::size_of::<Interval>(),
+            VectorData::Variant(v) => {
+                v.capacity() * std::mem::size_of::<Arc<crate::variant::Variant>>()
+            }
+            VectorData::VarChar(s) => s.memory_size(),
+            VectorData::Uuid(v) => v.capacity() * 16,
+            VectorData::Int128(v) => v.capacity() * 16,
+            VectorData::UInt128(v) => v.capacity() * 16,
+            VectorData::Array { values, valid, .. } => {
+                values.memory_size() + valid.as_ref().map_or(0, |v| v.capacity())
+            }
+        };
+        payload + self.validity.capacity() * 8 + std::mem::size_of::<Vector>()
+    }
+
     pub fn is_valid(&self, idx: usize) -> bool {
         debug_assert!(idx < self.len);
         bit_get(&self.validity, idx)
@@ -1074,6 +1105,70 @@ impl Vector {
             }
         }
     }
+    /// Overwrite slot `dst[k]` with `src`'s row `src_rows[k]`, which must be
+    /// valid, keeping `self`'s length: a result vector is patched where an
+    /// earlier argument left it NULL (COALESCE) instead of being rebuilt.
+    /// The two vectors must have the same layout.
+    pub(crate) fn set_rows_from(
+        &mut self,
+        dst: &[usize],
+        src: &Vector,
+        src_rows: &[usize],
+    ) -> Result<()> {
+        debug_assert_eq!(dst.len(), src_rows.len());
+        debug_assert!(
+            src_rows.iter().all(|&s| src.is_valid(s)),
+            "set_rows_from writes valid source rows"
+        );
+        if matches!(src.data(), VectorData::Array { .. }) {
+            // A fixed-width ARRAY cell cannot be written in place; the rare
+            // path pays a `Value` per cell.
+            for (&d, &s) in dst.iter().zip(src_rows) {
+                let value = src.get(s);
+                self.set_value(d, value)?;
+            }
+            return Ok(());
+        }
+        macro_rules! copy {
+            ($into:expr, $from:expr) => {
+                for (&d, &s) in dst.iter().zip(src_rows) {
+                    $into[d] = $from[s];
+                }
+            };
+        }
+        match (&mut self.data, src.data()) {
+            (VectorData::Boolean(d), VectorData::Boolean(s)) => copy!(d, s),
+            (VectorData::Int32(d), VectorData::Int32(s)) => copy!(d, s),
+            (VectorData::Int64(d), VectorData::Int64(s)) => copy!(d, s),
+            (VectorData::Float64(d), VectorData::Float64(s)) => copy!(d, s),
+            (VectorData::Date32(d), VectorData::Date32(s)) => copy!(d, s),
+            (VectorData::TimestampMicros(d), VectorData::TimestampMicros(s)) => copy!(d, s),
+            (VectorData::Decimal { values: d, .. }, VectorData::Decimal { values: s, .. }) => {
+                copy!(d, s)
+            }
+            (VectorData::Interval(d), VectorData::Interval(s)) => copy!(d, s),
+            (VectorData::VarChar(d), VectorData::VarChar(s)) => {
+                for (&k, &j) in dst.iter().zip(src_rows) {
+                    d.set(k, &s[j]);
+                }
+            }
+            (VectorData::Variant(d), VectorData::Variant(s)) => {
+                for (&k, &j) in dst.iter().zip(src_rows) {
+                    d[k] = Arc::clone(&s[j]);
+                }
+            }
+            _ => {
+                return Err(PinkDbError::Execution(
+                    "set_rows_from needs matching vector types".to_string(),
+                ));
+            }
+        }
+        for &d in dst {
+            bit_set(&mut self.validity, d);
+        }
+        Ok(())
+    }
+
     /// Copy element `idx` from `other` into `self` (for UPDATE-adjacent
     /// bulk moves: filter/project/sort/join/distinct outputs). Types must
     /// match; strings share the `Arc` (no allocation).
@@ -1524,6 +1619,40 @@ impl DataChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_size_counts_payload_validity_and_string_storage() {
+        let base = std::mem::size_of::<Vector>();
+        // Fixed width: the payload capacity, not the length, plus the validity
+        // words the vector holds.
+        let mut fixed = Vector::with_capacity(DataType::Bigint, 100);
+        for i in 0..100 {
+            fixed.push_valid(Value::Bigint(i)).unwrap();
+        }
+        assert_eq!(fixed.memory_size(), 100 * 8 + 2 * 8 + base);
+        // VARCHAR: a view per row, validity, and — for strings too long to
+        // inline — the buffer they share, counted once.
+        let inline = Vector::from_raw(
+            VectorData::VarChar(crate::strings::StrVec::repeat("abc", 10)),
+            vec![u64::MAX; mask_len(10)],
+        );
+        assert_eq!(
+            inline.memory_size(),
+            10 * std::mem::size_of::<crate::strings::StrView>() + 8 + base
+        );
+        let heap = Vector::from_raw(
+            VectorData::VarChar(crate::strings::StrVec::repeat("0123456789abcdefghij", 4)),
+            vec![u64::MAX; mask_len(4)],
+        );
+        assert_eq!(
+            heap.memory_size(),
+            4 * std::mem::size_of::<crate::strings::StrView>()
+                + std::mem::size_of::<Arc<[u8]>>()
+                + 20
+                + 8
+                + base
+        );
+    }
 
     #[test]
     fn push_get_and_nulls() {

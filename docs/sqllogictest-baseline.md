@@ -9,6 +9,7 @@ Pass rate of pinkdb on DuckDB's own sqllogictest corpus, measured with
 - Corpus: `~/Desktop/projects/ducklake-vortex/ducklake/duckdb/test/sql`
 - Run: 2026-11-02, release build (`--jobs 8`), `.test` only (`.test_slow` is
   behind `--slow`)
+- **Refreshed 2026-11-02 after merging wave 136 and HUGEINT (slt-3a): 451 pass**, 3,458 fail, 320 skip, 4 timeout. Files that set the process-wide `memory_limit` now run one at a time after the parallel phase (pinkdb's limit is per process, DuckDB's per database). One file regressed for a real reason: `storage/temp_directory/max_swap_space_explicit.test` sets `memory_limit='2MB'`, below what pinkdb needs; it passed before only because the limit was ignored. The per-area tables below are from the 444 run.
 - 4,233 files: **444 pass**, 3,468 fail, 319 skip, 0 crash, 2 timeout.
   File pass rate **10.5%** (11.3% of files that ran); record pass rate **83.6%**
   of non-skipped records.

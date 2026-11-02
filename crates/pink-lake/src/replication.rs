@@ -2076,11 +2076,12 @@ fn extended_base(base: &DataTable, source: &DataTable) -> Result<DataTable> {
             base,
         )?);
     }
-    Ok(DataTable::from_columns(
-        base.name.clone(),
-        columns,
-        base.num_rows(),
-    ))
+    DataTable::from_columns(base.name.clone(), columns, base.num_rows()).map_err(|e| {
+        LakeError::Engine {
+            context: format!("building table \"{}\"", base.name),
+            source: e,
+        }
+    })
 }
 
 /// How the destination schema relates to the source schema.
@@ -2524,7 +2525,7 @@ fn table_rows(table: &DataTable) -> Vec<Vec<Value>> {
     for row in 0..table.num_rows() {
         let mut values = Vec::with_capacity(table.num_cols());
         for column in 0..table.num_cols() {
-            values.push(table.get(row, column).unwrap_or(Value::Null));
+            values.push(table.get(row, column).unwrap().unwrap_or(Value::Null));
         }
         rows.push(values);
     }

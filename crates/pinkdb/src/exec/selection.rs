@@ -8,16 +8,8 @@
 //! suffices because a selection never spans chunks, and ascending order lets a
 //! conjunction narrow one in place.
 
-use crate::vector::DataChunk;
-
 /// Ascending row indices into a chunk, never more than `CHUNK_SIZE`.
 pub(crate) type Selection = Vec<u32>;
-
-/// A chunk together with the rows a filter kept from it.
-pub(crate) struct Selected {
-    pub chunk: DataChunk,
-    pub sel: Selection,
-}
 
 /// A selection holding at most `1/MATERIALIZE_DIVISOR` of its chunk is
 /// cheaper to *materialize once* than to read through: every column read pays

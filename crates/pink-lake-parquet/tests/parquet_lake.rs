@@ -92,8 +92,8 @@ fn assert_store_equal(a: &PinkDb, b: &PinkDb, what: &str) {
             );
             for r in 0..ta.num_rows() {
                 for c in 0..ta.columns.len() {
-                    let va = ta.get(r, c).unwrap();
-                    let vb = tb.get(r, c).unwrap();
+                    let va = ta.get(r, c).unwrap().unwrap();
+                    let vb = tb.get(r, c).unwrap().unwrap();
                     assert!(
                         values_equal(&va, &vb),
                         "{what}: {db}.{name} row {r} column {}: {va:?} vs {vb:?}",
@@ -213,7 +213,7 @@ fn all_types_rows() -> Vec<Vec<Value>> {
 fn append_rows(target: &mut DataTable, src: &DataTable) {
     for c in 0..src.num_chunks() {
         target
-            .append_shared_chunk(&src.scan_chunk(c).unwrap().columns)
+            .append_shared_chunk(&src.scan_chunk(c).unwrap().unwrap().columns)
             .unwrap();
     }
 }

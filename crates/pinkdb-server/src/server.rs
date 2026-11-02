@@ -1573,6 +1573,8 @@ pub(crate) fn profile_frame(profile: &QueryProfile) -> Response {
         columns: profile.columns,
         kind: profile.kind.clone(),
         in_transaction: profile.in_transaction,
+        memory_limit: profile.memory_limit,
+        memory_peak: profile.memory_peak,
         engine_version: profile.engine_version.to_string(),
     }
 }

@@ -32,12 +32,21 @@
 
 use std::sync::Arc;
 
+use parquet::bloom_filter::Sbbf;
+use parquet::column::page::PageReader;
 use parquet::column::reader::{ColumnReader, get_typed_column_reader};
 use parquet::data_type::{
     BoolType, ByteArrayType, DoubleType, FixedLenByteArrayType, FloatType, Int32Type, Int64Type,
     Int96Type,
 };
+use parquet::file::metadata::page_index::RowGroupPageIndex;
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader, RowGroupMetaData};
+use parquet::file::page_index::offset_index::PageLocation;
+use parquet::file::properties::{ReaderProperties, ReaderPropertiesPtr};
 use parquet::file::reader::{ChunkReader, FileReader, RowGroupReader, SerializedFileReader};
+use parquet::file::serialized_reader::{SerializedPageReader, SerializedRowGroupReader};
+use parquet::record::reader::RowIter;
+use parquet::schema::types::Type as SchemaType;
 use pinkdb::attached::{PruneOp, PrunePredicate};
 use pinkdb::{
     CHUNK_SIZE, DataChunk, DataType, PinkDbError, Result, TableScanOutput, Value, Vector,
@@ -272,11 +281,24 @@ fn decode_row_group<R: ChunkReader + 'static>(
             "cannot read row group {rg_index} of \"{path}\": {e}"
         ))
     })?;
+    decode_row_group_reader(&*row_group_reader, decoded, rows, path)
+}
+
+/// Decode one row group from any `RowGroupReader` (the serial reader or the
+/// page-filtered wrapper).
+fn decode_row_group_reader(
+    row_group_reader: &dyn RowGroupReader,
+    decoded: &[(usize, usize, &FileColumn)],
+    rows: usize,
+    path: &str,
+) -> Result<Vec<Vec<Vector>>> {
     // One column at a time: each needed file column decodes into
     // chunk-sized pieces (a vector cannot exceed CHUNK_SIZE rows).
     let mut pieces: Vec<Vec<Vector>> = Vec::with_capacity(decoded.len());
     for (_, _, column) in decoded {
-        pieces.push(decode_column(&*row_group_reader, column, rows)?);
+        pieces.push(decode_column(row_group_reader, column, rows).map_err(|e| {
+            PinkDbError::Execution(format!("column \"{}\" of \"{path}\": {e}", column.name))
+        })?);
     }
     Ok(pieces)
 }
@@ -1225,4 +1247,471 @@ fn push_entry(
     let value =
         value.map_err(|why| PinkDbError::Execution(format!("column \"{column}\": {why}")))?;
     out.push_value(value)
+}
+
+/// Gap merged across page spans: a page is tens of kilobytes, so a
+/// row-group-sized gap would fetch the bytes of pruned pages between
+/// survivors.
+const PAGE_COALESCE_GAP: u64 = 256 * 1024;
+
+/// Page-level pruning and read accounting for one streamed file scan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+
+pub struct PageCounts {
+    /// Data pages whose byte ranges were read.
+    pub pages: u64,
+    /// Data pages whose statistics proved no row can match.
+    pub pages_pruned: u64,
+}
+
+/// One streamed ranged scan: what was decoded, what it cost, and the page
+/// counts the lake's per-scan accounting reports.
+pub struct RangedStream {
+    pub output: TableScanOutput,
+    pub stats: RemoteReadStats,
+    pub pages: PageCounts,
+    pub meta: Option<crate::file_meta::FileMeta>,
+}
+
+/// Stream a ranged scan one row group at a time, pruning pages through the
+/// Parquet column/offset index when the file carries one.
+///
+/// This is the lake's data-file read: the caller consumes a row group's chunks
+/// before the next row group is fetched, so the peak is one row group (plus
+/// the chunk the sink is holding), not the file. Page pruning is an
+/// optimization only: every path here returns exactly the rows the whole-file
+/// read would (the engine re-applies the filter above the scan).
+pub fn scan_page_streamed(
+    resolved: &Resolved,
+    projection: Option<&[usize]>,
+    filters: &[PrunePredicate],
+    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+) -> Result<RangedStream> {
+    let width = resolved.schema.len();
+    let mut needed = vec![false; width];
+    match projection {
+        Some(cols) => {
+            for &c in cols {
+                if c < width {
+                    needed[c] = true;
+                }
+            }
+        }
+        None => needed.iter_mut().for_each(|n| *n = true),
+    }
+
+    let transport = Arc::new(crate::ranged::TransportCounters::default());
+    let mut out = TableScanOutput::default();
+    let mut pages = PageCounts::default();
+    let placeholders: Vec<Option<Arc<Vector>>> = (0..width)
+        .map(|i| (!needed[i]).then(|| Arc::new(Vector::new_empty(resolved.schema[i].1))))
+        .collect();
+    let plan = DecodePlan {
+        resolved,
+        filters,
+        needed,
+        placeholders,
+    };
+
+    for file in &resolved.files {
+        if !file_survives(resolved, file, filters) {
+            continue;
+        }
+        out.files += 1;
+        if !needs_file_decode(file, &plan) {
+            scan_metadata_only(file, &plan, &mut out, sink)?;
+            continue;
+        }
+        let Some(spec) = &file.remote else {
+            // No positional source: the serial reader still streams one row
+            // group at a time, it just cannot skip pages.
+            let reader =
+                SerializedFileReader::new(std::fs::File::open(&file.meta.path).map_err(|e| {
+                    PinkDbError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("cannot open \"{}\": {e}", file.meta.path),
+                    ))
+                })?)
+                .map_err(|e| {
+                    PinkDbError::Execution(format!(
+                        "cannot read parquet file \"{}\": {e}",
+                        file.meta.path
+                    ))
+                })?;
+            scan_reader(&reader, file, &plan, &mut out, sink)?;
+            continue;
+        };
+        scan_file_pages(spec, &transport, file, &plan, &mut out, &mut pages, sink)?;
+    }
+    Ok(RangedStream {
+        output: out,
+        stats: transport.snapshot(),
+        pages,
+        meta: resolved.files.first().map(|file| file.meta.clone()),
+    })
+}
+
+/// One file through the page-aware ranged path.
+#[allow(clippy::too_many_arguments)]
+fn scan_file_pages(
+    spec: &crate::ranged::RemoteSpec,
+    transport: &Arc<crate::ranged::TransportCounters>,
+    file: &FileResolved,
+    plan: &DecodePlan<'_>,
+    out: &mut TableScanOutput,
+    pages: &mut PageCounts,
+    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+) -> Result<()> {
+    let chunk_reader = crate::ranged::RemoteFile::with_counters(spec, Arc::clone(transport));
+    let cache = chunk_reader.cache();
+    // The footer carries the column and offset indexes when the writer wrote
+    // them (`EnabledStatistics::Page`); a file without them reads exactly as
+    // before.
+    let metadata = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Optional)
+        .parse_and_finish(&chunk_reader)
+        .map_err(|e| {
+            PinkDbError::Execution(format!(
+                "cannot read parquet file \"{}\": {e}",
+                file.meta.path
+            ))
+        })?;
+    let chunk = Arc::new(chunk_reader);
+    let props: ReaderPropertiesPtr = Arc::new(ReaderProperties::builder().build());
+    let decoded = decoded_columns(file, plan);
+    if decoded.is_empty() {
+        return scan_metadata_only(file, plan, out, sink);
+    }
+
+    for (rg_index, rg) in file.meta.row_groups.iter().enumerate() {
+        if !row_group_survives(plan.resolved, file, rg_index, plan.filters) {
+            out.row_groups_pruned += 1;
+            continue;
+        }
+        out.row_groups += 1;
+        let rows = rg.rows as usize;
+        let rg_meta = metadata.row_group(rg_index);
+        let index = metadata.page_index_for_row_group(rg_index);
+        let selection = page_selection(
+            plan.resolved,
+            file,
+            rg_index,
+            rows,
+            &index,
+            &decoded,
+            plan.filters,
+        );
+        let kept_rows = selection.as_ref().map_or(rows, |selection| selection.rows);
+        if let Some(selection) = &selection {
+            pages.pages += selection.pages_read;
+            pages.pages_pruned += selection.pages_pruned;
+        }
+        let spans = match &selection {
+            Some(selection) => selection.spans.clone(),
+            None => {
+                // No page plan: the whole chunk is read, so every indexed page
+                // is read too.
+                pages.pages += decoded
+                    .iter()
+                    .filter_map(|(_, at, _)| index.offset_index(*at))
+                    .map(|offset| offset.page_locations().len() as u64)
+                    .sum::<u64>();
+                chunk_spans(rg, &decoded)
+            }
+        };
+        if !spans.is_empty() {
+            // Page spans are one page each: coalesce with a page-sized gap so
+            // surviving pages far apart do not pull the file between them.
+            let coalesced = if selection.is_some() {
+                crate::ranged::coalesce_spans_with_gap(spans, PAGE_COALESCE_GAP)
+            } else {
+                crate::ranged::coalesce_spans(spans)
+            };
+            let fetched = crate::ranged::fetch_spans(
+                spec.source.as_ref(),
+                &coalesced,
+                spec.parallelism.max(1),
+                transport,
+            );
+            for (span, result) in coalesced.iter().zip(fetched) {
+                let bytes = result.map_err(|e| {
+                    PinkDbError::Execution(format!("remote parquet read failed: {e}"))
+                })?;
+                if bytes.len() as u64 != span.len {
+                    return Err(PinkDbError::Execution(format!(
+                        "remote parquet read failed: GET {} (range {}..{}) returned {} bytes, \
+                         expected {}",
+                        file.meta.path,
+                        span.start,
+                        span.end(),
+                        bytes.len(),
+                        span.len
+                    )));
+                }
+                cache.insert(span.start, bytes);
+            }
+        }
+
+        let row_group =
+            SerializedRowGroupReader::new(Arc::clone(&chunk), rg_meta, index, Arc::clone(&props))
+                .map_err(|e| {
+                PinkDbError::Execution(format!(
+                    "cannot read row group {rg_index} of \"{}\": {e}",
+                    file.meta.path
+                ))
+            })?;
+        let pieces = match &selection {
+            Some(selection) => {
+                let filtered = PageRowGroup {
+                    inner: row_group,
+                    chunk: Arc::clone(&chunk),
+                    meta: rg_meta,
+                    props: Arc::clone(&props),
+                    locations: selection.locations.clone(),
+                };
+                decode_row_group_reader(&filtered, &decoded, kept_rows, &file.meta.path)?
+            }
+            None => decode_row_group_reader(&row_group, &decoded, rows, &file.meta.path)?,
+        };
+        out.columns_decoded += decoded.len() as u64;
+        assemble_row_group(file, plan, kept_rows, &decoded, pieces, sink)?;
+    }
+    Ok(())
+}
+
+/// The coalesced whole-column-chunk ranges a row group decodes without a page
+/// plan.
+fn chunk_spans(
+    rg: &crate::file_meta::RowGroupMeta,
+    decoded: &[(usize, usize, &FileColumn)],
+) -> Vec<crate::ranged::ByteSpan> {
+    decoded
+        .iter()
+        .flat_map(|(_, _, column)| {
+            (0..column.leaves).filter_map(move |offset| {
+                rg.chunks
+                    .get(column.leaf + offset)
+                    .and_then(crate::ranged::chunk_span)
+            })
+        })
+        .filter(|span| span.len <= crate::ranged::MAX_REQUEST_BYTES)
+        .collect()
+}
+
+/// One row group's page selection: which decoded pages survive, the byte
+/// ranges to prefetch, and the row count they cover.
+struct PageSelection {
+    rows: usize,
+    /// Data pages read and pruned, counted once per decoded column.
+    pages_read: u64,
+    pages_pruned: u64,
+    /// Per file column: the page locations to read, with contiguous
+    /// `first_row_index` values so the page reader's row counts stay right.
+    locations: Vec<Option<Vec<PageLocation>>>,
+    spans: Vec<crate::ranged::ByteSpan>,
+}
+
+/// Prune pages of one row group through the column index.
+///
+/// The rules are DuckDB's (`parquet_reader.cpp`/`column_reader.cpp`): a page is
+/// skipped only when its own statistics prove no row can satisfy a predicate,
+/// with the same NULL and float rules as row-group pruning; page 0 always
+/// stays (it anchors the dictionary page and keeps every decoded column's row
+/// ranges identical). Decoded columns must share their page boundaries —
+/// REQUIRED for dropping rows — while a filter column may have finer or
+/// coarser pages, mapped onto the decoded pages by row range.
+fn page_selection(
+    resolved: &Resolved,
+    file: &FileResolved,
+    rg_index: usize,
+    rows: usize,
+    index: &RowGroupPageIndex,
+    decoded: &[(usize, usize, &FileColumn)],
+    filters: &[PrunePredicate],
+) -> Option<PageSelection> {
+    // Repeated/shredded columns encode several leaves per row, so a page's
+    // row count is not its value count; leave them at row-group granularity.
+    if decoded.iter().any(|(_, _, column)| {
+        column.leaves != 1 || matches!(column.ty, DataType::Array { .. } | DataType::Variant)
+    }) {
+        return None;
+    }
+    let mut decoded_pages: Vec<&[PageLocation]> = Vec::with_capacity(decoded.len());
+    for (_, at, _) in decoded {
+        decoded_pages.push(index.offset_index(*at)?.page_locations().as_slice());
+    }
+    let first = decoded_pages.first()?;
+    if first.is_empty() {
+        return None;
+    }
+    // Dropping rows needs the same page boundaries in every decoded column.
+    if decoded_pages.iter().any(|locations| {
+        locations.len() != first.len()
+            || locations
+                .iter()
+                .zip(first.iter())
+                .any(|(a, b)| a.first_row_index != b.first_row_index)
+    }) {
+        return None;
+    }
+    let page_count = first.len();
+    let mut bounds: Vec<usize> = first
+        .iter()
+        .map(|page| page.first_row_index as usize)
+        .collect();
+    bounds.push(rows);
+    let mut kept = vec![true; page_count];
+    let mut pruned_any = false;
+    for filter in filters {
+        if filter.path.is_some() {
+            continue;
+        }
+        let Some(at) = file.out_to_file.get(filter.column).copied().flatten() else {
+            continue;
+        };
+        let (Some(column_index), Some(offset_index)) =
+            (index.column_index(at), index.offset_index(at))
+        else {
+            continue;
+        };
+        let locations = offset_index.page_locations();
+        if column_index.num_pages() as usize != locations.len() {
+            continue;
+        }
+        let column = &file.meta.columns[at];
+        let out_type = resolved.schema[filter.column].1;
+        for (page, location) in locations.iter().enumerate() {
+            let start = location.first_row_index as usize;
+            let end = locations
+                .get(page + 1)
+                .map(|next| next.first_row_index as usize)
+                .unwrap_or(rows);
+            if end <= start {
+                continue;
+            }
+            let stats = crate::file_meta::page_stats(column_index, page, column);
+            if stats_keeps(&stats, column, filter, out_type, (end - start) as u64) {
+                continue;
+            }
+            for page in 1..page_count {
+                if kept[page] && bounds[page] < end && bounds[page + 1] > start {
+                    kept[page] = false;
+                    pruned_any = true;
+                }
+            }
+        }
+    }
+    if !pruned_any {
+        return None;
+    }
+
+    // Contiguous synthetic row indexes: the page reader derives each page's
+    // row count from the next location, and skipped pages must not widen it.
+    let mut starts = vec![0i64; page_count];
+    let mut kept_rows = 0i64;
+    for page in 0..page_count {
+        starts[page] = kept_rows;
+        if kept[page] {
+            kept_rows += (bounds[page + 1] - bounds[page]) as i64;
+        }
+    }
+    let mut locations: Vec<Option<Vec<PageLocation>>> = vec![None; file.meta.columns.len()];
+    let mut spans = Vec::new();
+    for (slot, (_, at, _)) in decoded.iter().enumerate() {
+        let pages = decoded_pages[slot];
+        let mut kept_locations = Vec::with_capacity(page_count);
+        for (page, location) in pages.iter().enumerate() {
+            if !kept[page] {
+                continue;
+            }
+            kept_locations.push(PageLocation {
+                offset: location.offset,
+                compressed_page_size: location.compressed_page_size,
+                first_row_index: starts[page],
+            });
+            spans.push(crate::ranged::ByteSpan {
+                start: location.offset as u64,
+                len: location.compressed_page_size as u64,
+            });
+        }
+        // The dictionary page sits before page 0; the page reader fetches it
+        // from the gap, so prefetch it too.
+        let chunk = file.meta.row_groups[rg_index]
+            .chunks
+            .get(decoded[slot].2.leaf);
+        if let Some(chunk) = chunk.filter(|chunk| chunk_starts_before(chunk, pages[0].offset)) {
+            let start = chunk_start(chunk);
+            spans.push(crate::ranged::ByteSpan {
+                start,
+                len: pages[0].offset as u64 - start,
+            });
+        }
+        locations[*at] = Some(kept_locations);
+    }
+    let kept_pages = kept.iter().filter(|kept| **kept).count() as u64;
+    let columns = decoded.len() as u64;
+    Some(PageSelection {
+        rows: kept_rows as usize,
+        pages_read: kept_pages * columns,
+        pages_pruned: (page_count as u64 - kept_pages) * columns,
+        locations,
+        spans,
+    })
+}
+
+fn chunk_start(chunk: &crate::file_meta::ChunkInfo) -> u64 {
+    match chunk.dictionary_page_offset {
+        Some(offset) if offset >= 0 => offset as u64,
+        _ => chunk.data_page_offset as u64,
+    }
+}
+
+fn chunk_starts_before(chunk: &crate::file_meta::ChunkInfo, offset: i64) -> bool {
+    chunk_start(chunk) < offset as u64
+}
+
+/// A row group whose decoded columns read only the surviving page locations.
+struct PageRowGroup<'a, R: ChunkReader + 'static> {
+    inner: SerializedRowGroupReader<'a, R>,
+    chunk: Arc<R>,
+    meta: &'a RowGroupMetaData,
+    props: ReaderPropertiesPtr,
+    locations: Vec<Option<Vec<PageLocation>>>,
+}
+
+impl<R: ChunkReader + 'static> RowGroupReader for PageRowGroup<'_, R> {
+    fn metadata(&self) -> &RowGroupMetaData {
+        self.inner.metadata()
+    }
+
+    fn num_columns(&self) -> usize {
+        self.inner.num_columns()
+    }
+
+    fn get_column_page_reader(
+        &self,
+        column: usize,
+    ) -> parquet::errors::Result<Box<dyn PageReader>> {
+        match self.locations.get(column).and_then(|pages| pages.clone()) {
+            Some(pages) => {
+                let reader = SerializedPageReader::new_with_properties(
+                    Arc::clone(&self.chunk),
+                    self.meta.column(column),
+                    self.meta.num_rows() as usize,
+                    Some(pages),
+                    Arc::clone(&self.props),
+                )?;
+                Ok(Box::new(reader))
+            }
+            None => self.inner.get_column_page_reader(column),
+        }
+    }
+
+    fn get_column_bloom_filter(&self, column: usize) -> Option<&Sbbf> {
+        self.inner.get_column_bloom_filter(column)
+    }
+
+    fn get_row_iter(&self, projection: Option<SchemaType>) -> parquet::errors::Result<RowIter<'_>> {
+        self.inner.get_row_iter(projection)
+    }
 }

@@ -216,10 +216,9 @@ function main() {
     assert(snap.ok === true, `snapshot failed: ${JSON.stringify(snap)}`);
     snapshotBytes = snap.bytes;
     assert(snapshotBytes.length > 20, "snapshot is empty");
-    // The `.pink` format's magic lives in the trailer: the last 20 bytes are
-    // `footer_crc32c u32 | footer_len u64 | "PINKDB06"`.
-    const magic = textDecoder.decode(snapshotBytes.slice(snapshotBytes.length - 8));
-    assert(magic === "PINKDB06", `bad magic ${JSON.stringify(magic)}`);
+    // The `.pink` format's magic starts the file: header slot 0's magic.
+    const magic = textDecoder.decode(snapshotBytes.slice(0, 8));
+    assert(magic === "PINKDB07", `bad magic ${JSON.stringify(magic)}`);
   });
 
   check("pw_restore into a second handle yields the same SELECT", () => {

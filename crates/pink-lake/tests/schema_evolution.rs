@@ -83,7 +83,7 @@ fn materialize(wa: &WritableAttachment) -> PinkDb {
             col.default = src.default.clone();
         }
         for c in 0..base.num_chunks() {
-            let chunk = base.scan_chunk(c).unwrap();
+            let chunk = base.scan_chunk(c).unwrap().unwrap();
             t.append_shared_chunk(&chunk.columns).unwrap();
         }
     }

@@ -35,7 +35,7 @@ use crate::persist::crc32c;
 use crate::storage::{DataTable, DbCatalog, PinkDb, SchemaPath};
 use crate::{PinkDbError, Result};
 
-/// `PINKDBI1`, the image magic (a `.pink` file ends with `PINKDB06`).
+/// `PINKDBI1`, the image magic (a `.pink` file starts with `PINKDB07`).
 const MAGIC: &[u8; 8] = b"PINKDBI1";
 /// The image format this build writes and reads. Format 2 (wave 131a) carries
 /// the database's schemas: the image embeds a footer whose per-database
@@ -77,7 +77,7 @@ impl PinkDb {
     fn attach_rows_in(&mut self, ns: &SchemaPath, name: &str, rows: &DataTable) -> Result<()> {
         let table = self.table_mut_in(ns.clone(), name)?;
         for chunk_idx in 0..rows.num_chunks() {
-            let chunk = rows.scan_chunk(chunk_idx).ok_or_else(|| {
+            let chunk = rows.scan_chunk(chunk_idx)?.ok_or_else(|| {
                 PinkDbError::Execution("lake table changed while it was being loaded".to_string())
             })?;
             table.append_shared_chunk(&chunk.columns)?;

@@ -39,7 +39,10 @@ pub fn write(path: &Path, table: &DataTable) -> Result<()> {
                 PinkDbError::Execution(format!("cannot write \"{}\": {e}", path.display()))
             })?;
         for i in 0..table.num_chunks() {
-            let Some(chunk) = table.scan_chunk(i) else {
+            let Some(chunk) = table.scan_chunk(i).map_err(|e| {
+                PinkDbError::Execution(format!("cannot read chunk {i} of \"{}\": {e}", table.name))
+            })?
+            else {
                 continue;
             };
             let batch = build_batch(&schema, &chunk)?;

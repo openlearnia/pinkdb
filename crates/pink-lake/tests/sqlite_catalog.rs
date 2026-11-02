@@ -613,7 +613,7 @@ fn a_schema_only_commit_is_recorded_like_ducklake() {
             db.create_table_in(dbname, table, base.schema()).unwrap();
             let target = db.table_mut_in(dbname, table).unwrap();
             for chunk in 0..base.num_chunks() {
-                let chunk = base.scan_chunk(chunk).unwrap();
+                let chunk = base.scan_chunk(chunk).unwrap().unwrap();
                 target.append_shared_chunk(&chunk.columns).unwrap();
             }
         }

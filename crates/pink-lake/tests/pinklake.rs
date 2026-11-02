@@ -1,4 +1,4 @@
-//! `.pink` (PINKDB06) lake tests: the data-file format every build reads and
+//! `.pink` (PINKDB07) lake tests: the data-file format every build reads and
 //! writes. The statistics block is written by every save here and is what
 //! `.lake attach` reads without opening a data file; queries that need data
 //! read only the projected column chunks.
@@ -113,7 +113,10 @@ fn assert_same_store(a: &PinkDb, b: &PinkDb) {
             assert_eq!(ta.num_rows(), tb.num_rows(), "{dbname}.{table} rows");
             for r in 0..ta.num_rows() {
                 for c in 0..ta.num_cols() {
-                    let (va, vb) = (ta.get(r, c).unwrap(), tb.get(r, c).unwrap());
+                    let (va, vb) = (
+                        ta.get(r, c).unwrap().unwrap(),
+                        tb.get(r, c).unwrap().unwrap(),
+                    );
                     match (&va, &vb) {
                         (Value::Double(x), Value::Double(y)) => assert_eq!(
                             x.to_bits(),
@@ -172,10 +175,10 @@ fn lean_save_publishes_a_v5_lake_and_reloads_bit_exactly() {
     assert_eq!(files.len(), all_tables(&expected).len());
     for file in &files {
         let bytes = std::fs::read(file).unwrap();
-        // The engine's current `.pink` format: `PINKDB06`, whose magic lives
-        // in the trailer (the last 20 bytes).
+        // The engine's current `.pink` format: `PINKDB07`, whose magic starts
+        // the file (header slot 0).
         assert!(
-            pinkdb::persist::is_pinkdb06(&bytes),
+            pinkdb::persist::is_pinkdb(&bytes),
             "{} is not engine `.pink` bytes",
             file.display()
         );
@@ -192,7 +195,7 @@ fn lean_save_publishes_a_v5_lake_and_reloads_bit_exactly() {
         "the loaded store re-saves byte-identically"
     );
     assert_eq!(
-        loaded.table("héllo✓").unwrap().get(0, 0),
+        loaded.table("héllo✓").unwrap().get(0, 0).unwrap(),
         Some(Value::Varchar("π≈3.14".into()))
     );
     assert_eq!(
@@ -200,6 +203,7 @@ fn lean_save_publishes_a_v5_lake_and_reloads_bit_exactly() {
             .table_in("analytics", "a.b")
             .unwrap()
             .get(1, 0)
+            .unwrap()
             .unwrap(),
         Value::Double(-0.0)
     );
@@ -573,7 +577,7 @@ fn lean_time_travel_reads_old_versions_through_the_stats_blocks() {
     );
     assert_eq!(lake.decode_stats().0, 1);
     // ...v2's version file is a different decode, and the current version
-    // decodes its own file once (then caches).
+    // decodes its own file (nothing is cached between queries).
     assert_eq!(
         select_rows(&mut attached, "SELECT x FROM t AT (VERSION => 2);"),
         vec![vec![Value::Integer(1)]]
@@ -586,9 +590,9 @@ fn lean_time_travel_reads_old_versions_through_the_stats_blocks() {
     assert_eq!(
         select_rows(&mut attached, "SELECT x FROM t AT (VERSION => 2);"),
         vec![vec![Value::Integer(1)]],
-        "the version attachment caches"
+        "the version attachment is reused"
     );
-    assert_eq!(lake.decode_stats().0, 3);
+    assert_eq!(lake.decode_stats().0, 4, "its decode is not");
     // v1 has no table at all, and unknown versions are clean errors.
     let err = attached
         .execute("SELECT * FROM t AT (VERSION => 1);")

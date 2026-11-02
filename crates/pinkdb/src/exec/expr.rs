@@ -5279,34 +5279,58 @@ fn eval_coalesce(
     cx: &Cx,
 ) -> Result<Vector> {
     let n = chunk.num_rows();
-    let mut slots: Vec<Option<Value>> = vec![None; n];
-    let mut undecided: Vec<usize> = (0..n).collect();
+    let mut out: Option<Vector> = None;
+    let mut pending: Vec<usize> = (0..n).collect();
     for a in args {
-        if undecided.is_empty() {
+        if pending.is_empty() {
             break;
         }
-        let vals = if undecided.len() == n {
+        // A NULL literal resolves nothing; skipping it keeps its own dtype
+        // (the binder leaves it uncast) out of the result vector.
+        if matches!(a, BoundExpr::Literal(Value::Null)) {
+            continue;
+        }
+        let first = out.is_none();
+        let mut vals = if first {
+            // The first argument's rows are the result's rows: no copy unless
+            // its dtype has to change.
             eval_expr(a, chunk, cx)?
         } else {
-            eval_expr(a, &chunk.gather(&undecided), cx)?
+            eval_expr(a, &chunk.gather(&pending), cx)?
         };
-        let mut rest = Vec::with_capacity(undecided.len());
-        for (j, &row) in undecided.iter().enumerate() {
+        if vals.dtype() != dtype {
+            vals = coerce_to(&vals, dtype)?;
+        }
+        if first {
+            pending = (0..n).filter(|&r| vals.is_null(r)).collect();
+            out = Some(vals);
+            continue;
+        }
+        let out = out.as_mut().expect("the first argument set the result");
+        let mut dst = Vec::with_capacity(pending.len());
+        let mut src = Vec::with_capacity(pending.len());
+        let mut rest = Vec::with_capacity(pending.len());
+        for (j, &row) in pending.iter().enumerate() {
             if vals.is_null(j) {
                 rest.push(row);
             } else {
-                slots[row] = Some(vals.get(j));
+                dst.push(row);
+                src.push(j);
             }
         }
-        undecided = rest;
-    }
-    let mut out = Vector::new_empty(dtype);
-    for s in slots {
-        match s {
-            Some(Value::Null) | None => out.push_null()?,
-            Some(v) => out.push_value(v)?,
+        if !dst.is_empty() {
+            out.set_rows_from(&dst, &vals, &src)?;
         }
+        pending = rest;
     }
+    let Some(out) = out else {
+        // Every argument is a NULL literal.
+        let mut nulls = Vector::with_capacity(dtype, n);
+        for _ in 0..n {
+            nulls.push_null()?;
+        }
+        return Ok(nulls);
+    };
     Ok(out)
 }
 /// One row of an ARRAY column, borrowed from the flat buffer.
@@ -5579,6 +5603,237 @@ mod tests {
         let v = eval_expr(&e, &chunk2(), &test_cx(&db)).unwrap();
         assert_eq!(v.get(0), V::Double(3.5));
         assert_eq!(v.get(1), V::Null);
+    }
+
+    fn col(index: usize, dtype: DataType) -> B {
+        B::Column { index, dtype }
+    }
+
+    fn coalesce(args: Vec<B>, dtype: DataType) -> B {
+        B::Coalesce { args, dtype }
+    }
+
+    fn values(v: &Vector) -> Vec<V> {
+        (0..v.len()).map(|i| v.get(i)).collect()
+    }
+
+    /// `COALESCE` patches the rows each argument leaves NULL into one typed
+    /// vector: the first argument's own vector when nothing is NULL, and an
+    /// argument's slot only where every earlier argument was NULL.
+    #[test]
+    fn coalesce_fills_the_rows_each_argument_leaves_null() {
+        let db = PinkDb::new();
+        let cx = test_cx(&db);
+        let ints = |vals: &[Option<i32>]| {
+            let mut v = Vector::new_empty(DataType::Integer);
+            for x in vals {
+                match x {
+                    Some(i) => v.push_valid(V::Integer(*i)).unwrap(),
+                    None => v.push_null().unwrap(),
+                }
+            }
+            v
+        };
+        let a = ints(&[Some(1), None, None, Some(4)]);
+        let b = ints(&[Some(20), Some(30), None, Some(40)]);
+        let c = ints(&[Some(300), Some(0), Some(500), Some(0)]);
+        let chunk = DataChunk::new(vec![a, b, c]).unwrap();
+        let e = coalesce(
+            vec![
+                col(0, DataType::Integer),
+                col(1, DataType::Integer),
+                col(2, DataType::Integer),
+            ],
+            DataType::Integer,
+        );
+        let v = eval_expr(&e, &chunk, &cx).unwrap();
+        assert_eq!(
+            values(&v),
+            [
+                V::Integer(1),
+                V::Integer(30),
+                V::Integer(500),
+                V::Integer(4)
+            ]
+        );
+
+        // Nothing NULL in the first argument: its vector is the result and no
+        // later argument runs at all.
+        let div = B::Binary {
+            op: BinaryOp::Divide,
+            left: Box::new(B::Literal(V::Integer(1))),
+            right: Box::new(B::Literal(V::Integer(0))),
+            dtype: DataType::Double,
+        };
+        let full = ints(&[Some(1), Some(2)]);
+        let chunk = DataChunk::new(vec![full]).unwrap();
+        let e = coalesce(
+            vec![col(0, DataType::Integer), B::Literal(V::Null), div],
+            DataType::Integer,
+        );
+        assert_eq!(
+            values(&eval_expr(&e, &chunk, &cx).unwrap()),
+            [V::Integer(1), V::Integer(2)]
+        );
+
+        // An argument that errors on a row an earlier one decided never runs
+        // there: `COALESCE(x, 1 / y)` with `y = 0` only where `x` is valid.
+        let x = ints(&[Some(7), None, Some(9), None]);
+        let y = ints(&[Some(0), Some(5), Some(0), Some(2)]);
+        let chunk = DataChunk::new(vec![x, y]).unwrap();
+        let div = B::Binary {
+            op: BinaryOp::Divide,
+            left: Box::new(B::Literal(V::Integer(1))),
+            right: Box::new(col(1, DataType::Integer)),
+            dtype: DataType::Double,
+        };
+        let e = coalesce(vec![col(0, DataType::Integer), div], DataType::Double);
+        assert_eq!(
+            values(&eval_expr(&e, &chunk, &cx).unwrap()),
+            [
+                V::Double(7.0),
+                V::Double(0.2),
+                V::Double(9.0),
+                V::Double(0.5)
+            ]
+        );
+
+        // All-NULL arguments still yield a vector of the result type.
+        let chunk = DataChunk::new(vec![ints(&[None, None])]).unwrap();
+        let e = coalesce(
+            vec![B::Literal(V::Null), col(0, DataType::Integer)],
+            DataType::Integer,
+        );
+        let v = eval_expr(&e, &chunk, &cx).unwrap();
+        assert_eq!(v.dtype(), DataType::Integer);
+        assert_eq!(values(&v), [V::Null, V::Null]);
+        let e = coalesce(
+            vec![B::Literal(V::Null), B::Literal(V::Null)],
+            DataType::Integer,
+        );
+        let v = eval_expr(&e, &chunk, &cx).unwrap();
+        assert_eq!(v.dtype(), DataType::Integer);
+        assert_eq!(values(&v), [V::Null, V::Null]);
+    }
+
+    /// Every payload layout a COALESCE can carry, including a first argument
+    /// whose type has to widen to the result's.
+    #[test]
+    fn coalesce_covers_the_scalar_types() {
+        let db = PinkDb::new();
+        let cx = test_cx(&db);
+        // BIGINT result from an INTEGER first argument (the binder casts, and
+        // the evaluator still tolerates an uncast argument).
+        let mut ints = Vector::new_empty(DataType::Integer);
+        ints.push_null().unwrap();
+        ints.push_valid(V::Integer(5)).unwrap();
+        let mut bigs = Vector::new_empty(DataType::Bigint);
+        bigs.push_valid(V::Bigint(9)).unwrap();
+        bigs.push_null().unwrap();
+        let chunk = DataChunk::new(vec![ints, bigs]).unwrap();
+        let e = coalesce(
+            vec![col(0, DataType::Integer), col(1, DataType::Bigint)],
+            DataType::Bigint,
+        );
+        assert_eq!(
+            values(&eval_expr(&e, &chunk, &cx).unwrap()),
+            [V::Bigint(9), V::Bigint(5)]
+        );
+
+        // DOUBLE, DECIMAL, DATE and VARCHAR first arguments with a NULL row.
+        let mut dbl = Vector::new_empty(DataType::Double);
+        dbl.push_null().unwrap();
+        dbl.push_valid(V::Double(1.5)).unwrap();
+        let mut dbl2 = Vector::new_empty(DataType::Double);
+        dbl2.push_valid(V::Double(2.5)).unwrap();
+        dbl2.push_valid(V::Double(3.5)).unwrap();
+        let dec = DataType::Decimal {
+            precision: 9,
+            scale: 2,
+        };
+        let mut dec1 = Vector::new_empty(dec);
+        dec1.push_null().unwrap();
+        dec1.push_valid(V::Decimal {
+            value: 150,
+            precision: 9,
+            scale: 2,
+        })
+        .unwrap();
+        let mut dec2 = Vector::new_empty(dec);
+        dec2.push_valid(V::Decimal {
+            value: 250,
+            precision: 9,
+            scale: 2,
+        })
+        .unwrap();
+        dec2.push_valid(V::Decimal {
+            value: 350,
+            precision: 9,
+            scale: 2,
+        })
+        .unwrap();
+        let mut date1 = Vector::new_empty(DataType::Date);
+        date1.push_null().unwrap();
+        date1.push_valid(V::Date(19000)).unwrap();
+        let mut date2 = Vector::new_empty(DataType::Date);
+        date2.push_valid(V::Date(20000)).unwrap();
+        date2.push_valid(V::Date(21000)).unwrap();
+        let strs = |vals: &[Option<&str>]| {
+            let mut v = Vector::new_empty(DataType::Varchar);
+            for s in vals {
+                match s {
+                    Some(s) => v.push_valid(V::Varchar((*s).to_string())).unwrap(),
+                    None => v.push_null().unwrap(),
+                }
+            }
+            v
+        };
+        // The empty string is not NULL, and a heap string replaces an inline
+        // one.
+        let s1 = strs(&[None, Some("")]);
+        let s2 = strs(&[Some("abcdefghijklm"), Some("x")]);
+        let chunk = DataChunk::new(vec![dbl, dbl2, dec1, dec2, date1, date2, s1, s2]).unwrap();
+        let got =
+            |args: Vec<B>, dtype| values(&eval_expr(&coalesce(args, dtype), &chunk, &cx).unwrap());
+        assert_eq!(
+            got(
+                vec![col(0, DataType::Double), col(1, DataType::Double)],
+                DataType::Double
+            ),
+            [V::Double(2.5), V::Double(1.5)]
+        );
+        assert_eq!(
+            got(vec![col(2, dec), col(3, dec)], dec),
+            [
+                V::Decimal {
+                    value: 250,
+                    precision: 9,
+                    scale: 2,
+                },
+                V::Decimal {
+                    value: 150,
+                    precision: 9,
+                    scale: 2,
+                },
+            ]
+        );
+        assert_eq!(
+            got(
+                vec![col(4, DataType::Date), col(5, DataType::Date)],
+                DataType::Date
+            ),
+            [V::Date(20000), V::Date(19000)]
+        );
+        assert_eq!(
+            got(
+                vec![col(6, DataType::Varchar), col(7, DataType::Varchar)],
+                DataType::Varchar
+            ),
+            [
+                V::Varchar("abcdefghijklm".to_string()),
+                V::Varchar(String::new())
+            ]
+        );
     }
 
     #[test]

@@ -8,6 +8,23 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-11-02
+### DuckDB's own test corpus, and what it found first ✅
+
+- **`pinkdb-slt`** (`tools/sqllogictest`) runs DuckDB's sqllogictest files
+  against pinkdb and reports pass rates per area; a committed baseline makes a
+  regression fail the gate. 444 → 451 of DuckDB's 4,233 `test/sql` files pass
+  so far ([docs/sqllogictest-baseline.md](docs/sqllogictest-baseline.md)).
+- **`PRAGMA`** in DuckDB's forms (`show_tables`, `table_info`, `database_list`,
+  `version`, the `pragma_*` functions; DuckDB's test-only pragmas accepted).
+- **Settings**: `SET`/`RESET`/`current_setting` with DuckDB's names;
+  `default_null_order` and `default_order` are honoured; an unknown setting is
+  an error, as in DuckDB.
+- **`GROUP BY ALL`**, `ORDER BY ALL`, `count()`, `CHAR(n)`, `range`/`date`/
+  `timestamp` as column names, `read_csv_auto`, `ATTACH ':memory:'`.
+- **`HUGEINT`**: literals beyond BIGINT, casts, arithmetic with DuckDB's
+  overflow errors, comparisons; storing it and sending it to clients come next.
+
 ## 2026-11-01
 ### Dialect, second pass — DuckDB forms dashboards and ETL use ✅
 
@@ -23,6 +40,74 @@ one-liners below.
   `columns={…}`.
 - **Subqueries in `FROM` need no alias** (`unnamed_subquery`, …), and an
   unaliased `count(*)` is named `count_star()` as in DuckDB.
+
+### Wave 136 (steps a–b, through b-4) — a memory limit, a lazily opened store ✅
+
+Opening a saved store no longer decodes it, and a statement that would
+outgrow the process's memory budget fails with an out-of-memory error
+instead of being killed by the OS. Results are unchanged.
+
+- **`SET memory_limit = '2GB'`** (alias `max_memory`, `-1` = no limit) sets
+  one process-wide budget: 80 % of the memory the process may use — physical
+  RAM, or the tighter cgroup limit a container imposed — and no limit on
+  wasm32. Hash-join builds, hash aggregates, sorts and the other large
+  operators reserve the chunks they hold against it and release them on drop;
+  over the limit the statement fails with DuckDB's out-of-memory error. A
+  profile reports the limit and the statement's peak, on the wire protocol's
+  v16 `Profile` frame.
+- **Lazy open:** the footer now records every chunk's row count (footer
+  version 7), so opening a `.pink` file checksums the column chunks and
+  installs descriptors without decoding a page. A chunk is decoded on first
+  read, and a scan decodes only the columns the query asks for. A version-6
+  or older file is refused with the documented older-pinkdb error — there is
+  no v6 reader and no conversion.
+- **Eviction:** a decoded chunk is charged to the budget and can be dropped
+  again under pressure, least recently used first, so a store larger than the
+  budget still scans. Dirty and pinned chunks are never evicted.
+- **Copy-through `.save`:** a checkpoint re-encodes only the chunks changed
+  since the last save and copies the rest byte for byte.
+- **`COMMIT` that cannot take the store's lease** now aborts the transaction,
+  so the caller's retry can `BEGIN` again instead of tripping over "already
+  in a transaction".
+
+### Wave 136 (steps w1–w2) — the `.pink` v7 layout: two header slots, streamed writes ✅
+
+A `.pink` file no longer ends with a trailer, and a save no longer builds the
+whole file in memory. Existing v7 files are unreadable after this change —
+the layout is the v7 format; a v6 file is refused with the older-pinkdb error.
+
+- **Layout:** offsets 0 and 4096 hold two 4 KiB header slots (magic
+  `PINKDB07`, iteration, footer offset/length/CRC32C, file length, slot
+  CRC32C); the data region starts at 8192 and the footer follows it. A
+  reader takes the valid slot with the higher iteration, so a torn write
+  leaves the previous state readable, and a ranged reader (the lake) needs
+  two requests — the first 8 KiB, then the footer. Where the lake catalog
+  already records the footer location, its single request still works.
+- **Streamed save:** `.save` and `CHECKPOINT` write the data region one row
+  group at a time through a positioned writer, copy unchanged chunks byte for
+  byte, then the footer, then slot 0 — so the writer's peak memory is a row
+  group rather than the whole file. A save of an unchanged store is still
+  byte-identical.
+- **`free_ranges`:** the footer gains a sorted list of data-region ranges no
+  row group references (empty today; the append-only checkpoint fills it).
+  Readers parse it, range-check it and otherwise ignore it.
+
+### Wave 135 (steps a–d) — pipelines, string keys, big GROUP BYs ✅
+
+QuackLab's mart refresh SELECTs run 1.5–2.9× faster than after wave 140,
+and the refresh's peak memory fell by about a third. Results are unchanged.
+
+- **Pipelines:** aggregates and every other query root now push chunks
+  through filters, projections and join probes (inner, left, right, semi,
+  anti, mark) in parallel without materializing intermediate join results.
+  `SET pipeline_execution = false` runs the previous executor, for
+  comparison.
+- **VARCHAR join and GROUP BY keys** of up to 12 bytes are hashed and
+  compared as their 16-byte string views, without touching the string bytes.
+- **`COALESCE`** is evaluated a vector at a time.
+- **GROUP BY with millions of groups** merges per-chunk partial tables
+  without copying their keys and without a final sort: 17–21 % faster on
+  QuackLab's 1.9M-group fact roll-up, 250 MB less memory.
 
 ### Wave 132 — DuckLake interop ✅
 

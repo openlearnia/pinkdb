@@ -131,7 +131,8 @@ const DUCKDB_SETTINGS: &[&str] = &[
     "max_streaming_buffer_size",
     "max_temp_directory_size",
     "max_vacuum_tasks",
-    // wave 136a replaces the stored value with a real process-wide pool.
+    // Process-wide, wave 136a's memory pool: `SET`/`RESET` move the pool's
+    // limit (exec `set_setting`), `current_setting` reads it.
     "memory_limit",
     "merge_join_threshold",
     "nested_loop_join_threshold",
@@ -241,9 +242,15 @@ pub(crate) fn canonical(name: &str) -> Option<&'static str> {
 
 /// pinkdb's own switches. They are settings rather than `SET VARIABLE`
 /// variables so that `SET name = value` means one thing, and they have no
-/// DuckDB counterpart: `join_filter_pushdown` and the two HNSW search knobs
-/// are debugging switches here.
-const PINKDB_SETTINGS: &[&str] = &["hnsw_ef_search", "hnsw_exact", "join_filter_pushdown"];
+/// DuckDB counterpart: `join_filter_pushdown`, `pipeline_execution` (wave 135:
+/// `false` forces the materialized path) and the two HNSW search knobs are
+/// debugging switches here.
+const PINKDB_SETTINGS: &[&str] = &[
+    "hnsw_ef_search",
+    "hnsw_exact",
+    "join_filter_pushdown",
+    "pipeline_execution",
+];
 
 /// The same, as the error path wants it: an unknown name is DuckDB's Catalog
 /// Error, which is what the corpus' `statement error` tests expect.

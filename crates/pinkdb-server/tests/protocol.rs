@@ -86,13 +86,14 @@ fn requests_round_trip() {
 /// v10 profiling messages; wave 101a adds the VARIANT value and dtype tags;
 /// wave 95c adds the `SetVariable` `Done` kind (v12); wave 107a adds the ARRAY
 /// value (tag 11) and dtype (tag 10) tags (v13); wave 139b adds the UUID value
-/// (tag 12) and dtype (tag 11) tags (v15); wave 139c adds the HUGEINT value
+/// (tag 12) and dtype (tag 11) tags (v15); wave 136a adds the memory limit and
+/// peak to the profile frame (v16); HUGEINT step 6 adds the HUGEINT value
 /// (tag 13) and dtype (tag 12) tags and the UHUGEINT value (tag 14) and dtype
-/// (tag 13) tags (v16).
+/// (tag 13) tags (v17).
 /// A change here is a protocol change and must bump [`PROTOCOL_VERSION`].
 #[test]
-fn protocol_v16_pins_the_schema_done_kinds_and_keeps_the_v15_surface() {
-    assert_eq!(PROTOCOL_VERSION, 16);
+fn protocol_v17_pins_the_hugeint_tags_and_keeps_the_v16_surface() {
+    assert_eq!(PROTOCOL_VERSION, 17);
     assert_eq!(msg_type::LOGIN, 6);
     assert_eq!(msg_type::LOGGED_IN, 18);
     assert_eq!(msg_type::SET_PROFILING, 7);
@@ -186,6 +187,8 @@ fn profile_round_trips_every_field_and_extremes() {
         columns: 7,
         kind: "Selected".to_string(),
         in_transaction: false,
+        memory_limit: 8,
+        memory_peak: 9,
         engine_version: "0.1.0".to_string(),
     });
     response_round_trip(Response::Profile {
@@ -199,12 +202,15 @@ fn profile_round_trips_every_field_and_extremes() {
         columns: u32::MAX,
         kind: String::new(),
         in_transaction: true,
+        memory_limit: u64::MAX,
+        memory_peak: u64::MAX,
         engine_version: String::new(),
     });
 }
 
 /// Hand-build a `Profile` body: seven u64s, u32 columns, the kind string, the
-/// in_transaction byte, and the engine-version string.
+/// in_transaction byte, the memory limit and peak, and the engine-version
+/// string.
 fn profile_body(in_transaction: u8) -> Vec<u8> {
     let mut body = Vec::new();
     for n in 1..=7u64 {
@@ -214,6 +220,8 @@ fn profile_body(in_transaction: u8) -> Vec<u8> {
     body.extend_from_slice(&8u32.to_le_bytes());
     body.extend_from_slice(b"Selected");
     body.push(in_transaction);
+    body.extend_from_slice(&8u64.to_le_bytes());
+    body.extend_from_slice(&9u64.to_le_bytes());
     body.extend_from_slice(&5u32.to_le_bytes());
     body.extend_from_slice(b"0.1.0");
     body

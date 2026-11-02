@@ -46,9 +46,24 @@
 //! shrinks the value set): a pruned file could not have matched the
 //! predicate *before* its deletes either. That is the opposite direction
 //! from the table-level aggregates above, which fall back — both rules are
-//! exact, and neither is an approximation. A pruned load is never merged
-//! into the session cache (it is a different row set); a query whose
-//! predicates cannot prune takes the ordinary cached path unchanged.
+//! exact, and neither is an approximation. A pruned load returns its own row
+//! set; nothing decoded is kept between queries (wave 133a removed the
+//! session-wide materialized table), so a pruned and an unpruned query cost
+//! what each one reads and nothing more.
+//!
+//! # Streamed scans (wave 133a)
+//!
+//! Every data scan streams. [`LakeAttachment::scan_streamed_io`] walks the
+//! surviving files, has each format push one morsel (a row group, or the
+//! pages a predicate leaves) at a time, and folds each morsel into the
+//! engine's sink — so peak memory is a morsel, not the table. Surviving files
+//! are read with at most [`crate::parallel_limit`] in flight (ordered scans
+//! stay serial, because the sink must see file order then row order), and the
+//! scan returns [`ScanIo`]: files, row groups and pages read versus pruned,
+//! plus the transport requests and bytes it issued. A format that cannot
+//! stream (or a file with positional deletes, whose positions address the
+//! whole file) decodes as one morsel through the same path, so answers are
+//! identical either way.
 //!
 //! # Counters
 //!
@@ -184,7 +199,8 @@ struct AttachedFile {
     partition: Option<std::collections::BTreeMap<String, Option<String>>>,
     /// Where the file's footer is (wave 102, `.pink` data files): recorded by
     /// the catalog so a projected read fetches the footer without probing
-    /// the trailer. `None` for formats the catalog does not locate this way.
+    /// the header slots. `None` for formats the catalog does not locate this
+    /// way.
     footer: Option<crate::format::FooterLocation>,
 }
 
@@ -221,17 +237,85 @@ impl AttachedEntry {
     }
 }
 
-/// A table with at most this many live rows is materialized and cached even
-/// when the query is an aggregate: that keeps one decode per referenced
-/// column for later statements at a bounded cost (64 chunks). A bigger table
-/// streams its data files into the fold instead, so its memory does not grow
-/// with the table (wave 98c).
-const MATERIALIZE_MAX_ROWS: u64 = 64 * pinkdb::CHUNK_SIZE as u64;
+/// How many file footers one attachment keeps: a projected scan decodes a
+/// file's footer only when the catalog's schema record is older than the
+/// file, so a hot table otherwise re-reads the same footer every scan.
+const FOOTER_CACHE_MAX: usize = 64;
 
-/// The rows a table publishes: its data files plus the inlined rows unioned
-/// after them.
-fn live_rows(entry: &AttachedEntry) -> u64 {
-    entry.files.iter().map(|file| file.rows).sum::<u64>() + entry.inlined.len() as u64
+/// What a streamed file needs from its attachment: where the data lives and
+/// the footer cache shared across the attachment's life.
+struct FileIo<'a> {
+    storage: &'a Arc<dyn Storage>,
+    root: &'a std::path::Path,
+    footers: &'a FooterCache,
+}
+
+/// Per-attachment footer cache, keyed by `(relative path, row count)`.
+///
+/// The row count stands in for the file's identity: a data file is
+/// immutable, so `(path, rows)` names one file for the attachment's life
+/// (a re-written path with different rows is a different file).
+type FooterCache = Mutex<HashMap<(String, u64), Option<crate::format::FileFooter>>>;
+
+/// Test-only gauge of concurrent file streams: a scan's in-flight bound is
+/// asserted against this instead of sampling RSS, which is noisy and slow.
+#[cfg(test)]
+pub(crate) mod inflight {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(crate) static LIVE: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    /// One file stream in flight for the guard's lifetime.
+    pub(crate) struct InFlight;
+
+    impl InFlight {
+        pub(crate) fn enter() -> Self {
+            let live = LIVE.fetch_add(1, Ordering::SeqCst) + 1;
+            PEAK.fetch_max(live, Ordering::SeqCst);
+            Self
+        }
+
+        pub(crate) fn reset() {
+            PEAK.store(LIVE.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            LIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// What one streamed scan read and what it pruned — the accounting a
+/// `EXPLAIN`-style surface reports (wave 133a).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanIo {
+    /// Data files this scan opened and data files the catalog statistics
+    /// proved cannot match.
+    pub files: u64,
+    pub files_pruned: u64,
+    /// Row groups decoded and row groups whose statistics proved no match.
+    pub row_groups: u64,
+    pub row_groups_pruned: u64,
+    /// Data pages read and pages whose statistics proved no match (a format
+    /// without a page index reports zero).
+    pub pages: u64,
+    pub pages_pruned: u64,
+    /// Transport requests and response bytes this scan issued, measured as
+    /// the backend's counters advanced (0 for a local lake).
+    pub requests: u64,
+    pub bytes: u64,
+}
+
+impl ScanIo {
+    fn add(&mut self, other: &crate::format::ScanCounters) {
+        self.row_groups += other.row_groups;
+        self.row_groups_pruned += other.row_groups_pruned;
+        self.pages += other.pages;
+        self.pages_pruned += other.pages_pruned;
+    }
 }
 
 /// One attached lake, as the engine sees it.
@@ -255,8 +339,11 @@ pub(crate) struct LakeAttachment {
     /// instead of touching a file.
     unavailable: HashMap<(String, String), String>,
     tables: Vec<AttachedTable>,
-    /// Materialized columns per table, decoded lazily and cached.
-    cache: Mutex<HashMap<(String, String), CachedTable>>,
+    /// File footers decoded by projected scans, bounded by
+    /// [`FOOTER_CACHE_MAX`].
+    footers: FooterCache,
+    /// What the last [`LakeAttachment::scan_streamed_io`] call read.
+    last_scan: Mutex<Option<ScanIo>>,
     /// Decodes performed (tests: a stats-only query must not decode).
     loads: AtomicU64,
     /// Columns decoded in total (diagnostics and tests: projection pushdown
@@ -298,17 +385,6 @@ impl std::ops::Deref for VersionView<'_> {
             VersionView::Built(attachment) => attachment,
         }
     }
-}
-
-/// One table's materialized state: the columns decoded so far, plus NULL
-/// placeholders (same chunking) for the ones not decoded yet. Every column of
-/// `table` is chunk-aligned with every other, so a column decoded later can
-/// be swapped in without touching the rest.
-#[derive(Debug)]
-struct CachedTable {
-    table: Arc<DataTable>,
-    /// One flag per column: true = decoded (its chunks hold values).
-    present: Vec<bool>,
 }
 
 impl LakeAttachment {
@@ -365,6 +441,199 @@ impl LakeAttachment {
         }
         requested
     }
+
+    /// What this attachment's last [`LakeAttachment::scan_streamed_io`] read
+    /// and pruned (`None` before the first streamed scan).
+    /// What the most recent [`Self::scan_streamed_io`] call read and pruned
+    /// (the surfaced form of [`ScanIo`]).
+    #[allow(dead_code)] // wave 133b reads it; nothing in this crate does yet.
+    pub fn last_scan(&self) -> Option<ScanIo> {
+        *self.last_scan.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// [`AttachedLake::scan_streamed`] with ordering control and per-scan I/O
+    /// accounting — the streamed path every lake scan takes (wave 133a).
+    ///
+    /// `ordered` pushes chunks in manifest order, file by file, so row order
+    /// is stable; a caller asks for it when order is observable (a positional
+    /// `LIMIT`, `EXCEPT`, or a sort key the planner cannot sort above). An
+    /// unordered scan reads up to `crate::parallel_limit()` files at once and
+    /// pushes each morsel as it decodes.
+    ///
+    /// Data files are streamed by the format provider one morsel at a time
+    /// (a row group, or page range); a file the provider cannot stream
+    /// (positional deletes, or no projected reader) is one morsel holding the
+    /// whole file. Either way the scan holds only the in-flight morsels.
+    /// [`pinkdb::AttachedLake::scan_streamed`] with the accounting and the
+    /// ordering choice: `ordered` keeps file order then row order (serial,
+    /// because the sink sees one file at a time); `false` reads surviving
+    /// files with bounded parallelism and pushes morsels as they finish.
+    /// Returns the rows pushed and what the scan read and pruned.
+    pub fn scan_streamed_io(
+        &self,
+        db: &str,
+        table: &str,
+        columns: Option<&[usize]>,
+        predicates: &[pinkdb::PrunePredicate],
+        ordered: bool,
+        sink: &mut dyn FnMut(DataChunk) -> std::result::Result<(), PinkDbError>,
+    ) -> std::result::Result<(u64, ScanIo), PinkDbError> {
+        self.stream_scan(db, table, columns, predicates, ordered, sink)
+    }
+
+    /// The scan proper. A sink failure is the engine's own error and must come
+    /// back unchanged (not wrapped as "lake data error"); everything else the
+    /// scan raises keeps its lake context. Recording the sink's error here is
+    /// what tells the two apart: any later failure is that failure's
+    /// consequence, because the scan stops pushing as soon as it happens.
+    fn stream_scan(
+        &self,
+        db: &str,
+        table: &str,
+        columns: Option<&[usize]>,
+        predicates: &[pinkdb::PrunePredicate],
+        ordered: bool,
+        sink: &mut dyn FnMut(DataChunk) -> std::result::Result<(), PinkDbError>,
+    ) -> std::result::Result<(u64, ScanIo), PinkDbError> {
+        let failed = std::cell::RefCell::new(None::<PinkDbError>);
+        let mut record = |chunk: DataChunk| -> std::result::Result<(), PinkDbError> {
+            match sink(chunk) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    failed.borrow_mut().get_or_insert(error);
+                    Err(PinkDbError::Execution(
+                        "the lake scan stopped pushing rows".to_string(),
+                    ))
+                }
+            }
+        };
+        let scanned = self.stream_scan_inner(db, table, columns, predicates, ordered, &mut record);
+        match scanned {
+            Ok(ok) => Ok(ok),
+            Err(_) if failed.borrow().is_some() => Err(failed.into_inner().expect("checked above")),
+            Err(other) => Err(PinkDbError::Execution(other.to_string())),
+        }
+    }
+
+    fn stream_scan_inner(
+        &self,
+        db: &str,
+        table: &str,
+        columns: Option<&[usize]>,
+        predicates: &[pinkdb::PrunePredicate],
+        ordered: bool,
+        sink: &mut dyn FnMut(DataChunk) -> std::result::Result<(), PinkDbError>,
+    ) -> Result<(u64, ScanIo)> {
+        let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
+        if let Some(message) = self.unavailable.get(&key) {
+            return Err(LakeError::Engine {
+                context: format!("lake {}", self.location),
+                source: PinkDbError::Execution(message.clone()),
+            });
+        }
+        let Some(entry) = self.files.get(&key).cloned() else {
+            return Err(LakeError::Engine {
+                context: format!("lake {}", self.location),
+                source: PinkDbError::Catalog(format!(
+                    "lake {} has no table \"{db}.{table}\"",
+                    self.location
+                )),
+            });
+        };
+        let requested = self.requested_columns(&key, columns);
+        if requested.is_empty() {
+            return Err(LakeError::Engine {
+                context: format!("lake {}", self.location),
+                source: PinkDbError::Catalog(format!(
+                    "lake {} table \"{db}.{table}\" has no columns",
+                    self.location
+                )),
+            });
+        }
+        let survivors = file_survivors(&entry, predicates);
+        let mut io = ScanIo {
+            files: survivors.len() as u64,
+            files_pruned: (entry.files.len() - survivors.len()) as u64,
+            ..ScanIo::default()
+        };
+        self.loads.fetch_add(1, Ordering::Relaxed);
+        self.files_decoded
+            .fetch_add(survivors.len() as u64, Ordering::Relaxed);
+        let decoded_count = if entry.projected {
+            requested.iter().filter(|&&w| w).count() as u64
+        } else {
+            requested.len() as u64
+        };
+        self.columns_decoded
+            .fetch_add(decoded_count, Ordering::Relaxed);
+        let full = !entry.projected || requested.iter().all(|&w| w);
+        let decoded: Vec<usize> = (0..requested.len()).filter(|&i| requested[i]).collect();
+        let columns = if full { None } else { Some(decoded.as_slice()) };
+        // The backend's counters, so this scan's share of requests and bytes
+        // is measurable (a local lake reports zero).
+        let before = self.storage.stats();
+        let mut rows = 0u64;
+        let files = FileIo {
+            storage: &self.storage,
+            root: &self.root,
+            footers: &self.footers,
+        };
+        if ordered || survivors.len() <= 1 {
+            for file in &survivors {
+                let (file_rows, counters) =
+                    stream_file(&files, &entry, file, columns, predicates, sink)?;
+                rows += file_rows;
+                io.add(&counters);
+            }
+        } else {
+            let (file_rows, counters) =
+                stream_files_parallel(&files, &entry, &survivors, columns, predicates, sink)?;
+            rows += file_rows;
+            io.add(&counters);
+        }
+        if !entry.inlined.is_empty() {
+            let record = entry.record.as_ref().ok_or_else(|| LakeError::Corrupt {
+                path: self.catalog_path().to_path_buf(),
+                message: format!(
+                    "table \"{}\" carries inlined rows but no schema record",
+                    entry.key()
+                ),
+            })?;
+            let wanted = requested_mask(entry.schema.len(), columns);
+            let (table, _present) = crate::inlined::materialize_live(
+                &entry.inlined,
+                record,
+                &entry.key(),
+                &entry.table,
+                Some(&wanted),
+                self.catalog_path(),
+            )?;
+            for index in 0..table.num_chunks() {
+                let chunk = table
+                    .scan_chunk(index)
+                    .map_err(|source| LakeError::Engine {
+                        context: format!("scan of \"{}\"", entry.key()),
+                        source,
+                    })?
+                    .ok_or_else(|| LakeError::Internal {
+                        message: format!(
+                            "inlined chunk {index} of \"{}\" disappeared",
+                            entry.key()
+                        ),
+                    })?;
+                rows += chunk.num_rows() as u64;
+                sink(chunk).map_err(|source| LakeError::Engine {
+                    context: format!("scan of \"{}\"", entry.key()),
+                    source,
+                })?;
+            }
+        }
+        let after = self.storage.stats();
+        io.requests = after.requests.saturating_sub(before.requests);
+        io.bytes = after.bytes.saturating_sub(before.bytes);
+        *self.last_scan.lock().unwrap_or_else(|p| p.into_inner()) = Some(io);
+        Ok((rows, io))
+    }
 }
 
 impl AttachedLake for LakeAttachment {
@@ -390,9 +659,6 @@ impl AttachedLake for LakeAttachment {
         if let Some(message) = self.unavailable.get(&key) {
             return Err(PinkDbError::Execution(message.clone()));
         }
-        // One decode per table at a time: the lock is held across the decode
-        // so concurrent readers of one store materialize each column once.
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         let Some(entry) = self.files.get(&key).cloned() else {
             return Err(PinkDbError::Catalog(format!(
                 "lake {} has no table \"{db}.{table}\"",
@@ -406,78 +672,27 @@ impl AttachedLake for LakeAttachment {
                 self.location
             )));
         }
-        match cache.get_mut(&key) {
-            Some(cached) => {
-                let missing: Vec<usize> = (0..requested.len())
-                    .filter(|&i| requested[i] && !cached.present[i])
-                    .collect();
-                if missing.is_empty() {
-                    return Ok(AttachedScan {
-                        table: Arc::clone(&cached.table),
-                        present: cached.present.clone(),
-                    });
-                }
-                self.loads.fetch_add(1, Ordering::Relaxed);
-                let decoded_count = if !entry.projected {
-                    // A `.pink` projection decodes the whole table.
-                    cached.present.len() as u64
-                } else {
-                    missing.len() as u64
-                };
-                self.columns_decoded
-                    .fetch_add(decoded_count, Ordering::Relaxed);
-                self.files_decoded
-                    .fetch_add(entry.files.len() as u64, Ordering::Relaxed);
-                let (fresh, _fresh_present) = self
-                    .load_entry(&entry, Some(&missing))
-                    .map_err(|e| PinkDbError::Execution(e.to_string()))?;
-                if !entry.projected {
-                    // A `.pink` projection decodes the whole table: the fresh
-                    // decode is the complete state, no column merge needed.
-                    cached.present = vec![true; fresh.num_cols()];
-                    cached.table = Arc::new(fresh);
-                } else {
-                    let merged = merge_projected(&cached.table, &fresh, &missing, &entry.table)
-                        .map_err(|e| PinkDbError::Execution(e.to_string()))?;
-                    for &i in &missing {
-                        cached.present[i] = true;
-                    }
-                    cached.table = Arc::new(merged);
-                }
-                Ok(AttachedScan {
-                    table: Arc::clone(&cached.table),
-                    present: cached.present.clone(),
-                })
-            }
-            None => {
-                self.loads.fetch_add(1, Ordering::Relaxed);
-                let decoded_count = if !entry.projected {
-                    // A `.pink` projection decodes the whole table (no
-                    // projected reader); it counts every column.
-                    requested.len() as u64
-                } else {
-                    requested.iter().filter(|&&w| w).count() as u64
-                };
-                self.columns_decoded
-                    .fetch_add(decoded_count, Ordering::Relaxed);
-                self.files_decoded
-                    .fetch_add(entry.files.len() as u64, Ordering::Relaxed);
-                let full = !entry.projected || requested.iter().all(|&w| w);
-                let decoded: Vec<usize> = (0..requested.len()).filter(|&i| requested[i]).collect();
-                let (table, present) = self
-                    .load_entry(&entry, if full { None } else { Some(&decoded) })
-                    .map_err(|e| PinkDbError::Execution(e.to_string()))?;
-                let table = Arc::new(table);
-                cache.insert(
-                    key,
-                    CachedTable {
-                        table: Arc::clone(&table),
-                        present: present.clone(),
-                    },
-                );
-                Ok(AttachedScan { table, present })
-            }
-        }
+        self.loads.fetch_add(1, Ordering::Relaxed);
+        // A `.pink` projection decodes every column (the provider has no
+        // projected reader); a projected provider decodes only these.
+        let decoded_count = if entry.projected {
+            requested.iter().filter(|&&w| w).count() as u64
+        } else {
+            requested.len() as u64
+        };
+        self.columns_decoded
+            .fetch_add(decoded_count, Ordering::Relaxed);
+        self.files_decoded
+            .fetch_add(entry.files.len() as u64, Ordering::Relaxed);
+        let full = !entry.projected || requested.iter().all(|&w| w);
+        let decoded: Vec<usize> = (0..requested.len()).filter(|&i| requested[i]).collect();
+        let (table, present) = self
+            .load_entry(&entry, if full { None } else { Some(&decoded) })
+            .map_err(|e| PinkDbError::Execution(e.to_string()))?;
+        Ok(AttachedScan {
+            table: Arc::new(table),
+            present,
+        })
     }
 
     fn load_filtered(
@@ -503,15 +718,11 @@ impl AttachedLake for LakeAttachment {
         let survivors = file_survivors(&entry, predicates);
         if survivors.len() == entry.files.len() && !entry.format.prunes_row_groups() {
             // Nothing pruned and the provider cannot prune *inside* a file:
-            // take the ordinary cached path, so a query whose predicates
-            // cannot prune behaves exactly as before (and shares the
-            // materialized columns).
+            // decode the table as the unfiltered load does.
             return self.load_projected(db, table, columns);
         }
-        // A pruned load is a different row set than the full table, so it is
-        // never merged into the session cache: it decodes its surviving files
-        // (only the requested columns, where the format supports a
-        // projection) and is returned as-is.
+        // Only the surviving files decode, and only the columns the query
+        // references; nothing is kept for a later query.
         let requested = self.requested_columns(&key, columns);
         self.loads.fetch_add(1, Ordering::Relaxed);
         self.files_decoded
@@ -555,12 +766,12 @@ impl AttachedLake for LakeAttachment {
     }
 
     fn streams_scan(&self, db: &str, table: &str) -> bool {
+        // Every scan streams: a statistics-only query decodes nothing, and a
+        // data query folds one morsel per referenced column at a time, so a
+        // table never has to fit in memory (wave 133a, replacing the wave 98c
+        // materializing bound).
         let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
-        !self.unavailable.contains_key(&key)
-            && self
-                .files
-                .get(&key)
-                .is_some_and(|entry| live_rows(entry) > MATERIALIZE_MAX_ROWS)
+        !self.unavailable.contains_key(&key) && self.files.contains_key(&key)
     }
 
     fn scan_streamed(
@@ -571,119 +782,9 @@ impl AttachedLake for LakeAttachment {
         predicates: &[pinkdb::PrunePredicate],
         sink: &mut dyn FnMut(DataChunk) -> std::result::Result<(), PinkDbError>,
     ) -> std::result::Result<u64, PinkDbError> {
-        let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
-        if let Some(message) = self.unavailable.get(&key) {
-            return Err(PinkDbError::Execution(message.clone()));
-        }
-        let Some(entry) = self.files.get(&key).cloned() else {
-            return Err(PinkDbError::Catalog(format!(
-                "lake {} has no table \"{db}.{table}\"",
-                self.location
-            )));
-        };
-        let requested = self.requested_columns(&key, columns);
-        if requested.is_empty() {
-            return Err(PinkDbError::Catalog(format!(
-                "lake {} table \"{db}.{table}\" has no columns",
-                self.location
-            )));
-        }
-        // A table that fits the materializing bound keeps the session cache's
-        // economics (one decode per referenced column, reused by later
-        // statements). Above it the fold streams data files; that path neither
-        // reads nor fills the cache, since filling it is what it must not do.
-        if live_rows(&entry) <= MATERIALIZE_MAX_ROWS {
-            let scan = self.load_filtered(db, table, columns, predicates)?;
-            let mut rows = 0u64;
-            for chunk in scan.chunks() {
-                rows += chunk.num_rows() as u64;
-                sink(chunk)?;
-            }
-            return Ok(rows);
-        }
-        let survivors = file_survivors(&entry, predicates);
-        self.loads.fetch_add(1, Ordering::Relaxed);
-        self.files_decoded
-            .fetch_add(survivors.len() as u64, Ordering::Relaxed);
-        let decoded_count = if !entry.projected {
-            requested.len() as u64
-        } else {
-            requested.iter().filter(|&&w| w).count() as u64
-        };
-        self.columns_decoded
-            .fetch_add(decoded_count, Ordering::Relaxed);
-        let full = !entry.projected || requested.iter().all(|&w| w);
-        let decoded: Vec<usize> = (0..requested.len()).filter(|&i| requested[i]).collect();
-        let columns = if full { None } else { Some(&decoded[..]) };
-        // One data file at a time: the chunks of the decoded file are pushed
-        // (and dropped) before the next file is read, so the peak is one
-        // file's decode. Row groups inside a file still decode in parallel
-        // (the Parquet reader's read-ahead window).
-        let mut present: Option<Vec<bool>> = None;
-        let mut rows = 0u64;
-        for file in &survivors {
-            let (chunked, file_present) =
-                load_file(&self.storage, &self.root, &entry, file, columns, predicates)
-                    .map_err(|e| PinkDbError::Execution(e.to_string()))?;
-            match &present {
-                None => present = Some(file_present.clone()),
-                Some(first) if *first != file_present => {
-                    return Err(PinkDbError::Execution(format!(
-                        "attached files of \"{}\" disagree on the decoded columns",
-                        entry.key()
-                    )));
-                }
-                Some(_) => {}
-            }
-            let file_scan = AttachedScan {
-                table: Arc::new(chunked),
-                present: file_present,
-            };
-            for chunk in file_scan.chunks() {
-                rows += chunk.num_rows() as u64;
-                sink(chunk)?;
-            }
-        }
-        if !entry.inlined.is_empty() {
-            let record = entry.record.as_ref().ok_or_else(|| {
-                PinkDbError::Catalog(format!(
-                    "lake {} table \"{}\" carries inlined rows but no schema record",
-                    self.location,
-                    entry.key()
-                ))
-            })?;
-            let wanted = match &present {
-                Some(present) => present.clone(),
-                None => requested_mask(entry.schema.len(), columns),
-            };
-            let (table, inlined_present) = crate::inlined::materialize_live(
-                &entry.inlined,
-                record,
-                &entry.key(),
-                &entry.table,
-                Some(&wanted),
-                self.catalog_path(),
-            )
-            .map_err(|e| PinkDbError::Execution(e.to_string()))?;
-            if let Some(first) = &present
-                && *first != inlined_present
-            {
-                return Err(PinkDbError::Execution(format!(
-                    "attached inlined rows of \"{}\" disagree with the files on the \
-                     decoded columns",
-                    entry.key()
-                )));
-            }
-            let inlined_scan = AttachedScan {
-                table: Arc::new(table),
-                present: inlined_present,
-            };
-            for chunk in inlined_scan.chunks() {
-                rows += chunk.num_rows() as u64;
-                sink(chunk)?;
-            }
-        }
-        Ok(rows)
+        Ok(self
+            .scan_streamed_io(db, table, columns, predicates, false, sink)?
+            .0)
     }
 
     fn table_at(
@@ -869,7 +970,15 @@ impl LakeAttachment {
         // manifest order. `map_bounded` returns results in input order, so
         // the first error is the same one a serial loop would report.
         let decoded = crate::map_bounded(files, crate::parallel_limit(), |file| {
-            load_file(&self.storage, &self.root, entry, file, columns, filters)
+            load_file(
+                &self.storage,
+                &self.root,
+                &self.footers,
+                entry,
+                file,
+                columns,
+                filters,
+            )
         });
         let mut union: Option<(DataTable, Vec<bool>)> = None;
         for (i, result) in decoded.into_iter().enumerate() {
@@ -1017,9 +1126,191 @@ fn requested_mask(n_cols: usize, columns: Option<&[usize]>) -> Vec<bool> {
 /// projected provider decodes only the physical columns a mapped logical
 /// column needs, others decode whole and project in memory.
 #[cfg_attr(not(test), allow(unused_variables))]
+/// One data file's physical decode plan: what the file holds, how those
+/// columns map onto the table's logical schema, which physical columns the
+/// request must decode, and the pushed predicates in physical indices.
+struct FilePlan {
+    physical_schema: Vec<(String, pinkdb::DataType)>,
+    mapping: crate::schema::FileMapping,
+    decoded: Vec<usize>,
+    filters: Vec<pinkdb::attached::PrunePredicate>,
+}
+
+/// Plan one data file's projected decode, or `None` when the file must be
+/// decoded whole (a provider without a projected reader, or a schema the
+/// catalog record and footer cannot prove).
+fn file_plan(
+    storage: &Arc<dyn Storage>,
+    footers: &FooterCache,
+    entry: &AttachedEntry,
+    file: &AttachedFile,
+    data_file: &DataFile<'_>,
+    columns: Option<&[usize]>,
+    filters: &[pinkdb::attached::PrunePredicate],
+) -> Result<Option<FilePlan>> {
+    if !entry.projected {
+        // No projected reader exists for this provider (the engine `.pink`
+        // bytes are the built-in case): any missing column materializes the
+        // whole table through the provider's reader.
+        return Ok(None);
+    }
+    // A projection-capable provider. With a v5 record whose epoch equals the
+    // file's, the record already is the file's physical schema: no footer
+    // read is needed to map columns (a projected scan still reads its footer
+    // once to decode). Otherwise the footer is the authority; a provider
+    // without one falls back to the always-correct full decode.
+    let path = storage.abs(&file.rel);
+    let need_footer = entry
+        .record
+        .as_ref()
+        .is_none_or(|record| file.schema_version != record.version);
+    let footer = if need_footer {
+        footer_stats(entry, file, data_file, footers)?
+    } else {
+        None
+    };
+    let physical_schema: Vec<(String, pinkdb::DataType)> = match &footer {
+        Some(footer) => footer.schema.clone(),
+        None => match &entry.record {
+            Some(record) if !need_footer => record.schema_pairs(),
+            _ => return Ok(None),
+        },
+    };
+    // Which physical columns the request needs. With a record, logical
+    // indices are mapped through the file's schema epoch (a dropped column's
+    // bytes are never read; a default-filled one needs no data).
+    let mapping = match &entry.record {
+        Some(schema) => schema.map_file(file.schema_version, &physical_schema, &path)?,
+        None => crate::schema::FileMapping {
+            physical: (0..physical_schema.len()).map(Some).collect(),
+        },
+    };
+    let logical_width = mapping.physical.len();
+    let wanted: Vec<bool> = match columns {
+        Some(cols) => {
+            let mut w = vec![false; logical_width];
+            for &i in cols {
+                if i < w.len() {
+                    w[i] = true;
+                }
+            }
+            w
+        }
+        None => vec![true; logical_width],
+    };
+    let mut physical: Vec<usize> = Vec::new();
+    for (li, on) in wanted.iter().enumerate() {
+        if *on
+            && let Some(pi) = mapping.physical[li]
+            && !physical.contains(&pi)
+        {
+            physical.push(pi);
+        }
+    }
+    physical.sort_unstable();
+    // The query's predicates use logical column indices; the provider's
+    // ranged scan sees the file's physical schema. Translate (and drop a
+    // predicate on a column this file does not physically carry) before
+    // handing them over. Pruning is only ever an optimization, so dropping a
+    // translation is safe; passing a wrong index is not.
+    let filters: Vec<pinkdb::PrunePredicate> = filters
+        .iter()
+        .filter_map(|filter| {
+            let physical = (*mapping.physical.get(filter.column)?)?;
+            Some(pinkdb::PrunePredicate {
+                column: physical,
+                op: filter.op,
+                value: filter.value.clone(),
+                path: filter.path.clone(),
+            })
+        })
+        .collect();
+    // Decode at least one physical column: the row count has to come from
+    // somewhere even when the request only needs default-filled columns.
+    let decoded = if physical.is_empty() {
+        vec![0]
+    } else {
+        physical
+    };
+    Ok(Some(FilePlan {
+        physical_schema,
+        mapping,
+        decoded,
+        filters,
+    }))
+}
+
+/// The file's footer statistics, from the attachment's bounded cache when
+/// this attachment has read them before.
+fn footer_stats(
+    entry: &AttachedEntry,
+    file: &AttachedFile,
+    data_file: &DataFile<'_>,
+    footers: &FooterCache,
+) -> Result<Option<crate::format::FileFooter>> {
+    let cache_key = (file.rel.clone(), file.rows);
+    let cached = footers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&cache_key)
+        .cloned();
+    if let Some(cached) = cached {
+        return Ok(cached);
+    }
+    let footer = entry.format.footer_stats(data_file)?;
+    let mut cache = footers.lock().unwrap_or_else(|p| p.into_inner());
+    if cache.len() >= FOOTER_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert(cache_key, footer.clone());
+    Ok(footer)
+}
+
+/// Decode one data file whole through its provider, apply its positional
+/// deletes and project it onto the table's logical schema.
+fn load_whole_file(
+    storage: &Arc<dyn Storage>,
+    root: &std::path::Path,
+    entry: &AttachedEntry,
+    file: &AttachedFile,
+    data_file: &DataFile<'_>,
+) -> Result<(DataTable, Vec<bool>)> {
+    let key = entry.key();
+    let table = decode_via_provider(entry, data_file, root)?;
+    if table.num_rows() as u64 != file.rows {
+        return Err(LakeError::Corrupt {
+            path: storage.abs(&file.rel),
+            message: format!(
+                "table \"{key}\": data file \"{}\" has {} rows, but the manifest \
+                 says {}",
+                file.rel,
+                table.num_rows(),
+                file.rows
+            ),
+        });
+    }
+    let table = apply_file_deletes(&table, &file.deletes, &key, &file.rel)?;
+    match &entry.record {
+        Some(schema) => {
+            let mapping = schema.map_file(
+                file.schema_version,
+                &table.schema(),
+                &storage.abs(&file.rel),
+            )?;
+            let all = vec![true; table.num_cols()];
+            schema.project_table(&mapping, &table, &all, &entry.table)
+        }
+        None => {
+            let present = vec![true; table.num_cols()];
+            Ok((table, present))
+        }
+    }
+}
+
 fn load_file(
     storage: &Arc<dyn Storage>,
     root: &std::path::Path,
+    footers: &FooterCache,
     entry: &AttachedEntry,
     file: &AttachedFile,
     columns: Option<&[usize]>,
@@ -1027,7 +1318,7 @@ fn load_file(
 ) -> Result<(DataTable, Vec<bool>)> {
     let key = entry.key();
     let abs = storage.abs(&file.rel);
-    // The catalog's footer location saves the trailer probe; the file's
+    // The catalog's footer location saves the header probe; the file's
     // positional deletes tell a row-group-pruning provider not to prune this
     // file (delete positions address the file's full row sequence).
     let mut data_file =
@@ -1035,204 +1326,304 @@ fn load_file(
     if !file.deletes.is_empty() {
         data_file = data_file.with_deletes(file.deletes.clone());
     }
-    if !entry.projected {
-        // No projected reader exists for this provider (the engine `.pink`
-        // bytes are the built-in case): any missing column materializes the
-        // whole table through the provider's reader — one decode, the same
-        // `.lake open` performs.
-        let table = decode_via_provider(entry, &data_file, root)?;
-        if table.num_rows() as u64 != file.rows {
-            return Err(LakeError::Corrupt {
-                path: storage.abs(&file.rel),
-                message: format!(
-                    "table \"{key}\": data file \"{}\" has {} rows, but the manifest \
-                     says {}",
-                    file.rel,
-                    table.num_rows(),
-                    file.rows
-                ),
-            });
-        }
-        let table = apply_file_deletes(&table, &file.deletes, &key, &file.rel)?;
-        match &entry.record {
-            Some(schema) => {
-                let mapping = schema.map_file(
-                    file.schema_version,
-                    &table.schema(),
-                    &storage.abs(&file.rel),
-                )?;
-                let all = vec![true; table.num_cols()];
-                schema.project_table(&mapping, &table, &all, &entry.table)
-            }
-            None => {
-                let present = vec![true; table.num_cols()];
-                Ok((table, present))
-            }
-        }
+    let Some(plan) = file_plan(storage, footers, entry, file, &data_file, columns, filters)? else {
+        return load_whole_file(storage, root, entry, file, &data_file);
+    };
+    let (file_table, file_present) =
+        match decode_projected_via_provider(entry, &data_file, root, &plan.decoded, &plan.filters)?
+        {
+            Some(decoded) => decoded,
+            None => return load_whole_file(storage, root, entry, file, &data_file),
+        };
+    // A provider that prunes row groups inside a file (wave 102, `.pink`)
+    // returns only the row groups that can match the predicates — never for a
+    // file with deletes (positions must stay aligned). The engine re-applies
+    // the full predicate above the scan, and a pruned load is never cached, so
+    // fewer rows is correct there; every other read must return exactly the
+    // manifest's count.
+    let may_prune_rows =
+        entry.format.prunes_row_groups() && !plan.filters.is_empty() && file.deletes.is_empty();
+    let rows_ok = if may_prune_rows {
+        file_table.num_rows() as u64 <= file.rows
     } else {
-        // A projection-capable provider. With a v5 record whose epoch equals
-        // the file's, the record already is the file's physical schema: no
-        // footer read is needed to map columns (a projected scan still reads
-        // its footer once to decode). Otherwise the footer is the authority;
-        // a provider without one falls back to the always-correct full
-        // decode.
-        let path = storage.abs(&file.rel);
-        let need_footer = entry
-            .record
-            .as_ref()
-            .is_none_or(|record| file.schema_version != record.version);
-        let footer = if need_footer {
-            entry.format.footer_stats(&data_file)?
-        } else {
-            None
-        };
-        let physical_schema: Vec<(String, pinkdb::DataType)> = match &footer {
-            Some(footer) => footer.schema.clone(),
-            None => match &entry.record {
-                Some(record) if !need_footer => record.schema_pairs(),
-                _ => {
-                    let table = decode_via_provider(entry, &data_file, root)?;
-                    if table.num_rows() as u64 != file.rows {
-                        return Err(LakeError::Corrupt {
-                            path,
-                            message: format!(
-                                "table \"{key}\": data file \"{}\" has {} rows, but the \
-                                 manifest says {}",
-                                file.rel,
-                                table.num_rows(),
-                                file.rows
-                            ),
-                        });
-                    }
-                    let table = apply_file_deletes(&table, &file.deletes, &key, &file.rel)?;
-                    return match &entry.record {
-                        Some(schema) => {
-                            let mapping = schema.map_file(
-                                file.schema_version,
-                                &table.schema(),
-                                &storage.abs(&file.rel),
-                            )?;
-                            let all = vec![true; table.num_cols()];
-                            schema.project_table(&mapping, &table, &all, &entry.table)
-                        }
-                        None => {
-                            let present = vec![true; table.num_cols()];
-                            Ok((table, present))
-                        }
-                    };
-                }
-            },
-        };
-        // Which physical columns the request needs. With a record, logical
-        // indices are mapped through the file's schema epoch (a dropped
-        // column's bytes are never read; a default-filled one needs no data).
-        let mapping = match &entry.record {
-            Some(schema) => schema.map_file(file.schema_version, &physical_schema, &path)?,
-            None => crate::schema::FileMapping {
-                physical: (0..physical_schema.len()).map(Some).collect(),
-            },
-        };
-        let logical_width = mapping.physical.len();
-        let wanted: Vec<bool> = match columns {
-            Some(cols) => {
-                let mut w = vec![false; logical_width];
-                for &i in cols {
-                    if i < w.len() {
-                        w[i] = true;
-                    }
-                }
-                w
-            }
-            None => vec![true; logical_width],
-        };
-        let mut physical: Vec<usize> = Vec::new();
-        for (li, on) in wanted.iter().enumerate() {
-            if *on
-                && let Some(pi) = mapping.physical[li]
-                && !physical.contains(&pi)
-            {
-                physical.push(pi);
-            }
+        file_table.num_rows() as u64 == file.rows
+    };
+    if !rows_ok {
+        return Err(LakeError::Corrupt {
+            path: storage.abs(&file.rel),
+            message: format!(
+                "table \"{key}\": data file \"{}\" has {} rows, but the manifest says {}",
+                file.rel,
+                file_table.num_rows(),
+                file.rows
+            ),
+        });
+    }
+    let file_table = apply_file_deletes(&file_table, &file.deletes, &key, &file.rel)?;
+    match &entry.record {
+        Some(schema) => {
+            schema.project_table(&plan.mapping, &file_table, &file_present, &entry.table)
         }
-        physical.sort_unstable();
-        // The query's predicates use logical column indices; the provider's
-        // ranged scan sees the file's physical schema. Translate (and drop a
-        // predicate on a column this file does not physically carry) before
-        // handing them over. Pruning is only ever an optimization, so
-        // dropping a translation is safe; passing a wrong index is not.
-        let physical_filters: Vec<pinkdb::PrunePredicate> = filters
-            .iter()
-            .filter_map(|filter| {
-                let physical = (*mapping.physical.get(filter.column)?)?;
-                Some(pinkdb::PrunePredicate {
-                    column: physical,
-                    op: filter.op,
-                    value: filter.value.clone(),
-                    path: filter.path.clone(),
-                })
-            })
-            .collect();
-        let (file_table, file_present) = if physical.len() == physical_schema.len() {
-            let table = decode_via_provider(entry, &data_file, root)?;
-            let present = vec![true; table.num_cols()];
-            (table, present)
-        } else {
-            // Decode at least one physical column: the row count has to come
-            // from somewhere even when the request only needs default-filled
-            // columns.
-            let decode_cols: Vec<usize> = if physical.is_empty() {
-                vec![0]
-            } else {
-                physical.clone()
-            };
-            match decode_projected_via_provider(
-                entry,
-                &data_file,
-                root,
-                &decode_cols,
-                &physical_filters,
-            )? {
-                Some(decoded) => decoded,
-                None => {
-                    let table = decode_via_provider(entry, &data_file, root)?;
-                    let present = vec![true; table.num_cols()];
-                    (table, present)
-                }
+        None => Ok((file_table, file_present)),
+    }
+}
+
+/// Stream one data file's projected columns into `sink`, one morsel at a
+/// time: the provider decodes and pushes a row group (or page range) while
+/// the previous morsel is already folded, so the peak is one morsel's bytes
+/// rather than the file's.
+///
+/// A file this path cannot stream — no projected reader, a schema nothing
+/// proves, or positional deletes (their positions address the file's rows and
+/// a pruned stream would shift them) — decodes whole, as one morsel.
+fn stream_file<F>(
+    io: &FileIo<'_>,
+    entry: &AttachedEntry,
+    file: &AttachedFile,
+    columns: Option<&[usize]>,
+    predicates: &[pinkdb::attached::PrunePredicate],
+    sink: &mut F,
+) -> Result<(u64, crate::format::ScanCounters)>
+where
+    F: FnMut(DataChunk) -> std::result::Result<(), PinkDbError> + ?Sized,
+{
+    #[cfg(test)]
+    let _in_flight = inflight::InFlight::enter();
+    let key = entry.key();
+    let abs = io.storage.abs(&file.rel);
+    let data_file = DataFile::new(&abs, &file.rel, Arc::clone(io.storage)).with_footer(file.footer);
+    let plan = if file.deletes.is_empty() {
+        file_plan(
+            io.storage, io.footers, entry, file, &data_file, columns, predicates,
+        )?
+    } else {
+        None
+    };
+    let Some(plan) = plan else {
+        let (table, _present) = load_file(
+            io.storage, io.root, io.footers, entry, file, columns, predicates,
+        )?;
+        let mut rows = 0u64;
+        for index in 0..table.num_chunks() {
+            let chunk = table
+                .scan_chunk(index)
+                .map_err(|source| LakeError::Engine {
+                    context: format!("scan of \"{key}\""),
+                    source,
+                })?
+                .ok_or_else(|| LakeError::Internal {
+                    message: format!("chunk {index} of \"{}\" disappeared", file.rel),
+                })?;
+            rows += chunk.num_rows() as u64;
+            sink(chunk).map_err(|source| LakeError::Engine {
+                context: format!("scan of \"{key}\""),
+                source,
+            })?;
+        }
+        return Ok((rows, crate::format::ScanCounters::default()));
+    };
+    let mut present = vec![false; plan.physical_schema.len()];
+    for &index in &plan.decoded {
+        present[index] = true;
+    }
+    let mut rows = 0u64;
+    let (file_rows, counters) = entry.format.scan(
+        &data_file,
+        &plan.decoded,
+        &plan.filters,
+        &mut |_offset, chunk| {
+            // The chunk has either the file's full physical width or just
+            // the requested columns, in order, and a column it did not decode
+            // is a zero-length placeholder (see `DataChunk::projected`). The
+            // projection needs the full physical width.
+            let width = plan.physical_schema.len();
+            let full_width = chunk.columns.len() == width;
+            if !full_width && chunk.columns.len() != plan.decoded.len() {
+                return Err(LakeError::Internal {
+                    message: format!(
+                        "table \"{key}\": data file \"{}\" pushed {} of {width} columns",
+                        file.rel,
+                        chunk.columns.len()
+                    ),
+                });
             }
-        };
-        // A provider that prunes row groups inside a file (wave 102, `.pink`)
-        // returns only the row groups that can match the predicates — never
-        // for a file with deletes (positions must stay aligned). The engine
-        // re-applies the full predicate above the scan, and a pruned load is
-        // never cached, so fewer rows is correct there; every other read must
-        // return exactly the manifest's count.
-        let may_prune_rows = entry.format.prunes_row_groups()
-            && !physical_filters.is_empty()
-            && file.deletes.is_empty();
-        let rows_ok = if may_prune_rows {
-            file_table.num_rows() as u64 <= file.rows
-        } else {
-            file_table.num_rows() as u64 == file.rows
-        };
-        if !rows_ok {
-            return Err(LakeError::Corrupt {
-                path: storage.abs(&file.rel),
-                message: format!(
-                    "table \"{key}\": data file \"{}\" has {} rows, but the manifest says {}",
-                    file.rel,
-                    file_table.num_rows(),
-                    file.rows
-                ),
+            let mut columns = Vec::with_capacity(width);
+            for (index, (name, dtype)) in plan.physical_schema.iter().enumerate() {
+                let held = if full_width {
+                    Some(Arc::clone(&chunk.columns[index]))
+                } else {
+                    plan.decoded
+                        .binary_search(&index)
+                        .ok()
+                        .map(|position| Arc::clone(&chunk.columns[position]))
+                };
+                let vector = match held {
+                    Some(vector) if vector.len() == chunk.num_rows() => vector,
+                    _ => {
+                        let mut vector = pinkdb::Vector::with_capacity(*dtype, chunk.num_rows());
+                        for _ in 0..chunk.num_rows() {
+                            vector.push_null().map_err(|source| LakeError::Engine {
+                                context: format!(
+                                    "building the NULL placeholder of \"{key}\".\"{name}\""
+                                ),
+                                source,
+                            })?;
+                        }
+                        Arc::new(vector)
+                    }
+                };
+                columns.push(
+                    pinkdb::storage::Column::from_chunks(name.clone(), *dtype, None, vec![vector])
+                        .map_err(|source| LakeError::Engine {
+                            context: format!("building column \"{key}\".\"{name}\""),
+                            source,
+                        })?,
+                );
+            }
+            let decoded = DataTable::from_columns(entry.table.clone(), columns, chunk.num_rows())
+                .map_err(|source| LakeError::Engine {
+                context: format!("building table \"{key}\""),
+                source,
+            })?;
+            let (table, _present) = match &entry.record {
+                Some(schema) => {
+                    schema.project_table(&plan.mapping, &decoded, &present, &entry.table)?
+                }
+                None => (decoded, present.clone()),
+            };
+            for index in 0..table.num_chunks() {
+                let out = table
+                    .scan_chunk(index)
+                    .map_err(|source| LakeError::Engine {
+                        context: format!("scan of \"{key}\""),
+                        source,
+                    })?
+                    .ok_or_else(|| LakeError::Internal {
+                        message: format!("chunk {index} of \"{}\" disappeared", file.rel),
+                    })?;
+                rows += out.num_rows() as u64;
+                sink(out).map_err(|source| LakeError::Engine {
+                    context: format!("scan of \"{key}\""),
+                    source,
+                })?;
+            }
+            Ok(())
+        },
+    )?;
+    // The engine re-applies the predicate above the scan, so a pruning
+    // provider may push fewer rows than the manifest lists; without pruning
+    // the count is exact.
+    let may_prune_rows =
+        entry.format.prunes_row_groups() && !plan.filters.is_empty() && file.deletes.is_empty();
+    let rows_ok = if may_prune_rows {
+        rows <= file.rows
+    } else {
+        rows == file.rows
+    };
+    if !rows_ok || rows != file_rows {
+        return Err(LakeError::Corrupt {
+            path: io.storage.abs(&file.rel),
+            message: format!(
+                "table \"{key}\": data file \"{}\" streamed {rows} rows, but the manifest says {}",
+                file.rel, file.rows
+            ),
+        });
+    }
+    Ok((rows, counters))
+}
+
+/// Stream `entry`'s surviving files on at most `crate::parallel_limit()`
+/// workers, pushing each morsel as it decodes. Only called when the caller
+/// does not need row order.
+#[allow(clippy::too_many_arguments)]
+fn stream_files_parallel(
+    io: &FileIo<'_>,
+    entry: &AttachedEntry,
+    files: &[AttachedFile],
+    columns: Option<&[usize]>,
+    predicates: &[pinkdb::attached::PrunePredicate],
+    sink: &mut dyn FnMut(DataChunk) -> std::result::Result<(), PinkDbError>,
+) -> Result<(u64, crate::format::ScanCounters)> {
+    let workers = crate::parallel_limit().clamp(1, files.len().max(1));
+    if workers == 1 {
+        let mut rows = 0u64;
+        let mut counters = crate::format::ScanCounters::default();
+        for file in files {
+            let (file_rows, file_counters) =
+                stream_file(io, entry, file, columns, predicates, &mut *sink)?;
+            rows += file_rows;
+            counters.row_groups += file_counters.row_groups;
+            counters.row_groups_pruned += file_counters.row_groups_pruned;
+            counters.pages += file_counters.pages;
+            counters.pages_pruned += file_counters.pages_pruned;
+        }
+        return Ok((rows, counters));
+    }
+    // The sink is not `Send` (it belongs to the query), so workers push their
+    // morsels through a bounded channel and this thread folds them. The bound
+    // keeps at most `workers` morsels queued, on top of the one each worker
+    // holds mid-decode.
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<DataChunk>(workers);
+    let failure = Mutex::new(None::<PinkDbError>);
+    let totals = Mutex::new((0u64, crate::format::ScanCounters::default()));
+    std::thread::scope(|scope| {
+        for worker in 0..workers {
+            let sender = sender.clone();
+            let failure = &failure;
+            let totals = &totals;
+            scope.spawn(move || {
+                let mut push = |chunk: DataChunk| -> std::result::Result<(), PinkDbError> {
+                    sender.send(chunk).map_err(|_| {
+                        PinkDbError::Execution("lake scan receiver stopped".to_string())
+                    })
+                };
+                for file in files.iter().skip(worker).step_by(workers) {
+                    if failure.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+                        break;
+                    }
+                    match stream_file(io, entry, file, columns, predicates, &mut push) {
+                        Ok((rows, counters)) => {
+                            let mut totals = totals.lock().unwrap_or_else(|p| p.into_inner());
+                            totals.0 += rows;
+                            totals.1.row_groups += counters.row_groups;
+                            totals.1.row_groups_pruned += counters.row_groups_pruned;
+                            totals.1.pages += counters.pages;
+                            totals.1.pages_pruned += counters.pages_pruned;
+                        }
+                        Err(LakeError::Engine { source, .. }) => {
+                            *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(source);
+                            break;
+                        }
+                        Err(other) => {
+                            *failure.lock().unwrap_or_else(|p| p.into_inner()) =
+                                Some(PinkDbError::Execution(other.to_string()));
+                            break;
+                        }
+                    }
+                }
             });
         }
-        let file_table = apply_file_deletes(&file_table, &file.deletes, &key, &file.rel)?;
-        match &entry.record {
-            Some(schema) => {
-                schema.project_table(&mapping, &file_table, &file_present, &entry.table)
+        drop(sender);
+        // Keep draining after a sink failure: a worker blocked on a full
+        // channel would otherwise never reach its end.
+        for chunk in receiver {
+            if failure.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+                continue;
             }
-            None => Ok((file_table, file_present)),
+            if let Err(source) = sink(chunk) {
+                *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(source);
+            }
         }
+    });
+    let failure = failure.into_inner().unwrap_or_else(|p| p.into_inner());
+    if let Some(source) = failure {
+        return Err(LakeError::Engine {
+            context: format!("scan of \"{}\"", entry.key()),
+            source,
+        });
     }
+    let totals = totals.into_inner().unwrap_or_else(|p| p.into_inner());
+    Ok(totals)
 }
 
 /// Decode one data file's projected physical columns through its provider,
@@ -1280,6 +1671,14 @@ fn decode_via_provider(
 ) -> Result<DataTable> {
     let mini = entry.format.read(file)?;
     let (file_db, file_table) = only_table(&mini, file.rel(), root)?;
+    // The lake's readers materialize whole tables (this path is the one that
+    // runs for formats without a projected reader), and `from_columns` folds
+    // statistics over the rows it is handed. The engine `.pink` reader keeps
+    // its data encoded, so decode it here.
+    file_table.decode_all().map_err(|e| LakeError::Engine {
+        context: format!("decoding data file \"{}\"", file.rel()),
+        source: e,
+    })?;
     if !file_db.eq_ignore_ascii_case(&entry.db)
         || !file_table.name.eq_ignore_ascii_case(&entry.table)
     {
@@ -1298,36 +1697,6 @@ fn decode_via_provider(
 /// Swap freshly decoded columns into an already materialized table. The two
 /// tables' chunkings must agree exactly (both come from the same slicing of
 /// the same file list, so they do); a mismatch is an internal error, never a
-/// silently misaligned column.
-fn merge_projected(
-    existing: &DataTable,
-    fresh: &DataTable,
-    columns: &[usize],
-    tablename: &str,
-) -> Result<DataTable> {
-    let rows: Vec<usize> = existing.columns[0].chunks.iter().map(|c| c.len()).collect();
-    let mut merged = existing.columns.clone();
-    for &i in columns {
-        let lens: Vec<usize> = fresh.columns[i].chunks.iter().map(|c| c.len()).collect();
-        if lens != rows {
-            return Err(LakeError::Internal {
-                message: format!(
-                    "projected decode of \"{tablename}\" column {i} produced a different \
-                     chunking ({} vs {} chunks)",
-                    lens.len(),
-                    rows.len()
-                ),
-            });
-        }
-        merged[i] = fresh.columns[i].clone();
-    }
-    Ok(DataTable::from_columns(
-        existing.name.clone(),
-        merged,
-        existing.num_rows,
-    ))
-}
-
 /// One `.pink` file's schema + gated statistics: its published per-file block
 /// (v4), or the entry-level block (v1). Either way the block is CRC-verified
 /// and cross-checked against the entry's key, the file's path and its row
@@ -1957,7 +2326,8 @@ pub(crate) fn build_from(
         files,
         unavailable,
         tables,
-        cache: Mutex::new(HashMap::new()),
+        footers: Mutex::new(HashMap::new()),
+        last_scan: Mutex::new(None),
         loads: AtomicU64::new(0),
         columns_decoded: AtomicU64::new(0),
         files_decoded: AtomicU64::new(0),
@@ -2082,18 +2452,16 @@ mod tests {
         );
         assert_eq!(db.loads(), 0, "COUNT(col) must not decode the data file");
         // A filtered scan of a `.pink` file takes the row-group-pruning path
-        // (wave 102): a pruned load is a subset of rows, so it is never
-        // cached — the next unfiltered query materializes (and caches) the
-        // table once, and later queries reuse it.
+        // (wave 102), and every later data query decodes afresh: the session
+        // no longer keeps a materialized copy of the table (wave 133a).
         let rows = query(&mut store, "SELECT COUNT(*) FROM t WHERE i > 0;");
         assert_eq!(db.loads(), 1);
         assert_eq!(db.files_decoded(), 1, "the one data file decoded");
         assert_eq!(rows, vec![vec![Value::Bigint(1)]]);
         let _ = query(&mut store, "SELECT SUM(i) FROM t;");
-        let materialized = 2;
-        assert_eq!(db.loads(), materialized, "the table is materialized once");
+        assert_eq!(db.loads(), 2, "a data query decodes");
         let _ = query(&mut store, "SELECT MAX(i) + SUM(i) FROM t;");
-        assert_eq!(db.loads(), materialized, "materialized tables are reused");
+        assert_eq!(db.loads(), 3, "nothing is cached between queries");
         // The empty table answers counts and NULL min/max without decoding.
         assert_eq!(
             query(
@@ -2141,7 +2509,7 @@ mod tests {
                 let mut min: Option<Value> = None;
                 let mut max: Option<Value> = None;
                 for row in 0..decoded.num_rows() {
-                    let v = decoded.get(row, i).unwrap();
+                    let v = decoded.get(row, i).unwrap().unwrap();
                     if v.is_null() {
                         nulls += 1;
                         continue;
@@ -2397,13 +2765,14 @@ mod tests {
         assert_eq!(full.num_rows(), 20_000);
         assert!(full.num_chunks() > 1, "the fixture must be multi-chunk");
 
-        // A sparse projection after the full load: nothing new to decode.
+        // A sparse projection after the full load decodes afresh: only the
+        // requested columns hold values, the rest are NULL placeholders.
         let projected = attachment
             .load_projected("main", "t", Some(&[0, 3]))
             .unwrap();
-        assert_eq!(attachment.loads(), 1, "the full load already decoded");
-        assert_eq!(attachment.columns_decoded(), 5);
-        assert_eq!(projected.present, vec![true; 5]);
+        assert_eq!(attachment.loads(), 2, "every load decodes");
+        assert_eq!(attachment.columns_decoded(), 7);
+        assert_eq!(projected.present, vec![true, false, false, true, false]);
         assert_eq!(projected.table.schema(), full.schema());
         assert_eq!(projected.table.num_rows(), full.num_rows());
 
@@ -2420,8 +2789,8 @@ mod tests {
         for j in 0..full.num_chunks() {
             for i in 0..full.num_cols() {
                 assert_eq!(
-                    sparse.table.columns[i].chunks[j].len(),
-                    full.columns[i].chunks[j].len(),
+                    sparse.table.columns[i].chunk_rows(j),
+                    full.columns[i].chunk_rows(j),
                     "chunk {j} column {i} length"
                 );
             }
@@ -2434,7 +2803,10 @@ mod tests {
             (4, true),
         ] {
             for row in 0..full.num_rows() {
-                let (a, b) = (sparse.table.get(row, i).unwrap(), full.get(row, i).unwrap());
+                let (a, b) = (
+                    sparse.table.get(row, i).unwrap().unwrap(),
+                    full.get(row, i).unwrap().unwrap(),
+                );
                 if decoded {
                     match (&a, &b) {
                         (Value::Double(x), Value::Double(y)) => assert_eq!(
@@ -2450,31 +2822,20 @@ mod tests {
             }
         }
 
-        // Extending decodes only the missing columns and keeps the decoded
-        // ones shared (no re-decode, no copy).
+        // A wider projection decodes its columns afresh: nothing is shared
+        // between loads (wave 133a).
         let extended = solo
             .load_projected("main", "t", Some(&[0, 1, 2, 3, 4]))
             .unwrap();
         assert_eq!(solo.loads(), 2);
-        assert_eq!(solo.columns_decoded(), 5);
+        assert_eq!(solo.columns_decoded(), 7);
         assert_eq!(extended.present, vec![true; 5]);
-        for i in [1usize, 4] {
-            for j in 0..full.num_chunks() {
-                assert!(
-                    Arc::ptr_eq(
-                        &sparse.table.columns[i].chunks[j],
-                        &extended.table.columns[i].chunks[j]
-                    ),
-                    "column {i} chunk {j} must be shared across projections"
-                );
-            }
-        }
-        // Every value now equals the full decode bit for bit.
+        // Every value equals the full decode bit for bit.
         for i in 0..full.num_cols() {
             for row in 0..full.num_rows() {
                 let (a, b) = (
-                    extended.table.get(row, i).unwrap(),
-                    full.get(row, i).unwrap(),
+                    extended.table.get(row, i).unwrap().unwrap(),
+                    full.get(row, i).unwrap().unwrap(),
                 );
                 match (&a, &b) {
                     (Value::Double(x), Value::Double(y)) => {
@@ -2503,9 +2864,10 @@ mod tests {
     }
 
     /// The engine's attached scan path drives `load_projected`: each query
-    /// decodes its referenced columns only, extensions are incremental, the
-    /// fast paths decode nothing at all, and every answer equals the
-    /// in-memory execution over the same rows.
+    /// decodes its referenced columns only, the fast paths decode nothing at
+    /// all, and every answer equals the in-memory execution over the same
+    /// rows. Nothing is cached between queries (wave 133a), so a repeated
+    /// column is decoded again — the check is per query, not cumulative.
     #[test]
     fn queries_decode_only_their_referenced_columns() {
         let dir = scratch("projection_queries");
@@ -2520,13 +2882,16 @@ mod tests {
         // The same rows in an ordinary store: the ground-truth answers.
         let mut plain = projection_store();
 
-        let mut check = |store: &mut PinkDb, sql: &str, decoded_after: u64| {
+        let mut total = 0u64;
+        let mut check = |store: &mut PinkDb, sql: &str, decoded: u64| {
+            let before = attachment.columns_decoded();
             let (attached, plain) = (query(store, sql), query(&mut plain, sql));
             assert_eq!(
-                attachment.columns_decoded(),
-                decoded_after,
+                attachment.columns_decoded() - before,
+                decoded,
                 "{sql}: columns decoded"
             );
+            total += decoded;
             assert_same_rows(&attached, &plain, sql);
         };
 
@@ -2543,46 +2908,37 @@ mod tests {
         check(&mut store, "SELECT MIN(d), MAX(d) FROM t;", 1);
         // Each fallback decodes exactly the referenced column; repeats of an
         // already-decoded column decode nothing.
-        check(&mut store, "SELECT SUM(i) FROM t;", 2);
-        check(&mut store, "SELECT AVG(i) FROM t;", 2);
+        check(&mut store, "SELECT SUM(i) FROM t;", 1);
+        check(&mut store, "SELECT AVG(i) FROM t;", 1);
         // A filter decodes the predicate's column. A pruned row-group load
         // is deliberately uncached (its rows are a subset), so it decodes
         // that column again even though the table already has it.
-        check(&mut store, "SELECT COUNT(*) FROM t WHERE i > 0;", 3);
+        check(&mut store, "SELECT COUNT(*) FROM t WHERE i > 0;", 1);
         // Order-by + limit: the sort key and the projected column.
-        check(&mut store, "SELECT g FROM t ORDER BY g DESC LIMIT 3;", 4);
-        check(&mut store, "SELECT v FROM t ORDER BY v LIMIT 5;", 5);
+        check(&mut store, "SELECT g FROM t ORDER BY g DESC LIMIT 3;", 1);
+        check(&mut store, "SELECT v FROM t ORDER BY v LIMIT 5;", 1);
         // GROUP BY aggregate: the key.
         check(
             &mut store,
             "SELECT b, COUNT(*) FROM t GROUP BY b ORDER BY b;",
-            6,
+            1,
         );
-        check(&mut store, "SELECT SUM(i), MIN(g), COUNT(v) FROM t;", 6);
+        check(&mut store, "SELECT SUM(i), MIN(g), COUNT(v) FROM t;", 3);
         // A window over projected columns.
         check(
             &mut store,
             "SELECT i, ROW_NUMBER() OVER (PARTITION BY b ORDER BY i) FROM t LIMIT 5;",
-            6,
+            2,
         );
         // `SELECT *` and expressions over several columns: every column is
         // already in, so nothing decodes.
-        check(&mut store, "SELECT * FROM t ORDER BY i LIMIT 2;", 6);
-        check(&mut store, "SELECT i + g + d FROM t LIMIT 2;", 6);
-        // The counter only ever grows; the decode count stops growing once
-        // every column is materialized.
-        assert_eq!(
-            attachment.loads(),
-            6,
-            "one decode per newly referenced column set (plus the pruned load)"
-        );
-        let loads = attachment.loads();
-        check(&mut store, "SELECT SUM(i), SUM(d) FROM t;", 6);
-        assert_eq!(
-            attachment.loads(),
-            loads,
-            "no decode once every column is in"
-        );
+        check(&mut store, "SELECT * FROM t ORDER BY i LIMIT 2;", 5);
+        check(&mut store, "SELECT i + g + d FROM t LIMIT 2;", 3);
+        // Every column of every query above, decoded afresh: the total is the
+        // sum of the per-query deltas, i.e. no query decoded more than its
+        // referenced columns.
+        assert_eq!(attachment.columns_decoded(), 20);
+        assert_eq!(total, 20);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2628,6 +2984,138 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(err.contains(&t_file), "the error must name {t_file}: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Wave 133a: a streamed scan prunes files from the catalog statistics,
+    /// reports what it read, reads surviving files with bounded parallelism,
+    /// and only keeps file/row order when the caller asks for it.
+    #[test]
+    fn streamed_scans_prune_report_io_bound_parallelism_and_keep_order_on_request() {
+        let dir = scratch("stream");
+        let lake_dir = dir.join("lake");
+        let mut base = PinkDb::new();
+        base.execute("CREATE TABLE t (i INTEGER);").unwrap();
+        {
+            let t = base.table_mut("t").unwrap();
+            for i in 0..4_000 {
+                t.append_row(vec![Value::Integer(i)]).unwrap();
+            }
+        }
+        crate::save_store(&base, &lake_dir).unwrap();
+        let mut lake = Lake::open(&lake_dir).unwrap();
+        lake.set_data_inlining_row_limit(0);
+        for file in 1..4 {
+            let mut rows = DataTable::new(
+                "t".to_string(),
+                vec![("i".to_string(), pinkdb::DataType::Integer)],
+            )
+            .unwrap();
+            for i in 0..4_000 {
+                rows.append_row(vec![Value::Integer(file * 4_000 + i)])
+                    .unwrap();
+            }
+            let mut commit = crate::incremental::Commit::new();
+            commit.append("main.t", Arc::new(rows));
+            lake.commit(&commit).unwrap();
+        }
+        let (attachment, _) = build(&lake, None).unwrap();
+        let table = attachment.tables()[0].clone();
+        assert_eq!(table.rows, 16_000);
+
+        let mut ordered = Vec::new();
+        let (rows, io) = attachment
+            .scan_streamed_io(&table.db, &table.table, None, &[], true, &mut |chunk| {
+                for row in 0..chunk.num_rows() {
+                    ordered.push(chunk.columns[0].get(row));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, 16_000);
+        let expected: Vec<Value> = (0..16_000).map(Value::Integer).collect();
+        assert_eq!(
+            ordered, expected,
+            "ordered output keeps file then row order"
+        );
+        assert_eq!(io.files, 4);
+        assert_eq!(io.files_pruned, 0);
+        assert_eq!(io.requests, 0, "a local lake issues no transport requests");
+        assert_eq!(io.bytes, 0);
+        assert_eq!(
+            attachment.last_scan(),
+            Some(io),
+            "the last scan's accounting stays readable"
+        );
+
+        // Unordered: same rows, read with at most `parallel_limit()` files in
+        // flight. Each worker holds several morsels and the channel is
+        // bounded, so a slow sink keeps every worker in flight.
+        super::inflight::InFlight::reset();
+        let mut unordered = Vec::new();
+        let (rows, io) = attachment
+            .scan_streamed_io(&table.db, &table.table, None, &[], false, &mut |chunk| {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                for row in 0..chunk.num_rows() {
+                    unordered.push(chunk.columns[0].get(row));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, 16_000);
+        assert_eq!(io.files, 4);
+        let limit = crate::parallel_limit();
+        let peak = super::inflight::PEAK.load(Ordering::SeqCst);
+        assert!(
+            peak <= limit,
+            "{peak} files were in flight, the limit is {limit}"
+        );
+        // How many reads overlap at the peak depends on thread scheduling (a
+        // loaded machine reached 3 of 4), so only overlap itself is asserted.
+        assert!(
+            peak > 1,
+            "an unordered scan of several files runs in parallel"
+        );
+        let mut sorted: Vec<i32> = unordered
+            .iter()
+            .map(|value| match value {
+                Value::Integer(i) => *i,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..16_000).collect::<Vec<i32>>());
+
+        // Catalog-side pruning: only the file whose zone map can match is read.
+        let predicates = [pinkdb::attached::PrunePredicate {
+            column: 0,
+            op: pinkdb::attached::PruneOp::GtEq,
+            value: Some(Value::Integer(12_000)),
+            path: None,
+        }];
+        let mut pruned = Vec::new();
+        let (rows, io) = attachment
+            .scan_streamed_io(
+                &table.db,
+                &table.table,
+                None,
+                &predicates,
+                true,
+                &mut |chunk| {
+                    for row in 0..chunk.num_rows() {
+                        pruned.push(chunk.columns[0].get(row));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(io.files, 1, "one file survives the zone map");
+        assert_eq!(io.files_pruned, 3);
+        assert_eq!(rows, 4_000);
+        assert_eq!(
+            pruned,
+            (12_000..16_000).map(Value::Integer).collect::<Vec<Value>>()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

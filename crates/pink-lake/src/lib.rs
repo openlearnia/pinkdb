@@ -13,7 +13,7 @@
 //! ```text
 //! <lake>/
 //!   lake-data.json              this catalog's data-ownership marker
-//!   data/<table>/<uuid>.pink    immutable per-table data files (`PINKDB06`)
+//!   data/<table>/<uuid>.pink    immutable per-table data files (`PINKDB07`)
 //!   data/<table>/<uuid>.pinkdel positional delete files (see delete_file)
 //! ```
 //!
@@ -429,7 +429,7 @@ mod zone;
 
 pub mod replication;
 
-pub use attach::AttachmentReport;
+pub use attach::{AttachmentReport, ScanIo};
 use catalog::{Catalog, DeleteRef, FileFormat, FileRef, PartitionKey, TableEntry};
 pub use cdc::{ChangeKind, ChangeRow};
 pub use crypto::EncryptionKey;
@@ -2182,7 +2182,7 @@ impl Lake {
                 partition: None,
                 row_id_start: None,
                 // Wave 102: the file's footer location, so a reader finds
-                // the footer without probing the file's trailer.
+                // the footer without probing the file's header.
                 footer_offset: footer.map(|f| f.offset),
                 footer_len: footer.map(|f| f.length),
                 footer_crc32c: footer.map(|f| f.crc32c),
@@ -2242,9 +2242,15 @@ impl Lake {
         let mut groups: BTreeMap<Vec<Option<String>>, Vec<usize>> = BTreeMap::new();
         let mut row = 0usize;
         for c in 0..src.num_chunks() {
-            let chunk = src.scan_chunk(c).ok_or_else(|| LakeError::Internal {
-                message: format!("chunk {c} of \"{key}\" disappeared while partitioning"),
-            })?;
+            let chunk = src
+                .scan_chunk(c)
+                .map_err(|e| LakeError::Engine {
+                    context: format!("reading chunk {c} of \"{key}\" while partitioning"),
+                    source: e,
+                })?
+                .ok_or_else(|| LakeError::Internal {
+                    message: format!("chunk {c} of \"{key}\" disappeared while partitioning"),
+                })?;
             for r in 0..chunk.num_rows {
                 let mut label = Vec::with_capacity(plan.len());
                 for (k, idx, dtype) in &plan {
@@ -3426,9 +3432,15 @@ pub(crate) fn only_table<'a>(
 /// for errors.
 pub(crate) fn copy_chunks(src: &DataTable, dst: &mut DataTable, context: &str) -> Result<()> {
     for i in 0..src.num_chunks() {
-        let chunk = src.scan_chunk(i).ok_or_else(|| LakeError::Internal {
-            message: format!("chunk {i} of {context} disappeared while copying"),
-        })?;
+        let chunk = src
+            .scan_chunk(i)
+            .map_err(|e| LakeError::Engine {
+                context: format!("reading chunk {i} of {context}"),
+                source: e,
+            })?
+            .ok_or_else(|| LakeError::Internal {
+                message: format!("chunk {i} of {context} disappeared while copying"),
+            })?;
         dst.append_shared_chunk(&chunk.columns)
             .map_err(|e| LakeError::Engine {
                 context: format!("appending chunk {i} of {context}"),
@@ -3465,7 +3477,7 @@ pub(crate) fn apply_file_deletes(
     let mut by_chunk: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     let mut start = 0usize;
     for c in 0..table.num_chunks() {
-        let len = table.columns[0].chunks[c].len();
+        let len = table.chunk_rows(c);
         for &p in positions {
             let p = p as usize;
             if p >= start && p < start + len {

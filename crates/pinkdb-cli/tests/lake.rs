@@ -727,12 +727,16 @@ fn tampered_data_files_are_clean_cli_errors_and_the_repl_stays_alive() {
         }
         tampers.push(("zeroed window", b));
     }
-    // A broken trailer (the last bytes carry the footer location and magic).
+    // A broken footer (the footer is the file's tail) and a broken header
+    // slot (the magic and the footer location live in the first 8 KiB).
     {
         let mut b = original.clone();
         let last = b.len() - 1;
         b[last] ^= 0xFF;
-        tampers.push(("broken trailer", b));
+        tampers.push(("broken footer", b));
+        let mut b = original.clone();
+        b[0] ^= 0xFF;
+        tampers.push(("broken header slot", b));
     }
 
     let mut saw_error = false;
@@ -1014,7 +1018,8 @@ fn attach_answers_equal_open_and_in_memory() {
 
 /// `pinkdb_lake_decodes()` reports data-file decodes end to end:
 /// statistics-only queries decode nothing, projection pushdown decodes
-/// exactly the referenced columns, and columns already decoded stay cached.
+/// exactly the referenced columns, and nothing is kept between queries
+/// (wave 133a dropped the session's materialized table).
 #[test]
 fn attach_decode_stats_show_projection_pushdown() {
     let dir = scratch("attach_stats");
@@ -1044,7 +1049,7 @@ fn attach_decode_stats_show_projection_pushdown() {
             "decodes: 1 loads, 1 columns, 1 files", // ORDER BY b: b only
             "decodes: 2 loads, 2 columns, 2 files", // + c (the file decodes again)
             "decodes: 3 loads, 3 columns, 3 files", // + a
-            "decodes: 3 loads, 3 columns, 3 files", // SELECT *: everything was cached
+            "decodes: 4 loads, 6 columns, 4 files", // SELECT *: all three columns
         ],
         "{out}"
     );
