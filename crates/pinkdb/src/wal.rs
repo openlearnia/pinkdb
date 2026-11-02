@@ -4982,9 +4982,14 @@ impl PinkDb {
         if truncated > 0 || handle.upgraded_last() {
             mutated = true;
         }
-        // Replay leaves the session wherever the last record did (a logged
-        // `USE` or the start at `main`): later appends must know that.
+        // Replay leaves the replay session wherever the last record did (a
+        // logged `USE` or the start at `main`): later appends must know that.
         handle.set_session_db(db.current_ns());
+        // The opening session itself starts on the store's default database,
+        // like a fresh connection: `USE` is session state, not store state
+        // (DuckDB), so a reopen must not inherit the log's last `USE`.
+        let session = crate::storage::SchemaPath::main(&db.fallback_db());
+        db.set_current_ns(session);
         // Every extension replay loaded is covered by the current WAL
         // generation (the live WAL is exactly what was just replayed): a
         // later record touching it must not emit a redundant prefix.
@@ -6444,6 +6449,19 @@ mod tests {
                     Value::Integer(i) => *i as i64,
                     Value::Bigint(i) => *i,
                     other => panic!("expected an integer, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    fn strings(db: &mut PinkDb, sql: &str) -> Vec<String> {
+        match db.execute(sql).unwrap().pop().unwrap() {
+            QueryResult::Selected { rows, .. } => rows
+                .into_iter()
+                .map(|r| match &r[0] {
+                    Value::Varchar(s) => s.clone(),
+                    other => panic!("expected a string, got {other:?}"),
                 })
                 .collect(),
             other => panic!("expected rows, got {other:?}"),
@@ -8967,6 +8985,57 @@ mod tests {
         );
     }
 
+    /// A reopen starts its session on the store's default database, exactly
+    /// as a fresh connection does: `USE` is session state and is not restored
+    /// from the log, though the log's own `USE` still replays the statements
+    /// that followed it.
+    #[test]
+    fn reopen_starts_in_the_default_database_after_a_logged_use() {
+        let p = tmp_ckpt("opendefault");
+        {
+            let mut db = durable(&p);
+            db.execute("CREATE TABLE s (x INTEGER); CREATE TABLE s2 (x INTEGER);")
+                .unwrap();
+            db.execute("CREATE DATABASE lk;").unwrap();
+            db.execute("USE lk; CREATE TABLE t (a INTEGER);").unwrap();
+            db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
+        }
+        let records = records_of(&wal_path(&p));
+        assert!(
+            records
+                .iter()
+                .any(|r| r.stmts.iter().any(|s| s.eq_ignore_ascii_case("USE lk"))),
+            "premise: the log holds the logged `USE`: {records:?}"
+        );
+
+        let mut back = durable(&p);
+        assert_eq!(back.current_db(), "main");
+        assert_eq!(
+            strings(&mut back, "SHOW TABLES;"),
+            vec!["s".to_string(), "s2".to_string()]
+        );
+        // Replay still honoured the logged `USE`: the table is in `lk`.
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM lk.t ORDER BY a;"),
+            vec![1, 2]
+        );
+        // A write in `main` right after the reopen lands in `main` on replay:
+        // the log's session is still `lk`, so the append is `USE`-prefixed.
+        back.execute("INSERT INTO s VALUES (9);").unwrap();
+        // `USE` works again in the reopened session, and its writes replay.
+        back.execute("USE lk; INSERT INTO t VALUES (3);").unwrap();
+        assert_eq!(strings(&mut back, "SHOW TABLES;"), vec!["t".to_string()]);
+        drop(back);
+        let mut again = durable(&p);
+        assert_eq!(again.current_db(), "main");
+        assert_eq!(
+            ints(&mut again, "SELECT a FROM lk.t ORDER BY a;"),
+            vec![1, 2, 3]
+        );
+        assert_eq!(ints(&mut again, "SELECT x FROM main.s;"), vec![9]);
+        cleanup(&p);
+    }
+
     /// A checkpoint publishes state and rolls the WAL: replay of the fresh
     /// generation starts at the checkpoint's session default (the session is
     /// not persisted), so appends after a checkpoint must `USE`-prefix again.
@@ -8988,9 +9057,9 @@ mod tests {
             ints(&mut back, "SELECT a FROM db1.t ORDER BY a;"),
             vec![1, 2]
         );
-        // Replay ends where the log left the session: the post-checkpoint
-        // insert was `USE`-prefixed, so the reopened session is db1.
-        assert_eq!(back.current_db(), "db1");
+        // The replay session ended in db1 (the insert was `USE`-prefixed),
+        // but the reopened session starts on the store's default database.
+        assert_eq!(back.current_db(), "main");
     }
 
     /// Databases created with quoted identifiers (spaces, keywords) must

@@ -23,6 +23,11 @@ keeps one entry per group.
   thread: 47 -> 66 ms). Integer-key aggregates (all of TPC-H) are unchanged,
   and results are bit-identical.
 
+### Fixes ✅
+
+- A reopened store starts in its default database; `USE` is per-connection,
+  as in DuckDB.
+
 ## 2026-11-02
 ### Wave 133 — lake scans stream, prune to pages, and stay within the memory limit ✅
 

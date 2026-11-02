@@ -247,3 +247,44 @@ fn databases_persist_across_save_and_reopen() {
     assert_eq!(out.matches("│ 2       │").count(), 1, "{out}");
     cleanup(&dir);
 }
+
+/// A reopen replays the log's statements, not its session: the REPL starts on
+/// the store's default database, as a fresh connection does, while the logged
+/// `USE` still sends the statements that followed it to the right database.
+#[test]
+fn a_reopened_store_starts_in_its_default_database() {
+    let dir = scratch("reopenuse");
+    let ckpt = dir.join("use.pink");
+    let path = ckpt.to_str().unwrap();
+    let cmds = format!(
+        ".open {path}\n\
+         CREATE TABLE s (x INTEGER);\n\
+         CREATE DATABASE lk;\n\
+         CREATE TABLE lk.t (x INTEGER);\n\
+         INSERT INTO lk.t VALUES (1);\n\
+         USE lk;\n\
+         .quit\n"
+    );
+    let out = run(&cmds);
+    assert!(!out.contains("Error"), "{out}");
+
+    let cmds = format!(
+        ".open {path}\n\
+         SELECT current_database();\n\
+         SHOW TABLES;\n\
+         .tables\n\
+         USE lk;\n\
+         SELECT x FROM t;\n\
+         .quit\n"
+    );
+    let out = run(&cmds);
+    assert!(!out.contains("Error"), "{out}");
+    // The new session is on main, and lists main's table, not lk's.
+    assert_eq!(out.matches("│ main").count(), 1, "{out}");
+    assert!(out.contains("s (0 rows)"), "{out}");
+    assert!(!out.contains("t (1 rows)"), "{out}");
+    // `USE` works again in the reopened session.
+    assert!(out.contains("Using lk.main."), "{out}");
+    assert_eq!(out.matches("│ 1       │").count(), 1, "{out}");
+    cleanup(&dir);
+}

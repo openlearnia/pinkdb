@@ -332,7 +332,14 @@ fn durable_replay_and_checkpoint_keep_quoted_schema_names() {
     }
     {
         let mut db = open(&scratch);
-        assert_eq!(strings(&mut db, "SELECT current_database();"), vec!["cat"]);
+        // A reopen starts on the store's default database: `USE` is session
+        // state, so the quoted schema is re-entered by name.
+        assert_eq!(strings(&mut db, "SELECT current_database();"), vec!["main"]);
+        assert_eq!(strings(&mut db, "SELECT current_schema();"), vec!["main"]);
+        run(&mut db, "USE cat.\"a b\";");
+        assert_eq!(strings(&mut db, "SELECT current_schema();"), vec!["a b"]);
+        assert_eq!(ints(&mut db, "SELECT * FROM t ORDER BY 1;"), vec![1, 2]);
+        run(&mut db, "USE cat.\"x\"\"y\";");
         assert_eq!(strings(&mut db, "SELECT current_schema();"), vec!["x\"y"]);
         assert_eq!(
             ints(&mut db, "SELECT * FROM cat.\"a b\".t ORDER BY 1;"),
@@ -373,10 +380,13 @@ fn durable_replay_of_qualified_macro_calls() {
     }
     {
         let mut db = open(&scratch);
-        assert_eq!(ints(&mut db, "SELECT s.m(41);"), vec![42]);
+        assert_eq!(strings(&mut db, "SELECT current_database();"), vec!["main"]);
         assert_eq!(ints(&mut db, "SELECT cat.s.m(41);"), vec![42]);
-        assert_eq!(ints(&mut db, "SELECT v FROM s.tm();"), vec![7]);
         assert_eq!(ints(&mut db, "SELECT v FROM cat.s.tm();"), vec![7]);
+        // `USE` is session state: the reopened session enters `cat` again.
+        run(&mut db, "USE cat;");
+        assert_eq!(ints(&mut db, "SELECT s.m(41);"), vec![42]);
+        assert_eq!(ints(&mut db, "SELECT v FROM s.tm();"), vec![7]);
         db.checkpoint().unwrap();
     }
     {
