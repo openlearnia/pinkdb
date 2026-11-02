@@ -153,6 +153,11 @@ fn push_value(out: &mut String, v: &Value) {
         | Value::Uuid(_) => {
             push_json_string(out, &v.to_string());
         }
+        // The JSON ABI has no 128-bit integer kind yet (step 6 of the HUGEINT
+        // plan); `pw_execute` refuses such a result instead of rounding it.
+        Value::Hugeint(_) | Value::Uhugeint(_) => {
+            unreachable!("pw_execute refuses 128-bit integer results")
+        }
     }
 }
 
@@ -315,6 +320,16 @@ fn push_result(out: &mut String, r: &QueryResult) {
 }
 
 /// `{"ok":true,"results":[...]}` for a successful execution.
+fn wide_type_in(results: &[QueryResult]) -> Option<String> {
+    results.iter().find_map(|r| match r {
+        QueryResult::Selected { types, .. } => types
+            .iter()
+            .find(|t| matches!(t, pinkdb::DataType::Hugeint | pinkdb::DataType::Uhugeint))
+            .map(|t| format!("{} is not yet supported in the WASM binding", t.name())),
+        _ => None,
+    })
+}
+
 fn results_json(results: &[QueryResult]) -> String {
     let mut out = String::from("{\"ok\":true,\"results\":[");
     for (i, r) in results.iter().enumerate() {
@@ -457,7 +472,10 @@ pub extern "C" fn pw_exec(handle: u32, sql: *const u8, len: u32) -> *mut u8 {
         };
         match with_db(handle, |db| db.execute(sql)) {
             None => error_json(&format!("unknown handle {handle}")),
-            Some(Ok(results)) => results_json(&results),
+            Some(Ok(results)) => match wide_type_in(&results) {
+                Some(e) => error_json(&e),
+                None => results_json(&results),
+            },
             Some(Err(e)) => error_json(&e.to_string()),
         }
     }))
@@ -536,6 +554,19 @@ mod tests {
         let mut out = String::new();
         push_value(&mut out, v);
         out
+    }
+
+    #[test]
+    fn hugeint_results_name_the_binding_boundary() {
+        let results = [QueryResult::Selected {
+            names: vec!["h".to_string()],
+            types: vec![pinkdb::DataType::Hugeint],
+            rows: Vec::new(),
+        }];
+        assert_eq!(
+            wide_type_in(&results).as_deref(),
+            Some("HUGEINT is not yet supported in the WASM binding")
+        );
     }
 
     #[test]

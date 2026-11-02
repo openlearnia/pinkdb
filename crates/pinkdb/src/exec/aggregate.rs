@@ -93,6 +93,14 @@ pub(crate) fn encode_value(buf: &mut Vec<u8>, v: &Value) {
             buf.push(11);
             a.hash_key(buf);
         }
+        Value::Hugeint(x) => {
+            buf.push(13);
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::Uhugeint(x) => {
+            buf.push(14);
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
     }
 }
 
@@ -1235,6 +1243,9 @@ fn compare_cell(data: &VectorData, i: usize, c: &Value) -> std::cmp::Ordering {
             };
             crate::types::interval_cmp(d[i], y)
         }
+        (VectorData::Uuid(d), Value::Uuid(y)) => d[i].cmp(y),
+        (VectorData::Int128(d), Value::Hugeint(y)) => d[i].cmp(y),
+        (VectorData::UInt128(d), Value::Uhugeint(y)) => d[i].cmp(y),
         _ => compare_values(&cell_value(data, i), c),
     }
 }
@@ -1257,6 +1268,8 @@ fn cell_value(data: &VectorData, i: usize) -> Value {
         },
         VectorData::Variant(d) => Value::Variant(std::sync::Arc::clone(&d[i])),
         VectorData::Uuid(d) => Value::Uuid(d[i]),
+        VectorData::Int128(d) => Value::Hugeint(d[i]),
+        VectorData::UInt128(d) => Value::Uhugeint(d[i]),
         VectorData::Array {
             elem,
             len,

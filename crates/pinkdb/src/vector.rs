@@ -46,6 +46,10 @@ pub enum VectorData {
     },
     /// UUID: the unsigned 128-bit values.
     Uuid(Vec<u128>),
+    /// Signed 128-bit integers (`HUGEINT`).
+    Int128(Vec<i128>),
+    /// Unsigned 128-bit integers (`UHUGEINT`).
+    UInt128(Vec<u128>),
 }
 
 /// Bit `i` of an optional element bitmap; no bitmap means every element is
@@ -141,6 +145,8 @@ impl VectorData {
                 len: *len,
             },
             VectorData::Uuid(_) => DataType::Uuid,
+            VectorData::Int128(_) => DataType::Hugeint,
+            VectorData::UInt128(_) => DataType::Uhugeint,
         }
     }
 
@@ -165,6 +171,8 @@ impl VectorData {
             // Rows, like every other variant; `len` is never zero.
             VectorData::Array { len, values, .. } => values.len() / *len as usize,
             VectorData::Uuid(v) => v.len(),
+            VectorData::Int128(v) => v.len(),
+            VectorData::UInt128(v) => v.len(),
         }
     }
 
@@ -191,6 +199,8 @@ impl VectorData {
                 valid: None,
             },
             DataType::Uuid => VectorData::Uuid(Vec::with_capacity(cap)),
+            DataType::Hugeint => VectorData::Int128(Vec::with_capacity(cap)),
+            DataType::Uhugeint => VectorData::UInt128(Vec::with_capacity(cap)),
         }
     }
 }
@@ -333,6 +343,8 @@ impl Vector {
                 )
             }
             Value::Uuid(bits) => (VectorData::Uuid(vec![*bits; n]), true),
+            Value::Hugeint(x) => (VectorData::Int128(vec![*x; n]), true),
+            Value::Uhugeint(x) => (VectorData::UInt128(vec![*x; n]), true),
         };
         let mut validity = vec![if all_valid { u64::MAX } else { 0 }; mask_len(n)];
         if all_valid && !n.is_multiple_of(64) {
@@ -388,6 +400,8 @@ impl Vector {
                 }
             }
             VectorData::Uuid(v) => v.push(0),
+            VectorData::Int128(v) => v.push(0),
+            VectorData::UInt128(v) => v.push(0),
         }
     }
 
@@ -521,6 +535,8 @@ impl Vector {
                 Value::Array(Arc::new(cell))
             }
             VectorData::Uuid(v) => Value::Uuid(v[idx]),
+            VectorData::Int128(v) => Value::Hugeint(v[idx]),
+            VectorData::UInt128(v) => Value::Uhugeint(v[idx]),
         }
     }
 
@@ -606,6 +622,8 @@ impl Vector {
                 array_push_cell(*elem, *len, values, valid, &x)?;
             }
             (VectorData::Uuid(v), Value::Uuid(bits)) => v.push(bits),
+            (VectorData::Int128(v), Value::Hugeint(x)) => v.push(x),
+            (VectorData::UInt128(v), Value::Uhugeint(x)) => v.push(x),
             (data, other) => {
                 return Err(PinkDbError::Type(format!(
                     "type mismatch: cannot push {other} into {:?} vector",
@@ -716,6 +734,17 @@ impl Vector {
         Ok(())
     }
 
+    /// Typed HUGEINT append.
+    pub(crate) fn push_i128(&mut self, x: i128) -> Result<()> {
+        self.check_room()?;
+        match &mut self.data {
+            VectorData::Int128(v) => v.push(x),
+            data => return Err(typed_push_error("a hugeint", data.dtype())),
+        }
+        self.finish_typed_push();
+        Ok(())
+    }
+
     /// Shared tail of the typed push helpers: bump `len`, mark the new row valid.
     fn finish_typed_push(&mut self) {
         self.len += 1;
@@ -765,6 +794,12 @@ impl Vector {
                 d.extend(s[start..start + len].iter().cloned());
             }
             (VectorData::Uuid(d), VectorData::Uuid(s)) => {
+                d.extend_from_slice(&s[start..start + len]);
+            }
+            (VectorData::Int128(d), VectorData::Int128(s)) => {
+                d.extend_from_slice(&s[start..start + len]);
+            }
+            (VectorData::UInt128(d), VectorData::UInt128(s)) => {
                 d.extend_from_slice(&s[start..start + len]);
             }
             (
@@ -862,6 +897,8 @@ impl Vector {
             }
             (VectorData::Variant(v), Value::Variant(x)) => v[idx] = x,
             (VectorData::Uuid(v), Value::Uuid(bits)) => v[idx] = bits,
+            (VectorData::Int128(v), Value::Hugeint(x)) => v[idx] = x,
+            (VectorData::UInt128(v), Value::Uhugeint(x)) => v[idx] = x,
             (
                 VectorData::Array {
                     elem,
@@ -1027,6 +1064,14 @@ impl Vector {
                 buf.push(12);
                 buf.extend_from_slice(&v[idx].to_le_bytes());
             }
+            VectorData::Int128(v) => {
+                buf.push(13);
+                buf.extend_from_slice(&v[idx].to_le_bytes());
+            }
+            VectorData::UInt128(v) => {
+                buf.push(14);
+                buf.extend_from_slice(&v[idx].to_le_bytes());
+            }
         }
     }
     /// Copy element `idx` from `other` into `self` (for UPDATE-adjacent
@@ -1058,6 +1103,8 @@ impl Vector {
             (VectorData::Interval(d), VectorData::Interval(s)) => d.push(s[idx]),
             (VectorData::Variant(d), VectorData::Variant(s)) => d.push(Arc::clone(&s[idx])),
             (VectorData::Uuid(d), VectorData::Uuid(s)) => d.push(s[idx]),
+            (VectorData::Int128(d), VectorData::Int128(s)) => d.push(s[idx]),
+            (VectorData::UInt128(d), VectorData::UInt128(s)) => d.push(s[idx]),
             (
                 VectorData::Array {
                     elem,
@@ -1209,6 +1256,8 @@ impl Vector {
                 |x: &Arc<crate::variant::Variant>| Arc::clone(x)
             )),
             VectorData::Uuid(_) => VectorData::Uuid(gather!(Uuid, 0, |x: &u128| *x)),
+            VectorData::Int128(_) => VectorData::Int128(gather!(Int128, 0, |x: &i128| *x)),
+            VectorData::UInt128(_) => VectorData::UInt128(gather!(UInt128, 0, |x: &u128| *x)),
             VectorData::Array { .. } => return per_row(),
         };
         let mut validity = vec![0u64; mask_len(n)];
@@ -1267,6 +1316,12 @@ impl Vector {
                 VectorData::Variant(selection.iter().map(|i| Arc::clone(&v[pick(i)])).collect())
             }
             VectorData::Uuid(v) => VectorData::Uuid(selection.iter().map(|i| v[pick(i)]).collect()),
+            VectorData::Int128(v) => {
+                VectorData::Int128(selection.iter().map(|i| v[pick(i)]).collect())
+            }
+            VectorData::UInt128(v) => {
+                VectorData::UInt128(selection.iter().map(|i| v[pick(i)]).collect())
+            }
             VectorData::Array { .. } => {
                 let mut out = Vector::with_capacity(self.dtype(), n);
                 for i in selection {
@@ -1523,6 +1578,33 @@ mod tests {
         let mut v = Vector::new_empty(DataType::Varchar);
         let err = v.push_valid(Value::Integer(1)).unwrap_err();
         assert!(matches!(err, PinkDbError::Type(_)));
+    }
+
+    #[test]
+    fn hugeint_vectors_push_get_and_copy_all_128_bits() {
+        let mut v = Vector::new_empty(DataType::Hugeint);
+        v.push_i128(i128::MIN).unwrap();
+        v.push_null().unwrap();
+        v.push_valid(Value::Hugeint(1)).unwrap();
+        assert_eq!(v.dtype(), DataType::Hugeint);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v.get(0), Value::Hugeint(i128::MIN));
+        assert_eq!(v.get(1), Value::Null);
+        assert_eq!(v.get(2), Value::Hugeint(1));
+        // Key bytes: tag 13 then the full little-endian payload.
+        let mut buf = Vec::new();
+        v.encode_into(&mut buf, 2);
+        assert_eq!(buf, [13, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // Copying must keep the high half, not just the low 64 bits.
+        let mut copy = Vector::new_empty(DataType::Hugeint);
+        copy.extend_from(&v, 0, 3);
+        assert_eq!(copy.get(0), Value::Hugeint(i128::MIN));
+        assert!(copy.is_null(1));
+        assert_eq!(copy.gather(&[2, 0]).get(1), Value::Hugeint(i128::MIN));
+        // A constant UHUGEINT vector carries the top bit too.
+        let wide = Vector::new_const(&Value::Uhugeint(u128::MAX), 2);
+        assert_eq!(wide.dtype(), DataType::Uhugeint);
+        assert_eq!(wide.get(1), Value::Uhugeint(u128::MAX));
     }
 
     #[test]

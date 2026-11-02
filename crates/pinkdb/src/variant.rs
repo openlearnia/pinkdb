@@ -1435,6 +1435,15 @@ pub fn from_value(v: &Value) -> Result<Variant> {
         Value::Decimal {
             value: x, scale, ..
         } => Variant::Decimal(*x, *scale),
+        // The decimal kind holds a HUGEINT exactly; UHUGEINT values above
+        // `i128::MAX` have no VARIANT kind until step 8.
+        Value::Hugeint(x) => Variant::Decimal(*x, 0),
+        Value::Uhugeint(x) => Variant::Decimal(
+            i128::try_from(*x).map_err(|_| {
+                PinkDbError::Execution(format!("cannot CAST {x} to VARIANT: out of range"))
+            })?,
+            0,
+        ),
         Value::Varchar(s) => {
             return from_json_str(s).map_err(|e| {
                 PinkDbError::Execution(format!("cannot CAST VARCHAR to VARIANT: {e}"))

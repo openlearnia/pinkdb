@@ -1028,6 +1028,7 @@ impl DataTable {
                 v @ (Value::Varchar(_)
                 | Value::Integer(_)
                 | Value::Bigint(_)
+                | Value::Hugeint(_)
                 | Value::Double(_)
                 | Value::Decimal { .. }),
                 t @ (DataType::Boolean
@@ -1035,7 +1036,8 @@ impl DataTable {
                 | DataType::Bigint
                 | DataType::Double
                 | DataType::Date
-                | DataType::Timestamp),
+                | DataType::Timestamp
+                | DataType::Hugeint),
             ) if matches!(v, Value::Varchar(_))
                 || !matches!(t, DataType::Boolean | DataType::Date | DataType::Timestamp) =>
             {

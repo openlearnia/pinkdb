@@ -377,6 +377,12 @@ pub(crate) fn value_literal(value: &Value) -> Result<String> {
         // through `ArrayValue::parse`. The element kind and length ride the
         // CAST's target type, so the text carries no type of its own.
         Value::Array(a) => format!("CAST('{}' AS {})", a.text().replace('\'', "''"), a.dtype()),
+        // A bare 128-bit literal would re-parse as a narrower integer, and
+        // the negative extreme cannot be written as `-<digits>` at all, so
+        // pin the type and route the extreme through its text form.
+        Value::Hugeint(x) if *x == i128::MIN => format!("CAST('{x}' AS HUGEINT)"),
+        Value::Hugeint(x) => format!("CAST({x} AS HUGEINT)"),
+        Value::Uhugeint(x) => format!("CAST({x} AS UHUGEINT)"),
     })
 }
 

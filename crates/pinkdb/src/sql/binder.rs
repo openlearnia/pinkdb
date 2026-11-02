@@ -848,12 +848,14 @@ fn fixed_operand_dtype(op: BinaryOp, other: DataType) -> Option<DataType> {
 
 /// DECIMAL `(precision, scale)` of a value operand: DECIMAL keeps its own,
 /// INTEGER/BIGINT widen like DuckDB (`INTEGER → DECIMAL(10,0)`,
-/// `BIGINT → DECIMAL(19,0)`); anything else (DOUBLE) is not decimal-exact.
+/// `BIGINT → DECIMAL(19,0)`, `HUGEINT → DECIMAL(38,0)`); anything else
+/// (DOUBLE) is not decimal-exact.
 pub(crate) fn decimal_operand_width(t: DataType) -> Option<(u8, u8)> {
     match t {
         DataType::Decimal { precision, scale } => Some((precision, scale)),
         DataType::Integer => Some((10, 0)),
         DataType::Bigint => Some((19, 0)),
+        DataType::Hugeint => Some((DECIMAL_MAX_PRECISION, 0)),
         _ => None,
     }
 }
@@ -890,6 +892,9 @@ pub(crate) fn common_numeric(a: DataType, b: DataType) -> Result<DataType> {
             let wb = decimal_operand_width(b).expect("numeric without a decimal width");
             decimal_common(wa, wb)
         }
+        (DataType::Hugeint, _) | (_, DataType::Hugeint) => DataType::Hugeint,
+        // HUGEINT wins over every narrower integer, and loses to DOUBLE and
+        // DECIMAL (the arms above).
         (DataType::Bigint, _) | (_, DataType::Bigint) => DataType::Bigint,
         _ => DataType::Integer,
     })
@@ -1467,19 +1472,22 @@ fn cast_decimal_literal_to_column(l: BoundExpr, r: BoundExpr) -> (BoundExpr, Bou
     (l, r)
 }
 
-/// A string literal compared with a UUID is that UUID's text: DuckDB gives
-/// literals the other operand's type implicitly, and every other pair still
-/// has to agree.
+/// A string literal compared with a UUID or a 128-bit integer is that value's
+/// text: DuckDB gives literals the other operand's type implicitly, and every
+/// other pair still has to agree.
 fn cast_uuid_literal(l: BoundExpr, r: BoundExpr) -> (BoundExpr, BoundExpr) {
     let cast = |e: BoundExpr, t: DataType| BoundExpr::Cast {
         expr: Box::new(e),
         dtype: t,
     };
-    if l.dtype() == DataType::Uuid && matches!(r, BoundExpr::Literal(Value::Varchar(_))) {
-        return (l, cast(r, DataType::Uuid));
+    let text_cmp = |t: DataType| matches!(t, DataType::Uuid | DataType::Hugeint);
+    if text_cmp(l.dtype()) && matches!(r, BoundExpr::Literal(Value::Varchar(_))) {
+        let t = l.dtype();
+        return (l, cast(r, t));
     }
-    if r.dtype() == DataType::Uuid && matches!(l, BoundExpr::Literal(Value::Varchar(_))) {
-        return (cast(l, DataType::Uuid), r);
+    if text_cmp(r.dtype()) && matches!(l, BoundExpr::Literal(Value::Varchar(_))) {
+        let t = r.dtype();
+        return (cast(l, t), r);
     }
     (l, r)
 }
@@ -4879,10 +4887,23 @@ fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
                     "AVG needs a numeric argument".to_string(),
                 ));
             }
+            // The 128-bit accumulator is step 4 of the HUGEINT plan; until
+            // then the aggregate refuses instead of averaging through i64.
+            if matches!(t, DataType::Hugeint | DataType::Uhugeint) {
+                return Err(PinkDbError::Type(format!(
+                    "AVG over {} is not yet supported (step 4 of the HUGEINT plan)",
+                    t.name()
+                )));
+            }
             Ok(DataType::Double)
         }
         AggFunc::Sum => match arg.expect("sum has an arg") {
             DataType::Integer | DataType::Bigint => Ok(DataType::Bigint),
+            // Step 4 gives SUM a 128-bit accumulator and a HUGEINT result.
+            DataType::Hugeint | DataType::Uhugeint => Err(PinkDbError::Type(format!(
+                "SUM over {} is not yet supported (step 4 of the HUGEINT plan)",
+                arg.expect("sum has an arg").name()
+            ))),
             DataType::Double => Ok(DataType::Double),
             // SUM(DECIMAL(p,s)) → DECIMAL(38,s) with a runtime overflow check
             // (DuckDB).
@@ -10428,6 +10449,7 @@ fn can_assign(from: DataType, to: DataType) -> bool {
             DataType::Boolean
                 | DataType::Integer
                 | DataType::Bigint
+                | DataType::Hugeint
                 | DataType::Double
                 | DataType::Decimal { .. }
                 | DataType::Date
@@ -10439,7 +10461,11 @@ fn can_assign(from: DataType, to: DataType) -> bool {
     let numeric = |t: DataType| {
         matches!(
             t,
-            DataType::Integer | DataType::Bigint | DataType::Double | DataType::Decimal { .. }
+            DataType::Integer
+                | DataType::Bigint
+                | DataType::Hugeint
+                | DataType::Double
+                | DataType::Decimal { .. }
         )
     };
     DataTable::can_coerce(from, to)
@@ -14094,6 +14120,8 @@ fn duckdb_data_type_id(dtype: DataType) -> i64 {
         DataType::Array { .. } => 108,
         // DuckDB's LogicalTypeId::UUID.
         DataType::Uuid => 54,
+        DataType::Uhugeint => 49,
+        DataType::Hugeint => 50,
         DataType::Variant => 109,
     }
 }

@@ -3132,6 +3132,12 @@ pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         ),
         // UUID: DuckDB orders them by their unsigned 128-bit value.
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
+        // 128-bit integers: `wide_cmp` normalizes the sign/width promotion,
+        // so every pairing with a narrower number agrees with the kernels.
+        (Value::Hugeint(_) | Value::Uhugeint(_), _)
+        | (_, Value::Hugeint(_) | Value::Uhugeint(_)) => {
+            wide_cmp(a, b).unwrap_or_else(|| format!("{a:?}").cmp(&format!("{b:?}")))
+        }
         // VARIANT: the documented cross-kind total order (`variant::cmp`),
         // which is also its equality and its hash key.
         (Value::Variant(x), Value::Variant(y)) => crate::variant::cmp(x, y),
@@ -3171,6 +3177,69 @@ pub(crate) fn num_cmp(x: f64, y: f64) -> std::cmp::Ordering {
     // `is_nan` ordering gives NaN == NaN and NaN > non-NaN.
     x.partial_cmp(&y)
         .unwrap_or_else(|| x.is_nan().cmp(&y.is_nan()))
+}
+
+/// Order two values when at least one is a 128-bit integer and the other is
+/// an integer, DOUBLE or DECIMAL.
+///
+/// Signed/unsigned promotion follows DuckDB's `MaxLogicalType`: a negative
+/// HUGEINT sorts below every UHUGEINT, and same-signedness values compare as
+/// their exact 128-bit values. DECIMAL is exact at scale 0 for HUGEINT; a
+/// UHUGEINT can exceed `i128`, so it compares through DOUBLE like DuckDB's
+/// UHUGEINT/DECIMAL promotion.
+fn wide_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let int128 = |v: &Value| -> Option<(bool, u128)> {
+        match v {
+            Value::Integer(i) => Some((false, *i as i128 as u128)),
+            Value::Bigint(i) => Some((false, *i as i128 as u128)),
+            Value::Hugeint(i) => Some((false, *i as u128)),
+            Value::Uhugeint(u) => Some((true, *u)),
+            _ => None,
+        }
+    };
+    let ord = match (a, b) {
+        (Value::Hugeint(x), Value::Double(y)) => num_cmp(*x as f64, *y),
+        (Value::Double(x), Value::Hugeint(y)) => num_cmp(*x, *y as f64),
+        (Value::Uhugeint(x), Value::Double(y)) => num_cmp(*x as f64, *y),
+        (Value::Double(x), Value::Uhugeint(y)) => num_cmp(*x, *y as f64),
+        (Value::Hugeint(x), Value::Decimal { value, scale, .. }) => {
+            crate::types::decimal_cmp(*x, 0, *value, *scale)
+        }
+        (Value::Decimal { value, scale, .. }, Value::Hugeint(y)) => {
+            crate::types::decimal_cmp(*value, *scale, *y, 0)
+        }
+        (Value::Uhugeint(x), Value::Decimal { value, scale, .. }) => {
+            num_cmp(*x as f64, crate::types::decimal_to_f64(*value, *scale))
+        }
+        (Value::Decimal { value, scale, .. }, Value::Uhugeint(y)) => {
+            num_cmp(crate::types::decimal_to_f64(*value, *scale), *y as f64)
+        }
+        (x, y) => {
+            let (ux, vx) = int128(x)?;
+            let (uy, vy) = int128(y)?;
+            match (ux, uy) {
+                (false, false) => (vx as i128).cmp(&(vy as i128)),
+                (true, true) => vx.cmp(&vy),
+                // Unsigned promotion: a negative signed value is below 0.
+                (false, true) => {
+                    if (vx as i128) < 0 {
+                        Ordering::Less
+                    } else {
+                        vx.cmp(&vy)
+                    }
+                }
+                (true, false) => {
+                    if (vy as i128) < 0 {
+                        Ordering::Greater
+                    } else {
+                        vx.cmp(&vy)
+                    }
+                }
+            }
+        }
+    };
+    Some(ord)
 }
 
 /// A DOUBLE `Value` (the mixed decimal/double comparator's helper; callers

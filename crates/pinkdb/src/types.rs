@@ -174,6 +174,11 @@ pub enum DataType {
     /// 16-byte universally unique identifier, ordered and grouped by its
     /// unsigned 128-bit value (DuckDB's rules).
     Uuid,
+    /// Signed 128-bit integer (DuckDB's `HUGEINT`). Storage, wire and ABI
+    /// support arrives in steps 5–7 of `docs/slt-3-hugeint-plan.md`.
+    Hugeint,
+    /// Unsigned 128-bit integer (DuckDB's `UHUGEINT`); step 8.
+    Uhugeint,
 }
 
 /// Element kind of an [`DataType::Array`]. A small `Copy` enum, not a boxed
@@ -280,6 +285,8 @@ impl DataType {
             DataType::Variant => "VARIANT".to_string(),
             DataType::Array { elem, len } => format!("{}[{len}]", elem.name()),
             DataType::Uuid => "UUID".to_string(),
+            DataType::Hugeint => "HUGEINT".to_string(),
+            DataType::Uhugeint => "UHUGEINT".to_string(),
         }
     }
 
@@ -297,6 +304,8 @@ impl DataType {
             "BOOLEAN" | "BOOL" => Some(DataType::Boolean),
             "INTEGER" | "INT" => Some(DataType::Integer),
             "BIGINT" | "LONG" => Some(DataType::Bigint),
+            "HUGEINT" | "INT128" => Some(DataType::Hugeint),
+            "UHUGEINT" | "UINT128" => Some(DataType::Uhugeint),
             "DOUBLE" | "FLOAT" | "REAL" => Some(DataType::Double),
             // DuckDB's CHAR/CHARACTER/BPCHAR are VARCHAR with the length
             // ignored (measured: `char(1)` and `char(0)` both give VARCHAR).
@@ -364,7 +373,12 @@ impl DataType {
     pub fn is_numeric(self) -> bool {
         matches!(
             self,
-            DataType::Integer | DataType::Bigint | DataType::Double | DataType::Decimal { .. }
+            DataType::Integer
+                | DataType::Bigint
+                | DataType::Hugeint
+                | DataType::Uhugeint
+                | DataType::Double
+                | DataType::Decimal { .. }
         )
     }
 
@@ -438,6 +452,10 @@ pub enum Value {
     Array(std::sync::Arc<crate::array::ArrayValue>),
     /// UUID: the unsigned 128-bit value (see [`crate::uuid`]).
     Uuid(u128),
+    /// Signed 128-bit integer (`HUGEINT`).
+    Hugeint(i128),
+    /// Unsigned 128-bit integer (`UHUGEINT`).
+    Uhugeint(u128),
 }
 
 impl PartialEq for Value {
@@ -472,6 +490,8 @@ impl PartialEq for Value {
             Value::Variant(a) => matches!(other, Value::Variant(b) if a == b),
             Value::Array(a) => matches!(other, Value::Array(b) if a == b),
             Value::Uuid(a) => matches!(other, Value::Uuid(b) if a == b),
+            Value::Hugeint(a) => matches!(other, Value::Hugeint(b) if a == b),
+            Value::Uhugeint(a) => matches!(other, Value::Uhugeint(b) if a == b),
         }
     }
 }
@@ -518,6 +538,8 @@ impl Value {
                 len: a.len() as u32,
             }),
             Value::Uuid(_) => Some(DataType::Uuid),
+            Value::Hugeint(_) => Some(DataType::Hugeint),
+            Value::Uhugeint(_) => Some(DataType::Uhugeint),
         }
     }
 }
@@ -547,6 +569,8 @@ impl fmt::Display for Value {
             Value::Variant(v) => write!(f, "{v}"),
             Value::Array(a) => f.write_str(&a.text()),
             Value::Uuid(bits) => f.write_str(&crate::uuid::format(*bits)),
+            Value::Hugeint(x) => write!(f, "{x}"),
+            Value::Uhugeint(x) => write!(f, "{x}"),
         }
     }
 }
@@ -785,6 +809,16 @@ fn div_pow10_round(v: i128, p: i128) -> Option<i128> {
     }
 }
 
+fn div_pow10_round_u128(v: u128, p: u128) -> Option<u128> {
+    debug_assert!(p > 0);
+    if p == 1 {
+        return Some(v);
+    }
+    let half = p / 2;
+    let (q, r) = (v / p, v % p);
+    Some(if r >= half { q.checked_add(1)? } else { q })
+}
+
 /// Rescale `v / 10^from` to a `to`-digit scale. Scaling up is exact (`None`
 /// on i128 overflow — the caller reports a DECIMAL overflow); scaling down
 /// rounds half away from zero (DuckDB's cast rule).
@@ -980,6 +1014,82 @@ pub fn parse_decimal_str(s: &str, precision: u8, scale: u8) -> std::result::Resu
         ));
     }
     Ok(value)
+}
+
+/// Parse a VARCHAR cell into a HUGEINT with DuckDB's INT128 cast rules:
+/// surrounding whitespace trimmed, `_` separators dropped, `0x`/`0b` strings
+/// read as bit patterns, and a fraction or exponent rounded half away from
+/// zero. The digits never pass through `f64`, so a 39-digit literal keeps
+/// every digit (DuckDB accepts exactly the same range).
+pub fn parse_i128_str(s: &str) -> Option<i128> {
+    let t = s.trim();
+    let (neg, body) = match t.as_bytes().first()? {
+        b'-' => (true, &t[1..]),
+        b'+' => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let body: String = body.chars().filter(|c| *c != '_').collect();
+    // Hex/binary strings are bit patterns, and DuckDB refuses a sign on them
+    // (`'-0x07'::HUGEINT` is a conversion error).
+    let radix = if body.starts_with("0x") || body.starts_with("0X") {
+        Some(16)
+    } else if body.starts_with("0b") || body.starts_with("0B") {
+        Some(2)
+    } else {
+        None
+    };
+    if let Some(radix) = radix {
+        if neg {
+            return None;
+        }
+        return i128::try_from(u128::from_str_radix(&body[2..], radix).ok()?).ok();
+    }
+    let (mantissa, exp) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i32>().ok()?),
+        None => (body.as_str(), 0),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    if (int_part.is_empty() && frac_part.is_empty())
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    // DuckDB scales through a 38-digit decimal, so a positive exponent that
+    // leaves more than 38 fractional digits behind is a conversion error rather
+    // than a rounded value: `'1.<44 digits>1e5'` fails, `'1.<43 digits>1e5'`
+    // rounds (corpus `test_hugeint_exponent`).
+    if exp > 0 && frac_part.len() as i64 - exp as i64 > 38 {
+        return None;
+    }
+    let digits = format!("{int_part}{frac_part}");
+    // The magnitude of INT128's minimum is 2^127, which overflows `i128`, so
+    // the scaling runs in `u128` and only the final sign decides the range.
+    let mut magnitude: u128 = digits.parse().ok()?;
+    // value = digits * 10^exp, where the fraction already moved the point.
+    let exp = exp.checked_sub(frac_part.len() as i32)?;
+    if magnitude != 0 {
+        if exp >= 0 {
+            magnitude = magnitude.checked_mul(10u128.checked_pow(exp as u32)?)?;
+        } else {
+            magnitude = match 10u128.checked_pow(-exp as u32) {
+                Some(p) => div_pow10_round_u128(magnitude, p)?,
+                // 10^39 exceeds u128, so the fraction is below half a unit.
+                None => 0,
+            };
+        }
+    }
+    if neg {
+        if magnitude > 1u128 << 127 {
+            return None;
+        }
+        Some(0u128.wrapping_sub(magnitude) as i128)
+    } else {
+        i128::try_from(magnitude).ok()
+    }
 }
 
 // ---------- interval ----------
@@ -1579,6 +1689,89 @@ mod tests {
         assert_eq!(Value::Null.to_string(), "NULL");
         assert_eq!(Value::Integer(-3).to_string(), "-3");
         assert_eq!(Value::Varchar("hi".to_string()).to_string(), "hi");
+    }
+
+    #[test]
+    fn hugeint_names_values_and_display() {
+        assert_eq!(DataType::from_sql("hugeint"), Some(DataType::Hugeint));
+        assert_eq!(DataType::from_sql("INT128"), Some(DataType::Hugeint));
+        assert_eq!(DataType::from_sql("uhugeint"), Some(DataType::Uhugeint));
+        assert_eq!(DataType::from_sql("UINT128"), Some(DataType::Uhugeint));
+        assert_eq!(DataType::Hugeint.name(), "HUGEINT");
+        assert_eq!(DataType::Hugeint.to_string(), "HUGEINT");
+        assert_eq!(DataType::Uhugeint.name(), "UHUGEINT");
+        assert!(DataType::Hugeint.is_numeric());
+        assert!(DataType::Uhugeint.is_numeric());
+        assert_eq!(
+            Value::Hugeint(i128::MAX).data_type(),
+            Some(DataType::Hugeint)
+        );
+        assert_eq!(
+            Value::Hugeint(i128::MAX).to_string(),
+            "170141183460469231731687303715884105727"
+        );
+        assert_eq!(
+            Value::Hugeint(i128::MIN).to_string(),
+            "-170141183460469231731687303715884105728"
+        );
+        assert_eq!(
+            Value::Uhugeint(u128::MAX).to_string(),
+            "340282366920938463463374607431768211455"
+        );
+        assert_eq!(Value::Hugeint(-1), Value::Hugeint(-1));
+        // `PartialEq` is variant-strict; the cross-width order lives in
+        // `plan::compare_values` (checked below).
+        assert_ne!(Value::Hugeint(1), Value::Bigint(1));
+    }
+
+    #[test]
+    fn hugeint_ordering_includes_the_extremes_and_the_narrower_widths() {
+        use std::cmp::Ordering;
+        let mut v = vec![
+            Value::Hugeint(i128::MAX),
+            Value::Hugeint(i128::MIN),
+            Value::Hugeint(0),
+            Value::Hugeint(-1),
+            Value::Hugeint(1),
+        ];
+        v.sort_by(crate::plan::compare_values);
+        assert_eq!(
+            v,
+            vec![
+                Value::Hugeint(i128::MIN),
+                Value::Hugeint(-1),
+                Value::Hugeint(0),
+                Value::Hugeint(1),
+                Value::Hugeint(i128::MAX),
+            ]
+        );
+        let cmp = crate::plan::compare_values;
+        // The same integer is the same key at every width, so GROUP BY and
+        // DISTINCT agree with the comparison kernels.
+        assert_eq!(cmp(&Value::Hugeint(1), &Value::Integer(1)), Ordering::Equal);
+        assert_eq!(cmp(&Value::Hugeint(1), &Value::Bigint(1)), Ordering::Equal);
+        assert_eq!(
+            cmp(&Value::Uhugeint(1), &Value::Integer(1)),
+            Ordering::Equal
+        );
+        assert_eq!(
+            cmp(&Value::Hugeint(1), &Value::Double(1.0)),
+            Ordering::Equal
+        );
+        assert_eq!(
+            cmp(&Value::Hugeint(1), &Value::decimal(1, 0)),
+            Ordering::Equal
+        );
+        // Unsigned promotion: a negative signed value sorts below every
+        // unsigned one, and above them by magnitude otherwise.
+        assert_eq!(
+            cmp(&Value::Hugeint(-1), &Value::Uhugeint(0)),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp(&Value::Uhugeint(u128::MAX), &Value::Hugeint(i128::MAX)),
+            Ordering::Greater
+        );
     }
 
     #[test]

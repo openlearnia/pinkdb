@@ -331,6 +331,11 @@ fn special_values(dtype: DataType) -> Vec<Value> {
                 ))
             })
             .collect(),
+        // No `engine_types()` entry lists these yet (step 5 of the HUGEINT
+        // plan), so a contract table never carries one.
+        DataType::Hugeint | DataType::Uhugeint => {
+            unreachable!("no 128-bit integer column in a format contract table")
+        }
     }
 }
 
@@ -396,6 +401,10 @@ fn sample_value(dtype: DataType) -> Value {
         DataType::Timestamp => Value::Timestamp(1),
         DataType::Decimal { scale, .. } => Value::decimal(1, scale),
         DataType::Uuid => Value::Uuid(1),
+        // The refusal store holds every engine type, so it needs a value even
+        // for the ones `engine_types()` does not list yet.
+        DataType::Hugeint => Value::Hugeint(1),
+        DataType::Uhugeint => Value::Uhugeint(1),
         DataType::Interval => Value::Interval {
             months: 1,
             days: 2,

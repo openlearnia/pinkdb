@@ -1244,6 +1244,15 @@ fn field_value(text: &str, dtype: DataType) -> Result<Value> {
             .parse::<i64>()
             .map(Value::Bigint)
             .map_err(|_| PinkDbError::Type(format!("cannot parse \"{text}\" as BIGINT")))?,
+        // The CSV reader has no 128-bit integer path yet (step 5 of the
+        // HUGEINT plan); the sniffer never infers it, but a declared column
+        // can name it.
+        DataType::Hugeint | DataType::Uhugeint => {
+            return Err(PinkDbError::Execution(format!(
+                "{} is not yet supported in CSV",
+                dtype.name()
+            )));
+        }
         DataType::Double => text
             .parse::<f64>()
             .map(Value::Double)
@@ -2623,6 +2632,22 @@ mod tests {
 
     fn table_rows(db: &PinkDb, name: &str) -> Vec<Vec<Value>> {
         rows_of(db.table(name).expect("table"))
+    }
+
+    #[test]
+    fn hugeint_cells_name_the_boundary() {
+        let err = field_value("1", DataType::Hugeint).expect_err("no HUGEINT CSV layout yet");
+        assert!(
+            err.to_string()
+                .contains("HUGEINT is not yet supported in CSV"),
+            "{err}"
+        );
+        let err = field_value("1", DataType::Uhugeint).expect_err("no UHUGEINT CSV layout yet");
+        assert!(
+            err.to_string()
+                .contains("UHUGEINT is not yet supported in CSV"),
+            "{err}"
+        );
     }
 
     fn table_types(db: &PinkDb, name: &str) -> Vec<DataType> {

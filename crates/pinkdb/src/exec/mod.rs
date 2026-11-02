@@ -8051,6 +8051,15 @@ fn encode_key_into(v: &Vector, idx: usize, spec: SortSpec, out: &mut Vec<u8>) {
                 out.extend_from_slice(&be);
             }
         }
+        VectorData::Int128(d) => push_be_i128(out, d[idx], desc),
+        VectorData::UInt128(d) => {
+            let be = d[idx].to_be_bytes();
+            if desc {
+                out.extend(be.iter().map(|b| !b));
+            } else {
+                out.extend_from_slice(&be);
+            }
+        }
         // Unreachable: `encode_sort_keys` bails to the `Value` comparator for
         // VARIANT and ARRAY, whose byte order is not their sort order.
         VectorData::Variant(_) => unreachable!("VARIANT sort keys use the Value comparator"),
@@ -9743,6 +9752,58 @@ mod tests {
         assert_send_sync::<DataChunk>();
         assert_send_sync::<Value>();
         assert_send_sync::<QueryResult>();
+    }
+
+    /// Sorting and grouping compare raw key bytes, so the encoding of a
+    /// 128-bit integer must order exactly like `compare_values`: the sign flip
+    /// has to cover all 128 bits, and the unsigned form must leave them alone.
+    #[test]
+    fn wide_integer_key_bytes_order_like_compare_values() {
+        let spec = SortSpec {
+            desc: false,
+            nulls_first: false,
+        };
+        let signed = [i128::MIN, i128::MIN + 1, -1, 0, 1, i128::MAX - 1, i128::MAX];
+        let mut v = Vector::new_empty(DataType::Hugeint);
+        for x in signed {
+            v.push_i128(x).expect("push");
+        }
+        assert_key_order(&v, spec);
+
+        let unsigned = [
+            0u128,
+            1,
+            i128::MAX as u128,
+            i128::MAX as u128 + 1,
+            u128::MAX,
+        ];
+        let mut u = Vector::new_empty(DataType::Uhugeint);
+        for x in unsigned {
+            u.push_valid(Value::Uhugeint(x)).expect("push");
+        }
+        assert_key_order(&u, spec);
+    }
+
+    /// Encode every row, sort by bytes and check the order agrees with the
+    /// value comparator (the invariant GROUP BY and ORDER BY rely on).
+    fn assert_key_order(v: &Vector, spec: SortSpec) {
+        let mut keys: Vec<(Vec<u8>, Value)> = (0..v.len())
+            .map(|i| {
+                let mut key = Vec::new();
+                encode_key_into(v, i, spec, &mut key);
+                (key, v.get(i))
+            })
+            .collect();
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        for pair in keys.windows(2) {
+            assert_eq!(
+                std::cmp::Ordering::Less,
+                crate::plan::compare_values(&pair[0].1, &pair[1].1),
+                "{:?} should sort before {:?}",
+                pair[0].1,
+                pair[1].1
+            );
+        }
     }
 
     /// The bulk write paths' staging: an oversized query chunk is split at the

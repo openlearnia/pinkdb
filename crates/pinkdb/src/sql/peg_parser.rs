@@ -1456,14 +1456,19 @@ fn number_value(text: &str) -> std::result::Result<Value, &'static str> {
 }
 
 /// Integer literal → `Value` with DuckDB's magnitude rule (INTEGER when it
-/// fits i32, else BIGINT); out-of-i64-range text is a parse error, exactly like
-/// the lexer's `Token::Integer` overflow error.
+/// fits i32, BIGINT when it fits i64, else HUGEINT); out-of-i128-range text is
+/// a parse error, exactly like the lexer's `Token::Integer` overflow error.
 fn int_value(text: &str) -> std::result::Result<Value, &'static str> {
-    let n = parse_int(text).ok_or("integer literal out of range")?;
-    if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
-        Ok(Value::Integer(n as i32))
-    } else {
+    let n: i128 = text
+        .replace('_', "")
+        .parse()
+        .map_err(|_| "integer literal out of range")?;
+    if let Ok(n) = i32::try_from(n) {
+        Ok(Value::Integer(n))
+    } else if let Ok(n) = i64::try_from(n) {
         Ok(Value::Bigint(n))
+    } else {
+        Ok(Value::Hugeint(n))
     }
 }
 
@@ -1505,9 +1510,52 @@ fn table_qualifier(qual: Qualifier, is_temp: bool) -> std::result::Result<Qualif
     }
 }
 
+/// Fold a primary's postfix operators left to right.
+fn apply_postfix(e: Expr, rest: Vec<PostfixOp>) -> Expr {
+    rest.into_iter().fold(e, |expr, op| match op {
+        PostfixOp::Cast(dtype) => Expr::Cast {
+            expr: Box::new(expr),
+            dtype,
+        },
+        PostfixOp::Index(i) => Expr::Subscript {
+            base: Box::new(expr),
+            index: Box::new(i),
+        },
+        PostfixOp::Slice(from, to) => Expr::Slice {
+            base: Box::new(expr),
+            from: from.map(Box::new),
+            to: to.map(Box::new),
+        },
+        // `(expr).a` is a field lookup by name: the same node a
+        // `v['a']` subscript builds, so the binder sees one
+        // shape for both spellings.
+        PostfixOp::Field(field) => Expr::Subscript {
+            base: Box::new(expr),
+            index: Box::new(Expr::Literal(Value::Varchar(field))),
+        },
+        // `AT TIME ZONE` is the two-argument `timezone(zone, ts)`
+        // scalar, DuckDB's desugaring (its column titles show
+        // `timezone('UTC', …)` too).
+        PostfixOp::AtTimeZone(zone) => Expr::Function {
+            qual: Box::new(Qualifier::none()),
+            name: "timezone".to_string(),
+            args: vec![zone, expr],
+            distinct: false,
+            filter: None,
+        },
+    })
+}
+
+/// The value of `-<digits>`: the sign is part of the literal, so i128::MIN's
+/// magnitude (which does not fit i128 on its own) parses.
+fn neg_int_literal(text: &str, rest: Vec<PostfixOp>) -> std::result::Result<Expr, &'static str> {
+    let value = int_value(&format!("-{text}"))?;
+    Ok(apply_postfix(Expr::Literal(value), rest))
+}
+
 peg::parser! {
     grammar peg_sql() for str {
-        use super::{apply_cmp, desugar_case, int_value, table_qualifier, CmpTail};
+        use super::{apply_cmp, apply_postfix, desugar_case, int_value, neg_int_literal, table_qualifier, CmpTail};
 
         // Source text between two positions. `DEFAULT` keeps the expression
         // as written for introspection and persistence; the bound expression
@@ -3570,7 +3618,11 @@ peg::parser! {
               }
 
         rule unary() -> Expr
-            = minus() e:unary() { Expr::Unary { op: UnaryOp::Negate, expr: Box::new(e) } }
+            // The minus is part of an integer literal, so the magnitude of
+            // i128::MIN (which does not fit i128 on its own) parses; postfix
+            // casts still bind to the literal (`-5::HUGEINT`).
+            = minus() n:int_text() ws() rest:(op:postfix_op() { op })* {? neg_int_literal(n, rest) }
+            / minus() e:unary() { Expr::Unary { op: UnaryOp::Negate, expr: Box::new(e) } }
             / plus() e:unary() { Expr::Unary { op: UnaryOp::Plus, expr: Box::new(e) } }
             / cast_postfix()
 
@@ -3579,34 +3631,7 @@ peg::parser! {
         /// sit under `unary`, so `-x::INT` is `-(x::INT)`, `a || b::VARCHAR`
         /// casts only `b`, and `v['a'][1]` subscripts the field first).
         rule cast_postfix() -> Expr
-            = e:primary() rest:(op:postfix_op() { op })* {
-                  rest.into_iter().fold(e, |expr, op| match op {
-                      PostfixOp::Cast(dtype) => Expr::Cast { expr: Box::new(expr), dtype },
-                      PostfixOp::Index(i) => Expr::Subscript { base: Box::new(expr), index: Box::new(i) },
-                      PostfixOp::Slice(from, to) => Expr::Slice {
-                          base: Box::new(expr),
-                          from: from.map(Box::new),
-                          to: to.map(Box::new),
-                      },
-                      // `(expr).a` is a field lookup by name: the same node a
-                      // `v['a']` subscript builds, so the binder sees one
-                      // shape for both spellings.
-                      PostfixOp::Field(field) => Expr::Subscript {
-                          base: Box::new(expr),
-                          index: Box::new(Expr::Literal(Value::Varchar(field))),
-                      },
-                      // `AT TIME ZONE` is the two-argument `timezone(zone, ts)`
-                      // scalar, DuckDB's desugaring (its column titles show
-                      // `timezone('UTC', …)` too).
-                      PostfixOp::AtTimeZone(zone) => Expr::Function {
-                          qual: Box::new(Qualifier::none()),
-                          name: "timezone".to_string(),
-                          args: vec![zone, expr],
-                          distinct: false,
-                          filter: None,
-                      },
-                  })
-              }
+            = e:primary() rest:(op:postfix_op() { op })* { apply_postfix(e, rest) }
 
         rule postfix_op() -> PostfixOp
             = dcolon() ty:type_name() { PostfixOp::Cast(ty) }
@@ -5094,8 +5119,8 @@ mod tests {
         "SELECT t.5;",
         "SELECT 5.e2;",
         "SELECT 1.e2;",
-        "SELECT 99999999999999999999;",
-        "SELECT -9223372036854775808;",
+        "SELECT 170141183460469231731687303715884105728;",
+        "SELECT -170141183460469231731687303715884105729;",
         "SELECT `x`;",
         "SELECT 1)",
         "SELECT (1;",
@@ -5371,21 +5396,44 @@ mod tests {
         assert_eq!(lit("SELECT 1E-2;"), Value::Double(0.01));
         assert_eq!(lit("SELECT 0.5E-3;"), Value::Double(0.0005));
         assert_eq!(lit("SELECT 3e2;"), Value::Double(300.0));
-        // i32-fitting integers stay INTEGER, larger ones BIGINT.
+        // i32-fitting integers stay INTEGER, larger ones BIGINT, and past
+        // i64 the cascade ends at HUGEINT (a literal that does not fit i128
+        // is still a parse error: DuckDB would widen it to BIGNUM).
         assert_eq!(lit("SELECT 2147483647;"), Value::Integer(i32::MAX));
         assert_eq!(lit("SELECT 2147483648;"), Value::Bigint(2147483648));
         assert_eq!(lit("SELECT 9223372036854775807;"), Value::Bigint(i64::MAX));
+        assert_eq!(
+            lit("SELECT 9223372036854775808;"),
+            Value::Hugeint(9223372036854775808)
+        );
+        assert_eq!(
+            lit("SELECT 99999999999999999999;"),
+            Value::Hugeint(99999999999999999999)
+        );
+        // The minus folds into the literal, so i64::MIN stays BIGINT and the
+        // signed 128-bit extremes parse.
+        assert_eq!(lit("SELECT -9223372036854775808;"), Value::Bigint(i64::MIN));
+        assert_eq!(
+            lit("SELECT -170141183460469231731687303715884105728;"),
+            Value::Hugeint(i128::MIN)
+        );
+        assert_eq!(
+            lit("SELECT 170141183460469231731687303715884105727;"),
+            Value::Hugeint(i128::MAX)
+        );
+        // A cast after a folded literal still applies to the literal
+        // (the binder keeps `Cast(Literal(...))`; `tests/hugeint.rs` checks
+        // the value it produces).
+        assert!(parse("SELECT -5::HUGEINT;").is_ok());
         // `1.` is not a float (the dot stays a token), a bare exponent marker
-        // is not a number, and out-of-i64-range text is a parse error — so
-        // i64::MIN cannot be spelled as a literal.
+        // is not a number, and text past i128 is a parse error.
         for sql in [
             "SELECT 1.;",
             "SELECT 1.e2;",
             "SELECT 5.;",
             "SELECT 1e+;",
-            "SELECT 9223372036854775808;",
-            "SELECT 99999999999999999999;",
-            "SELECT -9223372036854775808;",
+            "SELECT 170141183460469231731687303715884105728;",
+            "SELECT -170141183460469231731687303715884105729;",
         ] {
             assert!(matches!(parse(sql), Err(PinkDbError::Parse(_))), "{sql}");
         }

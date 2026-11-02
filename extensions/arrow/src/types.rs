@@ -148,6 +148,15 @@ pub fn arrow_type(dtype: DataType) -> Result<ArrowType> {
         DataType::Timestamp => ArrowType::Timestamp(TimeUnit::Microsecond, None),
         DataType::Decimal { precision, scale } => ArrowType::Decimal128(precision, scale as i8),
         DataType::Interval => ArrowType::Interval(IntervalUnit::MonthDayNano),
+        // Arrow can carry a 128-bit integer as Decimal128(38,0), but that
+        // loses the integer type, so the writer refuses instead (step 7 of
+        // the HUGEINT plan).
+        DataType::Hugeint | DataType::Uhugeint => {
+            return Err(PinkDbError::Type(format!(
+                "{} is not yet supported in Arrow",
+                dtype.name()
+            )));
+        }
         DataType::Variant => {
             return Err(PinkDbError::Type(
                 "arrow has no VARIANT type pinkdb can write exactly; the arrow extension \

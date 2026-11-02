@@ -2716,6 +2716,14 @@ fn encode_key(value: &Value, out: &mut Vec<u8>) {
             out.push(12);
             out.extend_from_slice(&bits.to_le_bytes());
         }
+        Value::Hugeint(value) => {
+            out.push(13);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        Value::Uhugeint(value) => {
+            out.push(14);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
     }
 }
 

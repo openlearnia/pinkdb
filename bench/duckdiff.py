@@ -886,6 +886,8 @@ def run_small():
     run_catalog()
     run_defaults()
     run_settings()
+    run_hugeint()
+    run_hugeint_arithmetic()
     run_attach()
     run_arrow()
     run_parquet()
@@ -1550,6 +1552,146 @@ def run_settings():
     print("== settings and dialect battery (slt-2) ==")
     for label, sql, ordered, expect_error in SETTINGS_QUERIES:
         run_case(label, sql, ordered, expect_error, SETTINGS_SETUP, SETTINGS_SETUP)
+
+
+# ---- slt-3: HUGEINT literals, casts, typeof and DESCRIBE ----
+#
+# 128-bit integers are the widest DuckDB integer; the probes pin the width a
+# literal takes, the text/DOUBLE/DECIMAL conversions and their exact refusal
+# paths, so a regression in the promotion table shows up as a value mismatch.
+HUGEINT_SETUP = """
+CREATE TABLE hs (x HUGEINT);
+INSERT INTO hs VALUES (42), (-1), ('1267650600228229401496703205376'),
+    (170141183460469231731687303715884105727),
+    (-170141183460469231731687303715884105728);
+"""
+
+HUGEINT_QUERIES = [
+    # A literal takes the narrowest type that fits; 1e19 passed BIGINT.
+    ("dialect-hugeint-literal-width",
+     "SELECT 1, 10000000000, 10000000000000000000, typeof(1), typeof(10000000000), "
+     "typeof(10000000000000000000);", False, False),
+    ("dialect-hugeint-literals",
+     "SELECT 0::HUGEINT, -0::HUGEINT, 42::HUGEINT, -42::HUGEINT, "
+     "10000000000000000000000000000::HUGEINT;", False, False),
+    ("dialect-hugeint-bounds",
+     "SELECT 170141183460469231731687303715884105727::HUGEINT, "
+     "(-170141183460469231731687303715884105728)::HUGEINT;", False, False),
+    # CAST from text: spaces, a fraction, an exponent and `_` separators.
+    ("dialect-hugeint-text",
+     "SELECT '7'::HUGEINT, '  12  '::HUGEINT, '1.5'::HUGEINT, '3.6e2'::HUGEINT, "
+     "'1_000'::HUGEINT, '0x07'::HUGEINT, '0b101010'::HUGEINT;", False, False),
+    ("dialect-hugeint-text-garbage",
+     "SELECT 'abc'::HUGEINT;", False, True),
+    ("dialect-hugeint-text-range",
+     "SELECT '170141183460469231731687303715884105728'::HUGEINT;", False, True),
+    # DOUBLE rounds half away from zero, like DuckDB, not to even.
+    ("dialect-hugeint-double-rounds",
+     "SELECT 1.9::HUGEINT, -1.9::HUGEINT, 1.5::HUGEINT, 2.5::HUGEINT, "
+     "-2.5::HUGEINT, 1e18::HUGEINT;", False, False),
+    ("dialect-hugeint-double-range",
+     "SELECT 1e300::HUGEINT;", False, True),
+    # The ±2^127 bounds are exclusive for DOUBLE input: 2^127 is exactly
+    # representable as a DOUBLE but is not a HUGEINT DuckDB accepts.
+    ("dialect-hugeint-double-bound",
+     "SELECT (1.7014118346046923e38)::HUGEINT, (-1.7014118346046923e38)::HUGEINT;",
+     False, True),
+    # Text with more fractional digits than DuckDB's 38-digit decimal
+    # intermediate is a conversion error, not a rounding to zero.
+    ("dialect-hugeint-text-precision",
+     "SELECT '" + "1." + "0" * 300 + "1e5'::HUGEINT;", False, True),
+    ("dialect-hugeint-narrows",
+     "SELECT 42::HUGEINT::INTEGER, 42::HUGEINT::BIGINT, 42::HUGEINT::DOUBLE, "
+     "0::HUGEINT::BOOLEAN, 1::HUGEINT::BOOLEAN, (-1)::HUGEINT::BOOLEAN, "
+     "1::HUGEINT::VARCHAR;", False, False),
+    ("dialect-hugeint-narrow-range",
+     "SELECT 100000000000::HUGEINT::INTEGER;", False, True),
+    ("dialect-hugeint-bigint-range",
+     "SELECT 9223372036854775808::HUGEINT::BIGINT;", False, True),
+    # DECIMAL widens exactly; narrowing truncates toward zero and refuses
+    # values DECIMAL(38,s) cannot hold.
+    ("dialect-hugeint-decimal",
+     "SELECT 42::HUGEINT::DECIMAL(38,5), 12.345::DECIMAL(10,3)::HUGEINT, "
+     "(-12.345)::DECIMAL(10,3)::HUGEINT;", False, False),
+    ("dialect-hugeint-decimal-range",
+     "SELECT 170141183460469231731687303715884105727::HUGEINT::DECIMAL(38,1);",
+     False, True),
+    ("dialect-hugeint-typeof",
+     "SELECT typeof(42::HUGEINT), typeof(42::HUGEINT + 1), "
+     "typeof(42::HUGEINT / 2), typeof(min(x)), typeof(max(x)) FROM hs;",
+     False, False),
+    ("dialect-hugeint-describe", "DESCRIBE hs;", True, False),
+    ("dialect-hugeint-column", "SELECT x FROM hs ORDER BY x;", True, False),
+]
+
+
+# ---- slt-3: HUGEINT arithmetic, overflow and comparison ----
+#
+# DuckDB spells 128-bit overflow `Out of Range Error: Overflow in … of INT128`;
+# both sides must refuse the same expressions (and accept the same edges).
+HUGEINT_ARITH_QUERIES = [
+    ("dialect-hugeint-arith",
+     "SELECT 42::HUGEINT + 42::HUGEINT, 100::HUGEINT - 42::HUGEINT, "
+     "-42::HUGEINT + 100::HUGEINT, 3::HUGEINT - 5::HUGEINT, "
+     "-3::HUGEINT - 5::HUGEINT, 12::HUGEINT - (-12)::HUGEINT, "
+     "100::HUGEINT * 50::HUGEINT, -100::HUGEINT * (-50)::HUGEINT, "
+     "100::HUGEINT / 4::HUGEINT, 90::HUGEINT % 20::HUGEINT, "
+     "-90::HUGEINT % 20::HUGEINT, 90::HUGEINT % (-20)::HUGEINT;",
+     False, False),
+    ("dialect-hugeint-arith-wide",
+     "SELECT '1267650600228229401496703205376'::HUGEINT * 2, "
+     "100000000000000000000::HUGEINT + 100000000000000000000::HUGEINT, "
+     "'5'::HUGEINT + '-10000000000000000002'::HUGEINT, "
+     "-10000000000000000002::HUGEINT - (-10000000000000000002)::HUGEINT;",
+     False, False),
+    ("dialect-hugeint-add-overflow",
+     "SELECT 170141183460469231731687303715884105727 + 1;", False, True),
+    ("dialect-hugeint-sub-overflow",
+     "SELECT -170141183460469231731687303715884105728 - 1;", False, True),
+    ("dialect-hugeint-mul-overflow",
+     "SELECT 170141183460469231731687303715884105727 * 2;", False, True),
+    ("dialect-hugeint-mod-zero",
+     "SELECT 5::HUGEINT % 0;", False, True),
+    ("dialect-hugeint-neg-overflow",
+     "SELECT -x FROM hs WHERE x = '-170141183460469231731687303715884105728';",
+     False, True),
+    ("dialect-hugeint-mod-edges",
+     "SELECT 170141183460469231731687303715884105727 % -2, "
+     "-170141183460469231731687303715884105728 % 3, "
+     "170141183460469231731687303715884105727 % "
+     "170141183460469231731687303715884105726;", False, False),
+    ("dialect-hugeint-abs",
+     "SELECT ABS('-1329227995784915872903807060280344576'::HUGEINT), "
+     "ABS(0::HUGEINT), ABS('-100'::HUGEINT);", False, False),
+    ("dialect-hugeint-cmp",
+     "SELECT 1::HUGEINT = 1, 1::HUGEINT = 1.0, 1::HUGEINT < 2, "
+     "1::HUGEINT = 1::BIGINT, 5::HUGEINT <> 5::HUGEINT, "
+     "18446744073709551621::HUGEINT > 5::HUGEINT;", False, False),
+    ("dialect-hugeint-filter",
+     "SELECT x FROM hs WHERE x < '1267650600228229401496703205376' ORDER BY x;",
+     True, False),
+    ("dialect-hugeint-filter-widths",
+     "SELECT COUNT(*) FROM hs WHERE x > 42;", False, False),
+    ("dialect-hugeint-filter-eq",
+     "SELECT COUNT(*) FROM hs WHERE x = 42;", False, False),
+    ("dialect-hugeint-filter-ne",
+     "SELECT COUNT(*) FROM hs WHERE x <> -1;", False, False),
+    ("dialect-hugeint-group",
+     "SELECT x, COUNT(*) FROM hs GROUP BY x ORDER BY x;", True, False),
+    ("dialect-hugeint-minmax", "SELECT MIN(x), MAX(x) FROM hs;", False, False),
+]
+
+
+def run_hugeint():
+    print("== HUGEINT literals, casts and typeof battery (slt-3) ==")
+    for label, sql, ordered, expect_error in HUGEINT_QUERIES:
+        run_case(label, sql, ordered, expect_error, HUGEINT_SETUP, HUGEINT_SETUP)
+
+
+def run_hugeint_arithmetic():
+    print("== HUGEINT arithmetic and comparison battery (slt-3) ==")
+    for label, sql, ordered, expect_error in HUGEINT_ARITH_QUERIES:
+        run_case(label, sql, ordered, expect_error, HUGEINT_SETUP, HUGEINT_SETUP)
 
 
 # ---- unaliased expression names ----
