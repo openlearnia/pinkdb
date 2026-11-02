@@ -9,6 +9,26 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-11-02
+### Wave 133 — lake scans stream, prune to pages, and stay within the memory limit ✅
+
+A query on a lake database reads only what it needs, in parallel, and never
+holds a whole table.
+
+- **Streaming**: every lake scan (plain, aggregate, sort, both join sides,
+  `AT (VERSION => …)`) runs through the pipeline executor one row group at a
+  time; the engine no longer decodes and caches a whole table on first use.
+  Store scans and lake scans share one pull-based source.
+- **Pruning**: files by catalog statistics, row groups by Parquet footers,
+  and pages by the Parquet page index, which pinkdb now writes and reads;
+  projections, filters and join-filter bounds all reach the scan.
+- **Reads**: only the projected columns' byte ranges, coalesced, from local
+  disk or object storage, several files in parallel.
+- **Memory**: decoded lake data is charged to the memory pool like store data,
+  so `memory_limit` bounds a lake query and fails it cleanly when exceeded.
+- **`EXPLAIN ANALYZE`** prints each scan's reads, and `pinkdb_scan_io()` reports
+  the last statement's per-source reads and bytes (replacing
+  `pinkdb_lake_decodes()`).
+
 ### DuckDB's own test corpus, and what it found first ✅
 
 - **`pinkdb-slt`** (`tools/sqllogictest`) runs DuckDB's sqllogictest files
