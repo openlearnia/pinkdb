@@ -388,12 +388,12 @@ pub(crate) fn constant_column(
         }
         chunks.push(std::sync::Arc::new(v));
     }
-    Ok(pinkdb::storage::Column::from_chunks(
-        name.to_string(),
-        dtype,
-        default.cloned(),
-        chunks,
-    ))
+    pinkdb::storage::Column::from_chunks(name.to_string(), dtype, default.cloned(), chunks).map_err(
+        |e| LakeError::Engine {
+            context: format!("building column \"{name}\""),
+            source: e,
+        },
+    )
 }
 
 /// How each *current* column reads from a base-version row (the write-side

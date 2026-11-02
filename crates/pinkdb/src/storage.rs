@@ -59,7 +59,7 @@ pub(crate) fn reset_decode_count() {
 }
 
 /// One column: its schema + its chunk list.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Column {
     pub name: String,
     pub dtype: DataType,
@@ -74,7 +74,11 @@ pub struct Column {
     /// behind a [`ChunkHandle`] so a chunk can be decoded late (or not at all)
     /// without a caller knowing. Read them through [`Column::chunk`],
     /// [`Column::chunk_mut`] and [`Column::chunk_rows`].
-    chunks: Vec<ChunkHandle>,
+    ///
+    /// Each handle is its own `Arc` so the cache can hold a `Weak` to it and
+    /// drop its payload under memory pressure; a snapshot clones the handles
+    /// (sharing the payloads), never the `Arc`s.
+    chunks: Vec<Arc<ChunkHandle>>,
 }
 
 /// The bytes of a `.pink` file a lazily opened store decodes from.
@@ -164,29 +168,82 @@ impl EncodedChunk {
 /// One chunk of a column: its rows, plus where its payload lives.
 ///
 /// A chunk is one encoded page. The `.pink` loader leaves it in the retained
-/// file image (`encoded`) and the first [`Column::chunk`] decodes it into
-/// `decoded`, which the handle keeps. `decoded` is behind a `Mutex` so
-/// `chunk(&self)` can fill it while a scan holds `&Column`; the write path
-/// ([`Column::chunk_mut`]) takes the same lock and then has the only `&mut`.
+/// file image (`encoded`) and the first [`Column::chunk`] decodes it into the
+/// handle's state, which keeps it — and the pool reservation that pays for it
+/// — until the cache drops it again under memory pressure. The state is
+/// behind a `Mutex` so `chunk(&self)` can fill it while a scan holds
+/// `&Column`; the write path ([`Column::chunk_mut`]) takes the same lock.
 pub(crate) struct ChunkHandle {
-    /// The store-image descriptor, while the chunk is still in the image.
+    /// The store-image descriptor of this chunk. It stays: an evicted chunk
+    /// decodes again from here (which re-checks the CRC32C).
     encoded: Option<EncodedChunk>,
-    /// The decoded payload, shared: scans clone the `Arc`, mutations
-    /// copy-on-write it (`Column::chunk_mut`). `None` = still encoded.
-    decoded: Mutex<Option<Arc<Vector>>>,
-    /// The rows differ from the stored form, so a save must re-encode this
-    /// chunk instead of copying its bytes through.
+    /// The decoded side, under one lock so that a check and the drop it
+    /// guards cannot interleave with a decode or a write.
+    state: Mutex<ChunkState>,
+}
+
+/// The decoded side of a [`ChunkHandle`], all under one lock.
+#[derive(Default)]
+struct ChunkState {
+    /// The decoded payload, shared: scans clone the `Arc`. `None` = not
+    /// decoded (yet, or again).
+    payload: Option<ChunkPayload>,
+    /// The payload differs from the stored form, so a save must re-encode
+    /// this chunk instead of copying its bytes through. The cache never evicts
+    /// a dirty chunk, and both the flag and the start of the write are set
+    /// under this lock, so it can never evict one mid-write either.
     dirty: bool,
+}
+
+/// A decoded chunk and the pool reservation that pays for it. The reservation
+/// is shared with a snapshot's copy of the handle: the bytes stay charged
+/// while any handle can still reach them.
+struct ChunkPayload {
+    vector: Arc<Vector>,
+    charge: Arc<crate::memory::Reservation>,
+}
+
+/// What the cache found when it tried to evict one chunk.
+enum Evict {
+    /// Decoded payload dropped, giving the pool back this many bytes.
+    Freed(usize),
+    /// Undecidable now — pinned by a scan, or locked by another thread — so it
+    /// stays a candidate.
+    Busy,
+    /// Never a candidate: dirty, or not backed by the store image.
+    Never,
 }
 
 impl ChunkHandle {
     /// A handle over a payload the caller just built or decoded: nothing on
-    /// disk describes it yet, so it is dirty.
-    fn new(decoded: Arc<Vector>) -> Self {
+    /// disk describes it yet, so it is dirty, and the pool is charged for it
+    /// so the store's real footprint stays visible.
+    fn new(decoded: Arc<Vector>) -> Result<Self> {
+        let charge = crate::memory::reserve(decoded.memory_size())?;
+        Ok(Self {
+            encoded: None,
+            state: Mutex::new(ChunkState {
+                payload: Some(ChunkPayload {
+                    vector: decoded,
+                    charge: Arc::new(charge),
+                }),
+                dirty: true,
+            }),
+        })
+    }
+
+    /// The empty chunk a new (or cleared) column starts with. Nothing to
+    /// charge yet: bytes arrive through `chunk_mut`, which re-charges it.
+    fn empty(dtype: DataType) -> Self {
         Self {
             encoded: None,
-            decoded: Mutex::new(Some(decoded)),
-            dirty: true,
+            state: Mutex::new(ChunkState {
+                payload: Some(ChunkPayload {
+                    vector: Arc::new(Vector::new_empty(dtype)),
+                    charge: Arc::new(crate::memory::Reservation::empty()),
+                }),
+                dirty: true,
+            }),
         }
     }
 
@@ -200,28 +257,66 @@ impl ChunkHandle {
     ) -> Self {
         Self {
             encoded: Some(EncodedChunk::new(image, offset, length, rows)),
-            decoded: Mutex::new(None),
-            dirty: false,
+            state: Mutex::new(ChunkState::default()),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Arc<Vector>>> {
-        self.decoded.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> std::sync::MutexGuard<'_, ChunkState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The decoded payload, decoding it from the store image on first touch.
-    fn get(&self, dtype: DataType) -> Result<Arc<Vector>> {
-        let mut slot = self.lock();
-        if let Some(decoded) = slot.as_ref() {
-            return Ok(Arc::clone(decoded));
+    /// The payload if it is already decoded, marking it dirty for a write
+    /// path.
+    fn decoded(&self, dirty: bool) -> Option<Arc<Vector>> {
+        let mut state = self.lock();
+        let vector = state.payload.as_ref().map(|p| Arc::clone(&p.vector));
+        if vector.is_some() && dirty {
+            state.dirty = true;
         }
-        let encoded = self.encoded.as_ref().ok_or_else(|| {
-            PinkDbError::Execution("corrupt file: a chunk has no payload".to_string())
-        })?;
+        vector
+    }
+
+    /// The payload, decoding it from the store image on first touch (and again
+    /// after the cache evicted it). `dirty` marks a write path's access, which
+    /// also makes the chunk unevictable.
+    ///
+    /// The reservation for the decode is taken *before* the handle is locked:
+    /// a reservation that fails runs the evictor, which locks handles with
+    /// `try_lock`, and must not find this one held by the thread that needs
+    /// the memory.
+    fn get(handle: &Arc<ChunkHandle>, dtype: DataType, dirty: bool) -> Result<Arc<Vector>> {
+        install_evictor();
+        if let Some(vector) = handle.decoded(dirty) {
+            return Ok(vector);
+        }
+        let (rows, length) = match handle.encoded.as_ref() {
+            Some(encoded) => (encoded.rows, encoded.length),
+            None => return Err(missing_payload()),
+        };
+        let mut charge = crate::memory::reserve(decoded_bound(dtype, rows, length as usize))?;
+        let mut state = handle.lock();
+        // Another thread may have decoded the chunk while this one reserved.
+        if let Some(payload) = state.payload.as_ref() {
+            let vector = Arc::clone(&payload.vector);
+            state.dirty |= dirty;
+            return Ok(vector);
+        }
+        let encoded = handle.encoded.as_ref().ok_or_else(missing_payload)?;
         #[cfg(test)]
         DECODES.with(|count| count.set(count.get() + 1));
         let decoded = Arc::new(encoded.decode(dtype)?);
-        *slot = Some(Arc::clone(&decoded));
+        // The bound over-estimates; the charge follows the chunk's real size.
+        charge.resize(decoded.memory_size())?;
+        state.payload = Some(ChunkPayload {
+            vector: Arc::clone(&decoded),
+            charge: Arc::new(charge),
+        });
+        state.dirty |= dirty;
+        // Registered under the handle's lock: an eviction that raced past here
+        // would leave a decoded chunk the cache never sees again.
+        if !dirty {
+            register(&Arc::downgrade(handle));
+        }
         Ok(decoded)
     }
 
@@ -230,8 +325,9 @@ impl ChunkHandle {
     /// bug, not a corrupt file.
     fn decoded_chunk(&self) -> Arc<Vector> {
         self.lock()
+            .payload
             .as_ref()
-            .cloned()
+            .map(|p| Arc::clone(&p.vector))
             .expect("the write path decoded this chunk")
     }
 
@@ -239,44 +335,199 @@ impl ChunkHandle {
     /// through [`Column::chunk_mut`]), a still-encoded one carries the count
     /// the footer recorded. Every column of a table shares the boundaries.
     fn rows(&self) -> usize {
-        match self.lock().as_ref() {
-            Some(decoded) => decoded.len(),
+        match self.lock().payload.as_ref() {
+            Some(payload) => payload.vector.len(),
             None => self.encoded.as_ref().map_or(0, |e| e.rows),
         }
     }
+
+    /// Bring the pool charge up to what the payload holds now. A write path
+    /// grows a chunk in place — a VARCHAR buffer doubles, a preallocated chunk
+    /// fills up — so the size charged when the chunk was built is stale. The
+    /// charge is taken before the write, so it can lag one write behind; the
+    /// budget is approximate by construction (see [`crate::memory`]).
+    fn charge_current(&self) -> Result<()> {
+        let bytes = match self.lock().payload.as_ref() {
+            Some(payload) if payload.vector.memory_size() != payload.charge.bytes() => {
+                payload.vector.memory_size()
+            }
+            _ => return Ok(()),
+        };
+        // Taken before the lock: a failure runs the evictor, which locks
+        // handles with `try_lock` and must not find this one held.
+        let charge = crate::memory::reserve(bytes)?;
+        let mut state = self.lock();
+        let Some(payload) = state.payload.as_mut() else {
+            return Ok(());
+        };
+        // A snapshot may still hold the old charge (and the pre-write payload
+        // it pays for), so it keeps paying it until it drops.
+        let old = std::mem::replace(&mut payload.charge, Arc::new(charge));
+        drop(state);
+        drop(old);
+        Ok(())
+    }
+
+    /// The cache's attempt on this chunk: drop the decoded payload when it is
+    /// clean, still in the image and nobody else holds it. All checks run
+    /// under the lock, so a chunk the write path just marked dirty is never
+    /// dropped out from under the write.
+    fn evict(&self) -> Evict {
+        let Ok(mut state) = self.state.try_lock() else {
+            return Evict::Busy;
+        };
+        if state.dirty || self.encoded.is_none() {
+            return Evict::Never;
+        }
+        let Some(payload) = state.payload.as_ref() else {
+            return Evict::Never;
+        };
+        // Another owner (a scan, a hash-join build, a snapshot) decides what
+        // this chunk's rows are; dropping the payload would not free them.
+        if Arc::strong_count(&payload.vector) != 1 {
+            return Evict::Busy;
+        }
+        let bytes = payload.charge.bytes();
+        let payload = state.payload.take().expect("checked above");
+        // Free the payload outside the handle's lock: it can be a 2048-row
+        // buffer with one allocation per VARCHAR cell.
+        drop(state);
+        drop(payload);
+        Evict::Freed(bytes)
+    }
+
+    /// A snapshot's copy of this handle: it shares the decoded payload (and
+    /// therefore pins it against eviction) instead of copying it.
+    fn duplicate(&self) -> ChunkHandle {
+        let state = self.lock();
+        ChunkHandle {
+            encoded: self.encoded.clone(),
+            state: Mutex::new(ChunkState {
+                payload: state.payload.as_ref().map(|p| ChunkPayload {
+                    vector: Arc::clone(&p.vector),
+                    charge: Arc::clone(&p.charge),
+                }),
+                dirty: state.dirty,
+            }),
+        }
+    }
+}
+
+fn missing_payload() -> PinkDbError {
+    PinkDbError::Execution("corrupt file: a chunk has no payload".to_string())
 }
 
 /// Print the chunk's shape, not its payload (a derived impl would dump values
 /// through every `Debug` of a table, column or query result).
 impl std::fmt::Debug for ChunkHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let decoded = self.lock();
-        let rows = match decoded.as_ref() {
-            Some(decoded) => decoded.len(),
+        let state = self.lock();
+        let rows = match state.payload.as_ref() {
+            Some(payload) => payload.vector.len(),
             None => self.encoded.as_ref().map_or(0, |e| e.rows),
         };
         f.debug_struct("ChunkHandle")
             .field("rows", &rows)
-            .field("decoded", &decoded.as_ref().map(|v| v.len()))
+            .field(
+                "decoded",
+                &state.payload.as_ref().map(|payload| payload.vector.len()),
+            )
             .field(
                 "encoded",
                 &self.encoded.as_ref().map(|e| (e.offset, e.length)),
             )
-            .field("dirty", &self.dirty)
+            .field("dirty", &state.dirty)
+            .field("charged", &state.payload.as_ref().map(|p| p.charge.bytes()))
             .finish()
     }
 }
 
-/// Snapshotting a table clones its handles: the clone shares any decoded
-/// payload and keeps the image descriptor (a `Mutex` has no `Clone`).
-impl Clone for ChunkHandle {
-    fn clone(&self) -> Self {
-        Self {
-            encoded: self.encoded.clone(),
-            decoded: Mutex::new(self.lock().clone()),
-            dirty: self.dirty,
+/// The cache of decoded, clean, lazily backed chunks in decode order, oldest
+/// first: the eviction candidates, weakly held so a dropped column leaves no
+/// trace (and a stale entry is pruned on the next pass).
+static DECODED: Mutex<Vec<std::sync::Weak<ChunkHandle>>> = Mutex::new(Vec::new());
+
+/// Note a just-decoded chunk as a candidate, after the currently oldest.
+fn register(handle: &std::sync::Weak<ChunkHandle>) {
+    let mut lru = DECODED.lock().unwrap_or_else(|e| e.into_inner());
+    lru.push(handle.clone());
+}
+
+/// The pool's evictor (see [`crate::memory::set_evictor`]): drop decoded
+/// chunks that are clean, still backed by the image and unpinned, oldest
+/// first, until `want` bytes are back or nothing is left to drop.
+///
+/// This runs on the thread whose reservation is failing, so it never waits for
+/// a handle: another thread may hold one while it reserves (a chunk growing
+/// after a decode, a write), and blocking here would deadlock those two
+/// threads against each other. `try_lock` plus the retry in
+/// [`crate::memory::acquire`] is what makes the eviction best-effort instead.
+fn evict_decoded(want: usize) -> usize {
+    let mut lru = DECODED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut freed = 0;
+    let mut i = 0;
+    while i < lru.len() && freed < want {
+        let Some(handle) = lru[i].upgrade() else {
+            lru.remove(i);
+            continue;
+        };
+        match handle.evict() {
+            Evict::Freed(bytes) => {
+                freed += bytes;
+                lru.remove(i);
+            }
+            Evict::Busy => i += 1,
+            Evict::Never => {
+                lru.remove(i);
+            }
         }
     }
+    freed
+}
+
+/// Hand the cache to the pool once, so a reservation that would pass the limit
+/// drops decoded chunks before it fails.
+fn install_evictor() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::memory::set_evictor(evict_decoded));
+}
+
+/// Upper bound on the bytes a decoded chunk holds, reserved before the decode
+/// so the pool's `used` never passes its limit.
+///
+/// The design's formula (`docs/wave-136b-design.md` §4.2): the widest payload
+/// per row plus the validity bitmap, and for the variable-width types the
+/// encoded bytes, which the decoded buffers are carved out of. A FSST or
+/// compression-framed page decodes to *more* than it stores, so there the
+/// reservation grows after the decode
+/// ([`crate::memory::Reservation::resize`]): the limit still holds, and a limit
+/// set below what such a page decodes to refuses the read rather than
+/// overshooting it.
+fn decoded_bound(dtype: DataType, rows: usize, encoded_len: usize) -> usize {
+    let (per_row, elems) = match dtype {
+        // One byte per row over-estimates the bitmap `Vec<bool>`.
+        DataType::Boolean => (1, 0),
+        DataType::Integer | DataType::Date => (4, 0),
+        DataType::Bigint | DataType::Timestamp | DataType::Double => (8, 0),
+        DataType::Decimal { .. } => (16, 0),
+        DataType::Interval => (std::mem::size_of::<crate::types::Interval>(), 0),
+        // One view per row; the bytes it points at are in the page.
+        DataType::Varchar => (std::mem::size_of::<crate::strings::StrView>(), 0),
+        // One shared tree per row; the trees sum to no more than the page.
+        DataType::Variant => (std::mem::size_of::<Arc<crate::variant::Variant>>(), 0),
+        DataType::Array { elem, len } => {
+            // `ArrayElems` stores INTEGER elements as `i64`.
+            let width = if elem == crate::types::ArrayElem::Float {
+                4
+            } else {
+                8
+            };
+            (width, rows.saturating_mul(len as usize))
+        }
+    };
+    let payload = rows * per_row + elems * per_row;
+    let element_bitmap = elems.div_ceil(8);
+    payload + element_bitmap + rows.div_ceil(8) + encoded_len + std::mem::size_of::<Vector>()
 }
 
 /// Chunks above which a dropped column releases them in parallel.
@@ -297,13 +548,52 @@ impl Drop for Column {
     }
 }
 
+impl Clone for Column {
+    /// A snapshot shares the decoded payloads (`ChunkHandle::duplicate`) and
+    /// keeps the image descriptors, so cloning a table copies no chunk data.
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            dtype: self.dtype,
+            default: self.default.clone(),
+            chunks: self
+                .chunks
+                .iter()
+                .map(|handle| Arc::new(handle.duplicate()))
+                .collect(),
+        }
+    }
+}
+
+/// One chunk of a column, held open for writing (see [`Column::chunk_mut`]).
+///
+/// It owns the handle's lock, so the decoded payload cannot be evicted (or
+/// copied by a racing `chunk`) while the write is in progress. `DerefMut`
+/// does the copy-on-write: a payload a snapshot still shares is copied first.
+pub struct ChunkMut<'a>(std::sync::MutexGuard<'a, ChunkState>);
+
+impl std::ops::Deref for ChunkMut<'_> {
+    type Target = Vector;
+
+    fn deref(&self) -> &Vector {
+        &self.0.payload.as_ref().expect("chunk_mut decodes").vector
+    }
+}
+
+impl std::ops::DerefMut for ChunkMut<'_> {
+    fn deref_mut(&mut self) -> &mut Vector {
+        let payload = self.0.payload.as_mut().expect("chunk_mut decodes");
+        Arc::make_mut(&mut payload.vector)
+    }
+}
+
 impl Column {
     fn new(name: String, dtype: DataType) -> Self {
         Self {
             name,
             dtype,
             default: None,
-            chunks: vec![ChunkHandle::new(Arc::new(Vector::new_empty(dtype)))],
+            chunks: vec![Arc::new(ChunkHandle::empty(dtype))],
         }
     }
 
@@ -314,13 +604,17 @@ impl Column {
         dtype: DataType,
         default: Option<Value>,
         chunks: Vec<Arc<Vector>>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let chunks = chunks
+            .into_iter()
+            .map(|chunk| ChunkHandle::new(chunk).map(Arc::new))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
             name,
             dtype,
             default,
-            chunks: chunks.into_iter().map(ChunkHandle::new).collect(),
-        }
+            chunks,
+        })
     }
 
     fn out_of_range(&self, i: usize) -> PinkDbError {
@@ -337,7 +631,7 @@ impl Column {
     /// touch and kept; a corrupt page surfaces as an error, never a panic.
     pub fn chunk(&self, i: usize) -> Result<Arc<Vector>> {
         match self.chunks.get(i) {
-            Some(handle) => handle.get(self.dtype),
+            Some(handle) => ChunkHandle::get(handle, self.dtype, false),
             None => Err(self.out_of_range(i)),
         }
     }
@@ -348,18 +642,16 @@ impl Column {
     /// A still-encoded chunk is decoded here (a write touches the chunks it
     /// changes and no others). The executor never holds a chunk across a `&mut`
     /// borrow of its column, so the `Arc::make_mut` never actually clones.
-    pub fn chunk_mut(&mut self, i: usize) -> Result<&mut Vector> {
-        let chunks = self.chunks.len();
-        let Some(handle) = self.chunks.get_mut(i) else {
-            return Err(PinkDbError::Execution(format!(
-                "chunk {i} out of range for column \"{}\" ({chunks} chunks)",
-                self.name
-            )));
+    pub fn chunk_mut(&mut self, i: usize) -> Result<ChunkMut<'_>> {
+        let Some(handle) = self.chunks.get(i) else {
+            return Err(self.out_of_range(i));
         };
-        handle.get(self.dtype)?;
-        handle.dirty = true;
-        let decoded = handle.decoded.get_mut().unwrap_or_else(|e| e.into_inner());
-        Ok(Arc::make_mut(decoded.as_mut().expect("decoded above")))
+        // The write may grow the payload: re-charge it before it does.
+        handle.charge_current()?;
+        ChunkHandle::get(handle, self.dtype, true)?;
+        let mut state = handle.lock();
+        state.dirty = true;
+        Ok(ChunkMut(state))
     }
 
     /// Rows in chunk `i`. Metadata only: a pruned or projected scan asks this
@@ -383,23 +675,30 @@ impl Column {
     }
 
     /// Append a finished chunk (the loader's and bulk append's paths).
-    pub fn push_chunk(&mut self, chunk: Arc<Vector>) {
-        self.chunks.push(ChunkHandle::new(chunk));
+    pub fn push_chunk(&mut self, chunk: Arc<Vector>) -> Result<()> {
+        self.chunks.push(Arc::new(ChunkHandle::new(chunk)?));
+        Ok(())
     }
 
     /// Replace chunk `i`'s payload in place (the loader reuses the empty tail,
     /// a delete rewrites a chunk as its gathered survivor rows).
-    fn set_chunk(&mut self, i: usize, chunk: Arc<Vector>) {
-        self.chunks[i] = ChunkHandle::new(chunk);
+    fn set_chunk(&mut self, i: usize, chunk: Arc<Vector>) -> Result<()> {
+        self.chunks[i] = Arc::new(ChunkHandle::new(chunk)?);
+        Ok(())
     }
 
     /// Install the chunk list a lazily opened table read from the footer: still
     /// encoded in the store image, decoded on first touch. An empty store of a
     /// zero-row table keeps the column's single empty chunk.
-    fn set_chunks(&mut self, chunks: Vec<ChunkHandle>) {
+    fn set_chunks(&mut self, chunks: Vec<Arc<ChunkHandle>>) {
         if !chunks.is_empty() {
             self.chunks = chunks;
         }
+    }
+
+    /// Drop every chunk and start again from one empty one.
+    fn reset_chunks(&mut self) {
+        self.chunks = vec![Arc::new(ChunkHandle::empty(self.dtype))];
     }
 
     /// Chunk `i`'s payload when the write path just decoded it (a `set_chunk`
@@ -916,7 +1215,7 @@ impl DataTable {
     /// empty chunk.
     pub(crate) fn set_loaded_chunks(
         &mut self,
-        chunks: Vec<Vec<ChunkHandle>>,
+        chunks: Vec<Vec<Arc<ChunkHandle>>>,
         rows: usize,
     ) -> Result<()> {
         let corrupt = || {
@@ -974,7 +1273,7 @@ impl DataTable {
     pub(crate) fn clear_rows(&mut self) {
         self.num_rows = 0;
         for col in &mut self.columns {
-            col.chunks = vec![ChunkHandle::new(Arc::new(Vector::new_empty(col.dtype)))];
+            col.reset_chunks();
         }
         self.stats = TableStats::new(self.columns.len());
         self.zones = self.columns.iter().map(|_| vec![Zone::empty()]).collect();
@@ -1149,7 +1448,7 @@ impl DataTable {
             zones.push(zone);
         }
         self.columns
-            .push(Column::from_chunks(name, dtype, default, chunks));
+            .push(Column::from_chunks(name, dtype, default, chunks)?);
         self.stats.cols.push(stats);
         self.zones.push(zones);
         Ok(())
@@ -1546,7 +1845,7 @@ impl DataTable {
             .unwrap_or(true);
         if tail_full {
             for (ci, col) in self.columns.iter_mut().enumerate() {
-                col.push_chunk(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)));
+                col.push_chunk(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)))?;
                 self.zones[ci].push(Zone::empty());
             }
         }
@@ -1640,11 +1939,11 @@ impl DataTable {
             let replacing = tail_len == 0 && self.columns[0].num_chunks() > 0;
             if replacing {
                 for (col, src) in self.columns.iter_mut().zip(chunk) {
-                    col.set_chunk(col.num_chunks() - 1, Arc::clone(src));
+                    col.set_chunk(col.num_chunks() - 1, Arc::clone(src))?;
                 }
             } else {
                 for (col, src) in self.columns.iter_mut().zip(chunk) {
-                    col.push_chunk(Arc::clone(src));
+                    col.push_chunk(Arc::clone(src))?;
                 }
             }
             for (ci, (zone, hll)) in self.fold_chunk_stats(chunk).into_iter().enumerate() {
@@ -1673,7 +1972,7 @@ impl DataTable {
                 .unwrap_or(true);
             if tail_full {
                 for col in &mut self.columns {
-                    col.push_chunk(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)));
+                    col.push_chunk(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)))?;
                 }
                 for zones in &mut self.zones {
                     zones.push(Zone::empty());
@@ -1878,7 +2177,7 @@ impl DataTable {
         let removed = len - keep.len();
         for col in &mut self.columns {
             let gathered = Arc::new(col.chunk(chunk)?.gather(&keep));
-            col.set_chunk(chunk, gathered);
+            col.set_chunk(chunk, gathered)?;
         }
         // Drop chunks left empty (all columns share chunk boundaries).
         let dropped_chunk = self.columns[0].chunk_rows(chunk) == 0;
@@ -4403,7 +4702,7 @@ mod tests {
             .unwrap()
             .set_value(0, Value::Bigint(42))
             .unwrap();
-        assert!(t.columns[0].chunks[0].dirty);
+        assert!(t.columns[0].chunks[0].lock().dirty);
         assert_eq!(t.get(0, 0).unwrap(), Some(Value::Bigint(42)));
         // The snapshot kept the old payload: `chunk_mut` cloned the `Arc`
         // instead of writing through the shared one.

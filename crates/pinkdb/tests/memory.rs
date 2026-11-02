@@ -221,3 +221,44 @@ fn the_profile_reports_the_limit_and_the_statement_peak() {
     );
     assert_eq!(memory::used(), 0, "the statement's reservation outlived it");
 }
+
+/// Growing a reservation charges the account the delta, not the total:
+/// the peak is the largest state, not the sum of every resize.
+#[test]
+fn a_reservation_charges_the_account_only_what_it_holds() {
+    let _lock = memory::test_lock();
+    let before = memory::used();
+    memory::set_limit(memory::UNLIMITED);
+    let account = memory::Account::new();
+    let mut held = account.reserve(1_000).unwrap();
+    assert_eq!(account.peak(), 1_000);
+    held.grow(500).unwrap();
+    assert_eq!(account.peak(), 1_500);
+    held.shrink(1_200);
+    assert_eq!(account.peak(), 1_500);
+    assert_eq!(memory::used(), before + 300);
+    drop(held);
+    assert_eq!(memory::used(), before);
+    assert_eq!(account.peak(), 1_500);
+    memory::reset_limit();
+}
+
+/// A failed grow leaves the reservation and the pool unchanged.
+#[test]
+fn a_failed_grow_keeps_the_pool_where_it_was() {
+    let _lock = memory::test_lock();
+    let before = memory::used();
+    memory::set_limit(before + 1_000);
+    let account = memory::Account::new();
+    let mut held = account.reserve(800).unwrap();
+    let err = held.grow(800).unwrap_err().to_string();
+    assert!(
+        err.starts_with("Out of Memory Error: failed to allocate data of size 800 bytes"),
+        "{err}"
+    );
+    assert_eq!(held.bytes(), 800);
+    assert_eq!(memory::used(), before + 800);
+    drop(held);
+    assert_eq!(memory::used(), before);
+    memory::reset_limit();
+}

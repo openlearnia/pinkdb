@@ -31,6 +31,29 @@ static LIMIT: AtomicUsize = AtomicUsize::new(UNLIMITED);
 static EXPLICIT: AtomicBool = AtomicBool::new(false);
 static DEFAULT: OnceLock<usize> = OnceLock::new();
 
+/// The cache's eviction hook: frees up to the requested bytes of decoded
+/// chunks and returns how much the pool got back.
+pub type Evictor = fn(usize) -> usize;
+
+static EVICTOR: OnceLock<Evictor> = OnceLock::new();
+
+/// Register the callback a reservation that would pass the limit calls before
+/// it fails (the storage layer's decoded-chunk cache). The first call wins:
+/// there is one hook per process, and it is stateless.
+pub fn set_evictor(evict: Evictor) {
+    let _ = EVICTOR.set(evict);
+}
+
+/// Reserve `bytes` from the pool without an [`Account`]: a storage chunk's
+/// charge, which follows the chunk's own lifetime rather than a statement's.
+pub fn reserve(bytes: usize) -> Result<Reservation> {
+    acquire(bytes)?;
+    Ok(Reservation {
+        bytes,
+        account: None,
+    })
+}
+
 /// The current process-wide limit, in bytes ([`UNLIMITED`] for none).
 pub fn limit() -> usize {
     if EXPLICIT.load(Ordering::Relaxed) {
@@ -340,17 +363,33 @@ impl Drop for Reservation {
 }
 
 fn acquire(bytes: usize) -> Result<()> {
+    if try_acquire(bytes) {
+        return Ok(());
+    }
+    // Over the limit. The storage layer caches decoded chunks it can drop and
+    // decode again, so give it the chance to free `bytes` first and retry
+    // once: a reservation that still does not fit fails as before. The
+    // evictor only releases reservations, so it never re-enters here.
+    let freed = EVICTOR.get().map_or(0, |evict| evict(bytes));
+    if freed > 0 && try_acquire(bytes) {
+        return Ok(());
+    }
+    Err(out_of_memory(bytes))
+}
+
+/// Charge `bytes` if the pool has room; `false` when they would pass the limit.
+fn try_acquire(bytes: usize) -> bool {
     let limit = limit();
     let mut used = USED.load(Ordering::Relaxed);
     loop {
         let next = used.saturating_add(bytes);
         if next > limit {
-            return Err(out_of_memory(bytes));
+            return false;
         }
         match USED.compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Relaxed) {
             Ok(_) => {
                 PEAK.fetch_max(next, Ordering::Relaxed);
-                return Ok(());
+                return true;
             }
             Err(current) => used = current,
         }
@@ -478,46 +517,5 @@ mod tests {
         );
         assert_eq!(human_bytes(2 * 1000 * 1000 * 1000), "1.8 GiB");
         assert_eq!(human_bytes(UNLIMITED), "16383.9 PiB");
-    }
-
-    /// Growing a reservation charges the account the delta, not the total:
-    /// the peak is the largest state, not the sum of every resize.
-    #[test]
-    fn a_reservation_charges_the_account_only_what_it_holds() {
-        let _lock = test_lock();
-        let before = used();
-        set_limit(UNLIMITED);
-        let account = Account::new();
-        let mut held = account.reserve(1_000).unwrap();
-        assert_eq!(account.peak(), 1_000);
-        held.grow(500).unwrap();
-        assert_eq!(account.peak(), 1_500);
-        held.shrink(1_200);
-        assert_eq!(account.peak(), 1_500);
-        assert_eq!(used(), before + 300);
-        drop(held);
-        assert_eq!(used(), before);
-        assert_eq!(account.peak(), 1_500);
-        reset_limit();
-    }
-
-    /// A failed grow leaves the reservation and the pool unchanged.
-    #[test]
-    fn a_failed_grow_keeps_the_pool_where_it_was() {
-        let _lock = test_lock();
-        let before = used();
-        set_limit(before + 1_000);
-        let account = Account::new();
-        let mut held = account.reserve(800).unwrap();
-        let err = held.grow(800).unwrap_err().to_string();
-        assert!(
-            err.starts_with("Out of Memory Error: failed to allocate data of size 800 bytes"),
-            "{err}"
-        );
-        assert_eq!(held.bytes(), 800);
-        assert_eq!(used(), before + 800);
-        drop(held);
-        assert_eq!(used(), before);
-        reset_limit();
     }
 }

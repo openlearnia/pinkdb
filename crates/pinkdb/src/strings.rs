@@ -182,6 +182,15 @@ impl SharedList {
         self.0.iter().flat_map(|l| l.iter())
     }
 
+    /// The list's own bytes plus every buffer it holds, each counted in full
+    /// even when another vector's list shares the buffer.
+    fn memory_size(&self) -> usize {
+        self.0.as_ref().map_or(0, |list| {
+            list.capacity() * std::mem::size_of::<Arc<[u8]>>()
+                + list.iter().map(|b| b.len()).sum::<usize>()
+        })
+    }
+
     /// Append `buffer`, returning its index.
     fn push(&mut self, buffer: &Arc<[u8]>) -> u32 {
         let list = Arc::make_mut(self.0.get_or_insert_with(Arc::default));
@@ -225,6 +234,16 @@ impl StrVec {
             own: Vec::new(),
             shared: SharedList::default(),
         }
+    }
+
+    /// The bytes this vector holds: its view array, its owned buffer, and the
+    /// shared buffers it reads through. A shared buffer is counted once per
+    /// vector, so two vectors over one buffer each charge it: the pool's
+    /// budget errs high, never low.
+    pub fn memory_size(&self) -> usize {
+        self.views.capacity() * std::mem::size_of::<StrView>()
+            + self.own.capacity()
+            + self.shared.memory_size()
     }
 
     /// `n` copies of `s`, sharing one buffer.
@@ -526,6 +545,25 @@ impl<S: AsRef<str>> FromIterator<S> for StrVec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_size_counts_a_shared_buffer_once_per_vector() {
+        let buffer: Arc<[u8]> = Arc::from("a string long enough to live in the buffer".as_bytes());
+        let ranges = [(0usize, 40usize), (0, 40)];
+        let a = StrVec::over_buffer(Arc::clone(&buffer), ranges.into_iter());
+        let b = StrVec::over_buffer(Arc::clone(&buffer), ranges.into_iter());
+        let views = 2 * std::mem::size_of::<StrView>();
+        // Both views read the one buffer, counted once: the vector's charge is
+        // the views plus the bytes, not twice the bytes.
+        let list = std::mem::size_of::<Arc<[u8]>>() + buffer.len();
+        assert_eq!(a.memory_size(), views + list);
+        // Two vectors over the same buffer each count it, so the pool errs
+        // high: see `StrVec::memory_size`.
+        assert_eq!(b.memory_size(), views + list);
+        // Short strings are inlined, so there is no buffer to count.
+        let short = StrVec::over_buffer(Arc::clone(&buffer), [(0usize, 4usize)].into_iter());
+        assert_eq!(short.memory_size(), std::mem::size_of::<StrView>());
+    }
 
     #[test]
     fn short_and_long_strings_round_trip_through_every_copy() {

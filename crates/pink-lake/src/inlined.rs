@@ -222,12 +222,18 @@ pub(crate) fn materialize_live(
                 })?;
             }
         }
-        columns.push(pinkdb::storage::Column::from_chunks(
-            col.name.clone(),
-            col.dtype,
-            col.default.clone(),
-            vec![Arc::new(vector)],
-        ));
+        columns.push(
+            pinkdb::storage::Column::from_chunks(
+                col.name.clone(),
+                col.dtype,
+                col.default.clone(),
+                vec![Arc::new(vector)],
+            )
+            .map_err(|e| LakeError::Engine {
+                context: format!("building column \"{}\"", col.name),
+                source: e,
+            })?,
+        );
         present.push(wanted[i]);
     }
     let table =

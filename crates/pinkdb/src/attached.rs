@@ -959,7 +959,7 @@ mod tests {
                         col.dtype,
                         None,
                         chunks,
-                    ));
+                    )?);
                 }
             }
             let table = DataTable::from_columns(full.name.clone(), out, full.num_rows)?;

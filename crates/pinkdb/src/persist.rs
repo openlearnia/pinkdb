@@ -4541,7 +4541,7 @@ pub fn decode_projected_columns(
             *dtype,
             None,
             chunks,
-        ));
+        )?);
     }
     DataTable::from_columns(table.table.clone(), out, total_rows)
 }
@@ -4947,18 +4947,18 @@ fn load_table_data(
     }
     // Assemble the handles chunk by chunk: every column shares the boundaries
     // the footer recorded, so nothing needs decoding here.
-    let mut columns: Vec<Vec<crate::storage::ChunkHandle>> = Vec::with_capacity(n_cols);
+    let mut columns: Vec<Vec<Arc<crate::storage::ChunkHandle>>> = Vec::with_capacity(n_cols);
     for column_pages in &pages {
         let mut handles = Vec::with_capacity(tdir.row_groups.len() * CHUNKS_PER_ROW_GROUP);
         for (g, rg) in tdir.row_groups.iter().enumerate() {
             for (p, &rows) in rg.chunk_rows.iter().enumerate() {
                 let (offset, length) = column_pages[g][p];
-                handles.push(crate::storage::ChunkHandle::new_encoded(
+                handles.push(Arc::new(crate::storage::ChunkHandle::new_encoded(
                     Arc::clone(image),
                     offset,
                     length,
                     rows as usize,
-                ));
+                )));
             }
         }
         columns.push(handles);
