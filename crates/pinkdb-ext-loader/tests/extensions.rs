@@ -473,7 +473,7 @@ fn execution_from_rayon_workers_is_correct() {
         ),
         vec![vec![
             Value::Bigint(BIG_ROWS - 4000),
-            Value::Bigint(expected_sum)
+            Value::Hugeint(i128::from(expected_sum))
         ]]
     );
 
@@ -587,7 +587,7 @@ fn connections_share_the_same_registry() {
     for h in handles {
         assert_eq!(
             h.join().unwrap(),
-            vec![vec![Value::Bigint(12), Value::Varchar("OK".to_string())]]
+            vec![vec![Value::Hugeint(12), Value::Varchar("OK".to_string())]]
         );
     }
 
@@ -677,7 +677,7 @@ fn aggregates_windows_and_joins_accept_dynamic_calls() {
             &mut db,
             "SELECT COUNT(*), SUM(ext_double_it(g.k)) FROM g JOIN u ON g.k = u.k;"
         ),
-        vec![vec![Value::Bigint(3), Value::Bigint(8)]]
+        vec![vec![Value::Bigint(3), Value::Hugeint(8)]]
     );
 }
 
@@ -758,7 +758,7 @@ fn load_extension_statement_loads_and_registers() {
     let results = db2.execute(&sql).unwrap();
     match results.last().unwrap() {
         QueryResult::Selected { rows, .. } => {
-            assert_eq!(rows, &vec![vec![Value::Bigint(12)]])
+            assert_eq!(rows, &vec![vec![Value::Hugeint(12)]])
         }
         other => panic!("expected rows, got {other:?}"),
     }
@@ -957,7 +957,7 @@ fn wal_replay_reuses_the_already_loaded_extension() {
         );
         assert_eq!(
             rows(&mut db, "SELECT SUM(ext_double_it(a)) FROM t;"),
-            vec![vec![Value::Bigint(36)]]
+            vec![vec![Value::Hugeint(36)]]
         );
     }
 

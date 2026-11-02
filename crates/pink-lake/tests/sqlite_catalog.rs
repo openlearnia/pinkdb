@@ -245,6 +245,7 @@ fn three_hundred_single_row_commits_write_only_the_delta() {
         match &rows[0][0] {
             Value::Integer(v) => i64::from(*v),
             Value::Bigint(v) => *v,
+            Value::Hugeint(v) => i64::try_from(*v).expect("fits in i64"),
             other => panic!("expected an integer count, got {other:?}"),
         },
         1 + COMMITS as i64

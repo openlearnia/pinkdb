@@ -212,6 +212,8 @@ fn reopen_after_drop_keeps_the_head() {
     let count = match &rows[0][0] {
         Value::Integer(v) => i64::from(*v),
         Value::Bigint(v) => *v,
+        // SUM returns HUGEINT; these tests only sum small values.
+        Value::Hugeint(v) => i64::try_from(*v).expect("fits in i64"),
         other => panic!("expected an integer count, got {other:?}"),
     };
     assert_eq!(count, 2);
@@ -287,6 +289,7 @@ fn four_writers_race_on_one_pink_catalog() {
             .map(|row| match &row[0] {
                 Value::Integer(v) => i64::from(*v),
                 Value::Bigint(v) => *v,
+                Value::Hugeint(v) => i64::try_from(*v).expect("fits in i64"),
                 other => panic!("expected an integer, got {other:?}"),
             })
             .collect()

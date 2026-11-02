@@ -10663,13 +10663,13 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                vec![V::Null, V::Bigint(2), V::Bigint(7)],
-                vec![s(""), V::Bigint(2), V::Bigint(9)],
-                vec![s("a"), V::Bigint(1), V::Bigint(2)],
-                vec![s("abcdefghijkl"), V::Bigint(2), V::Bigint(12)],
-                vec![s("abcdefghijklm"), V::Bigint(1), V::Bigint(4)],
-                vec![s("abcd0000"), V::Bigint(1), V::Bigint(5)],
-                vec![s("abcd0001"), V::Bigint(1), V::Bigint(6)],
+                vec![V::Null, V::Bigint(2), V::Hugeint(7)],
+                vec![s(""), V::Bigint(2), V::Hugeint(9)],
+                vec![s("a"), V::Bigint(1), V::Hugeint(2)],
+                vec![s("abcdefghijkl"), V::Bigint(2), V::Hugeint(12)],
+                vec![s("abcdefghijklm"), V::Bigint(1), V::Hugeint(4)],
+                vec![s("abcd0000"), V::Bigint(1), V::Hugeint(5)],
+                vec![s("abcd0001"), V::Bigint(1), V::Hugeint(6)],
             ]
         );
     }

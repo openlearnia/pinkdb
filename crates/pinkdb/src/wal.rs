@@ -7591,6 +7591,100 @@ mod tests {
         cleanup(&full);
     }
 
+    /// HUGEINT through the incremental path: the clean row group is copied
+    /// through byte for byte and the group whose chunk changed is re-encoded
+    /// by the 128-bit PLAIN encoder, so a reopen must see both unchanged
+    /// except for the updated value.
+    #[test]
+    fn hugeint_columns_checkpoint_incrementally_and_reopen() {
+        let p = tmp_ckpt("hugeint");
+        // Wide values: every one of them is past BIGINT, so a widen-to-i64
+        // round trip would corrupt them.
+        let wide = |i: i64| i128::from(i) << 64;
+        let replaced = wide(150_000);
+        let updated: i128 = i128::MAX / 2;
+        let expected_sum: i128 = (0..200_000i64).map(wide).sum::<i128>() - replaced + updated;
+        {
+            let mut db = durable(&p);
+            db.execute("CREATE TABLE t (h HUGEINT);").unwrap();
+            // 200,000 rows: two row groups, so one stays clean while the
+            // other moves.
+            let values = (0..200_000i64)
+                .map(|i| format!("({})", wide(i)))
+                .collect::<Vec<_>>()
+                .join(",");
+            db.execute(&format!("INSERT INTO t VALUES {values};"))
+                .unwrap();
+            db.checkpoint().unwrap();
+            let before = image_layout(&p)
+                .into_iter()
+                .find(|(name, _)| name.ends_with(".t"))
+                .unwrap()
+                .1;
+            assert_eq!(before.len(), 2, "one span per row group");
+            let bytes_before = std::fs::read(&p).unwrap();
+            let iteration_before = iteration(&p);
+            db.execute(&format!("UPDATE t SET h = {updated} WHERE h = {replaced};"))
+                .unwrap();
+            db.checkpoint().unwrap();
+            assert!(
+                iteration(&p) > iteration_before,
+                "the checkpoint must land as a new iteration"
+            );
+            let after = image_layout(&p)
+                .into_iter()
+                .find(|(name, _)| name.ends_with(".t"))
+                .unwrap()
+                .1;
+            assert_eq!(
+                after[0], before[0],
+                "the clean row group must not move: the checkpoint is incremental"
+            );
+            let bytes_after = std::fs::read(&p).unwrap();
+            let (offset, len) = before[0];
+            let span = offset as usize..(offset + len) as usize;
+            assert_eq!(
+                &bytes_after[span.clone()],
+                &bytes_before[span],
+                "the clean row group's bytes must not be rewritten"
+            );
+            assert!(
+                !crate::persist::footer_free_ranges_for_test(&p)
+                    .unwrap()
+                    .is_empty(),
+                "the superseded group must leave free space"
+            );
+        }
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT COUNT(*) FROM t;"), vec![200_000]);
+        match back
+            .execute("SELECT SUM(h) FROM t;")
+            .unwrap()
+            .pop()
+            .unwrap()
+        {
+            QueryResult::Selected { rows, .. } => {
+                assert_eq!(rows, vec![vec![Value::Hugeint(expected_sum)]])
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        // The updated row must decode as the value written, and the untouched
+        // rows as theirs.
+        match back
+            .execute("SELECT MIN(h), MAX(h) FROM t;")
+            .unwrap()
+            .pop()
+            .unwrap()
+        {
+            QueryResult::Selected { rows, .. } => assert_eq!(
+                rows,
+                vec![vec![Value::Hugeint(wide(0)), Value::Hugeint(updated)]]
+            ),
+            other => panic!("expected rows, got {other:?}"),
+        }
+        cleanup(&p);
+    }
+
     #[test]
     fn checkpoint_crashes_recover_one_complete_state() {
         for (tag, fault) in [

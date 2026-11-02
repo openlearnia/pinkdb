@@ -108,10 +108,10 @@ fn an_aggregate_over_a_lake_streams_data_files_into_the_fold() {
         rows,
         vec![vec![
             Value::Bigint(kept as i64),
-            Value::Bigint(
+            Value::Hugeint(
                 (0..total)
                     .filter(|i| i % 5 != 0)
-                    .map(|i| i as i64 * 2)
+                    .map(|i| i128::from(i) * 2)
                     .sum()
             ),
         ]]
@@ -135,7 +135,7 @@ fn an_aggregate_over_a_lake_streams_data_files_into_the_fold() {
     let (peak, folded) = db.stream_stats();
     assert_eq!(
         rows,
-        vec![vec![Value::Bigint(700), Value::Bigint(700 * 699)]]
+        vec![vec![Value::Bigint(700), Value::Hugeint(700 * 699)]]
     );
     // Only the first file (rows 0..2999) survives the zone-map prune, so the
     // fold sees that file whole and the filter keeps 700 of its rows.
@@ -148,7 +148,7 @@ fn an_aggregate_over_a_lake_streams_data_files_into_the_fold() {
         rows,
         vec![vec![
             Value::Bigint(total as i64),
-            Value::Bigint((0..total).map(|i| i as i64 * 2).sum()),
+            Value::Hugeint((0..total).map(|i| i128::from(i) * 2).sum()),
         ]]
     );
     drop(db);

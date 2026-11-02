@@ -451,7 +451,7 @@ fn statements_run_in_order_and_stop_at_the_first_error() {
     assert_eq!(results[0]["kind"], "ok");
     assert_eq!(results[1]["message"], "Inserted 2 rows");
     assert_eq!(results[2]["rows"][0][0], "3");
-    assert_eq!(results[2]["columns"][0]["type"], "BIGINT");
+    assert_eq!(results[2]["columns"][0]["type"], "HUGEINT");
     assert!(results[2]["profile"]["total_ms"].as_f64().unwrap() >= 0.0);
     assert_eq!(out["error"]["index"], 3);
     assert!(
