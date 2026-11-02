@@ -194,6 +194,15 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2 id="2026-11-02">2026-11-02<a class="anchor" href="#2026-11-02" aria-label="Permalink: 2026-11-02">#</a></h2>
+<h3>DuckDB's own test corpus, and what it found first ✅</h3>
+<ul>
+<li><strong><code>pinkdb-slt</code></strong> (<code>tools/sqllogictest</code>) runs DuckDB's sqllogictest files against pinkdb and reports pass rates per area; a committed baseline makes a regression fail the gate. 444 → 451 of DuckDB's 4,233 <code>test/sql</code> files pass so far ([docs/sqllogictest-baseline.md](docs/sqllogictest-baseline.md)).</li>
+<li><strong><code>PRAGMA</code></strong> in DuckDB's forms (<code>show_tables</code>, <code>table_info</code>, <code>database_list</code>, <code>version</code>, the <code>pragma_*</code> functions; DuckDB's test-only pragmas accepted).</li>
+<li><strong>Settings</strong>: <code>SET</code>/<code>RESET</code>/<code>current_setting</code> with DuckDB's names; <code>default_null_order</code> and <code>default_order</code> are honoured; an unknown setting is an error, as in DuckDB.</li>
+<li><strong><code>GROUP BY ALL</code></strong>, <code>ORDER BY ALL</code>, <code>count()</code>, <code>CHAR(n)</code>, <code>range</code>/<code>date</code>/ <code>timestamp</code> as column names, <code>read_csv_auto</code>, <code>ATTACH ':memory:'</code>.</li>
+<li><strong><code>HUGEINT</code></strong>: literals beyond BIGINT, casts, arithmetic with DuckDB's overflow errors, comparisons; storing it and sending it to clients come next.</li>
+</ul>
 <h2 id="2026-11-01">2026-11-01<a class="anchor" href="#2026-11-01" aria-label="Permalink: 2026-11-01">#</a></h2>
 <h3>Dialect, second pass — DuckDB forms dashboards and ETL use ✅</h3>
 <ul>
@@ -1330,6 +1339,7 @@ progress log</a>.</p>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
 <ul>
+  <li><a href="#2026-11-02">2026-11-02</a></li>
   <li><a href="#2026-11-01">2026-11-01</a></li>
   <li><a href="#2026-10-31">2026-10-31</a></li>
   <li><a href="#2026-10-30">2026-10-30</a></li>

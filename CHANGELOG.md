@@ -8,6 +8,23 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-11-02
+### DuckDB's own test corpus, and what it found first ✅
+
+- **`pinkdb-slt`** (`tools/sqllogictest`) runs DuckDB's sqllogictest files
+  against pinkdb and reports pass rates per area; a committed baseline makes a
+  regression fail the gate. 444 → 451 of DuckDB's 4,233 `test/sql` files pass
+  so far ([docs/sqllogictest-baseline.md](docs/sqllogictest-baseline.md)).
+- **`PRAGMA`** in DuckDB's forms (`show_tables`, `table_info`, `database_list`,
+  `version`, the `pragma_*` functions; DuckDB's test-only pragmas accepted).
+- **Settings**: `SET`/`RESET`/`current_setting` with DuckDB's names;
+  `default_null_order` and `default_order` are honoured; an unknown setting is
+  an error, as in DuckDB.
+- **`GROUP BY ALL`**, `ORDER BY ALL`, `count()`, `CHAR(n)`, `range`/`date`/
+  `timestamp` as column names, `read_csv_auto`, `ATTACH ':memory:'`.
+- **`HUGEINT`**: literals beyond BIGINT, casts, arithmetic with DuckDB's
+  overflow errors, comparisons; storing it and sending it to clients come next.
+
 ## 2026-11-01
 ### Dialect, second pass — DuckDB forms dashboards and ETL use ✅
 
