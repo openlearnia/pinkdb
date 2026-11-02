@@ -169,7 +169,10 @@ fn a_lake_scan_streams_a_table_larger_than_the_limit() {
     });
 
     let (rows, sum) = expected_total();
-    assert_eq!(answer, vec![vec![Value::Bigint(rows), Value::Bigint(sum)]]);
+    assert_eq!(
+        answer,
+        vec![vec![Value::Bigint(rows), Value::Hugeint(i128::from(sum))]]
+    );
     assert!(
         memory::used() <= LIMIT,
         "the scan left the pool over its limit"
@@ -202,7 +205,10 @@ fn a_lake_sort_that_must_hold_the_table_fails_like_a_store_scan() {
     // The failed statement released its reservation: the same table still
     // streams through the pool afterwards.
     let (rows, sum) = expected_total();
-    assert_eq!(answer, vec![vec![Value::Bigint(rows), Value::Bigint(sum)]]);
+    assert_eq!(
+        answer,
+        vec![vec![Value::Bigint(rows), Value::Hugeint(i128::from(sum))]]
+    );
     assert!(
         used <= LIMIT,
         "the failed sort left the pool over its limit"

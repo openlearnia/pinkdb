@@ -260,8 +260,11 @@ fn use_sessions_are_isolated_per_client() {
         rows(b.execute("SELECT v FROM t;").unwrap()),
         vec![vec![varchar("b")]]
     );
+    // `main` names both the default database and every database's default
+    // schema, so the cross-database name is fully qualified (wave 131, as in
+    // DuckDB: an ambiguous two-part name is an error).
     assert_eq!(
-        rows(a.execute("SELECT v FROM main.t;").unwrap()),
+        rows(a.execute("SELECT v FROM main.main.t;").unwrap()),
         vec![vec![varchar("b")]]
     );
     assert_eq!(
