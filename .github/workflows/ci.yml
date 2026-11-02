@@ -165,9 +165,10 @@ jobs:
               cargo test -p pinkdb-cli --features fts-regex
               cargo test -p pinkdb-server --features fts
               # Full-text search is opt-in, and its default tokenizer must not
-              # pull in `regex`: the default binary links neither.
+              # pull in `regex` (the CLI links `regex` anyway, through the
+              # string extension's regexp functions: no path may run via fts).
               ! cargo tree -p pinkdb-cli -e normal | grep -q pinkdb-fts
-              ! cargo tree -p pinkdb-cli -e normal --features fts | grep -q regex
+              ! cargo tree -p pinkdb-cli -e normal --features fts -i regex | grep -q pinkdb-fts
           - name: embeddings
             run: |
               cargo test -p pinkdb-embeddings
