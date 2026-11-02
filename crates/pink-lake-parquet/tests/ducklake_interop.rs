@@ -1654,15 +1654,17 @@ fn pinkdb_rows(table: &DataTable) -> Vec<Vec<String>> {
     (0..table.num_rows())
         .map(|row| {
             (0..table.schema().len())
-                .map(|column| match table.get(row, column) {
-                    None | Some(Value::Null) => "<null>".to_string(),
-                    Some(Value::Varchar(text)) => text,
-                    Some(Value::Boolean(flag)) => flag.to_string(),
-                    Some(Value::Integer(number)) => number.to_string(),
-                    Some(Value::Bigint(number)) => number.to_string(),
-                    Some(Value::Timestamp(micros)) => micros.to_string(),
-                    Some(other) => panic!("unexpected value {other}"),
-                })
+                .map(
+                    |column| match table.get(row, column).expect("decode a chunk") {
+                        None | Some(Value::Null) => "<null>".to_string(),
+                        Some(Value::Varchar(text)) => text,
+                        Some(Value::Boolean(flag)) => flag.to_string(),
+                        Some(Value::Integer(number)) => number.to_string(),
+                        Some(Value::Bigint(number)) => number.to_string(),
+                        Some(Value::Timestamp(micros)) => micros.to_string(),
+                        Some(other) => panic!("unexpected value {other}"),
+                    },
+                )
                 .collect()
         })
         .collect()
