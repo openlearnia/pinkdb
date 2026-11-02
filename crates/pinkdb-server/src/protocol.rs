@@ -87,7 +87,10 @@ use pinkdb::{DataType, Value};
 /// dtype carries an element byte and a `u32` length.
 /// v14: `CREATE/DROP SCHEMA` `Done` kinds (tags 27–28); `Used`'s `name` is
 /// `db\0schema` (wave 131b).
-pub const PROTOCOL_VERSION: u32 = 15;
+/// v15: `UUID` value (tag 12) and dtype (tag 11) tags (wave 139b).
+/// v16: [`Response::Profile`] carries the process-wide memory limit and the
+/// statement's peak pool usage (wave 136a).
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -465,6 +468,10 @@ pub enum Response {
         columns: u32,
         kind: String,
         in_transaction: bool,
+        /// v16: the process-wide memory limit and the statement's peak pool
+        /// usage, both in bytes.
+        memory_limit: u64,
+        memory_peak: u64,
         engine_version: String,
     },
     /// The statement (or handshake) failed; the connection stays usable.
@@ -691,6 +698,8 @@ impl Response {
                 columns,
                 kind,
                 in_transaction,
+                memory_limit,
+                memory_peak,
                 engine_version,
             } => {
                 put_u64(&mut buf, *parse);
@@ -703,6 +712,8 @@ impl Response {
                 put_u32(&mut buf, *columns);
                 put_str(&mut buf, kind)?;
                 put_u8(&mut buf, u8::from(*in_transaction));
+                put_u64(&mut buf, *memory_limit);
+                put_u64(&mut buf, *memory_peak);
                 put_str(&mut buf, engine_version)?;
             }
             Response::Error { message } => put_str(&mut buf, message)?,
@@ -786,6 +797,8 @@ impl Response {
                 columns: r.u32("Profile.columns")?,
                 kind: r.string("Profile.kind")?,
                 in_transaction: r.flag("Profile.in_transaction")?,
+                memory_limit: r.u64("Profile.memory_limit")?,
+                memory_peak: r.u64("Profile.memory_peak")?,
                 engine_version: r.string("Profile.engine_version")?,
             },
             msg_type::ERROR => Response::Error {

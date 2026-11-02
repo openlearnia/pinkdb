@@ -3748,6 +3748,10 @@ impl<'a> Binder<'a> {
                 ));
             };
             let canonical = crate::settings::resolve(setting)?;
+            // The process-wide limit lives in the memory pool (wave 136a).
+            if crate::memory::is_limit_setting(canonical) {
+                return self.bind_current_setting(args);
+            }
             let value = crate::settings::current(&self.session, canonical).unwrap_or(Value::Null);
             return Ok(BoundExpr::Literal(value));
         }
@@ -4080,6 +4084,35 @@ impl<'a> Binder<'a> {
             Value::Varchar(roles.join(","))
         };
         Ok(BoundExpr::Literal(value))
+    }
+
+    /// `current_setting('memory_limit')`: the value of a process-wide setting,
+    /// spliced in at bind time as a literal. The `$memory_limit` dependency
+    /// keeps the existing rule that a WAL-logged statement may not read
+    /// process/session state (replay would see another process's value).
+    fn bind_current_setting(&mut self, args: &[Expr]) -> Result<BoundExpr> {
+        let name = match args {
+            [Expr::Literal(Value::Varchar(name))] => name.to_ascii_lowercase(),
+            _ => {
+                return Err(PinkDbError::Type(
+                    "current_setting() takes one constant setting name".to_string(),
+                ));
+            }
+        };
+        if !matches!(name.as_str(), "memory_limit" | "max_memory") {
+            return Err(PinkDbError::Catalog(format!(
+                "unrecognized configuration parameter \"{name}\""
+            )));
+        }
+        let mut deps = self.dynamic_functions_used.borrow_mut();
+        let dep = "$memory_limit".to_string();
+        if !deps.contains(&dep) {
+            deps.push(dep);
+        }
+        drop(deps);
+        Ok(BoundExpr::Literal(Value::Varchar(
+            crate::memory::human_bytes(crate::memory::limit()),
+        )))
     }
 
     /// `now()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, …: the statement's clock,

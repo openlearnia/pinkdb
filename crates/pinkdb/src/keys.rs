@@ -74,7 +74,7 @@ pub(crate) fn take_or_build(
     // so a reopen pays one O(rows) build before its first keyed write.
     // shortcut: the map is not persisted; persist it beside the checkpoint
     // when reopening a large store gets hot.
-    Ok(Some(KeySpace::build(t)))
+    Ok(Some(KeySpace::build(t)?))
 }
 
 /// Put a map (built, taken or already empty) back into the table.
@@ -116,7 +116,7 @@ impl KeySpace {
     }
 
     /// Build the key map from the table's current rows.
-    pub(crate) fn build(t: &DataTable) -> KeySpace {
+    pub(crate) fn build(t: &DataTable) -> Result<KeySpace> {
         let specs: Vec<KeySpec> = t
             .constraints
             .keys
@@ -132,10 +132,10 @@ impl KeySpace {
             version: t.version,
         };
         if space.specs.is_empty() {
-            return space;
+            return Ok(space);
         }
         for ci in 0..t.num_chunks() {
-            let Some(chunk) = t.scan_chunk(ci) else {
+            let Some(chunk) = t.scan_chunk(ci)? else {
                 continue;
             };
             for row in 0..chunk.num_rows() {
@@ -156,7 +156,7 @@ impl KeySpace {
                 }
             }
         }
-        space
+        Ok(space)
     }
 
     /// The row a new image would collide with: the declared key named by

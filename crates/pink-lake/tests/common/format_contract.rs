@@ -549,8 +549,8 @@ fn assert_table_equal(format_id: &str, what: &str, want: &DataTable, got: &DataT
     );
     for row in 0..want.num_rows() {
         for (column, definition) in want.columns.iter().enumerate() {
-            let a = want.get(row, column).unwrap();
-            let b = got.get(row, column).unwrap();
+            let a = want.get(row, column).unwrap().unwrap();
+            let b = got.get(row, column).unwrap().unwrap();
             assert!(
                 values_equal(&a, &b),
                 "{format_id}: {what}: row {row} column {:?}: {a:?} vs {b:?}",

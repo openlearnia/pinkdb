@@ -222,7 +222,7 @@ fn partitioned_commits_split_one_file_per_value_set() {
     let ids: Vec<i32> = {
         let t = loaded.table("t").unwrap();
         (0..t.num_rows())
-            .map(|r| match t.get(r, 0).unwrap() {
+            .map(|r| match t.get(r, 0).unwrap().unwrap() {
                 Value::Integer(i) => i,
                 other => panic!("{other:?}"),
             })

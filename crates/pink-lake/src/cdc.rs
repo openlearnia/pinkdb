@@ -482,7 +482,7 @@ impl Lake {
             .unwrap_or(&delete.target.rel);
         let mut out = Vec::new();
         for row in 0..decoded.num_rows() {
-            let names_target = match decoded.get(row, file_path) {
+            let names_target = match cell(decoded, row, file_path, &path)? {
                 Some(Value::Varchar(file)) => {
                     file == delete.target.rel
                         || file.ends_with(&format!("/{}", delete.target.rel))
@@ -499,15 +499,16 @@ impl Lake {
             if !names_target {
                 continue;
             }
-            let Some(position) = unsigned(&decoded.get(row, pos)) else {
+            let Some(position) = unsigned(&cell(decoded, row, pos, &path)?) else {
                 return Err(LakeError::Corrupt {
                     path,
                     message: "parquet delete pos is not a non-negative integer".to_string(),
                 });
             };
-            let snapshot = snapshots
-                .and_then(|index| unsigned(&decoded.get(row, index)))
-                .map(change_version);
+            let snapshot = match snapshots {
+                Some(index) => unsigned(&cell(decoded, row, index, &path)?).map(change_version),
+                None => None,
+            };
             out.push((position, snapshot));
         }
         check_delete_count(delete, out.len())?;
@@ -647,21 +648,24 @@ impl Lake {
                 ),
             });
         }
+        let path = self.storage.abs(&file.rel);
         let physical = decoded.schema();
         // The hidden snapshot column holds DuckLake snapshot ids; change rows
         // are reported by pinkdb version.
-        let hidden = |name: &str, version: bool| -> Option<Vec<Option<u64>>> {
-            let index = physical.iter().position(|(column, _)| column == name)?;
-            Some(
-                (0..decoded.num_rows())
-                    .map(|row| {
-                        unsigned(&decoded.get(row, index))
-                            .map(|id| if version { change_version(id) } else { id })
-                    })
-                    .collect(),
-            )
+        let hidden = |name: &str, version: bool| -> Result<Option<Vec<Option<u64>>>> {
+            let Some(index) = physical.iter().position(|(column, _)| column == name) else {
+                return Ok(None);
+            };
+            let mut ids = Vec::with_capacity(decoded.num_rows());
+            for row in 0..decoded.num_rows() {
+                ids.push(
+                    unsigned(&cell(decoded, row, index, &path)?)
+                        .map(|id| if version { change_version(id) } else { id }),
+                );
+            }
+            Ok(Some(ids))
         };
-        let snapshots = hidden(SNAPSHOT_COLUMN, true);
+        let snapshots = hidden(SNAPSHOT_COLUMN, true)?;
         if file.partial.is_some() && snapshots.is_none() {
             // DuckLake's own readers refuse a partial file that cannot be
             // filtered by snapshot: without the ids every row would read as a
@@ -675,7 +679,7 @@ impl Lake {
                 ),
             });
         }
-        let row_ids = hidden(ROW_ID_COLUMN, false);
+        let row_ids = hidden(ROW_ID_COLUMN, false)?;
         let projected: DataTable = match record {
             Some(record) => {
                 let file_version = file.schema_version.unwrap_or(record.version);
@@ -692,7 +696,7 @@ impl Lake {
         for row in 0..projected.num_rows() {
             let mut row_values = Vec::with_capacity(projected.num_cols());
             for col in 0..projected.num_cols() {
-                row_values.push(projected.get(row, col).unwrap_or(Value::Null));
+                row_values.push(cell(&projected, row, col, &path)?.unwrap_or(Value::Null));
             }
             values.push(row_values);
         }
@@ -741,6 +745,20 @@ fn kind_rank(kind: ChangeKind) -> u8 {
         ChangeKind::Insert | ChangeKind::UpdatePostimage => 0,
         ChangeKind::Delete | ChangeKind::UpdatePreimage => 1,
     }
+}
+
+/// One cell of a decoded change file. A lazily decoded chunk can fail where a
+/// materialized one never did, so the error keeps its lake context.
+fn cell(
+    table: &DataTable,
+    row: usize,
+    col: usize,
+    path: &std::path::Path,
+) -> Result<Option<Value>> {
+    table.get(row, col).map_err(|source| LakeError::Engine {
+        context: format!("reading the change rows of \"{}\"", path.display()),
+        source,
+    })
 }
 
 /// A positive integer stored in one of the value types the hidden columns and

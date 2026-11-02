@@ -608,9 +608,18 @@ impl LakeAttachment {
                 self.catalog_path(),
             )?;
             for index in 0..table.num_chunks() {
-                let chunk = table.scan_chunk(index).ok_or_else(|| LakeError::Internal {
-                    message: format!("inlined chunk {index} of \"{}\" disappeared", entry.key()),
-                })?;
+                let chunk = table
+                    .scan_chunk(index)
+                    .map_err(|source| LakeError::Engine {
+                        context: format!("scan of \"{}\"", entry.key()),
+                        source,
+                    })?
+                    .ok_or_else(|| LakeError::Internal {
+                        message: format!(
+                            "inlined chunk {index} of \"{}\" disappeared",
+                            entry.key()
+                        ),
+                    })?;
                 rows += chunk.num_rows() as u64;
                 sink(chunk).map_err(|source| LakeError::Engine {
                     context: format!("scan of \"{}\"", entry.key()),
@@ -1395,9 +1404,15 @@ where
         )?;
         let mut rows = 0u64;
         for index in 0..table.num_chunks() {
-            let chunk = table.scan_chunk(index).ok_or_else(|| LakeError::Internal {
-                message: format!("chunk {index} of \"{}\" disappeared", file.rel),
-            })?;
+            let chunk = table
+                .scan_chunk(index)
+                .map_err(|source| LakeError::Engine {
+                    context: format!("scan of \"{key}\""),
+                    source,
+                })?
+                .ok_or_else(|| LakeError::Internal {
+                    message: format!("chunk {index} of \"{}\" disappeared", file.rel),
+                })?;
             rows += chunk.num_rows() as u64;
             sink(chunk).map_err(|source| LakeError::Engine {
                 context: format!("scan of \"{key}\""),
@@ -1456,14 +1471,19 @@ where
                         Arc::new(vector)
                     }
                 };
-                columns.push(pinkdb::storage::Column {
-                    name: name.clone(),
-                    dtype: *dtype,
-                    default: None,
-                    chunks: vec![vector],
-                });
+                columns.push(
+                    pinkdb::storage::Column::from_chunks(name.clone(), *dtype, None, vec![vector])
+                        .map_err(|source| LakeError::Engine {
+                            context: format!("building column \"{key}\".\"{name}\""),
+                            source,
+                        })?,
+                );
             }
-            let decoded = DataTable::from_columns(entry.table.clone(), columns, chunk.num_rows());
+            let decoded = DataTable::from_columns(entry.table.clone(), columns, chunk.num_rows())
+                .map_err(|source| LakeError::Engine {
+                context: format!("building table \"{key}\""),
+                source,
+            })?;
             let (table, _present) = match &entry.record {
                 Some(schema) => {
                     schema.project_table(&plan.mapping, &decoded, &present, &entry.table)?
@@ -1471,9 +1491,15 @@ where
                 None => (decoded, present.clone()),
             };
             for index in 0..table.num_chunks() {
-                let out = table.scan_chunk(index).ok_or_else(|| LakeError::Internal {
-                    message: format!("chunk {index} of \"{}\" disappeared", file.rel),
-                })?;
+                let out = table
+                    .scan_chunk(index)
+                    .map_err(|source| LakeError::Engine {
+                        context: format!("scan of \"{key}\""),
+                        source,
+                    })?
+                    .ok_or_else(|| LakeError::Internal {
+                        message: format!("chunk {index} of \"{}\" disappeared", file.rel),
+                    })?;
                 rows += out.num_rows() as u64;
                 sink(out).map_err(|source| LakeError::Engine {
                     context: format!("scan of \"{key}\""),
@@ -1644,6 +1670,14 @@ fn decode_via_provider(
 ) -> Result<DataTable> {
     let mini = entry.format.read(file)?;
     let (file_db, file_table) = only_table(&mini, file.rel(), root)?;
+    // The lake's readers materialize whole tables (this path is the one that
+    // runs for formats without a projected reader), and `from_columns` folds
+    // statistics over the rows it is handed. The engine `.pink` reader keeps
+    // its data encoded, so decode it here.
+    file_table.decode_all().map_err(|e| LakeError::Engine {
+        context: format!("decoding data file \"{}\"", file.rel()),
+        source: e,
+    })?;
     if !file_db.eq_ignore_ascii_case(&entry.db)
         || !file_table.name.eq_ignore_ascii_case(&entry.table)
     {
@@ -2474,7 +2508,7 @@ mod tests {
                 let mut min: Option<Value> = None;
                 let mut max: Option<Value> = None;
                 for row in 0..decoded.num_rows() {
-                    let v = decoded.get(row, i).unwrap();
+                    let v = decoded.get(row, i).unwrap().unwrap();
                     if v.is_null() {
                         nulls += 1;
                         continue;
@@ -2754,8 +2788,8 @@ mod tests {
         for j in 0..full.num_chunks() {
             for i in 0..full.num_cols() {
                 assert_eq!(
-                    sparse.table.columns[i].chunks[j].len(),
-                    full.columns[i].chunks[j].len(),
+                    sparse.table.columns[i].chunk_rows(j),
+                    full.columns[i].chunk_rows(j),
                     "chunk {j} column {i} length"
                 );
             }
@@ -2768,7 +2802,10 @@ mod tests {
             (4, true),
         ] {
             for row in 0..full.num_rows() {
-                let (a, b) = (sparse.table.get(row, i).unwrap(), full.get(row, i).unwrap());
+                let (a, b) = (
+                    sparse.table.get(row, i).unwrap().unwrap(),
+                    full.get(row, i).unwrap().unwrap(),
+                );
                 if decoded {
                     match (&a, &b) {
                         (Value::Double(x), Value::Double(y)) => assert_eq!(
@@ -2796,8 +2833,8 @@ mod tests {
         for i in 0..full.num_cols() {
             for row in 0..full.num_rows() {
                 let (a, b) = (
-                    extended.table.get(row, i).unwrap(),
-                    full.get(row, i).unwrap(),
+                    extended.table.get(row, i).unwrap().unwrap(),
+                    full.get(row, i).unwrap().unwrap(),
                 );
                 match (&a, &b) {
                     (Value::Double(x), Value::Double(y)) => {

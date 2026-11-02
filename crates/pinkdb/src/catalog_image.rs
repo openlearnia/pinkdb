@@ -77,7 +77,7 @@ impl PinkDb {
     fn attach_rows_in(&mut self, ns: &SchemaPath, name: &str, rows: &DataTable) -> Result<()> {
         let table = self.table_mut_in(ns.clone(), name)?;
         for chunk_idx in 0..rows.num_chunks() {
-            let chunk = rows.scan_chunk(chunk_idx).ok_or_else(|| {
+            let chunk = rows.scan_chunk(chunk_idx)?.ok_or_else(|| {
                 PinkDbError::Execution("lake table changed while it was being loaded".to_string())
             })?;
             table.append_shared_chunk(&chunk.columns)?;

@@ -541,7 +541,7 @@ fn column_at(table: &DataTable, name: &str, what: &str) -> Result<usize> {
 fn read_docs(table: &DataTable, id_at: usize, value_at: &[usize]) -> Result<Vec<DocInput>> {
     let mut docs = Vec::with_capacity(table.num_rows);
     let mut chunk = 0;
-    while let Some(rows) = table.scan_chunk(chunk) {
+    while let Some(rows) = table.scan_chunk(chunk)? {
         for row in 0..rows.num_rows {
             let id = match rows.columns[id_at].get(row) {
                 Value::Integer(id) => id as i64,
@@ -577,7 +577,7 @@ fn scan(
         .table_in(index_db, table)
         .map_err(|_| missing_index(index_db))?;
     let mut chunk = 0;
-    while let Some(rows) = table.scan_chunk(chunk) {
+    while let Some(rows) = table.scan_chunk(chunk)? {
         for index in 0..rows.num_rows {
             row(&rows, index)?;
         }

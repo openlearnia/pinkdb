@@ -35,6 +35,11 @@ pub struct QueryProfile {
     pub kind: String,
     /// True when the statement ran inside an open transaction.
     pub in_transaction: bool,
+    /// The process-wide memory limit the statement ran under (wave 136a).
+    pub memory_limit: u64,
+    /// The statement's peak memory-pool usage: the most bytes its operators
+    /// held reserved at once. Zero for a statement that reserved nothing.
+    pub memory_peak: u64,
     /// `env!("CARGO_PKG_VERSION")` of the pinkdb crate.
     pub engine_version: &'static str,
 }

@@ -828,3 +828,40 @@ fn table_functions_require_admin_in_every_statement_shape() {
         drop(handle);
     }
 }
+
+#[test]
+fn the_memory_limit_is_an_administrators_statement() {
+    for flavor in flavors() {
+        let (_handle, addr, db) = start_fresh(flavor);
+        let mut trusted = embedded(&db);
+        trusted
+            .execute(
+                "CREATE USER admin PASSWORD 'admin-secret';\
+                 GRANT ADMIN TO admin;\
+                 CREATE USER alice PASSWORD 'alice-secret';",
+            )
+            .unwrap();
+
+        // The limit is process-wide, so a non-admin may neither set nor reset
+        // it — also under its DuckDB name `max_memory`.
+        let mut alice = Client::connect(&addr).unwrap();
+        alice.login("alice", "alice-secret").unwrap();
+        for sql in [
+            "SET memory_limit = '1MB';",
+            "SET max_memory = '1MB';",
+            "RESET memory_limit;",
+        ] {
+            let e = err_of(alice.execute(sql));
+            assert!(
+                e.contains("needs the ADMIN privilege"),
+                "{flavor:?}: {sql}: {e}"
+            );
+        }
+
+        let mut admin = Client::connect(&addr).unwrap();
+        admin.login("admin", "admin-secret").unwrap();
+        admin.execute("SET memory_limit = '2GB';").unwrap();
+        admin.execute("RESET memory_limit;").unwrap();
+        drop(_handle);
+    }
+}

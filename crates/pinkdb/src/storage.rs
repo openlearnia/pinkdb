@@ -42,7 +42,7 @@ pub(crate) fn reset_index_rebuild_count() {
 }
 
 /// One column: its schema + its chunk list.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Column {
     pub name: String,
     pub dtype: DataType,
@@ -52,11 +52,498 @@ pub struct Column {
     /// default (an omitted `INSERT` column writes NULL). The `.pink` footer
     /// stores its text under the defaults flag and rebinds it at load.
     pub default: Option<ColumnDefault>,
-    /// Reference-counted chunks: scans share storage instead of cloning
-    /// megabytes per query. Mutations use copy-on-write (`Arc::make_mut`),
-    /// which never actually clones — the executor never holds chunks
-    /// across a `&mut` borrow.
-    pub chunks: Vec<Arc<Vector>>,
+    /// The chunks, oldest first. Private since wave 136b: the payload lives
+    /// behind a [`ChunkHandle`] so a chunk can be decoded late (or not at all)
+    /// without a caller knowing. Read them through [`Column::chunk`],
+    /// [`Column::chunk_mut`] and [`Column::chunk_rows`].
+    ///
+    /// Each handle is its own `Arc` so the cache can hold a `Weak` to it and
+    /// drop its payload under memory pressure; a snapshot clones the handles
+    /// (sharing the payloads), never the `Arc`s.
+    chunks: Vec<Arc<ChunkHandle>>,
+}
+
+/// The bytes of a `.pink` file a lazily opened store decodes from.
+///
+/// Every chunk handle of the store holds an `Arc` of it, so the image lives
+/// exactly as long as some chunk may still need it (a store whose every chunk
+/// was decoded or dropped releases it early). An encrypted store's image is
+/// the decrypted plaintext: the last reference overwrites it before the buffer
+/// is freed.
+pub(crate) struct StoreImage {
+    bytes: Box<[u8]>,
+    secret: bool,
+}
+
+impl StoreImage {
+    pub(crate) fn new(bytes: Vec<u8>, secret: bool) -> Arc<Self> {
+        Arc::new(Self {
+            bytes: bytes.into_boxed_slice(),
+            secret,
+        })
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for StoreImage {
+    fn drop(&mut self) {
+        if !self.secret {
+            return;
+        }
+        // One volatile byte store at a time: a plain store into memory that is
+        // freed right after may be dropped as dead, and `write_volatile` needs
+        // an aligned pointer, which a `u8` buffer does not guarantee for wider
+        // words. This runs once, when an encrypted session ends.
+        for byte in self.bytes.iter_mut() {
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Debug for StoreImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreImage")
+            .field("bytes", &self.bytes.len())
+            .field("secret", &self.secret)
+            .finish()
+    }
+}
+
+/// One chunk's bytes in the retained store image.
+///
+/// The open-time sweep verified the enclosing column chunk's CRC32C over
+/// exactly these bytes, so a decode validates the page structure only.
+#[derive(Debug, Clone)]
+pub(crate) struct EncodedChunk {
+    pub(crate) image: Arc<StoreImage>,
+    /// The page's byte range in the image.
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+    /// Rows the footer recorded for this chunk.
+    pub(crate) rows: usize,
+}
+
+impl EncodedChunk {
+    pub(crate) fn new(image: Arc<StoreImage>, offset: u64, length: u64, rows: usize) -> Self {
+        Self {
+            image,
+            offset,
+            length,
+            rows,
+        }
+    }
+
+    fn decode(&self, dtype: DataType) -> Result<Vector> {
+        let start = self.offset as usize;
+        let end = start + self.length as usize;
+        let bytes = self.image.bytes().get(start..end).ok_or_else(|| {
+            PinkDbError::Execution("corrupt file: a chunk is outside the file".to_string())
+        })?;
+        crate::persist::decode_page(bytes, dtype)
+    }
+}
+
+/// One chunk of a column: its rows, plus where its payload lives.
+///
+/// A chunk is one encoded page. The `.pink` loader leaves it in the retained
+/// file image (`encoded`) and the first [`Column::chunk`] decodes it into the
+/// handle's state, which keeps it — and the pool reservation that pays for it
+/// — until the cache drops it again under memory pressure. The state is
+/// behind a `Mutex` so `chunk(&self)` can fill it while a scan holds
+/// `&Column`; the write path ([`Column::chunk_mut`]) takes the same lock.
+pub(crate) struct ChunkHandle {
+    /// The decoded side and the store-image descriptor, under one lock so that
+    /// a check and the drop it guards cannot interleave with a decode, a
+    /// write, or a save repointing the descriptor.
+    state: Mutex<ChunkState>,
+}
+
+/// The state of a [`ChunkHandle`], all under one lock.
+#[derive(Default)]
+struct ChunkState {
+    /// Where this chunk's bytes are in the retained store image. It stays: an
+    /// evicted chunk decodes again from here (which re-checks the CRC32C), and
+    /// a save repoints it at the image it just wrote.
+    encoded: Option<EncodedChunk>,
+    /// The decoded payload, shared: scans clone the `Arc`. `None` = not
+    /// decoded (yet, or again).
+    payload: Option<ChunkPayload>,
+    /// The payload differs from the stored form, so a save must re-encode
+    /// this chunk instead of copying its bytes through. The cache never evicts
+    /// a dirty chunk, and both the flag and the start of the write are set
+    /// under this lock, so it can never evict one mid-write either.
+    dirty: bool,
+}
+
+/// A decoded chunk and the pool reservation that pays for it. The reservation
+/// is shared with a snapshot's copy of the handle: the bytes stay charged
+/// while any handle can still reach them.
+struct ChunkPayload {
+    vector: Arc<Vector>,
+    charge: Arc<crate::memory::Reservation>,
+}
+
+/// What the cache found when it tried to evict one chunk.
+enum Evict {
+    /// Decoded payload dropped, giving the pool back this many bytes.
+    Freed(usize),
+    /// Undecidable now — pinned by a scan, or locked by another thread — so it
+    /// stays a candidate.
+    Busy,
+    /// Never a candidate: dirty, or not backed by the store image.
+    Never,
+}
+
+impl ChunkHandle {
+    /// A handle over a payload the caller just built or decoded: nothing on
+    /// disk describes it yet, so it is dirty, and the pool is charged for it
+    /// so the store's real footprint stays visible.
+    fn new(decoded: Arc<Vector>) -> Result<Self> {
+        let charge = crate::memory::reserve(decoded.memory_size())?;
+        Ok(Self {
+            state: Mutex::new(ChunkState {
+                encoded: None,
+                payload: Some(ChunkPayload {
+                    vector: decoded,
+                    charge: Arc::new(charge),
+                }),
+                dirty: true,
+            }),
+        })
+    }
+
+    /// The empty chunk a new (or cleared) column starts with. Nothing to
+    /// charge yet: bytes arrive through `chunk_mut`, which re-charges it.
+    fn empty(dtype: DataType) -> Self {
+        Self {
+            state: Mutex::new(ChunkState {
+                encoded: None,
+                payload: Some(ChunkPayload {
+                    vector: Arc::new(Vector::new_empty(dtype)),
+                    charge: Arc::new(crate::memory::Reservation::empty()),
+                }),
+                dirty: true,
+            }),
+        }
+    }
+
+    /// A handle over a chunk still in the store image: the `.pink` loader
+    /// builds these from the footer, and the first read decodes it.
+    pub(crate) fn new_encoded(
+        image: Arc<StoreImage>,
+        offset: u64,
+        length: u64,
+        rows: usize,
+    ) -> Self {
+        Self {
+            state: Mutex::new(ChunkState {
+                encoded: Some(EncodedChunk::new(image, offset, length, rows)),
+                ..ChunkState::default()
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ChunkState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The payload if it is already decoded, marking it dirty for a write
+    /// path.
+    fn decoded(&self, dirty: bool) -> Option<Arc<Vector>> {
+        let mut state = self.lock();
+        let vector = state.payload.as_ref().map(|p| Arc::clone(&p.vector));
+        if vector.is_some() && dirty {
+            state.dirty = true;
+        }
+        vector
+    }
+
+    /// The payload, decoding it from the store image on first touch (and again
+    /// after the cache evicted it). `dirty` marks a write path's access, which
+    /// also makes the chunk unevictable.
+    ///
+    /// The reservation for the decode is taken *before* the handle is locked:
+    /// a reservation that fails runs the evictor, which locks handles with
+    /// `try_lock`, and must not find this one held by the thread that needs
+    /// the memory.
+    fn get(handle: &Arc<ChunkHandle>, dtype: DataType, dirty: bool) -> Result<Arc<Vector>> {
+        install_evictor();
+        if let Some(vector) = handle.decoded(dirty) {
+            return Ok(vector);
+        }
+        let (rows, length) = match handle.lock().encoded.as_ref() {
+            Some(encoded) => (encoded.rows, encoded.length),
+            None => return Err(missing_payload()),
+        };
+        let mut charge = crate::memory::reserve(decoded_bound(dtype, rows, length as usize))?;
+        let mut state = handle.lock();
+        // Another thread may have decoded the chunk while this one reserved.
+        if let Some(payload) = state.payload.as_ref() {
+            let vector = Arc::clone(&payload.vector);
+            state.dirty |= dirty;
+            return Ok(vector);
+        }
+        let encoded = state.encoded.clone().ok_or_else(missing_payload)?;
+        let decoded = Arc::new(encoded.decode(dtype)?);
+        // The bound over-estimates; the charge follows the chunk's real size.
+        charge.resize(decoded.memory_size())?;
+        state.payload = Some(ChunkPayload {
+            vector: Arc::clone(&decoded),
+            charge: Arc::new(charge),
+        });
+        state.dirty |= dirty;
+        // Registered under the handle's lock: an eviction that raced past here
+        // would leave a decoded chunk the cache never sees again.
+        if !dirty {
+            register(&Arc::downgrade(handle));
+        }
+        Ok(decoded)
+    }
+
+    /// The payload of a chunk the write path just decoded (`set_chunk` or
+    /// `chunk_mut` on this chunk). A still-encoded handle here is a caller
+    /// bug, not a corrupt file.
+    fn decoded_chunk(&self) -> Arc<Vector> {
+        self.lock()
+            .payload
+            .as_ref()
+            .map(|p| Arc::clone(&p.vector))
+            .expect("the write path decoded this chunk")
+    }
+
+    /// Rows in this chunk: a decoded payload is authoritative (it grows
+    /// through [`Column::chunk_mut`]), a still-encoded one carries the count
+    /// the footer recorded. Every column of a table shares the boundaries.
+    fn rows(&self) -> usize {
+        let state = self.lock();
+        match state.payload.as_ref() {
+            Some(payload) => payload.vector.len(),
+            None => state.encoded.as_ref().map_or(0, |e| e.rows),
+        }
+    }
+
+    /// Bring the pool charge up to what the payload holds now. A write path
+    /// grows a chunk in place — a VARCHAR buffer doubles, a preallocated chunk
+    /// fills up — so the size charged when the chunk was built is stale. The
+    /// charge is taken before the write, so it can lag one write behind; the
+    /// budget is approximate by construction (see [`crate::memory`]).
+    fn charge_current(&self) -> Result<()> {
+        let bytes = match self.lock().payload.as_ref() {
+            Some(payload) if payload.vector.memory_size() != payload.charge.bytes() => {
+                payload.vector.memory_size()
+            }
+            _ => return Ok(()),
+        };
+        // Taken before the lock: a failure runs the evictor, which locks
+        // handles with `try_lock` and must not find this one held.
+        let charge = crate::memory::reserve(bytes)?;
+        let mut state = self.lock();
+        let Some(payload) = state.payload.as_mut() else {
+            return Ok(());
+        };
+        // A snapshot may still hold the old charge (and the pre-write payload
+        // it pays for), so it keeps paying it until it drops.
+        let old = std::mem::replace(&mut payload.charge, Arc::new(charge));
+        drop(state);
+        drop(old);
+        Ok(())
+    }
+
+    /// The cache's attempt on this chunk: drop the decoded payload when it is
+    /// clean, still in the image and nobody else holds it. All checks run
+    /// under the lock, so a chunk the write path just marked dirty is never
+    /// dropped out from under the write.
+    fn evict(&self) -> Evict {
+        let Ok(mut state) = self.state.try_lock() else {
+            return Evict::Busy;
+        };
+        if state.dirty || state.encoded.is_none() {
+            return Evict::Never;
+        }
+        let Some(payload) = state.payload.as_ref() else {
+            return Evict::Never;
+        };
+        // Another owner (a scan, a hash-join build, a snapshot) decides what
+        // this chunk's rows are; dropping the payload would not free them.
+        if Arc::strong_count(&payload.vector) != 1 {
+            return Evict::Busy;
+        }
+        let bytes = payload.charge.bytes();
+        let payload = state.payload.take().expect("checked above");
+        // Free the payload outside the handle's lock: it can be a 2048-row
+        // buffer with one allocation per VARCHAR cell.
+        drop(state);
+        drop(payload);
+        Evict::Freed(bytes)
+    }
+
+    /// A snapshot's copy of this handle: it shares the decoded payload (and
+    /// therefore pins it against eviction) instead of copying it.
+    fn duplicate(&self) -> ChunkHandle {
+        let state = self.lock();
+        ChunkHandle {
+            state: Mutex::new(ChunkState {
+                encoded: state.encoded.clone(),
+                payload: state.payload.as_ref().map(|p| ChunkPayload {
+                    vector: Arc::clone(&p.vector),
+                    charge: Arc::clone(&p.charge),
+                }),
+                dirty: state.dirty,
+            }),
+        }
+    }
+
+    /// This chunk's stored form, when a save may copy it through: the handle is
+    /// clean, so whatever it holds is exactly what the image says.
+    fn stored(&self) -> Option<EncodedChunk> {
+        let state = self.lock();
+        if state.dirty {
+            return None;
+        }
+        state.encoded.clone()
+    }
+
+    /// Point the chunk at the image a save just wrote, at bytes that are its
+    /// stored form. Returns whether the chunk was dirty: a saved write is
+    /// stored now, so the cache may evict it.
+    ///
+    /// The payload is untouched and nothing is decoded: the image's bytes are
+    /// what this chunk holds, which is what makes the handle clean again.
+    fn repoint(&self, image: &Arc<StoreImage>, offset: u64, length: u64, rows: usize) -> bool {
+        let mut state = self.lock();
+        state.encoded = Some(EncodedChunk::new(Arc::clone(image), offset, length, rows));
+        std::mem::replace(&mut state.dirty, false)
+    }
+}
+
+fn missing_payload() -> PinkDbError {
+    PinkDbError::Execution("corrupt file: a chunk has no payload".to_string())
+}
+
+/// Print the chunk's shape, not its payload (a derived impl would dump values
+/// through every `Debug` of a table, column or query result).
+impl std::fmt::Debug for ChunkHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.lock();
+        let rows = match state.payload.as_ref() {
+            Some(payload) => payload.vector.len(),
+            None => state.encoded.as_ref().map_or(0, |e| e.rows),
+        };
+        f.debug_struct("ChunkHandle")
+            .field("rows", &rows)
+            .field(
+                "decoded",
+                &state.payload.as_ref().map(|payload| payload.vector.len()),
+            )
+            .field(
+                "encoded",
+                &state.encoded.as_ref().map(|e| (e.offset, e.length)),
+            )
+            .field("dirty", &state.dirty)
+            .field("charged", &state.payload.as_ref().map(|p| p.charge.bytes()))
+            .finish()
+    }
+}
+
+/// The cache of decoded, clean, lazily backed chunks in decode order, oldest
+/// first: the eviction candidates, weakly held so a dropped column leaves no
+/// trace (and a stale entry is pruned on the next pass).
+static DECODED: Mutex<Vec<std::sync::Weak<ChunkHandle>>> = Mutex::new(Vec::new());
+
+/// Note a just-decoded chunk as a candidate, after the currently oldest.
+fn register(handle: &std::sync::Weak<ChunkHandle>) {
+    let mut lru = DECODED.lock().unwrap_or_else(|e| e.into_inner());
+    lru.push(handle.clone());
+}
+
+/// The pool's evictor (see [`crate::memory::set_evictor`]): drop decoded
+/// chunks that are clean, still backed by the image and unpinned, oldest
+/// first, until `want` bytes are back or nothing is left to drop.
+///
+/// This runs on the thread whose reservation is failing, so it never waits for
+/// a handle: another thread may hold one while it reserves (a chunk growing
+/// after a decode, a write), and blocking here would deadlock those two
+/// threads against each other. `try_lock` plus the retry in
+/// [`crate::memory::acquire`] is what makes the eviction best-effort instead.
+fn evict_decoded(want: usize) -> usize {
+    let mut lru = DECODED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut freed = 0;
+    let mut i = 0;
+    while i < lru.len() && freed < want {
+        let Some(handle) = lru[i].upgrade() else {
+            lru.remove(i);
+            continue;
+        };
+        let result = handle.evict();
+        if std::env::var_os("PINKDB_EVICT_TRACE").is_some() {
+            eprintln!("EVICT lru={} used={}", lru.len(), crate::memory::used());
+        }
+        match result {
+            Evict::Freed(bytes) => {
+                freed += bytes;
+                lru.remove(i);
+            }
+            Evict::Busy => i += 1,
+            Evict::Never => {
+                lru.remove(i);
+            }
+        }
+    }
+    freed
+}
+
+/// Hand the cache to the pool once, so a reservation that would pass the limit
+/// drops decoded chunks before it fails.
+fn install_evictor() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::memory::set_evictor(evict_decoded));
+}
+
+/// Upper bound on the bytes a decoded chunk holds, reserved before the decode
+/// so the pool's `used` never passes its limit.
+///
+/// The design's formula (`docs/wave-136b-design.md` §4.2): the widest payload
+/// per row plus the validity bitmap, and for the variable-width types the
+/// encoded bytes, which the decoded buffers are carved out of. A FSST or
+/// compression-framed page decodes to *more* than it stores, so there the
+/// reservation grows after the decode
+/// ([`crate::memory::Reservation::resize`]): the limit still holds, and a limit
+/// set below what such a page decodes to refuses the read rather than
+/// overshooting it.
+fn decoded_bound(dtype: DataType, rows: usize, encoded_len: usize) -> usize {
+    let (per_row, elems) = match dtype {
+        // One byte per row over-estimates the bitmap `Vec<bool>`.
+        DataType::Boolean => (1, 0),
+        DataType::Integer | DataType::Date => (4, 0),
+        DataType::Bigint | DataType::Timestamp | DataType::Double => (8, 0),
+        DataType::Decimal { .. } => (16, 0),
+        DataType::Interval => (std::mem::size_of::<crate::types::Interval>(), 0),
+        // One view per row; the bytes it points at are in the page.
+        DataType::Varchar => (std::mem::size_of::<crate::strings::StrView>(), 0),
+        // One shared tree per row; the trees sum to no more than the page.
+        DataType::Variant => (std::mem::size_of::<Arc<crate::variant::Variant>>(), 0),
+        DataType::Uuid | DataType::Hugeint | DataType::Uhugeint => (16, 0),
+        DataType::Array { elem, len } => {
+            // `ArrayElems` stores INTEGER elements as `i64`.
+            let width = if elem == crate::types::ArrayElem::Float {
+                4
+            } else {
+                8
+            };
+            (width, rows.saturating_mul(len as usize))
+        }
+    };
+    let payload = rows * per_row + elems * per_row;
+    let element_bitmap = elems.div_ceil(8);
+    // The encoded page is already in memory and is not charged to the pool, so
+    // only the decoded copy is: reserving the page too would double the bound
+    // and make two decoders starve each other on a pool that could hold both.
+    let _ = encoded_len;
+    payload + element_bitmap + rows.div_ceil(8) + std::mem::size_of::<Vector>()
 }
 
 /// Chunks above which a dropped column releases them in parallel.
@@ -77,13 +564,220 @@ impl Drop for Column {
     }
 }
 
+impl Clone for Column {
+    /// A snapshot shares the decoded payloads (`ChunkHandle::duplicate`) and
+    /// keeps the image descriptors, so cloning a table copies no chunk data.
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            dtype: self.dtype,
+            default: self.default.clone(),
+            chunks: self
+                .chunks
+                .iter()
+                .map(|handle| Arc::new(handle.duplicate()))
+                .collect(),
+        }
+    }
+}
+
+/// One chunk of a column, held open for writing (see [`Column::chunk_mut`]).
+///
+/// It owns the handle's lock, so the decoded payload cannot be evicted (or
+/// copied by a racing `chunk`) while the write is in progress. `DerefMut`
+/// does the copy-on-write: a payload a snapshot still shares is copied first.
+pub struct ChunkMut<'a>(std::sync::MutexGuard<'a, ChunkState>);
+
+impl std::ops::Deref for ChunkMut<'_> {
+    type Target = Vector;
+
+    fn deref(&self) -> &Vector {
+        &self.0.payload.as_ref().expect("chunk_mut decodes").vector
+    }
+}
+
+impl std::ops::DerefMut for ChunkMut<'_> {
+    fn deref_mut(&mut self) -> &mut Vector {
+        let payload = self.0.payload.as_mut().expect("chunk_mut decodes");
+        Arc::make_mut(&mut payload.vector)
+    }
+}
+
 impl Column {
     fn new(name: String, dtype: DataType) -> Self {
         Self {
             name,
             dtype,
             default: None,
-            chunks: vec![Arc::new(Vector::new_empty(dtype))],
+            chunks: vec![Arc::new(ChunkHandle::empty(dtype))],
+        }
+    }
+
+    /// Build a column from finished chunks: the lake's projected decode and
+    /// `ALTER TABLE … ADD COLUMN` assemble columns this way.
+    pub fn from_chunks(
+        name: String,
+        dtype: DataType,
+        default: Option<ColumnDefault>,
+        chunks: Vec<Arc<Vector>>,
+    ) -> Result<Self> {
+        let chunks = chunks
+            .into_iter()
+            .map(|chunk| ChunkHandle::new(chunk).map(Arc::new))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            name,
+            dtype,
+            default,
+            chunks,
+        })
+    }
+
+    fn out_of_range(&self, i: usize) -> PinkDbError {
+        PinkDbError::Execution(format!(
+            "chunk {i} out of range for column \"{}\" ({} chunks)",
+            self.name,
+            self.chunks.len()
+        ))
+    }
+
+    /// Chunk `i`'s decoded payload, shared (`Arc::clone`, never a copy).
+    ///
+    /// A chunk the loader left in the store image is decoded here on first
+    /// touch and kept; a corrupt page surfaces as an error, never a panic.
+    /// How many of this column's chunks hold a decoded copy (a test hook: a
+    /// lazy open decodes none, and a projected or pruned scan decodes only the
+    /// chunks it reads, whichever thread decodes them).
+    #[cfg(test)]
+    pub(crate) fn decoded_chunks(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter(|chunk| chunk.lock().payload.is_some())
+            .count()
+    }
+
+    pub fn chunk(&self, i: usize) -> Result<Arc<Vector>> {
+        match self.chunks.get(i) {
+            Some(handle) => ChunkHandle::get(handle, self.dtype, false),
+            None => Err(self.out_of_range(i)),
+        }
+    }
+
+    /// Chunk `i` for writing: copy-on-write, and the chunk is marked dirty so a
+    /// later save re-encodes it instead of copying its stored bytes through.
+    ///
+    /// A still-encoded chunk is decoded here (a write touches the chunks it
+    /// changes and no others). The executor never holds a chunk across a `&mut`
+    /// borrow of its column, so the `Arc::make_mut` never actually clones.
+    pub fn chunk_mut(&mut self, i: usize) -> Result<ChunkMut<'_>> {
+        let Some(handle) = self.chunks.get(i) else {
+            return Err(self.out_of_range(i));
+        };
+        // The write may grow the payload: re-charge it before it does.
+        handle.charge_current()?;
+        ChunkHandle::get(handle, self.dtype, true)?;
+        let mut state = handle.lock();
+        state.dirty = true;
+        Ok(ChunkMut(state))
+    }
+
+    /// Rows in chunk `i`. Metadata only: a pruned or projected scan asks this
+    /// without decoding the payload. Out of range is a caller bug and panics,
+    /// exactly like the chunk slicing it replaces.
+    pub fn chunk_rows(&self, i: usize) -> usize {
+        self.chunks[i].rows()
+    }
+
+    pub fn num_chunks(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Total rows across the chunks.
+    pub fn len(&self) -> usize {
+        self.chunks.iter().map(|c| c.rows()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chunks.iter().all(|c| c.rows() == 0)
+    }
+
+    /// Append a finished chunk (the loader's and bulk append's paths).
+    pub fn push_chunk(&mut self, chunk: Arc<Vector>) -> Result<()> {
+        self.chunks.push(Arc::new(ChunkHandle::new(chunk)?));
+        Ok(())
+    }
+
+    /// Replace chunk `i`'s payload in place (the loader reuses the empty tail,
+    /// a delete rewrites a chunk as its gathered survivor rows).
+    fn set_chunk(&mut self, i: usize, chunk: Arc<Vector>) -> Result<()> {
+        self.chunks[i] = Arc::new(ChunkHandle::new(chunk)?);
+        Ok(())
+    }
+
+    /// Install the chunk list a lazily opened table read from the footer: still
+    /// encoded in the store image, decoded on first touch. An empty store of a
+    /// zero-row table keeps the column's single empty chunk.
+    fn set_chunks(&mut self, chunks: Vec<Arc<ChunkHandle>>) {
+        if !chunks.is_empty() {
+            self.chunks = chunks;
+        }
+    }
+
+    /// Drop every chunk and start again from one empty one.
+    fn reset_chunks(&mut self) {
+        self.chunks = vec![Arc::new(ChunkHandle::empty(self.dtype))];
+    }
+
+    /// Chunk `i`'s payload when the write path just decoded it (a `set_chunk`
+    /// or `chunk_mut` on this chunk). Panics on a still-encoded handle: that is
+    /// a caller bug, not a corrupt file.
+    fn chunk_decoded(&self, i: usize) -> Arc<Vector> {
+        self.chunks[i].decoded_chunk()
+    }
+
+    /// The decoded payloads, for the internal passes that fold a whole column:
+    /// statistics, zone maps and hash-index maps.
+    ///
+    /// Only valid on a fully decoded column: a lazily loaded table's chunks are
+    /// still in the image, so a fold that must read them decodes through
+    /// [`Self::chunk`] (as `ANALYZE` and `index_map_for` do) rather than
+    /// panicking here.
+    pub(crate) fn chunks_decoded(&self) -> impl Iterator<Item = Arc<Vector>> + '_ {
+        self.chunks.iter().map(|c| c.decoded_chunk())
+    }
+
+    /// The stored form of chunks `first..last`, when a save may copy the
+    /// group's bytes through instead of decoding and re-encoding them: every
+    /// chunk is clean and they still sit next to each other in one image, so
+    /// the group's encoded column chunk is those bytes. `None` falls back to
+    /// the encoder.
+    pub(crate) fn stored_group(
+        &self,
+        first: usize,
+        last: usize,
+    ) -> Option<(Arc<StoreImage>, Vec<EncodedChunk>)> {
+        let chunks = self.chunks.get(first..last)?;
+        let image = chunks.first()?.stored()?.image;
+        let mut encoded = Vec::with_capacity(chunks.len());
+        for handle in chunks {
+            let chunk = handle.stored()?;
+            if !Arc::ptr_eq(&chunk.image, &image) {
+                return None;
+            }
+            encoded.push(chunk);
+        }
+        Some((image, encoded))
+    }
+
+    /// Point the column's chunks at the image a save wrote: `ranges` holds each
+    /// chunk's `(offset, length, rows)` there, in chunk order. A chunk that was
+    /// dirty is stored now, so it becomes an eviction candidate.
+    pub(crate) fn repoint(&self, image: &Arc<StoreImage>, ranges: &[(u64, u64, usize)]) {
+        install_evictor();
+        for (handle, &(offset, length, rows)) in self.chunks.iter().zip(ranges) {
+            if handle.repoint(image, offset, length, rows) {
+                let _ = register;
+            }
         }
     }
 }
@@ -212,22 +906,91 @@ fn flush_vector_rows(
 /// A single-column hash index: maps a key value to the global row indices
 /// (flattened across chunks) where it occurs. NULL keys are not stored
 /// (NULL never matches `=`).
-#[derive(Debug, Clone)]
+///
+/// The map is built on first use and a mutation drops it instead of rebuilding
+/// it ([`DataTable::rebuild_indexes`] skips an unloaded map), so a store opened
+/// lazily pays for a map only when an indexed lookup actually runs.
+#[derive(Debug)]
 pub struct Index {
     pub name: String,
     pub column: usize,
-    pub map: std::collections::HashMap<Vec<u8>, Vec<usize>>,
+    /// `None` = not built (yet, or again). Behind a lock because the optimizer
+    /// and executor only see `&PinkDb`.
+    map: Mutex<Option<IndexMap>>,
+}
+
+/// A hash index's key → row posting lists.
+pub type IndexMap = std::collections::HashMap<Vec<u8>, Vec<usize>>;
+
+impl Clone for Index {
+    /// Clone the map the index currently holds, never share it: a snapshot's
+    /// map describes the snapshot's rows.
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            column: self.column,
+            map: Mutex::new(self.map().clone()),
+        }
+    }
+}
+
+impl Index {
+    pub(crate) fn new(name: String, column: usize) -> Self {
+        Self {
+            name,
+            column,
+            map: Mutex::new(None),
+        }
+    }
+
+    /// The map, `None` while it has not been built.
+    pub fn map(&self) -> std::sync::MutexGuard<'_, Option<IndexMap>> {
+        self.map.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The map for an in-place edit by the owner of the table's `&mut`.
+    pub fn map_mut(&mut self) -> &mut Option<IndexMap> {
+        self.map.get_mut().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Build the map if it is not built: `CREATE INDEX`, this test hook and
+    /// the first indexed lookup are the only builders.
+    pub fn ensure_map(&self, column: &Column) -> Result<()> {
+        let mut map = self.map();
+        if map.is_none() {
+            *map = Some(index_map_for(column)?);
+        }
+        Ok(())
+    }
+
+    /// The posting list for `key`, building the map from `column` on first use
+    /// (which decodes only that column's chunks).
+    pub(crate) fn lookup(&self, column: &Column, key: &[u8]) -> Result<Vec<usize>> {
+        self.ensure_map(column)?;
+        let map = self.map();
+        Ok(map
+            .as_ref()
+            .and_then(|map| map.get(key).cloned())
+            .unwrap_or_default())
+    }
+
+    /// Forget the map after a mutation: the next lookup rebuilds it from the
+    /// live chunks.
+    fn unload(&self) {
+        *self.map() = None;
+    }
 }
 
 /// Build one hash-index map from a column's chunks: non-NULL key encoding →
 /// global row indices (flattened across chunks, using each chunk's real
-/// length). Shared by `CREATE INDEX`, the lazy rebuild and the `.pink`
-/// loader (which rebuilds every persisted index from the decoded rows) so all
-/// of them produce identical keys.
-pub(crate) fn index_map_for(column: &Column) -> std::collections::HashMap<Vec<u8>, Vec<usize>> {
-    let mut map = std::collections::HashMap::new();
+/// length). Shared by `CREATE INDEX` and the deferred rebuild of a lazily
+/// loaded or invalidated index, so both produce identical keys. Only the
+/// indexed column is decoded.
+pub(crate) fn index_map_for(column: &Column) -> Result<IndexMap> {
+    let mut map = IndexMap::new();
     let mut offset = 0usize;
-    for chunk in column.chunks.iter() {
+    for i in 0..column.num_chunks() {
+        let chunk = column.chunk(i)?;
         for row in 0..chunk.len() {
             let v = chunk.get(row);
             if matches!(v, Value::Null) {
@@ -235,11 +998,11 @@ pub(crate) fn index_map_for(column: &Column) -> std::collections::HashMap<Vec<u8
             }
             let mut buf = Vec::new();
             crate::exec::aggregate::encode_value(&mut buf, &v);
-            map.entry(buf).or_insert_with(Vec::new).push(offset + row);
+            map.entry(buf).or_default().push(offset + row);
         }
         offset += chunk.len();
     }
-    map
+    Ok(map)
 }
 
 /// The kind of a declarative key constraint.
@@ -402,29 +1165,35 @@ impl DataTable {
     /// the same per-chunk lengths, summing to `num_rows` (the projection-aware
     /// lake reader assembles partially materialized tables without going
     /// through `append`). Assigns a fresh version stamp like any constructor.
-    pub fn from_columns(name: String, columns: Vec<Column>, num_rows: usize) -> Self {
+    ///
+    /// Constructing a table materializes it: the statistics fold reads every
+    /// row, and a column may still carry encoded chunks here (a table cloned
+    /// out of a lazily opened store).
+    pub fn from_columns(name: String, columns: Vec<Column>, num_rows: usize) -> Result<Self> {
         debug_assert!(
             !columns.is_empty(),
             "a table has at least one column (schemas are never empty)"
         );
         debug_assert!(
             {
-                let chunks = columns[0].chunks.len();
+                let chunks = columns[0].num_chunks();
                 columns.iter().all(|c| {
-                    c.chunks.len() == chunks
-                        && c.chunks
-                            .iter()
-                            .zip(&columns[0].chunks)
-                            .all(|(a, b)| a.len() == b.len())
+                    c.num_chunks() == chunks
+                        && (0..chunks).all(|i| c.chunk_rows(i) == columns[0].chunk_rows(i))
                 })
             },
             "from_columns needs chunk-aligned columns"
         );
+        for col in &columns {
+            for i in 0..col.num_chunks() {
+                col.chunk(i)?;
+            }
+        }
         // Exact statistics in one pass: a constructor sees the data it is
         // handed, and no caller has a cheaper source (the `.pink` loader reads
         // its footer instead, via `set_loaded_stats`).
         let (stats, zones) = TableStats::scan(&columns, num_rows as u64);
-        Self {
+        Ok(Self {
             name,
             columns,
             num_rows,
@@ -436,7 +1205,7 @@ impl DataTable {
             version: next_table_version(),
             stats,
             zones,
-        }
+        })
     }
 
     /// The table's catalog statistics.
@@ -469,7 +1238,7 @@ impl DataTable {
             && zones
                 .iter()
                 .zip(&self.columns)
-                .all(|(z, c)| z.len() == c.chunks.len());
+                .all(|(z, c)| z.len() == c.num_chunks());
         if stats.cols.len() == self.columns.len() {
             self.stats = stats;
         } else {
@@ -486,17 +1255,79 @@ impl DataTable {
     fn rebuilt_zones(&self) -> Vec<Vec<Zone>> {
         self.columns
             .iter()
-            .map(|c| c.chunks.iter().map(|v| Zone::of_vector(v)).collect())
+            .map(|c| {
+                (0..c.num_chunks())
+                    .map(|i| match c.chunk(i) {
+                        Ok(v) => Zone::of_vector(&v),
+                        // A damaged page leaves its chunk unprunable instead of
+                        // failing a load that only wanted zone maps; the read
+                        // that touches the chunk reports the corruption.
+                        Err(_) => Zone::empty(),
+                    })
+                    .collect()
+            })
             .collect()
+    }
+
+    /// Install the chunk handles a `.pink` open read from its footer.
+    ///
+    /// Every column must carry the same chunk boundaries, summing to `rows`;
+    /// the handles stay encoded in the store image until a read touches them.
+    /// An empty list (a store of a zero-row table) keeps each column's single
+    /// empty chunk.
+    pub(crate) fn set_loaded_chunks(
+        &mut self,
+        chunks: Vec<Vec<Arc<ChunkHandle>>>,
+        rows: usize,
+    ) -> Result<()> {
+        let corrupt = || {
+            PinkDbError::Execution(
+                "corrupt file: the chunk boundaries disagree between columns".to_string(),
+            )
+        };
+        let count = chunks.first().map_or(0, |c| c.len());
+        if chunks.len() != self.columns.len() {
+            return Err(corrupt());
+        }
+        let mut total = 0usize;
+        let mut bounds: Vec<usize> = Vec::with_capacity(count);
+        for (ci, column_chunks) in chunks.iter().enumerate() {
+            if column_chunks.len() != count {
+                return Err(corrupt());
+            }
+            for (i, handle) in column_chunks.iter().enumerate() {
+                if ci == 0 {
+                    bounds.push(handle.rows());
+                    total += handle.rows();
+                } else if handle.rows() != bounds[i] {
+                    return Err(corrupt());
+                }
+            }
+        }
+        if total != rows {
+            return Err(corrupt());
+        }
+        for (col, chunks) in self.columns.iter_mut().zip(chunks) {
+            col.set_chunks(chunks);
+        }
+        self.num_rows = rows;
+        Ok(())
     }
 
     /// Replace the statistics with an exact recomputation (`ANALYZE`): every
     /// zone rebuilt from the rows, every sketch emptied and refilled, `dirty`
-    /// cleared. O(rows), which is the point — it is the repair path.
-    pub(crate) fn analyze(&mut self) {
+    /// cleared. O(rows), which is the point — it is the repair path, and it
+    /// decodes a lazily loaded table's chunks.
+    pub(crate) fn analyze(&mut self) -> Result<()> {
+        for col in &mut self.columns {
+            for i in 0..col.num_chunks() {
+                col.chunk(i)?;
+            }
+        }
         let (stats, zones) = TableStats::scan(&self.columns, self.num_rows as u64);
         self.stats = stats;
         self.zones = zones;
+        Ok(())
     }
 
     /// Drop every row in place (materialized-view refresh): the column
@@ -504,7 +1335,7 @@ impl DataTable {
     pub(crate) fn clear_rows(&mut self) {
         self.num_rows = 0;
         for col in &mut self.columns {
-            col.chunks = vec![Arc::new(Vector::new_empty(col.dtype))];
+            col.reset_chunks();
         }
         self.stats = TableStats::new(self.columns.len());
         self.zones = self.columns.iter().map(|_| vec![Zone::empty()]).collect();
@@ -587,7 +1418,7 @@ impl DataTable {
     /// deleted or overwritten extreme value is the one case that can shrink a
     /// bound).
     fn refresh_zone(&mut self, col: usize, chunk: usize, dirty: bool) {
-        let new = Zone::of_vector(&self.columns[col].chunks[chunk]);
+        let new = Zone::of_vector(&self.columns[col].chunk_decoded(chunk));
         let old = std::mem::replace(&mut self.zones[col][chunk], new.clone());
         let st = &mut self.stats.cols[col];
         let held = old.holds(&st.min, &st.max);
@@ -654,17 +1485,12 @@ impl DataTable {
                 "Column with name \"{name}\" already exists!"
             )));
         }
-        let mut col = Column {
-            name,
-            dtype,
-            default: default.clone(),
-            chunks: Vec::new(),
-        };
         let lens: Vec<usize> = self
             .columns
             .first()
-            .map(|c| c.chunks.iter().map(|v| v.len()).collect())
+            .map(|c| (0..c.num_chunks()).map(|i| c.chunk_rows(i)).collect())
             .unwrap_or_default();
+        let mut chunks: Vec<Arc<Vector>> = Vec::with_capacity(lens.len());
         debug_assert_eq!(values.len(), lens.iter().sum::<usize>());
         let mut values = values.iter();
         for len in lens {
@@ -675,18 +1501,19 @@ impl DataTable {
                     _ => v.push_null()?,
                 }
             }
-            col.chunks.push(Arc::new(v));
+            chunks.push(Arc::new(v));
         }
         // A new column's statistics are exact from birth: every existing row
         // just received the same DEFAULT (usually NULL).
         let mut stats = ColStats::new();
-        let mut zones = Vec::with_capacity(col.chunks.len());
-        for chunk in &col.chunks {
+        let mut zones = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
             let zone = Zone::of_vector(chunk);
             stats.observe_chunk(chunk, &zone);
             zones.push(zone);
         }
-        self.columns.push(col);
+        self.columns
+            .push(Column::from_chunks(name, dtype, default, chunks)?);
         self.stats.cols.push(stats);
         self.zones.push(zones);
         Ok(())
@@ -743,12 +1570,15 @@ impl DataTable {
     }
 
     /// Mark the table's hash indexes stale after a mutation that may move or
-    /// remove rows (UPDATE/DELETE/TRUNCATE/ALTER). Cheap (one flag);
-    /// [`Self::rebuild_indexes`] rebuilds them lazily on the next indexed
-    /// lookup.
+    /// remove rows (UPDATE/DELETE/TRUNCATE/ALTER). Cheap (one flag, and dropping
+    /// each map); [`Self::rebuild_indexes`] rebuilds the maps a later indexed
+    /// lookup asks for.
     pub(crate) fn invalidate_indexes(&mut self) {
         if !self.indexes.is_empty() {
             self.indexes_stale = true;
+            for index in &self.indexes {
+                index.unload();
+            }
         }
     }
 
@@ -768,7 +1598,7 @@ impl DataTable {
             let values: Vec<Value> = self
                 .columns
                 .iter()
-                .map(|c| c.chunks[id.chunk].get(id.row))
+                .map(|c| c.chunk_decoded(id.chunk).get(id.row))
                 .collect();
             keys.reserve(&values, id);
         }
@@ -793,11 +1623,17 @@ impl DataTable {
             let Some(column) = self.columns.get(index.column) else {
                 continue;
             };
+            // A map nothing has asked for stays unbuilt; the next lookup builds
+            // it from the final rows.
+            let Some(map) = index.map_mut() else {
+                continue;
+            };
             // Walk the chunks once from the one holding `start`: a per-row
             // global lookup would rescan the chunk list for every row, which
             // makes a bulk append into an indexed table O(rows × chunks).
             let mut offset = 0usize;
-            for chunk in &column.chunks {
+            for i in 0..column.num_chunks() {
+                let chunk = column.chunk(i)?;
                 let len = chunk.len();
                 if offset + len > start {
                     for local in start.saturating_sub(offset)..len {
@@ -807,11 +1643,7 @@ impl DataTable {
                         }
                         let mut buf = Vec::new();
                         crate::exec::aggregate::encode_value(&mut buf, &value);
-                        index
-                            .map
-                            .entry(buf)
-                            .or_insert_with(Vec::new)
-                            .push(offset + local);
+                        map.entry(buf).or_insert_with(Vec::new).push(offset + local);
                     }
                 }
                 offset += len;
@@ -841,12 +1673,13 @@ impl DataTable {
                 let table = self.name.clone();
                 let mut pending: Vec<(u64, Vec<f32>)> = Vec::new();
                 let mut offset = 0usize;
-                for chunk in &column.chunks {
+                for i in 0..column.num_chunks() {
+                    let chunk = column.chunk(i)?;
                     let len = chunk.len();
                     if offset + len > start {
                         for local in start.saturating_sub(offset)..len {
                             let global = (offset + local) as u64;
-                            let Some(vector) = crate::vector_index::row_vector(chunk, local, n)
+                            let Some(vector) = crate::vector_index::row_vector(&chunk, local, n)
                             else {
                                 continue;
                             };
@@ -876,10 +1709,12 @@ impl DataTable {
         Ok(())
     }
 
-    /// Rebuild every hash index on this table from the live chunks, clearing
-    /// the stale flag. Called lazily by [`PinkDb::rebuild_stale_indexes`] at
-    /// the next statement boundary, so a later indexed lookup sees a snapshot
-    /// of the current rows.
+    /// Rebuild the hash indexes that hold a map, clearing the stale flag.
+    /// Called lazily by [`PinkDb::rebuild_stale_indexes`] at the next statement
+    /// boundary, so a later indexed lookup sees a snapshot of the current rows.
+    /// An index whose map was never built (a lazy open) stays unbuilt: its first
+    /// lookup builds it, and a mutation before that lookup only left it
+    /// unbuilt, which is the same as never having built it.
     pub(crate) fn rebuild_indexes(&mut self) {
         #[cfg(test)]
         INDEX_REBUILDS.with(|count| count.set(count.get() + 1));
@@ -889,10 +1724,16 @@ impl DataTable {
         let maps: Vec<_> = self
             .indexes
             .iter()
-            .map(|i| index_map_for(&self.columns[i.column]))
+            .map(|i| {
+                if i.map().is_none() {
+                    None
+                } else {
+                    index_map_for(&self.columns[i.column]).ok()
+                }
+            })
             .collect();
         for (index, map) in self.indexes.iter_mut().zip(maps) {
-            index.map = map;
+            *index.map_mut() = map;
         }
         self.indexes_stale = false;
     }
@@ -1079,12 +1920,11 @@ impl DataTable {
         let tail_full = self.columns[0]
             .chunks
             .last()
-            .map(|c| c.len() >= CHUNK_SIZE)
+            .map(|c| c.rows() >= CHUNK_SIZE)
             .unwrap_or(true);
         if tail_full {
             for (ci, col) in self.columns.iter_mut().enumerate() {
-                col.chunks
-                    .push(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)));
+                col.push_chunk(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)))?;
                 self.zones[ci].push(Zone::empty());
             }
         }
@@ -1092,14 +1932,14 @@ impl DataTable {
         let mut coerced = Vec::with_capacity(self.columns.len());
         for (col, val) in self.columns.iter_mut().zip(values) {
             let value = Self::coerce(val, col.dtype)?;
-            Arc::make_mut(col.chunks.last_mut().expect("tail chunk exists"))
+            col.chunk_mut(col.num_chunks() - 1)?
                 .push_value(value.clone())?;
             coerced.push(value);
         }
         self.num_rows += 1;
         // Exact incremental statistics: one value, one zone, one hash.
         self.stats.rows += 1;
-        let chunk = self.columns[0].chunks.len() - 1;
+        let chunk = self.columns[0].num_chunks() - 1;
         for (ci, value) in coerced.iter().enumerate() {
             self.stats.cols[ci].observe(value);
             self.zones[ci][chunk].observe(value);
@@ -1117,15 +1957,6 @@ impl DataTable {
         let chunk: Vec<Arc<Vector>> = chunk.into_iter().map(Arc::new).collect();
         self.append_shared_chunk(&chunk)
     }
-
-    /// [`DataTable::append_shared_chunk`] for the `.pink` loader: the footer
-    /// carries this table's statistics, so folding the loaded rows in again
-    /// would repeat a full pass for nothing. The caller installs them with
-    /// [`DataTable::set_loaded_stats`].
-    pub(crate) fn append_loaded_chunk(&mut self, chunk: &[Arc<Vector>]) -> Result<()> {
-        self.append_shared_chunk_inner(chunk, false)
-    }
-
     /// [`DataTable::append_chunk`] for already-shared columns: appends the
     /// caller's `Arc<Vector>`s (shared, never copied) where the chunking
     /// rules allow. Validation, values, chunk boundaries and version bumps
@@ -1134,14 +1965,10 @@ impl DataTable {
     /// The lake loader uses this to hand decoded chunks straight to the
     /// destination table without deep-cloning megabytes of payload.
     pub fn append_shared_chunk(&mut self, chunk: &[Arc<Vector>]) -> Result<()> {
-        self.append_shared_chunk_inner(chunk, true)
+        self.append_shared_chunk_inner(chunk)
     }
 
-    fn append_shared_chunk_inner(
-        &mut self,
-        chunk: &[Arc<Vector>],
-        track_stats: bool,
-    ) -> Result<()> {
+    fn append_shared_chunk_inner(&mut self, chunk: &[Arc<Vector>]) -> Result<()> {
         if chunk.len() != self.columns.len() {
             return Err(PinkDbError::Execution(format!(
                 "chunk has {} columns but table \"{}\" has {}",
@@ -1182,27 +2009,29 @@ impl DataTable {
         // produce exactly the same chunking; bulk loaders (CSV import, lake
         // load) append CHUNK_SIZE-row batches, so after the first batch every
         // append lands behind a full tail and takes the second fast path.
-        let tail_len = self.columns[0].chunks.last().map(|c| c.len()).unwrap_or(0);
+        let tail_len = if self.columns[0].num_chunks() == 0 {
+            0
+        } else {
+            self.columns[0].chunk_rows(self.columns[0].num_chunks() - 1)
+        };
         if tail_len == 0 || tail_len >= CHUNK_SIZE {
-            let replacing = tail_len == 0 && !self.columns[0].chunks.is_empty();
+            let replacing = tail_len == 0 && self.columns[0].num_chunks() > 0;
             if replacing {
                 for (col, src) in self.columns.iter_mut().zip(chunk) {
-                    *col.chunks.last_mut().expect("tail chunk exists") = Arc::clone(src);
+                    col.set_chunk(col.num_chunks() - 1, Arc::clone(src))?;
                 }
             } else {
                 for (col, src) in self.columns.iter_mut().zip(chunk) {
-                    col.chunks.push(Arc::clone(src));
+                    col.push_chunk(Arc::clone(src))?;
                 }
             }
-            if track_stats {
-                for (ci, (zone, hll)) in self.fold_chunk_stats(chunk).into_iter().enumerate() {
-                    self.stats.cols[ci].absorb_zone(&zone);
-                    self.stats.cols[ci].set_sketch(hll.map(std::sync::Arc::new));
-                    if replacing {
-                        *self.zones[ci].last_mut().expect("tail zone exists") = zone;
-                    } else {
-                        self.zones[ci].push(zone);
-                    }
+            for (ci, (zone, hll)) in self.fold_chunk_stats(chunk).into_iter().enumerate() {
+                self.stats.cols[ci].absorb_zone(&zone);
+                self.stats.cols[ci].set_sketch(hll.map(std::sync::Arc::new));
+                if replacing {
+                    *self.zones[ci].last_mut().expect("tail zone exists") = zone;
+                } else {
+                    self.zones[ci].push(zone);
                 }
             }
             self.num_rows += rows;
@@ -1212,50 +2041,45 @@ impl DataTable {
             return Ok(());
         }
         // Partial tail: merge, splitting at chunk boundaries as needed.
-        let first_chunk = self.columns[0].chunks.len().saturating_sub(1);
+        let first_chunk = self.columns[0].num_chunks().saturating_sub(1);
         let mut offset = 0;
         while offset < rows {
             let tail_full = self.columns[0]
                 .chunks
                 .last()
-                .map(|c| c.len() >= CHUNK_SIZE)
+                .map(|c| c.rows() >= CHUNK_SIZE)
                 .unwrap_or(true);
             if tail_full {
                 for col in &mut self.columns {
-                    col.chunks
-                        .push(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)));
+                    col.push_chunk(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)))?;
                 }
-                if track_stats {
-                    for zones in &mut self.zones {
-                        zones.push(Zone::empty());
-                    }
+                for zones in &mut self.zones {
+                    zones.push(Zone::empty());
                 }
             }
+            let tail = self.columns[0].num_chunks() - 1;
             let take = {
-                let tail_len = self.columns[0].chunks.last().map(|c| c.len()).unwrap_or(0);
+                let tail_len = self.columns[0].chunk_rows(tail);
                 (CHUNK_SIZE - tail_len).min(rows - offset)
             };
             for (col, src) in self.columns.iter_mut().zip(chunk) {
-                Arc::make_mut(col.chunks.last_mut().expect("tail chunk exists"))
-                    .extend_from(src, offset, take);
+                col.chunk_mut(tail)?.extend_from(src, offset, take);
             }
             offset += take;
             self.num_rows += take;
         }
         self.stats.rows += rows as u64;
-        if track_stats {
-            // Only the touched chunks are re-derived, and only their appended
-            // source rows are hashed (folded from the whole chunk instead
-            // would count the existing rows twice).
-            for (ci, src) in chunk.iter().enumerate() {
-                for c in first_chunk..self.columns[0].chunks.len() {
-                    self.refresh_zone(ci, c, false);
-                }
-                if let Some(hll) = &mut self.stats.cols[ci].hll {
-                    let hll = Arc::make_mut(hll);
-                    for row in 0..rows {
-                        hll.insert_cell(src, row);
-                    }
+        // Only the touched chunks are re-derived, and only their appended
+        // source rows are hashed (folded from the whole chunk instead
+        // would count the existing rows twice).
+        for (ci, src) in chunk.iter().enumerate() {
+            for c in first_chunk..self.columns[0].num_chunks() {
+                self.refresh_zone(ci, c, false);
+            }
+            if let Some(hll) = &mut self.stats.cols[ci].hll {
+                let hll = Arc::make_mut(hll);
+                for row in 0..rows {
+                    hll.insert_cell(src, row);
                 }
             }
         }
@@ -1300,7 +2124,7 @@ impl DataTable {
                 .get(*col)
                 .ok_or_else(|| PinkDbError::Execution(format!("column {col} out of range")))?
                 .dtype;
-            if *row >= self.columns[*col].chunks[chunk].len() {
+            if *row >= self.columns[*col].chunk_rows(chunk) {
                 return Err(PinkDbError::Execution(format!(
                     "row {row} out of bounds in chunk {chunk}"
                 )));
@@ -1308,7 +2132,9 @@ impl DataTable {
             staged.push((*col, *row, Self::coerce(v.clone(), dtype)?));
         }
         for (col, row, v) in &staged {
-            Arc::make_mut(&mut self.columns[*col].chunks[chunk]).set_value(*row, v.clone())?;
+            self.columns[*col]
+                .chunk_mut(chunk)?
+                .set_value(*row, v.clone())?;
         }
         if !staged.is_empty() {
             // The new values join the sketch and the zone is re-derived from
@@ -1380,12 +2206,11 @@ impl DataTable {
                 let n = n as usize;
                 let table = self.name.clone();
                 let index = def.writable(&table)?;
+                let payload = column.chunk(chunk)?;
                 for row in rows {
                     let global = chunk_start + row as u64;
                     index.delete(global);
-                    if let Some(vector) =
-                        crate::vector_index::row_vector(&column.chunks[chunk], row, n)
-                    {
+                    if let Some(vector) = crate::vector_index::row_vector(&payload, row, n) {
                         index.insert(global, &vector)?;
                     }
                 }
@@ -1408,9 +2233,9 @@ impl DataTable {
             return Ok(0);
         }
         self.require_vector_indexes_loaded()?;
-        let len = self.columns[0].chunks[chunk].len();
+        let len = self.columns[0].chunk_rows(chunk);
         let chunk_start = self.chunk_start(chunk);
-        let chunks_before = self.columns[0].chunks.len();
+        let chunks_before = self.columns[0].num_chunks();
         let mut drop_sorted = drop.to_vec();
         drop_sorted.sort_unstable();
         drop_sorted.dedup();
@@ -1430,10 +2255,11 @@ impl DataTable {
         }
         let removed = len - keep.len();
         for col in &mut self.columns {
-            col.chunks[chunk] = Arc::new(col.chunks[chunk].gather(&keep));
+            let gathered = Arc::new(col.chunk(chunk)?.gather(&keep));
+            col.set_chunk(chunk, gathered)?;
         }
         // Drop chunks left empty (all columns share chunk boundaries).
-        let dropped_chunk = self.columns[0].chunks[chunk].is_empty();
+        let dropped_chunk = self.columns[0].chunk_rows(chunk) == 0;
         if dropped_chunk {
             for col in &mut self.columns {
                 col.chunks.remove(chunk);
@@ -1464,7 +2290,7 @@ impl DataTable {
                 chunk_start,
                 chunk_len: len as u64,
                 deleted: drop_sorted,
-                chunk_dropped: self.columns[0].chunks.len() < chunks_before,
+                chunk_dropped: self.columns[0].num_chunks() < chunks_before,
             };
             let table = self.name.clone();
             for def in &mut self.vector_indexes {
@@ -1474,49 +2300,98 @@ impl DataTable {
         Ok(removed)
     }
 
+    /// How many chunks of the whole table are decoded; see
+    /// [`Column::decoded_chunks`].
+    #[cfg(test)]
+    pub(crate) fn decoded_chunks(&self) -> usize {
+        self.columns.iter().map(Column::decoded_chunks).sum()
+    }
+
     /// Number of stored chunks (all columns share the same count).
     pub fn num_chunks(&self) -> usize {
-        self.columns.first().map(|c| c.chunks.len()).unwrap_or(0)
+        self.columns.first().map(|c| c.num_chunks()).unwrap_or(0)
+    }
+
+    /// Rows in chunk `i` without decoding it (all columns share the
+    /// boundaries).
+    pub fn chunk_rows(&self, i: usize) -> usize {
+        self.columns.first().map(|c| c.chunk_rows(i)).unwrap_or(0)
     }
 
     /// Global row id of the first row in `chunk`. Deleting rows leaves
     /// interior chunks partially full, so this cannot assume full chunks
     /// before the tail.
     fn chunk_start(&self, chunk: usize) -> u64 {
-        self.columns[0].chunks[..chunk]
-            .iter()
-            .map(|c| c.len() as u64)
-            .sum()
+        (0..chunk).map(|i| self.chunk_rows(i) as u64).sum()
     }
 
     /// Read chunk `idx` as a `DataChunk` (columns shared by reference —
     /// scans never copy data).
-    pub fn scan_chunk(&self, idx: usize) -> Option<DataChunk> {
+    pub fn scan_chunk(&self, idx: usize) -> Result<Option<DataChunk>> {
         if idx >= self.num_chunks() {
-            return None;
+            return Ok(None);
         }
-        let cols = self.columns.iter().map(|c| c.chunks[idx].clone()).collect();
-        let mut chunk = DataChunk::from_arcs(cols)?;
+        let mut cols = Vec::with_capacity(self.columns.len());
+        for c in &self.columns {
+            cols.push(c.chunk(idx)?);
+        }
+        Ok(DataChunk::from_arcs(cols))
+    }
+
+    /// Read chunk `idx` with only the columns marked in `present` decoded; the
+    /// others come back as empty placeholders of the right type.
+    ///
+    /// A projector replaces every column it references anyway, so decoding a
+    /// pruned one is pure waste — and once chunks decode on demand, it is a
+    /// whole read the query never asked for (wave 136b step 2). Placeholders
+    /// stay checked: `DataChunk::expect_column` rejects one the projection does
+    /// reach.
+    /// Materialize every chunk. The lake hands whole tables to its readers, so
+    /// its provider path decodes here; queries decode only what they read.
+    pub fn decode_all(&self) -> Result<()> {
+        for col in &self.columns {
+            for i in 0..col.num_chunks() {
+                col.chunk(i)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn scan_chunk_projected(&self, idx: usize, present: &[bool]) -> Result<Option<DataChunk>> {
+        if idx >= self.num_chunks() {
+            return Ok(None);
+        }
+        let mut cols = Vec::with_capacity(self.columns.len());
+        for (ci, c) in self.columns.iter().enumerate() {
+            if present.get(ci).copied().unwrap_or(false) {
+                cols.push(c.chunk(idx)?);
+            } else {
+                cols.push(Arc::new(Vector::new_empty(c.dtype)));
+            }
+        }
+        let mut chunk = DataChunk::projected(cols, self.chunk_rows(idx));
         // Volatile expressions read the ordinal: a chunk read straight from
         // storage (an UPDATE, a trigger) is still the idx-th chunk in scan
         // order, which is what a plan-driven scan would stamp.
         chunk.ordinal = idx;
-        Some(chunk)
+        Ok(Some(chunk))
     }
 
     /// Value at (row, col).
-    pub fn get(&self, row: usize, col: usize) -> Option<Value> {
+    pub fn get(&self, row: usize, col: usize) -> Result<Option<Value>> {
         if row >= self.num_rows || col >= self.columns.len() {
-            return None;
+            return Ok(None);
         }
+        let column = &self.columns[col];
         let mut base = row;
-        for chunk in &self.columns[col].chunks {
-            if base < chunk.len() {
-                return Some(chunk.get(base));
+        for i in 0..column.num_chunks() {
+            let len = column.chunk_rows(i);
+            if base < len {
+                return Ok(Some(column.chunk(i)?.get(base)));
             }
-            base -= chunk.len();
+            base -= len;
         }
-        None
+        Ok(None)
     }
 }
 
@@ -3964,13 +4839,22 @@ impl PinkDb {
     /// transaction on the refreshed state is the intended retry). A WAL
     /// failure returns the error and leaves the transaction open (nothing was
     /// published) and the handle fail-stopped, exactly as before this wave.
+    /// Every other failure also aborts the transaction: nothing reached the
+    /// WAL yet, so a retry can start from `begin` again.
     pub fn commit(&mut self) -> Result<()> {
         if self.txn_snapshot.is_none() {
             return Err(PinkDbError::Execution(
                 "no transaction in progress".to_string(),
             ));
         }
-        let lease = self.acquire_lease()?;
+        // A busy lease is a retryable conflict (the lake's commit loop
+        // retries it), so the transaction must be gone by the time the caller
+        // begins again: leaving the snapshot open made that `begin` fail with
+        // "already in a transaction" instead.
+        let lease = match self.acquire_lease() {
+            Ok(lease) => lease,
+            Err(e) => return Err(self.abort_unpublished(e)),
+        };
         let writes = !self.wal_txn.is_empty();
         // Cross-process validation first (durable stores with a captured
         // base): it either applies the frames that arrived for other tables
@@ -3982,7 +4866,11 @@ impl PinkDb {
             let position = base.position();
             let mut touched = self.txn_touched.clone();
             touched.canonicalize();
-            if let Some(conflict) = self.optimistic_commit_check(g, &position, &touched)? {
+            let conflict = match self.optimistic_commit_check(g, &position, &touched) {
+                Ok(conflict) => conflict,
+                Err(e) => return Err(self.abort_unpublished(e)),
+            };
+            if let Some(conflict) = conflict {
                 self.rollback()?;
                 return Err(PinkDbError::Execution(conflict.message("transaction")));
             }
@@ -3996,7 +4884,11 @@ impl PinkDb {
             self.rollback()?;
             return Err(e);
         }
-        let lake_routed = writes && !self.dirty_lake_databases()?.is_empty();
+        let dirty = match self.dirty_lake_databases() {
+            Ok(dirty) => dirty,
+            Err(e) => return Err(self.abort_unpublished(e)),
+        };
+        let lake_routed = writes && !dirty.is_empty();
         if lake_routed && let Err(e) = self.route_committed_unit() {
             self.rollback()?;
             return Err(e);
@@ -4059,6 +4951,14 @@ impl PinkDb {
         // The base is released only after the record is durable.
         self.txn_base = None;
         Ok(())
+    }
+
+    /// Abort a commit that published nothing and keep the handle usable: once
+    /// the WAL append did not run, a rollback cannot lose durable data, so the
+    /// caller can begin the transaction again.
+    fn abort_unpublished(&mut self, error: PinkDbError) -> PinkDbError {
+        let _ = self.rollback();
+        error
     }
 
     /// Roll back: restore the snapshot, discarding all changes since BEGIN
@@ -4180,13 +5080,11 @@ impl PinkDb {
                 "column {column} out of range for table \"{table}\""
             )));
         };
-        let map = index_map_for(col);
+        let map = index_map_for(col)?;
         let first_index = t.indexes.is_empty();
-        t.indexes.push(Index {
-            name: name.to_string(),
-            column,
-            map,
-        });
+        let mut index = Index::new(name.to_string(), column);
+        *index.map_mut() = Some(map);
+        t.indexes.push(index);
         // A new index is fresh, but it must not clear a stale flag left by an
         // *older* index on the same table: that one still needs its rebuild.
         if first_index {
@@ -4267,10 +5165,11 @@ impl PinkDb {
             let t = self.table_in(&ns, table)?;
             let col = &t.columns[column];
             let mut offset = 0usize;
-            for chunk in &col.chunks {
+            for i in 0..col.num_chunks() {
+                let chunk = col.chunk(i)?;
                 let rows: Vec<(u64, Vec<f32>)> = (0..chunk.len())
                     .filter_map(|row| {
-                        crate::vector_index::row_vector(chunk, row, dim)
+                        crate::vector_index::row_vector(&chunk, row, dim)
                             .map(|vector| ((offset + row) as u64, vector))
                     })
                     .collect();
@@ -4737,10 +5636,94 @@ mod tests {
     fn append_and_get_with_coercion() {
         let t = sample();
         assert_eq!(t.num_rows(), 2);
-        assert_eq!(t.get(0, 0), Some(Value::Bigint(1)));
-        assert_eq!(t.get(1, 0), Some(Value::Bigint(2)));
-        assert_eq!(t.get(1, 1), Some(Value::Null));
-        assert_eq!(t.get(9, 0), None);
+        assert_eq!(t.get(0, 0).unwrap(), Some(Value::Bigint(1)));
+        assert_eq!(t.get(1, 0).unwrap(), Some(Value::Bigint(2)));
+        assert_eq!(t.get(1, 1).unwrap(), Some(Value::Null));
+        assert_eq!(t.get(9, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn chunk_rows_match_the_decoded_chunks() {
+        let mut t = DataTable::new(
+            "big".to_string(),
+            vec![
+                ("a".to_string(), DataType::Integer),
+                ("b".to_string(), DataType::Varchar),
+            ],
+        )
+        .unwrap();
+        for i in 0..(CHUNK_SIZE + 5) {
+            t.append_row(vec![
+                Value::Integer(i as i32),
+                Value::Varchar(format!("v{i}")),
+            ])
+            .unwrap();
+        }
+        assert_eq!(t.chunk_rows(0), CHUNK_SIZE);
+        assert_eq!(t.chunk_rows(1), 5);
+        for column in &t.columns {
+            assert_eq!(column.num_chunks(), t.num_chunks());
+            for i in 0..column.num_chunks() {
+                assert_eq!(column.chunk_rows(i), column.chunk(i).unwrap().len());
+            }
+            assert_eq!(column.len(), t.num_rows());
+        }
+        assert!(t.columns[0].chunk(2).is_err());
+    }
+
+    /// The metadata accessor keeps the old chunk-slicing contract: an index
+    /// past the end is a caller bug (a panic), not an error.
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn chunk_rows_out_of_range_panics() {
+        let t = sample();
+        let _ = t.chunk_rows(1);
+    }
+
+    #[test]
+    fn scan_chunk_projected_yields_placeholders() {
+        let t = sample();
+        let chunk = t.scan_chunk_projected(0, &[true, false]).unwrap().unwrap();
+        assert_eq!(chunk.num_rows(), 2);
+        assert!(chunk.is_present(0));
+        assert!(!chunk.is_present(1));
+        // The projected column is the stored chunk, not a copy.
+        assert!(Arc::ptr_eq(
+            &chunk.columns[0],
+            &t.columns[0].chunk(0).unwrap()
+        ));
+        assert_eq!(chunk.columns[0].get(0), Value::Bigint(1));
+        assert!(chunk.columns[1].is_empty());
+        // The full projection is the plain scan chunk.
+        let full = t.scan_chunk_projected(0, &[true, true]).unwrap().unwrap();
+        assert!(full.is_present(1));
+        assert_eq!(full.columns[1].get(0), Value::Varchar("ann".to_string()));
+        assert!(t.scan_chunk_projected(1, &[true, false]).unwrap().is_none());
+    }
+
+    #[test]
+    fn chunk_mut_copies_on_write_and_marks_dirty() {
+        let mut t = sample();
+        let snapshot = t.clone();
+        assert!(Arc::ptr_eq(
+            &snapshot.columns[0].chunk(0).unwrap(),
+            &t.columns[0].chunk(0).unwrap()
+        ));
+        t.columns[0]
+            .chunk_mut(0)
+            .unwrap()
+            .set_value(0, Value::Bigint(42))
+            .unwrap();
+        assert!(t.columns[0].chunks[0].lock().dirty);
+        assert_eq!(t.get(0, 0).unwrap(), Some(Value::Bigint(42)));
+        // The snapshot kept the old payload: `chunk_mut` cloned the `Arc`
+        // instead of writing through the shared one.
+        assert_eq!(snapshot.get(0, 0).unwrap(), Some(Value::Bigint(1)));
+        assert!(!Arc::ptr_eq(
+            &snapshot.columns[0].chunk(0).unwrap(),
+            &t.columns[0].chunk(0).unwrap()
+        ));
+        assert!(t.columns[0].chunk_mut(1).is_err());
     }
 
     #[test]
@@ -4768,11 +5751,11 @@ mod tests {
             t.append_row(vec![Value::Integer(i as i32)]).unwrap();
         }
         assert_eq!(t.num_chunks(), 2);
-        assert_eq!(t.scan_chunk(0).unwrap().num_rows(), CHUNK_SIZE);
-        assert_eq!(t.scan_chunk(1).unwrap().num_rows(), 5);
-        assert!(t.scan_chunk(2).is_none());
+        assert_eq!(t.scan_chunk(0).unwrap().unwrap().num_rows(), CHUNK_SIZE);
+        assert_eq!(t.scan_chunk(1).unwrap().unwrap().num_rows(), 5);
+        assert!(t.scan_chunk(2).unwrap().is_none());
         assert_eq!(
-            t.get(CHUNK_SIZE, 0),
+            t.get(CHUNK_SIZE, 0).unwrap(),
             Some(Value::Integer(CHUNK_SIZE as i32))
         );
     }
@@ -4811,15 +5794,18 @@ mod tests {
         t.append_chunk(chunk_rows(CHUNK_SIZE as i64, 2)).unwrap();
         assert_eq!(t.num_rows(), 2 + CHUNK_SIZE);
         assert_eq!(t.num_chunks(), 2);
-        assert_eq!(t.scan_chunk(0).unwrap().num_rows(), CHUNK_SIZE);
-        assert_eq!(t.scan_chunk(1).unwrap().num_rows(), 2);
+        assert_eq!(t.scan_chunk(0).unwrap().unwrap().num_rows(), CHUNK_SIZE);
+        assert_eq!(t.scan_chunk(1).unwrap().unwrap().num_rows(), 2);
         assert_eq!(
-            t.get(CHUNK_SIZE - 1, 0),
+            t.get(CHUNK_SIZE - 1, 0).unwrap(),
             Some(Value::Bigint(CHUNK_SIZE as i64 - 1))
         );
-        assert_eq!(t.get(CHUNK_SIZE, 0), Some(Value::Bigint(CHUNK_SIZE as i64)));
         assert_eq!(
-            t.get(CHUNK_SIZE + 1, 1),
+            t.get(CHUNK_SIZE, 0).unwrap(),
+            Some(Value::Bigint(CHUNK_SIZE as i64))
+        );
+        assert_eq!(
+            t.get(CHUNK_SIZE + 1, 1).unwrap(),
             Some(Value::Varchar(format!("v{}", CHUNK_SIZE + 1)))
         );
 
@@ -4881,8 +5867,8 @@ mod tests {
         assert_eq!(shared.num_rows(), copied.num_rows());
         assert_eq!(shared.num_chunks(), copied.num_chunks());
         for i in 0..shared.num_chunks() {
-            let a = shared.scan_chunk(i).unwrap();
-            let b = copied.scan_chunk(i).unwrap();
+            let a = shared.scan_chunk(i).unwrap().unwrap();
+            let b = copied.scan_chunk(i).unwrap().unwrap();
             assert_eq!(a.columns, b.columns, "chunk {i} differs");
             assert_eq!(a.num_rows(), b.num_rows());
         }
@@ -4892,8 +5878,14 @@ mod tests {
         let (mut shared2, full2, _) = mk();
         shared2.append_shared_chunk(&full2).unwrap();
         assert_eq!(shared2.num_chunks(), 1); // empty tail is replaced
-        assert!(Arc::ptr_eq(&shared2.columns[0].chunks[0], &full2[0]));
-        assert!(Arc::ptr_eq(&shared2.columns[1].chunks[0], &full2[1]));
+        assert!(Arc::ptr_eq(
+            &shared2.columns[0].chunk(0).unwrap(),
+            &full2[0]
+        ));
+        assert!(Arc::ptr_eq(
+            &shared2.columns[1].chunk(0).unwrap(),
+            &full2[1]
+        ));
     }
 
     /// The bulk write paths append whole chunks instead of rows; the catalog
@@ -5034,9 +6026,11 @@ mod tests {
     fn assert_index_matches_table(db: &PinkDb) {
         let table = db.table("t").unwrap();
         for index in &table.indexes {
+            let expected = index_map_for(&table.columns[index.column]).unwrap();
+            index.ensure_map(&table.columns[index.column]).unwrap();
             assert_eq!(
-                index.map,
-                index_map_for(&table.columns[index.column]),
+                *index.map(),
+                Some(expected),
                 "index {} must equal a full rebuild of the visible rows",
                 index.name
             );
@@ -5095,15 +6089,17 @@ mod tests {
             .unwrap();
         assert_eq!(index_rebuild_count(), 0);
         let table = db.table("t").unwrap();
-        let map = &table.indexes[0].map;
-        let zeros = map.get(&{
-            let mut buf = Vec::new();
-            crate::exec::aggregate::encode_value(&mut buf, &Value::Integer(0));
-            buf
-        });
-        assert!(zeros.is_some_and(|positions| positions.contains(&0)));
-        assert!(zeros.is_some_and(|positions| positions.contains(&CHUNK_SIZE)));
-        assert!(zeros.is_some_and(|positions| positions.iter().all(|p| *p < table.num_rows)));
+        {
+            let map = table.indexes[0].map();
+            let zeros = map.as_ref().expect("the append path keeps the map").get(&{
+                let mut buf = Vec::new();
+                crate::exec::aggregate::encode_value(&mut buf, &Value::Integer(0));
+                buf
+            });
+            assert!(zeros.is_some_and(|positions| positions.contains(&0)));
+            assert!(zeros.is_some_and(|positions| positions.contains(&CHUNK_SIZE)));
+            assert!(zeros.is_some_and(|positions| positions.iter().all(|p| *p < table.num_rows)));
+        }
         assert_index_matches_table(&db);
     }
 

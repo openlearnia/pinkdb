@@ -137,6 +137,14 @@ pub(crate) struct ExecBudget {
     external_services: std::sync::atomic::AtomicBool,
     /// The connection's cancellation switch, when a front-end installed one.
     cancel: Option<CancelFlag>,
+    /// This statement's memory account: every reservation it takes is also
+    /// charged here, so the profile can report the statement's own peak
+    /// instead of the process-wide high-water mark.
+    memory: crate::memory::Account,
+    /// Bytes of state that lives until the statement ends and that no
+    /// operator-local reservation can own (materialized CTEs, pipeline
+    /// outputs): charged once and released with the budget.
+    lasting: std::sync::Mutex<crate::memory::Reservation>,
 }
 
 /// [`ExecBudget`]'s recorded `external_io` results, in call order, and the
@@ -163,7 +171,28 @@ impl ExecBudget {
             external_calls: std::sync::Mutex::new(ExternalCalls::default()),
             external_services: std::sync::atomic::AtomicBool::new(true),
             cancel: None,
+            memory: crate::memory::Account::new(),
+            lasting: std::sync::Mutex::new(crate::memory::Reservation::empty()),
         }
+    }
+
+    /// This statement's memory account, for reservations an operator releases
+    /// when its own state drops.
+    pub(crate) fn memory(&self) -> &crate::memory::Account {
+        &self.memory
+    }
+
+    /// Charge bytes of state that lives until the statement ends.
+    pub(crate) fn materialize(&self, bytes: usize) -> Result<()> {
+        self.lasting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .grow(bytes)
+    }
+
+    /// The largest number of bytes this statement held at once.
+    pub(crate) fn memory_peak(&self) -> usize {
+        self.memory.peak()
     }
 
     /// Stop this statement when `cancel` is set (wave 121).
@@ -311,6 +340,12 @@ impl ExecBudget {
         }
         Ok(())
     }
+}
+
+/// `chunk_approx_bytes` over a whole output: what a materialized operator
+/// state (a sort's input, a collect sink) holds per chunk (wave 136a).
+pub(crate) fn chunks_approx_bytes(chunks: &[DataChunk]) -> usize {
+    chunks.iter().map(chunk_approx_bytes).sum()
 }
 
 /// Estimated in-memory size of one value, used only to enforce a byte cap
@@ -1093,6 +1128,22 @@ fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
             "a SET VARIABLE value did not evaluate to one value".to_string(),
         ));
     }
+    // The process-wide settings (wave 136a). `SET memory_limit = NULL` is the
+    // `RESET` form: the parser has no separate statement for it.
+    if crate::memory::is_limit_setting(name) {
+        match v.get(0) {
+            Value::Null => crate::memory::reset_limit(),
+            Value::Varchar(text) => crate::memory::set_limit(crate::memory::parse_limit(&text)?),
+            other => {
+                return Err(PinkDbError::Type(format!(
+                    "memory_limit takes a string like '2GB', not {other}"
+                )));
+            }
+        }
+        return Ok(QueryResult::SetVariable {
+            name: name.to_string(),
+        });
+    }
     cx.session.set(name, v.get(0));
     Ok(QueryResult::SetVariable {
         name: name.to_string(),
@@ -1103,6 +1154,36 @@ fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
 /// `SET VARIABLE` — nothing is logged or persisted, and the value is checked
 /// against DuckDB's rules before it is stored. `RESET ALL` passes `"*"`.
 fn set_setting(cx: &Cx, name: &str, value: Option<&BoundExpr>) -> Result<QueryResult> {
+    // `memory_limit` / `max_memory` are process-wide (wave 136a's pool), not
+    // session state: they move the pool's limit, and `RESET` restores the
+    // default. `RESET ALL` resets the session's settings only.
+    if crate::memory::is_limit_setting(name) {
+        match value {
+            Some(value) => {
+                let single = DataChunk {
+                    columns: Vec::new(),
+                    num_rows: 1,
+                    ordinal: 0,
+                };
+                let v = eval_expr(value, &single, cx)?;
+                match v.get(0) {
+                    Value::Null => crate::memory::reset_limit(),
+                    Value::Varchar(text) => {
+                        crate::memory::set_limit(crate::memory::parse_limit(&text)?)
+                    }
+                    other => {
+                        return Err(PinkDbError::Type(format!(
+                            "memory_limit takes a string like '2GB', not {other}"
+                        )));
+                    }
+                }
+            }
+            None => crate::memory::reset_limit(),
+        }
+        return Ok(QueryResult::SetVariable {
+            name: name.to_string(),
+        });
+    }
     match value {
         Some(value) => {
             let single = DataChunk {
@@ -1147,7 +1228,7 @@ fn analyze_tables(
             .collect(),
     };
     for (ns, name) in &targets {
-        db.table_mut_in(ns, name)?.analyze();
+        db.table_mut_in(ns, name)?.analyze()?;
     }
     Ok(targets.len())
 }
@@ -1442,7 +1523,16 @@ fn stage_batches(
         budget.check_deadline()?;
         for start in (0..chunk.num_rows()).step_by(CHUNK_SIZE) {
             let end = (start + CHUNK_SIZE).min(chunk.num_rows());
-            staged.push(stage_batch(chunk, start..end, sources, schema, defaults)?);
+            let batch = stage_batch(chunk, start..end, sources, schema, defaults)?;
+            // The staged rows live until the statement applies them, so charge
+            // them as they are built (wave 136a).
+            budget.materialize(
+                batch
+                    .iter()
+                    .map(|v| v.len() * std::mem::size_of::<Value>())
+                    .sum(),
+            )?;
+            staged.push(batch);
         }
     }
     Ok(staged)
@@ -1819,7 +1909,7 @@ pub(crate) fn run_plain(
                         // Deadline boundary: a timed-out UPDATE fails here, before
                         // any row is written back (atomic, no partial state).
                         cx.check_deadline()?;
-                        let chunk = t.scan_chunk(ci).ok_or_else(|| {
+                        let chunk = t.scan_chunk(ci)?.ok_or_else(|| {
                             PinkDbError::Execution("storage changed during UPDATE".to_string())
                         })?;
                         let targets = match predicate {
@@ -1877,7 +1967,7 @@ pub(crate) fn run_plain(
                     drops = Vec::with_capacity(t.num_chunks());
                     for ci in 0..t.num_chunks() {
                         cx.check_deadline()?;
-                        let chunk = t.scan_chunk(ci).ok_or_else(|| {
+                        let chunk = t.scan_chunk(ci)?.ok_or_else(|| {
                             PinkDbError::Execution("storage changed during DELETE".to_string())
                         })?;
                         drops.push(match predicate {
@@ -2928,19 +3018,153 @@ fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
 /// Every stored chunk of `t`, in order (columns shared by `Arc`, never
 /// copied).
 /// The chunks of `t` selected by `keep` (`None` reads every chunk).
-fn scan_chunks_of(t: &DataTable, keep: Option<&[usize]>) -> Vec<DataChunk> {
-    match keep {
-        None => {
-            let mut chunks = Vec::with_capacity(t.num_chunks());
-            for i in 0..t.num_chunks() {
-                if let Some(c) = t.scan_chunk(i) {
-                    chunks.push(c);
-                }
-            }
-            chunks
+/// A store table's chunks, read one at a time (wave 136b-4): `keep` is the
+/// chunks the zone maps left, `cols` the projection, and every consumer decodes
+/// a chunk when it starts on it instead of pinning the whole table first.
+#[derive(Clone)]
+pub(crate) struct StoreScan<'a> {
+    table: &'a DataTable,
+    keep: Option<Vec<usize>>,
+    present: Option<Vec<bool>>,
+}
+
+impl<'a> StoreScan<'a> {
+    pub(crate) fn new(t: &'a DataTable, cols: Option<&[usize]>, keep: Option<Vec<usize>>) -> Self {
+        StoreScan {
+            table: t,
+            keep,
+            present: cols.and_then(|cols| present_columns(t, cols)),
         }
-        Some(keep) => keep.iter().filter_map(|&i| t.scan_chunk(i)).collect(),
     }
+
+    /// The columns the scan outputs, in table order.
+    pub(crate) fn schema(&self) -> (Vec<String>, Vec<DataType>) {
+        self.table.schema().into_iter().unzip()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match &self.keep {
+            Some(keep) => keep.len(),
+            None => self.table.num_chunks(),
+        }
+    }
+
+    /// The rows the scan will output, from the footer's chunk row counts: no
+    /// chunk is decoded to count them.
+    pub(crate) fn rows(&self) -> usize {
+        (0..self.len())
+            .map(|i| self.table.chunk_rows(self.chunk_index(i)))
+            .sum()
+    }
+
+    /// Chunk `i` of the scan, or `None` when a column has fewer chunks.
+    pub(crate) fn chunk(&self, i: usize) -> Result<Option<DataChunk>> {
+        let index = self.chunk_index(i);
+        match &self.present {
+            Some(present) => self.table.scan_chunk_projected(index, present),
+            None => self.table.scan_chunk(index),
+        }
+    }
+
+    /// Every chunk of the scan, in scan order: for a consumer that cannot work
+    /// from one chunk at a time.
+    pub(crate) fn materialize(&self) -> Result<Vec<DataChunk>> {
+        let mut chunks = Vec::with_capacity(self.len());
+        for i in 0..self.len() {
+            if let Some(chunk) = self.chunk(i)? {
+                chunks.push(chunk);
+            }
+        }
+        Ok(chunks)
+    }
+
+    /// Fold every chunk of the scan, decoding each chunk when its turn comes
+    /// and dropping it before the next: at most one chunk per worker is pinned.
+    /// Tasks claim a run of chunks so the pool sees the work split the way a
+    /// scan over already-decoded chunks splits it; a task per chunk would pay
+    /// dispatch on every morsel of a long scan.
+    pub(crate) fn par_chunks<T, F>(&self, fold: F) -> Result<Vec<T>>
+    where
+        T: Send,
+        F: Fn(usize, Option<DataChunk>) -> Result<T> + Send + Sync,
+    {
+        let len = self.len();
+        let runs: Result<Vec<Vec<T>>> = (0..len.div_ceil(CHUNKS_PER_TASK))
+            .into_par_iter()
+            .map(|run| {
+                let first = run * CHUNKS_PER_TASK;
+                let last = (first + CHUNKS_PER_TASK).min(len);
+                let mut folded = Vec::with_capacity(last - first);
+                for i in first..last {
+                    folded.push(fold(i, self.chunk(i)?)?);
+                }
+                Ok(folded)
+            })
+            .collect();
+        Ok(runs?.into_iter().flatten().collect())
+    }
+
+    fn chunk_index(&self, i: usize) -> usize {
+        match &self.keep {
+            Some(keep) => keep[i],
+            None => i,
+        }
+    }
+}
+
+/// How many chunks of a scan one task folds before the next task takes over.
+const CHUNKS_PER_TASK: usize = 8;
+
+/// The columns a projection keeps, `None` when it keeps all of them (or names a
+/// column the table does not have, which reads everything and fails when the
+/// projection runs).
+fn present_columns(t: &DataTable, cols: &[usize]) -> Option<Vec<bool>> {
+    if cols.iter().any(|&i| i >= t.columns.len()) {
+        return None;
+    }
+    let mut present = vec![false; t.columns.len()];
+    for &i in cols {
+        present[i] = true;
+    }
+    if !present.iter().any(|&p| p) {
+        present[0] = true;
+    }
+    if present.iter().all(|&p| p) {
+        return None;
+    }
+    Some(present)
+}
+
+/// The store scan a plan reads, when it is one this pipeline can stream; the
+/// same zone pruning and projection `scan_output` would apply.
+pub(crate) fn store_scan<'a>(cx: &'a Cx, plan: &LogicalPlan) -> Result<Option<StoreScan<'a>>> {
+    let LogicalPlan::Scan { ns: qdb, table, at } = plan else {
+        return Ok(None);
+    };
+    if at.is_some() {
+        return Ok(None);
+    }
+    if qdb.is_none() && cx.ctes.contains_key(&table.to_ascii_lowercase()) {
+        return Ok(None);
+    }
+    let lookup = qdb
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| cx.db.current_ns().clone());
+    if cx
+        .db
+        .attached_lookup(lookup.db(), lookup.schema(), table)
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let t = cx.db.table_in(&lookup, table)?;
+    let keep = scan_candidates(t, cx.prunes.for_scan(plan), &cx.dynamic.for_scan(plan));
+    Ok(Some(StoreScan::new(t, cx.projections.for_scan(plan), keep)))
+}
+
+fn scan_chunks_of(t: &DataTable, keep: Option<&[usize]>) -> Result<Vec<DataChunk>> {
+    StoreScan::new(t, None, keep.map(<[usize]>::to_vec)).materialize()
 }
 
 /// The chunks of `t` whose stored zone maps leave every simple predicate
@@ -2967,10 +3191,7 @@ fn scan_candidates(
     }
     let mut keep = Vec::with_capacity(t.num_chunks());
     for chunk in 0..t.num_chunks() {
-        let Some(c) = t.scan_chunk(chunk) else {
-            continue;
-        };
-        let rows = c.num_rows() as u64;
+        let rows = t.chunk_rows(chunk) as u64;
         let static_ok = prunes.iter().all(|p| {
             t.zone(p.column, chunk)
                 .may_match(rows, p.op, p.value.as_ref())
@@ -3036,7 +3257,7 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         };
         let (names, types) = scan.table.schema().into_iter().unzip();
         return Ok(Output {
-            chunks: scan.chunks(),
+            chunks: scan.chunks()?,
             names,
             types,
         });
@@ -3047,7 +3268,7 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     let chunks = match projected {
         Some(cols) => project_scan_chunks_of(t, cols, keep.as_deref()),
         None => scan_chunks_of(t, keep.as_deref()),
-    };
+    }?;
     cx.check_deadline()?;
     Ok(Output {
         chunks,
@@ -3077,15 +3298,15 @@ fn table_function_output(
         };
         let lake = crate::lake_db::LakeFunctionCall::from_table_call(&name, args);
         let table = cx.db.lake_function_read(&lake)?;
-        let mut chunks = Vec::with_capacity(table.columns[0].chunks.len());
-        for i in 0..table.columns[0].chunks.len() {
+        let mut chunks = Vec::with_capacity(table.columns[0].num_chunks());
+        for i in 0..table.columns[0].num_chunks() {
             chunks.push(DataChunk {
                 columns: table
                     .columns
                     .iter()
-                    .map(|c| std::sync::Arc::clone(&c.chunks[i]))
-                    .collect(),
-                num_rows: table.columns[0].chunks[i].len(),
+                    .map(|c| c.chunk(i))
+                    .collect::<Result<Vec<_>>>()?,
+                num_rows: table.columns[0].chunk_rows(i),
                 ordinal: i,
             });
         }
@@ -3132,7 +3353,10 @@ fn query_result_from_table(table: DataTable) -> QueryResult {
     for row in 0..table.num_rows() {
         rows.push(
             (0..table.columns.len())
-                .map(|col| table.get(row, col).unwrap_or(Value::Null))
+                // A freshly materialized table cannot fail to decode a cell,
+                // and a poisoned one reads as NULL rather than aborting the
+                // write that already succeeded.
+                .map(|col| table.get(row, col).ok().flatten().unwrap_or(Value::Null))
                 .collect(),
         );
     }
@@ -3242,7 +3466,8 @@ fn exact_topk_rows(
     let (start32, start64, query_is_f64) = query_vector(query, dim)?;
     let mut heap: std::collections::BinaryHeap<ExactHit> = std::collections::BinaryHeap::new();
     let mut row = 0u64;
-    for chunk in &col.chunks {
+    for i in 0..col.num_chunks() {
+        let chunk = col.chunk(i)?;
         for r in 0..chunk.len() {
             if let Some((_elem, values, valid)) = chunk.array_row(r) {
                 let off = r * dim;
@@ -3314,14 +3539,9 @@ fn index_scan_output(
     let offsets: Vec<usize> = {
         let mut offsets = Vec::with_capacity(t.num_chunks() + 1);
         let mut offset = 0usize;
-        for chunk in t
-            .columns
-            .first()
-            .map(|c| c.chunks.as_slice())
-            .unwrap_or(&[])
-        {
+        for i in 0..t.num_chunks() {
             offsets.push(offset);
-            offset += chunk.len();
+            offset += t.chunk_rows(i);
         }
         offsets.push(offset);
         offsets
@@ -3342,12 +3562,11 @@ fn index_scan_output(
         let mut values = Vec::with_capacity(t.columns.len());
         let mut valid = true;
         for col in &t.columns {
-            match col.chunks.get(chunk_idx) {
-                Some(chunk) if row_in_chunk < chunk.len() => values.push(chunk.get(row_in_chunk)),
-                _ => {
-                    valid = false;
-                    break;
-                }
+            if chunk_idx < col.num_chunks() && row_in_chunk < col.chunk_rows(chunk_idx) {
+                values.push(col.chunk(chunk_idx)?.get(row_in_chunk));
+            } else {
+                valid = false;
+                break;
             }
         }
         if !valid {
@@ -3384,51 +3603,18 @@ fn index_scan_output(
 /// mirroring the lake reader's always-correct fallback. An empty `cols`
 /// still materializes column 0: a chunk carries its shape on its columns.
 #[cfg(test)]
-fn project_scan_chunks(t: &DataTable, cols: &[usize]) -> Vec<DataChunk> {
+fn project_scan_chunks(t: &DataTable, cols: &[usize]) -> Result<Vec<DataChunk>> {
     project_scan_chunks_of(t, cols, None)
 }
 
 /// [`project_scan_chunks`] over the chunks `keep` selects (`None` reads every
 /// chunk; a zone-map pruned scan passes the surviving indices).
-fn project_scan_chunks_of(t: &DataTable, cols: &[usize], keep: Option<&[usize]>) -> Vec<DataChunk> {
-    let ncols = t.num_cols();
-    if cols.iter().any(|&i| i >= ncols) {
-        return scan_chunks_of(t, keep);
-    }
-    let mut present = vec![false; ncols];
-    for &i in cols {
-        present[i] = true;
-    }
-    if !present.iter().any(|&p| p) {
-        present[0] = true;
-    }
-    if present.iter().all(|&p| p) {
-        return scan_chunks_of(t, keep);
-    }
-    let absent: Vec<Option<std::sync::Arc<Vector>>> = t
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (!present[i]).then(|| std::sync::Arc::new(Vector::new_empty(c.dtype))))
-        .collect();
-    let selected: Vec<usize> = match keep {
-        Some(keep) => keep.to_vec(),
-        None => (0..t.num_chunks()).collect(),
-    };
-    let mut chunks = Vec::with_capacity(selected.len());
-    for i in selected {
-        let Some(chunk) = t.scan_chunk(i) else {
-            continue;
-        };
-        let cols: Vec<std::sync::Arc<Vector>> = (0..ncols)
-            .map(|c| match &absent[c] {
-                Some(placeholder) => std::sync::Arc::clone(placeholder),
-                None => std::sync::Arc::clone(&chunk.columns[c]),
-            })
-            .collect();
-        chunks.push(DataChunk::projected(cols, chunk.num_rows()));
-    }
-    chunks
+fn project_scan_chunks_of(
+    t: &DataTable,
+    cols: &[usize],
+    keep: Option<&[usize]>,
+) -> Result<Vec<DataChunk>> {
+    StoreScan::new(t, Some(cols), keep.map(<[usize]>::to_vec)).materialize()
 }
 
 /// Exact aggregate answers from an attached lake table's stored statistics
@@ -3618,10 +3804,23 @@ fn count_selected(cx: &Cx, plan: &LogicalPlan) -> Result<Option<i64>> {
     let LogicalPlan::Filter { input, predicate } = plan else {
         return Ok(None);
     };
-    let inner = eval(cx, input)?;
     expr::prime(cx, [predicate])?;
-    let counts: Vec<i64> = inner
-        .chunks
+    // A store table is counted chunk by chunk: `eval` would decode the whole
+    // table before the count starts.
+    if let Some(scan) = store_scan(cx, input)? {
+        let counts = scan.par_chunks(|_, chunk| match chunk {
+            Some(chunk) => count_in(cx, predicate, std::slice::from_ref(&chunk)),
+            None => Ok(0),
+        })?;
+        return Ok(Some(counts.into_iter().sum()));
+    }
+    let inner = eval(cx, input)?;
+    Ok(Some(count_in(cx, predicate, &inner.chunks)?))
+}
+
+/// The rows of `chunks` that `predicate` selects.
+fn count_in(cx: &Cx, predicate: &BoundExpr, chunks: &[DataChunk]) -> Result<i64> {
+    let counts: Vec<i64> = chunks
         .par_iter()
         .map(|chunk| {
             let mut sel = selection::all_rows(chunk.num_rows());
@@ -3629,7 +3828,7 @@ fn count_selected(cx: &Cx, plan: &LogicalPlan) -> Result<Option<i64>> {
             Ok(sel.len() as i64)
         })
         .collect::<Result<_>>()?;
-    Ok(Some(counts.into_iter().sum()))
+    Ok(counts.into_iter().sum())
 }
 
 /// An INNER join's probe side, read through its filter's selection when it
@@ -3903,17 +4102,18 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             // The optimizer already canonicalized the literal to the indexed
             // column's type (H-5); re-apply the cast defensively so a plan
             // built by another path can never probe with a type-tagged key.
-            let column_type = t
+            let column = t
                 .columns
                 .get(idx.column)
-                .map(|c| c.dtype)
                 .ok_or_else(|| {
                     PinkDbError::Catalog(format!("index \"{index}\" has no column"))
                 })?;
-            let key_val = crate::exec::expr::cast_value(key_val, column_type)?;
+            let key_val = crate::exec::expr::cast_value(key_val, column.dtype)?;
             let mut key_buf = Vec::new();
             crate::exec::aggregate::encode_value(&mut key_buf, &key_val);
-            let row_indices = idx.map.get(&key_buf).cloned().unwrap_or_default();
+            // Builds the map on first use (decoding only the indexed column),
+            // then answers from it.
+            let row_indices = idx.lookup(column, &key_buf)?;
             index_scan_output(cx, &target, table, idx.column, &row_indices)
         }
         LogicalPlan::VectorTopK {
@@ -4579,10 +4779,15 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 debug_assert_eq!(aggs.len(), 1);
                 let total: i64 = match count_selected(cx, input)? {
                     Some(n) => n,
-                    None => {
-                        let inner = eval(cx, input)?;
-                        inner.chunks.iter().map(|c| c.num_rows() as i64).sum()
-                    }
+                    None => match store_scan(cx, input)? {
+                        // A bare store scan is counted from the footer's chunk
+                        // row counts: the chunks are never decoded.
+                        Some(scan) => scan.rows() as i64,
+                        None => {
+                            let inner = eval(cx, input)?;
+                            inner.chunks.iter().map(|c| c.num_rows() as i64).sum()
+                        }
+                    },
                 };
                 let mut vec = Vector::new_empty(DataType::Bigint);
                 vec.push_valid(Value::Bigint(total))?;
@@ -4708,7 +4913,10 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 };
                 return eval(&child, body);
             }
-                let mut out = eval(cx, query)?;
+            let mut out = eval(cx, query)?;
+            // The materialized CTE lives in `cx.ctes` for the rest of the
+            // statement, so every reference holds it: charge it once, here.
+            cx.budget.materialize(chunks_approx_bytes(&out.chunks))?;
             if let Some(step) = recursive {
                 // Semi-naive iteration: `name` is bound to the rows the last
                 // step added. `UNION` (not `UNION ALL`) also drops rows the
@@ -4771,6 +4979,9 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                         names: produced.names,
                         types: produced.types,
                     };
+                    // Only the new rows are charged: `out` already holds (and
+                    // charged) everything before this iteration.
+                    cx.budget.materialize(chunks_approx_bytes(&delta.chunks))?;
                     out.chunks.extend(fresh);
                 }
             }
@@ -5195,6 +5406,19 @@ struct MatchTable {
     /// The keys are a pair of integer columns packed into one BIGINT
     /// ([`MatchTable::build_pair`]); probes must pack theirs the same way.
     packed: bool,
+    /// Wave 136a: the build input and per-row arrays, held from build to the
+    /// last probe. Dead code on purpose: its `Drop` releases the pool.
+    #[allow(dead_code)]
+    held: crate::memory::Reservation,
+}
+
+/// Approximate bytes a match table for `rows` build rows holds: the per-row
+/// arrays, the bucket heads, and `key_bytes` of keys (wave 136a).
+fn match_table_bytes(rows: usize, key_bytes: usize) -> usize {
+    let buckets = (rows.max(1) * 2).next_power_of_two().max(1024);
+    rows * (std::mem::size_of::<u64>() + 5 * std::mem::size_of::<u32>() + 1)
+        + buckets * std::mem::size_of::<u32>()
+        + key_bytes
 }
 
 impl MatchTable {
@@ -5216,12 +5440,23 @@ impl MatchTable {
                     .collect()
             })
             .collect::<Result<_>>()?;
-        Ok(Self::from_key_vectors(&key_vectors, ints))
+        let rows: usize = right_chunks.iter().map(DataChunk::num_rows).sum();
+        // Charge the build input and the table before building: a runaway
+        // build fails here instead of allocating first (wave 136a).
+        let held = cx
+            .budget
+            .memory()
+            .reserve(match_table_bytes(rows, chunks_approx_bytes(right_chunks)))?;
+        Ok(Self::from_key_vectors(&key_vectors, ints, held))
     }
 
     /// The table over already evaluated build keys, one list per build
     /// chunk.
-    fn from_key_vectors(key_vectors: &[Vec<Vector>], ints: bool) -> MatchTable {
+    fn from_key_vectors(
+        key_vectors: &[Vec<Vector>],
+        ints: bool,
+        held: crate::memory::Reservation,
+    ) -> MatchTable {
         let strs = !ints && string_keys(key_vectors);
         let per_chunk: Vec<ChunkKeys> = key_vectors
             .par_iter()
@@ -5317,6 +5552,7 @@ impl MatchTable {
             locs,
             mask,
             packed: false,
+            held,
         }
     }
 
@@ -5336,9 +5572,14 @@ impl MatchTable {
                 Ok(pack_pair(&a, &b, false).map(|v| vec![v]))
             })
             .collect::<Result<_>>()?;
+        let rows: usize = chunks.iter().map(DataChunk::num_rows).sum();
+        let held = cx
+            .budget
+            .memory()
+            .reserve(match_table_bytes(rows, chunks_approx_bytes(chunks)))?;
         Ok(packed.map(|kvs| MatchTable {
             packed: true,
-            ..Self::from_key_vectors(&kvs, true)
+            ..Self::from_key_vectors(&kvs, true, held)
         }))
     }
 
@@ -7497,7 +7738,7 @@ fn fused_scan_aggregate(
     // Merge and emit through the shared post-partial phase, exactly like
     // `aggregate()`.
     let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
-    let chunks = merge_and_emit(partials, &key_types, aggs)?;
+    let chunks = merge_and_emit(partials, &key_types, aggs, cx.budget.memory())?;
     let (names, types) = agg_output_schema(keys, aggs);
     Ok(Some(Output {
         chunks,
@@ -7593,6 +7834,10 @@ fn distinct_on(cx: &Cx, chunks: &[DataChunk], keys: &[usize]) -> Result<Vec<Data
     let mut seen: FastSet<Vec<u8>> = FastSet::default();
     let mut out = Vec::new();
     let mut buf = Vec::new();
+    // The kept rows and the seen keys both grow with the input, so charge
+    // them per chunk (wave 136a).
+    let mut held = cx.budget.memory().reserve(0)?;
+    let mut seen_bytes = 0usize;
     for chunk in chunks {
         cx.check_deadline()?;
         let mut keep = Vec::new();
@@ -7606,10 +7851,12 @@ fn distinct_on(cx: &Cx, chunks: &[DataChunk], keys: &[usize]) -> Result<Vec<Data
             }
             if seen.insert(buf.clone()) {
                 keep.push(row);
+                seen_bytes += buf.len() + std::mem::size_of::<Vec<u8>>() + 8;
             }
         }
         if !keep.is_empty() {
             out.push(chunk.gather(&keep));
+            held.resize(chunks_approx_bytes(&out) + seen_bytes)?;
         }
     }
     Ok(out)
@@ -7941,6 +8188,11 @@ fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, SortSpec)]) -> Result
     // (arena bytes, row index). That comparator is a total order, so the
     // unstable parallel sort is deterministic; the row index is the old
     // `seq` tiebreak (input order), preserving tie stability.
+    //
+    // Wave 136a: the sort holds its input, the encoded keys and the sorted
+    // copy at once, so charge the input up front — a runaway ORDER BY fails
+    // before it allocates. Below the limit this is one atomic read/compare.
+    let mut held = cx.budget.memory().reserve(chunks_approx_bytes(chunks))?;
     let keyed = eval_sort_keys(cx, chunks, keys)?;
     let Some(arena) = encode_sort_keys(chunks, &keyed, keys) else {
         return sort_legacy(chunks, keys, &keyed);
@@ -7967,7 +8219,9 @@ fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, SortSpec)]) -> Result
             .then(a.cmp(&b))
     });
     let rows: Vec<u32> = rows.into_iter().map(|(_, r)| r).collect();
-    rebuild_sorted(chunks, &rows)
+    let out = rebuild_sorted(chunks, &rows)?;
+    held.resize(chunks_approx_bytes(&out) + arena.bytes.len() + n * 12)?;
+    Ok(out)
 }
 
 /// Top-N selection for `LIMIT` directly over `SORT`: every rayon partition
@@ -7987,6 +8241,12 @@ fn top_n(
     };
     let n = arena.offsets.len() - 1;
     debug_assert!(0 < limit && limit < n, "top-N needs a truncating limit");
+    // Wave 136a: the row indices and the candidate keys the heap partitions
+    // hold, charged per statement; the output is at most `limit` rows.
+    let mut held = cx
+        .budget
+        .memory()
+        .reserve(n * 12 + chunks_approx_bytes(chunks))?;
     // Cap the partition count so the merged candidate list stays a small
     // fraction of n: each partition returns ≤ limit candidates, and the
     // caller only routes here when limit × 16 ≤ n.
@@ -8031,6 +8291,7 @@ fn top_n(
         let sel: Vec<usize> = (0..last.num_rows()).collect();
         *last = last.gather(&sel);
     }
+    held.resize(chunks_approx_bytes(&out))?;
     Ok(Some(out))
 }
 
@@ -10296,10 +10557,18 @@ mod tests {
             build.push_valid(V::Varchar(s.to_string())).unwrap();
         }
         build.push_null().unwrap();
-        let table = MatchTable::from_key_vectors(&[vec![build.clone()]], false);
+        let table = MatchTable::from_key_vectors(
+            &[vec![build.clone()]],
+            false,
+            crate::memory::Reservation::empty(),
+        );
         assert!(matches!(table.keys, BuildKeys::Str(_)), "one VARCHAR key");
         // Two key columns cannot use the view path: they encode the tuple.
-        let table = MatchTable::from_key_vectors(&[vec![build.clone(), build.clone()]], false);
+        let table = MatchTable::from_key_vectors(
+            &[vec![build.clone(), build.clone()]],
+            false,
+            crate::memory::Reservation::empty(),
+        );
         assert!(matches!(table.keys, BuildKeys::Bytes { .. }), "two keys");
         // A probe vector the build never saw matches by view: same strings,
         // different buffers.
@@ -10307,7 +10576,11 @@ mod tests {
         for s in ["abcdefghijklm", "", "zzz"] {
             probe.push_valid(V::Varchar(s.to_string())).unwrap();
         }
-        let table = MatchTable::from_key_vectors(&[vec![build]], false);
+        let table = MatchTable::from_key_vectors(
+            &[vec![build]],
+            false,
+            crate::memory::Reservation::empty(),
+        );
         let pc = ProbeChunk::new(&table, vec![probe]);
         let rows = 0..pc.kvs[0].len();
         let Keys::Str(keys) = pc.keys(&table) else {
@@ -11652,7 +11925,7 @@ mod tests {
                 ("ts".to_string(), DataType::Timestamp),
             ]
         );
-        assert_eq!(t.get(1, 0), Some(Value::Null));
+        assert_eq!(t.get(1, 0).unwrap(), Some(Value::Null));
         // Almost-dates stay VARCHAR.
         let mut db2 = PinkDb::new();
         crate::csv::import_csv_string(&mut db2, "c", "d\n2024-13-01\n2024-01-15\n").unwrap();
@@ -11677,7 +11950,11 @@ mod tests {
         assert_eq!(a.num_rows(), b.num_rows());
         for r in 0..a.num_rows() {
             for c in 0..3 {
-                assert_eq!(a.get(r, c), b.get(r, c), "row {r} col {c}");
+                assert_eq!(
+                    a.get(r, c).unwrap(),
+                    b.get(r, c).unwrap(),
+                    "row {r} col {c}"
+                );
             }
         }
         std::fs::remove_file(&path).ok();
@@ -14274,7 +14551,7 @@ mod tests {
         let cx = Cx::new(&db);
         let t = db.table("f").unwrap();
         let chunks: Vec<DataChunk> = (0..t.num_chunks())
-            .map(|i| t.scan_chunk(i).unwrap())
+            .map(|i| t.scan_chunk(i).unwrap().unwrap())
             .collect();
         // `Value::Double(NaN) != Value::Double(NaN)`, so compare Debug forms.
         let debug_rows =
@@ -14398,7 +14675,7 @@ mod tests {
         let cx = Cx::new(&db);
         let t = db.table("m").unwrap();
         let chunks: Vec<DataChunk> = (0..t.num_chunks())
-            .map(|i| t.scan_chunk(i).unwrap())
+            .map(|i| t.scan_chunk(i).unwrap().unwrap())
             .collect();
         let asc = |index: usize, dtype: DataType| {
             (
@@ -16142,9 +16419,9 @@ mod tests {
         let t = db.table("w").unwrap();
         assert!(t.num_chunks() > 2, "the corpus must span chunks");
         let rows = t.num_rows();
-        let stored = t.scan_chunk(0).unwrap();
+        let stored = t.scan_chunk(0).unwrap().unwrap();
 
-        let chunks = project_scan_chunks(t, &[2]);
+        let chunks = project_scan_chunks(t, &[2]).unwrap();
         assert_eq!(chunks.len(), t.num_chunks());
         assert_eq!(chunks.iter().map(|c| c.num_rows()).sum::<usize>(), rows);
         let c = &chunks[0];
@@ -16155,17 +16432,18 @@ mod tests {
             assert_eq!(c.columns[i].len(), 0, "column {i} is a placeholder");
         }
         assert!(std::sync::Arc::ptr_eq(&c.columns[2], &stored.columns[2]));
-        // One shared placeholder per absent column, across all chunks.
+        // Absent columns are empty placeholders in every chunk.
         let c2 = &chunks[1];
-        assert!(std::sync::Arc::ptr_eq(&c.columns[0], &c2.columns[0]));
+        assert!(!c2.is_present(0));
+        assert_eq!(c2.columns[0].len(), 0);
 
         // An empty projection still materializes column 0 (chunk shape).
-        let empty = project_scan_chunks(t, &[]);
+        let empty = project_scan_chunks(t, &[]).unwrap();
         assert!(empty[0].is_present(0));
         assert!(!empty[0].is_present(1));
 
         // A full projection returns the stored chunks unchanged.
-        let full = project_scan_chunks(t, &[0, 1, 2, 3, 4]);
+        let full = project_scan_chunks(t, &[0, 1, 2, 3, 4]).unwrap();
         assert!(full[0].is_present(0));
         assert!(std::sync::Arc::ptr_eq(
             &full[0].columns[3],
@@ -16173,7 +16451,7 @@ mod tests {
         ));
 
         // Out-of-range indices fall back to a full scan.
-        let oob = project_scan_chunks(t, &[9]);
+        let oob = project_scan_chunks(t, &[9]).unwrap();
         assert!(oob[0].is_present(4));
     }
 

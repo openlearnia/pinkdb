@@ -412,6 +412,9 @@ struct ProfileDraft {
     optimize: Duration,
     execute: Duration,
     log: Duration,
+    /// Filled from the statement's budget when it finishes.
+    memory_limit: u64,
+    memory_peak: u64,
 }
 
 struct Txn {
@@ -621,6 +624,8 @@ impl Connection {
                         columns,
                         kind: kind.to_string(),
                         in_transaction,
+                        memory_limit: draft.memory_limit,
+                        memory_peak: draft.memory_peak,
                         engine_version: env!("CARGO_PKG_VERSION"),
                     });
                 }
@@ -903,12 +908,6 @@ impl Connection {
         sql_text: Option<&str>,
         mut profile: Option<&mut ProfileDraft>,
     ) -> Result<QueryResult> {
-        // Network authentication gate: evaluated before *every* statement of
-        // a batch with the store's current user catalog, so the first
-        // `CREATE USER` of an unauthenticated batch is allowed and the very
-        // next statement is refused. No-op for embedded connections (the
-        // gate is armed only by a network front-end) and once logged in.
-        self.ensure_login()?;
         // One budget per statement: the deadline starts here (before bind)
         // and is shared by every evaluation context of this statement. No
         // limits (the embedded default) is a zero-cost `None` budget.
@@ -917,6 +916,27 @@ impl Connection {
                 .with_external_services(self.external_services)
                 .with_cancel(self.cancel.clone()),
         );
+        let result = self.execute_one_with(stmt, sql_text, profile.as_deref_mut(), &budget);
+        if let Some(p) = profile {
+            p.memory_limit = crate::memory::limit() as u64;
+            p.memory_peak = budget.memory_peak() as u64;
+        }
+        result
+    }
+
+    fn execute_one_with(
+        &mut self,
+        stmt: &crate::sql::ast::Statement,
+        sql_text: Option<&str>,
+        mut profile: Option<&mut ProfileDraft>,
+        budget: &Arc<crate::exec::ExecBudget>,
+    ) -> Result<QueryResult> {
+        // Network authentication gate: evaluated before *every* statement of
+        // a batch with the store's current user catalog, so the first
+        // `CREATE USER` of an unauthenticated batch is allowed and the very
+        // next statement is refused. No-op for embedded connections (the
+        // gate is armed only by a network front-end) and once logged in.
+        self.ensure_login()?;
         // Transaction control never touches table data: handle first. The
         // whole transition (including COMMIT's WAL append) is execution time.
         match stmt {

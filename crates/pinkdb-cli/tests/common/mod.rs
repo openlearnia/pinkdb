@@ -31,10 +31,19 @@ pub fn run_merged(mut command: Command, stdin: &str) -> (String, ExitStatus) {
     (out, status)
 }
 
-/// Whether `line` is exactly a `.timer on` line with the phase breakdown:
+/// Whether `line` is exactly a `.timer on` line with the phase breakdown and
+/// the statement's memory peak next to the limit (wave 136a):
 /// `^Run Time \(s\): real [0-9]+\.[0-9]{3} \(parse [0-9.]+, bind [0-9.]+,
-/// optimize [0-9.]+, execute [0-9.]+, log [0-9.]+ ms\)$`.
+/// optimize [0-9.]+, execute [0-9.]+, log [0-9.]+ ms, memory <size>/<size>\)$`,
+/// where a size is `memory::human_bytes`'s `N bytes` / `N.N KiB` form.
 pub fn is_timer_line(line: &str) -> bool {
+    // `0 bytes`, `1 byte`, `12.7 GiB`: a number, a space, a unit.
+    fn is_size(s: &str) -> bool {
+        let Some((n, unit)) = s.split_once(' ') else {
+            return false;
+        };
+        digits_and_dots(n) && ["byte", "bytes", "KiB", "MiB", "GiB", "TiB", "PiB"].contains(&unit)
+    }
     fn digits(s: &str) -> bool {
         s.chars().all(|c| c.is_ascii_digit())
     }
@@ -47,9 +56,18 @@ pub fn is_timer_line(line: &str) -> bool {
     let Some((real, rest)) = rest.split_once(" (parse ") else {
         return false;
     };
-    let Some(rest) = rest.strip_suffix(" ms)") else {
+    let Some(rest) = rest.strip_suffix(')') else {
         return false;
     };
+    let Some((rest, memory)) = rest.split_once(" ms, memory ") else {
+        return false;
+    };
+    let Some((peak, limit)) = memory.split_once('/') else {
+        return false;
+    };
+    if !is_size(peak) || !is_size(limit) {
+        return false;
+    }
     let Some((int, frac)) = real.split_once('.') else {
         return false;
     };

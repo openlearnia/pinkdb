@@ -253,7 +253,7 @@ mod tests {
             out.push('\n');
             for row in 0..table.num_rows {
                 let cells: Vec<String> = (0..table.num_cols())
-                    .map(|c| match table.get(row, c).unwrap() {
+                    .map(|c| match table.get(row, c).unwrap().unwrap() {
                         Value::Null => String::new(),
                         Value::Integer(i) => i.to_string(),
                         Value::Bigint(i) => i.to_string(),

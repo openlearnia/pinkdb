@@ -41,6 +41,35 @@ one-liners below.
 - **Subqueries in `FROM` need no alias** (`unnamed_subquery`, …), and an
   unaliased `count(*)` is named `count_star()` as in DuckDB.
 
+### Wave 136 (steps a–b, through b-4) — a memory limit, a lazily opened store ✅
+
+Opening a saved store no longer decodes it, and a statement that would
+outgrow the process's memory budget fails with an out-of-memory error
+instead of being killed by the OS. Results are unchanged.
+
+- **`SET memory_limit = '2GB'`** (alias `max_memory`, `-1` = no limit) sets
+  one process-wide budget: 80 % of the memory the process may use — physical
+  RAM, or the tighter cgroup limit a container imposed — and no limit on
+  wasm32. Hash-join builds, hash aggregates, sorts and the other large
+  operators reserve the chunks they hold against it and release them on drop;
+  over the limit the statement fails with DuckDB's out-of-memory error. A
+  profile reports the limit and the statement's peak, on the wire protocol's
+  v16 `Profile` frame.
+- **Lazy open:** the footer now records every chunk's row count (footer
+  version 7), so opening a `.pink` file checksums the column chunks and
+  installs descriptors without decoding a page. A chunk is decoded on first
+  read, and a scan decodes only the columns the query asks for. A version-6
+  or older file is refused with the documented older-pinkdb error — there is
+  no v6 reader and no conversion.
+- **Eviction:** a decoded chunk is charged to the budget and can be dropped
+  again under pressure, least recently used first, so a store larger than the
+  budget still scans. Dirty and pinned chunks are never evicted.
+- **Copy-through `.save`:** a checkpoint re-encodes only the chunks changed
+  since the last save and copies the rest byte for byte.
+- **`COMMIT` that cannot take the store's lease** now aborts the transaction,
+  so the caller's retry can `BEGIN` again instead of tripping over "already
+  in a transaction".
+
 ### Wave 135 (steps a–d) — pipelines, string keys, big GROUP BYs ✅
 
 QuackLab's mart refresh SELECTs run 1.5–2.9× faster than after wave 140,

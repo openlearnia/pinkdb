@@ -133,7 +133,11 @@ fn seed_all_types(db: &mut PinkDb) {
 fn all_values(db: &PinkDb, table: &str) -> Vec<Vec<Value>> {
     let t = db.table(table).unwrap();
     (0..t.num_rows())
-        .map(|r| (0..t.num_cols()).map(|c| t.get(r, c).unwrap()).collect())
+        .map(|r| {
+            (0..t.num_cols())
+                .map(|c| t.get(r, c).unwrap().unwrap())
+                .collect()
+        })
         .collect()
 }
 

@@ -133,7 +133,7 @@ impl LakeFormat for PinkWrap {
         {
             let dst = mini.table_mut_in(db, table).unwrap();
             for i in 0..src.num_chunks() {
-                let chunk = src.scan_chunk(i).unwrap();
+                let chunk = src.scan_chunk(i).unwrap().unwrap();
                 dst.append_shared_chunk(&chunk.columns).unwrap();
             }
         }

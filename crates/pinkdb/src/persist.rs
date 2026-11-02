@@ -133,13 +133,14 @@ pub const ROW_GROUP_ROWS: usize = 122_880;
 pub const CHUNKS_PER_ROW_GROUP: usize = ROW_GROUP_ROWS / CHUNK_SIZE;
 
 /// The footer's own version word (bumped when the footer layout changes).
-/// Version 4 (wave 131a) puts every database's catalog sections under its
-/// schemas. Version 5 (wave 139a) stores a column DEFAULT as its SQL text
-/// instead of an encoded constant value; the text is rebound at load. Version
-/// 6 (wave 132b) always carries the store's persistent-secret section and a
-/// lake's declared data-file format. Files written by older builds are
-/// refused.
-const FOOTER_VERSION: u32 = 6;
+/// Version 7 (wave 136b) adds the per-chunk row counts to every row group, so
+/// a lazy open knows every chunk's row count without decoding it. Version 6
+/// (wave 132b) always carries the store's persistent-secret section and a
+/// lake's declared data-file format; 5 (wave 139a) stores a column DEFAULT as
+/// its SQL text (the text is rebound at load); 4 (wave 131a) puts every
+/// database's catalog sections under its schemas. Files written by older
+/// builds are refused.
+const FOOTER_VERSION: u32 = 7;
 
 /// A database's storage tag in the footer: rows in the file.
 const STORAGE_LOCAL: u8 = 0;
@@ -2811,11 +2812,16 @@ struct ColumnChunkDir {
     max: Option<Value>,
 }
 
-/// One row group's directory entry: its row count and one entry per column.
+/// One row group's directory entry: its row count, its per-chunk row counts
+/// and one entry per column.
 #[derive(Debug, Clone)]
 struct RowGroupDir {
     /// The row group's exact row count.
     rows: u64,
+    /// The rows in each engine chunk of the group, in order: every column
+    /// shares these boundaries, so a lazy open builds the handles from them
+    /// without decoding a page.
+    chunk_rows: Vec<u32>,
     /// One entry per column, in schema order.
     columns: Vec<ColumnChunkDir>,
 }
@@ -2892,8 +2898,6 @@ struct EncodedPage {
     frame: Vec<u8>,
     /// The page's exact statistics.
     stats: ChunkColumnStats,
-    /// The page's row count.
-    rows: usize,
 }
 
 /// Encode one page (one engine chunk) from its [`Vector`].
@@ -2908,7 +2912,6 @@ fn encode_page(v: &Vector) -> EncodedPage {
     EncodedPage {
         frame: w.buf,
         stats: crate::stats::Zone::of_vector(v),
-        rows: v.len(),
     }
 }
 
@@ -3136,9 +3139,12 @@ fn read_stat_value(r: &mut Reader) -> Result<Option<Value>> {
     Ok(v)
 }
 
-/// The index definitions of one table (the map itself is never stored: the
-/// loader rebuilds it from the decoded column).
-fn index_defs(t: &DataTable) -> Vec<IndexDef> {
+/// The index definitions of one table (the map itself is never stored: a lazy
+/// open leaves every map unbuilt and the first indexed lookup builds it).
+///
+/// `null_counts` are the exact NULL counts of the table's columns (the write
+/// pass observed them), so the definition does not read a single row.
+fn index_defs(t: &DataTable, null_counts: &[u64]) -> Vec<IndexDef> {
     let mut indexes: Vec<&Index> = t
         .indexes
         .iter()
@@ -3148,18 +3154,21 @@ fn index_defs(t: &DataTable) -> Vec<IndexDef> {
     indexes
         .into_iter()
         .map(|index| {
-            let column = &t.columns[index.column];
-            let distinct = if t.indexes_stale {
-                crate::storage::index_map_for(column).len()
-            } else {
-                index.map.len()
+            // A map that was never built still has a distinct count: save may
+            // decode the indexed column, so two loads of the same rows write
+            // the same bytes.
+            let distinct = match index.map().as_ref() {
+                Some(map) => map.len() as u64,
+                None => crate::storage::index_map_for(&t.columns[index.column])
+                    .map_or(0, |map| map.len() as u64),
             };
-            let indexed: usize = column.chunks.iter().map(|c| c.len() - c.null_count()).sum();
+            let nulls = null_counts.get(index.column).copied().unwrap_or(0);
+            let indexed = (t.num_rows() as u64).saturating_sub(nulls);
             IndexDef {
                 name: index.name.clone(),
                 column: index.column,
-                distinct_keys: distinct as u64,
-                indexed_rows: indexed as u64,
+                distinct_keys: distinct,
+                indexed_rows: indexed,
             }
         })
         .collect()
@@ -3170,14 +3179,19 @@ fn index_defs(t: &DataTable) -> Vec<IndexDef> {
 /// (they live in the lake's data files, whose chunks the loader appends after
 /// decoding), and the `.pink` reader refuses statistics larger than the table.
 fn index_defs_without_rows(t: &DataTable) -> Vec<IndexDef> {
-    index_defs(t)
-        .into_iter()
-        .map(|def| IndexDef {
+    let mut defs: Vec<IndexDef> = t
+        .indexes
+        .iter()
+        .filter(|i| i.column < t.columns.len())
+        .map(|i| IndexDef {
+            name: i.name.clone(),
+            column: i.column,
             distinct_keys: 0,
             indexed_rows: 0,
-            ..def
         })
-        .collect()
+        .collect();
+    defs.sort_by(|a, b| a.name.cmp(&b.name));
+    defs
 }
 
 /// Write one table's index definitions (the reader side of [`index_defs`]).
@@ -3315,34 +3329,30 @@ fn read_index_defs(r: &mut Reader) -> Result<Vec<IndexDef>> {
     Ok(out)
 }
 
-/// Rebuild one table's index maps from its decoded rows and install the
-/// definitions.
+/// Install one table's index definitions, with every map left unbuilt.
 ///
-/// The maps are **never** read from the file: an index can therefore never
+/// The maps are **never** read from the file and never built here: each one is
+/// built from the live rows by the first indexed lookup, so it can never
 /// disagree with the rows it indexes, whatever the file claims. The
 /// statistics are only bounded by the table's real row count.
 fn apply_indexes(t: &mut DataTable, defs: &[IndexDef]) -> Result<()> {
     let mut out: Vec<Index> = Vec::with_capacity(defs.len());
     for def in defs {
-        let Some(col) = t.columns.get(def.column) else {
+        if def.column >= t.columns.len() {
             return Err(PinkDbError::Execution(format!(
                 "corrupt file: index \"{}\" names column {} of a {}-column table",
                 def.name,
                 def.column,
                 t.columns.len()
             )));
-        };
+        }
         if def.indexed_rows > t.num_rows() as u64 || def.distinct_keys > def.indexed_rows {
             return Err(PinkDbError::Execution(format!(
                 "corrupt file: index \"{}\" statistics exceed the table",
                 def.name
             )));
         }
-        out.push(Index {
-            name: def.name.clone(),
-            column: def.column,
-            map: crate::storage::index_map_for(col),
-        });
+        out.push(Index::new(def.name.clone(), def.column));
     }
     t.indexes = out;
     t.indexes_stale = false;
@@ -3357,7 +3367,7 @@ impl PinkDb {
     /// sorted name order (deterministic bytes). Views are session-local and
     /// never persisted.
     fn to_bytes(&self) -> Result<Vec<u8>> {
-        Ok(self.to_bytes_inner(true, false, false)?.0)
+        Ok(self.to_image_inner(true, false, false)?.0.bytes().to_vec())
     }
 
     /// The engine catalog image (wave 96b): every database, macro, materialized
@@ -3366,26 +3376,35 @@ impl PinkDb {
     /// holds the rows; this is the metadata a stateless server restores from
     /// the catalog.
     pub(crate) fn to_metadata_bytes(&self) -> Result<Vec<u8>> {
-        Ok(self.to_bytes_inner(true, false, true)?.0)
+        Ok(self.to_image_inner(true, false, true)?.0.bytes().to_vec())
     }
 
     /// [`PinkDb::to_bytes`] with the chunk-parallel encode disabled (test
     /// switch: both paths must produce identical bytes).
     #[cfg(test)]
     fn to_bytes_impl(&self, parallel: bool) -> Result<Vec<u8>> {
-        Ok(self.to_bytes_inner(parallel, false, false)?.0)
+        Ok(self
+            .to_image_inner(parallel, false, false)?
+            .0
+            .bytes()
+            .to_vec())
     }
 
-    /// The one serialization path: `PINKDB06` bytes, optionally with the
+    /// The one serialization path: a `PINKDB06` image, optionally with the
     /// exact per-table statistics collected in the same chunk pass. The
-    /// statistics never influence the bytes (`to_bytes_inner(_, false).0` is
-    /// bit-identical to `to_bytes_inner(_, true).0`).
-    fn to_bytes_inner(
+    /// statistics never influence the bytes (`to_image_inner(_, false).0` is
+    /// bit-identical to `to_image_inner(_, true).0`).
+    ///
+    /// The returned image is what the store's chunk handles point at
+    /// afterwards: an unchanged table's chunks copied through, so a save
+    /// decodes nothing, and a saved write's chunk is stored (and evictable)
+    /// without a reopen.
+    fn to_image_inner(
         &self,
         parallel: bool,
         collect_stats: bool,
         omit_rows: bool,
-    ) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
+    ) -> Result<(Arc<crate::storage::StoreImage>, Vec<SavedTableStats>)> {
         // The optional catalog sections exist iff some object needs them (the
         // flags word is written in the footer, so decide it up front).
         let all_tables: Vec<&crate::storage::DataTable> = self
@@ -3421,6 +3440,9 @@ impl PinkDb {
         // The data region.
         let mut data = Writer::new();
         let mut saved: Vec<SavedTableStats> = Vec::new();
+        // Every table this pass wrote, with each chunk's new home: the handles
+        // point there once the image is complete.
+        let mut repoints: Vec<(&DataTable, TableRanges)> = Vec::new();
         let mut dbs = self.list_databases();
         dbs.sort();
         let mut db_dirs: Vec<DbDir> = Vec::with_capacity(dbs.len());
@@ -3473,7 +3495,7 @@ impl PinkDb {
                                 zones: vec![Vec::new(); t.columns.len()],
                             }
                         } else {
-                            write_table(
+                            let (dir, ranges) = write_table(
                                 &mut data,
                                 &ns,
                                 name,
@@ -3481,7 +3503,9 @@ impl PinkDb {
                                 parallel,
                                 collect_stats,
                                 &mut saved,
-                            )?
+                            )?;
+                            repoints.push((t, ranges));
+                            dir
                         };
                         tables.push(dir);
                     }
@@ -3571,6 +3595,10 @@ impl PinkDb {
                     fw.u32(tdir.row_groups.len() as u32);
                     for rg in &tdir.row_groups {
                         fw.u64(rg.rows);
+                        fw.u32(rg.chunk_rows.len() as u32);
+                        for &rows in &rg.chunk_rows {
+                            fw.u32(rows);
+                        }
                         for col in &rg.columns {
                             fw.u64(col.offset);
                             fw.u64(col.length);
@@ -3614,7 +3642,18 @@ impl PinkDb {
         data.u32(crc);
         data.u64(footer.len() as u64);
         data.bytes(MAGIC_V6);
-        Ok((data.buf, saved))
+        // An encrypted store's plaintext image is overwritten when its last
+        // handle drops it, exactly like the image a keyed open decrypts.
+        let image = crate::storage::StoreImage::new(data.buf, self.encryption_key.is_some());
+        // The handles point at the bytes just written: a dirty chunk is stored
+        // now, so the cache may evict it, and a clean one was copied through,
+        // so nothing was decoded to save it.
+        for (t, ranges) in repoints {
+            for (column, ranges) in t.columns.iter().zip(ranges) {
+                column.repoint(&image, &ranges);
+            }
+        }
+        Ok((image, saved))
     }
 
     /// The bytes [`PinkDb::save`] would write: every database in the `.pink`
@@ -3659,7 +3698,8 @@ impl PinkDb {
     /// `COUNT`/`MIN`/`MAX` from them without decoding a data file.
     pub fn to_pink_bytes_with_stats(&self) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
         self.ensure_wal_healthy()?;
-        self.to_bytes_inner(true, true, false)
+        let (image, saved) = self.to_image_inner(true, true, false)?;
+        Ok((image.bytes().to_vec(), saved))
     }
 
     /// Write every database to `path` in the `.pink` columnar format.
@@ -3673,8 +3713,8 @@ impl PinkDb {
     pub fn save(&self, path: &str) -> Result<()> {
         self.ensure_wal_healthy()?;
         self.guard_snapshot_target(path)?;
-        let bytes = self.to_pink_bytes()?;
-        Self::write_atomic(std::path::Path::new(path), &bytes)
+        let image = self.to_image_inner(true, false, false)?.0;
+        Self::write_atomic(std::path::Path::new(path), image.bytes())
     }
 
     /// [`PinkDb::save`] with at-rest encryption: the `PINKDB06` bytes are
@@ -3691,7 +3731,8 @@ impl PinkDb {
         {
             self.ensure_wal_healthy()?;
             self.guard_snapshot_target(path)?;
-            let sealed = crate::crypto::seal_container(&self.to_bytes()?, key, 0)?;
+            let image = self.to_image_inner(true, false, false)?.0;
+            let sealed = crate::crypto::seal_container(image.bytes(), key, 0)?;
             Self::write_atomic(std::path::Path::new(path), &sealed)
         }
     }
@@ -3699,7 +3740,8 @@ impl PinkDb {
     /// [`PinkDb::save`] plus `fsync` on the written file — the checkpoint
     /// primitive (the WAL is only rolled once this returns).
     pub(crate) fn save_sync(&self, path: &std::path::Path) -> Result<()> {
-        Self::write_sync(path, &self.to_bytes()?)
+        let image = self.to_image_inner(true, false, false)?.0;
+        Self::write_sync(path, image.bytes())
     }
 
     /// [`PinkDb::save_sync`] with at-rest encryption (checkpoint primitive for
@@ -3710,7 +3752,8 @@ impl PinkDb {
         path: &std::path::Path,
         key: &EncryptionKey,
     ) -> Result<()> {
-        let sealed = crate::crypto::seal_container(&self.to_bytes()?, key, 0)?;
+        let image = self.to_image_inner(true, false, false)?.0;
+        let sealed = crate::crypto::seal_container(image.bytes(), key, 0)?;
         Self::write_sync(path, &sealed)
     }
 
@@ -3768,7 +3811,7 @@ impl PinkDb {
         if crate::crypto::is_container(&data) {
             return Err(crate::crypto::encrypted_error(path));
         }
-        Self::load_bytes(&data)
+        Self::load_image(crate::storage::StoreImage::new(data, false))
     }
 
     /// [`PinkDb::open`] for an encrypted container, decrypting with `key`.
@@ -3791,7 +3834,7 @@ impl PinkDb {
                 )));
             }
             let plain = crate::crypto::open_container(&data, key, 0)?;
-            let mut db = Self::load_bytes(&plain)?;
+            let mut db = Self::load_image(crate::storage::StoreImage::new(plain, true))?;
             db.encryption_key = Some(key.clone());
             Ok(db)
         }
@@ -3825,14 +3868,22 @@ impl PinkDb {
                 ));
             }
             let plain = crate::crypto::open_container(data, key, 0)?;
-            let mut db = Self::load_bytes(&plain)?;
+            let mut db = Self::load_image(crate::storage::StoreImage::new(plain, true))?;
             db.encryption_key = Some(key.clone());
             Ok(db)
         }
     }
 
-    /// Decode a serialized `.pink` image (`PINKDB06`).
+    /// Decode a serialized `.pink` image (`PINKDB06`): copy it into the
+    /// retained store image a lazily opened store decodes from.
     fn load_bytes(data: &[u8]) -> Result<PinkDb> {
+        Self::load_image(crate::storage::StoreImage::new(data.to_vec(), false))
+    }
+
+    /// The one loader: the footer, then every table's chunk handles over the
+    /// retained image (see [`load_table_data`]). Nothing is decoded here.
+    fn load_image(image: Arc<crate::storage::StoreImage>) -> Result<PinkDb> {
+        let data = image.bytes();
         let footer = read_store_footer(data)?;
         // Start from an empty store: a file may legitimately have no `main`
         // (it was dropped) and `open` must round-trip exactly.
@@ -3875,12 +3926,12 @@ impl PinkDb {
             }
         }
         // The data region: every column chunk is verified on its own CRC32C
-        // and decoded in parallel.
+        // and installed as encoded handles, in parallel.
         for dbdir in &footer.databases {
             for sdir in &dbdir.schemas {
                 let ns = SchemaPath::new(&dbdir.name, &sdir.name);
                 for tdir in &sdir.tables {
-                    load_table_data(data, &mut db, &ns, tdir)?;
+                    load_table_data(&image, &mut db, &ns, tdir)?;
                 }
             }
         }
@@ -3993,8 +4044,17 @@ pub fn is_pinkdb06(bytes: &[u8]) -> bool {
     bytes.len() >= TRAILER_LEN && &bytes[bytes.len() - 8..] == MAGIC_V6
 }
 
+/// Where one written chunk's encoded pages sit in the new image: `(offset,
+/// length, rows)`, the same triple the footer's column-chunk entries record.
+type ChunkRange = (u64, u64, usize);
+
+/// Every written chunk's [`ChunkRange`], per column, in chunk order.
+type TableRanges = Vec<Vec<ChunkRange>>;
+
 /// Write one table's data region (its column chunks) and collect its footer
-/// entry.
+/// entry. The second value is each chunk's [`ChunkRange`] in the image written,
+/// per column, in chunk order: the handles point there once the image is
+/// complete.
 fn write_table(
     data: &mut Writer,
     ns: &crate::storage::SchemaPath,
@@ -4003,7 +4063,7 @@ fn write_table(
     parallel: bool,
     collect_stats: bool,
     saved: &mut Vec<SavedTableStats>,
-) -> Result<TableDir> {
+) -> Result<(TableDir, TableRanges)> {
     let schema = t.schema();
     let n_chunks = t.num_chunks();
     // The .pink format has no 128-bit integer layout yet (step 5 of
@@ -4017,55 +4077,138 @@ fn write_table(
             )));
         }
     }
-    // Share the chunk vectors first (Arc clones only), then encode per
-    // chunk. Order-preserving collect: the bytes are identical to a
-    // serial pass.
-    let mut scans: Vec<Vec<Arc<Vector>>> = Vec::with_capacity(n_chunks);
-    for chunk_idx in 0..n_chunks {
-        let chunk = t
-            .scan_chunk(chunk_idx)
-            .ok_or_else(|| PinkDbError::Execution("storage changed during save".to_string()))?;
-        scans.push(chunk.columns);
-    }
-    // The string layout stores offsets as `u32`; a chunk whose total
-    // VARCHAR bytes exceed that cannot be encoded faithfully (the
-    // offsets would wrap and the reader would reject the file). Refuse
-    // before writing instead of emitting a corrupt file.
-    for cols in &scans {
-        for v in cols {
-            if let VectorData::VarChar(strs) = v.data() {
-                let total: u64 = strs.iter().map(|s| s.len() as u64).sum();
-                if !varchar_offsets_fit(total) {
-                    return Err(PinkDbError::Execution(format!(
-                        "table \"{}.{name}\" has a VARCHAR chunk of {total} \
-                             bytes, over the .pink format's u32 string-offset limit",
-                        ns.db()
-                    )));
-                }
-            }
-        }
-    }
-    // Encode every page (one engine chunk per column) in parallel.
-    let pages: Vec<Vec<EncodedPage>> = if parallel && n_chunks >= PARALLEL_SAVE_MIN_CHUNKS {
-        scans
-            .par_iter()
-            .map(|cols| cols.iter().map(|v| encode_page(v)).collect())
-            .collect()
-    } else {
-        scans
-            .iter()
-            .map(|cols| cols.iter().map(|v| encode_page(v)).collect())
-            .collect()
-    };
-    // The per-column statistics of the whole table (the lake's stats
-    // block).
+    // The per-column statistics of the whole table (the lake's stats block).
     let mut accs: Vec<ChunkColumnStats> =
         schema.iter().map(|_| ChunkColumnStats::empty()).collect();
-    for chunk in &pages {
-        for (acc, page) in accs.iter_mut().zip(chunk.iter()) {
-            acc.merge(&page.stats);
+    // The row groups: 60 engine chunks each.
+    let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
+    let mut row_groups: Vec<RowGroupDir> = Vec::with_capacity(n_groups);
+    let mut ranges: TableRanges = vec![Vec::with_capacity(n_chunks); schema.len()];
+    for g in 0..n_groups {
+        let first = g * CHUNKS_PER_ROW_GROUP;
+        let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
+        let chunk_rows: Vec<u32> = (first..last).map(|i| t.chunk_rows(i) as u32).collect();
+        let rows: u64 = chunk_rows.iter().map(|&r| r as u64).sum();
+        let mut columns: Vec<ColumnChunkDir> = Vec::with_capacity(schema.len());
+        for (ci, column) in t.columns.iter().enumerate() {
+            let (dir, page_offsets) = if let Some(copy) = copy_through(column, first, last) {
+                // A clean group is already encoded exactly as the encoder
+                // would: copy its bytes, and take the chunk's statistics and
+                // encoding summary from what the footer says about them, so no
+                // page is decoded.
+                let bytes = &copy.image.bytes()[copy.start as usize..copy.end as usize];
+                let offset = data.buf.len() as u64;
+                data.bytes(bytes);
+                let mut acc = ChunkColumnStats::empty();
+                let mut encodings = 0u32;
+                let mut page_offsets = Vec::with_capacity(copy.pages.len());
+                for (i, &(rel, len)) in copy.pages.iter().enumerate() {
+                    acc.merge(t.zone(ci, first + i));
+                    encodings |= 1u32 << bytes[rel as usize];
+                    page_offsets.push((offset + rel as u64, len as u64));
+                }
+                accs[ci].merge(&acc);
+                let dir = ColumnChunkDir {
+                    offset,
+                    length: bytes.len() as u64,
+                    page_count: copy.pages.len() as u32,
+                    encodings,
+                    crc32c: crc32c(bytes),
+                    null_count: acc.null_count,
+                    nan_count: acc.nan_count,
+                    min: acc.min,
+                    max: acc.max,
+                };
+                (dir, page_offsets)
+            } else {
+                // Encode the group's pages: one engine chunk per page. Order is
+                // preserved, so the bytes are identical to a serial pass.
+                let encode = |i: usize| -> Result<EncodedPage> {
+                    let v = column.chunk(i)?;
+                    // The string layout stores offsets as `u32`; a chunk whose
+                    // total VARCHAR bytes exceed that cannot be encoded
+                    // faithfully (the offsets would wrap and the reader would
+                    // reject the file). Refuse before writing instead of
+                    // emitting a corrupt file.
+                    if let VectorData::VarChar(strs) = v.data() {
+                        let total: u64 = strs.iter().map(|s| s.len() as u64).sum();
+                        if !varchar_offsets_fit(total) {
+                            return Err(PinkDbError::Execution(format!(
+                                "table \"{ns}.{name}\" has a VARCHAR chunk of {total} \
+                                 bytes, over the .pink format's u32 string-offset limit"
+                            )));
+                        }
+                    }
+                    Ok(encode_page(&v))
+                };
+                let pages: Vec<EncodedPage> = if parallel && n_chunks >= PARALLEL_SAVE_MIN_CHUNKS {
+                    (first..last)
+                        .collect::<Vec<_>>()
+                        .par_iter()
+                        .map(|&i| encode(i))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    (first..last).map(encode).collect::<Result<Vec<_>>>()?
+                };
+                // The column chunk: the page index, then the pages.
+                let page_count = pages.len() as u32;
+                let index_len = 4 + page_count as usize * 8;
+                let mut chunk = Writer::new();
+                chunk.u32(page_count);
+                let mut rel = index_len as u32;
+                for page in &pages {
+                    let len = page.frame.len() as u32;
+                    chunk.u32(rel);
+                    chunk.u32(len);
+                    rel += len;
+                }
+                for page in &pages {
+                    chunk.bytes(&page.frame);
+                }
+                let bytes = chunk.buf;
+                let crc = crc32c(&bytes);
+                let offset = data.buf.len() as u64;
+                let length = bytes.len() as u64;
+                data.bytes(&bytes);
+                // The chunk's exact statistics and encoding summary.
+                let mut acc = ChunkColumnStats::empty();
+                let mut encodings = 0u32;
+                let mut page_offsets = Vec::with_capacity(pages.len());
+                let mut rel = index_len as u64;
+                for page in &pages {
+                    acc.merge(&page.stats);
+                    encodings |= 1u32 << page.frame[0];
+                    page_offsets.push((offset + rel, page.frame.len() as u64));
+                    rel += page.frame.len() as u64;
+                }
+                accs[ci].merge(&acc);
+                let dir = ColumnChunkDir {
+                    offset,
+                    length,
+                    page_count,
+                    encodings,
+                    crc32c: crc,
+                    null_count: acc.null_count,
+                    nan_count: acc.nan_count,
+                    min: acc.min,
+                    max: acc.max,
+                };
+                (dir, page_offsets)
+            };
+            for (i, &(offset, length)) in page_offsets.iter().enumerate() {
+                ranges[ci].push((offset, length, chunk_rows[i] as usize));
+            }
+            columns.push(dir);
         }
+        row_groups.push(RowGroupDir {
+            rows,
+            chunk_rows,
+            columns,
+        });
     }
+    // The footer's index statistics come from the exact per-column NULL counts
+    // the write pass just observed, so they need no second read of the rows.
+    let null_counts: Vec<u64> = accs.iter().map(|acc| acc.null_count).collect();
     if collect_stats {
         let mut entry = SavedTableStats {
             db: ns.db().to_string(),
@@ -4089,69 +4232,7 @@ fn write_table(
         variant_path_stats(t, &mut entry);
         saved.push(entry);
     }
-    // The pages, column by column: `by_column[ci]` holds the column's pages
-    // in chunk order.
-    let mut by_column: Vec<Vec<&EncodedPage>> = vec![Vec::with_capacity(n_chunks); schema.len()];
-    for chunk in &pages {
-        for (ci, page) in chunk.iter().enumerate() {
-            by_column[ci].push(page);
-        }
-    }
-    // The row groups: 60 engine chunks each.
-    let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
-    let mut row_groups: Vec<RowGroupDir> = Vec::with_capacity(n_groups);
-    for g in 0..n_groups {
-        let first = g * CHUNKS_PER_ROW_GROUP;
-        let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
-        let mut columns: Vec<ColumnChunkDir> = Vec::with_capacity(schema.len());
-        let rows: u64 = by_column
-            .first()
-            .map(|c| c[first..last].iter().map(|p| p.rows as u64).sum())
-            .unwrap_or(0);
-        for column_pages in &by_column {
-            // The column chunk: the page index, then the pages.
-            let group = &column_pages[first..last];
-            let page_count = group.len() as u32;
-            let index_len = 4 + page_count as usize * 8;
-            let mut chunk = Writer::new();
-            chunk.u32(page_count);
-            let mut rel = index_len as u32;
-            for page in group {
-                let len = page.frame.len() as u32;
-                chunk.u32(rel);
-                chunk.u32(len);
-                rel += len;
-            }
-            for page in group {
-                chunk.bytes(&page.frame);
-            }
-            let bytes = chunk.buf;
-            let crc = crc32c(&bytes);
-            let offset = data.buf.len() as u64;
-            let length = bytes.len() as u64;
-            data.bytes(&bytes);
-            // The chunk's exact statistics and encoding summary.
-            let mut acc = ChunkColumnStats::empty();
-            let mut encodings = 0u32;
-            for page in group {
-                acc.merge(&page.stats);
-                encodings |= 1u32 << page.frame[0];
-            }
-            columns.push(ColumnChunkDir {
-                offset,
-                length,
-                page_count,
-                encodings,
-                crc32c: crc,
-                null_count: acc.null_count,
-                nan_count: acc.nan_count,
-                min: acc.min,
-                max: acc.max,
-            });
-        }
-        row_groups.push(RowGroupDir { rows, columns });
-    }
-    Ok(TableDir {
+    let dir = TableDir {
         name: name.to_string(),
         schema,
         constraints: t.constraints.clone(),
@@ -4160,12 +4241,63 @@ fn write_table(
             .iter()
             .map(|c| c.default.as_ref().map(|d| d.text.clone()))
             .collect(),
-        indexes: index_defs(t),
+        indexes: index_defs(t, &null_counts),
         vector_indexes: vector_index_defs(t)?,
         row_count: t.num_rows() as u64,
         row_groups,
         stats: t.stats().clone(),
         zones: t.zones().to_vec(),
+    };
+    Ok((dir, ranges))
+}
+
+/// A row group's column chunk as it sits in the retained store image: the
+/// bytes' range there and each page's `(rel, len)` index entry.
+struct CopyThrough {
+    image: Arc<crate::storage::StoreImage>,
+    start: u64,
+    end: u64,
+    pages: Vec<(u32, u32)>,
+}
+
+/// The copy-through form of chunks `first..last` of `column`, when every one
+/// of them is clean, they still share one image, and the stored page index
+/// points at the pages the footer describes. `None` falls back to decoding and
+/// encoding the group.
+fn copy_through(column: &crate::storage::Column, first: usize, last: usize) -> Option<CopyThrough> {
+    let (image, chunks) = column.stored_group(first, last)?;
+    // The page index sits immediately before the first page, as the encoder
+    // wrote it: a 4-byte page count, then `(rel, len)` per page.
+    let index_len = 4 + chunks.len() * 8;
+    let start = chunks.first()?.offset.checked_sub(index_len as u64)?;
+    let last_chunk = chunks.last()?;
+    let end = last_chunk.offset.checked_add(last_chunk.length)?;
+    let bytes = image.bytes().get(start as usize..end as usize)?;
+    let mut r = Reader::new(bytes);
+    if usize::try_from(r.u32().ok()?).ok()? != chunks.len() {
+        return None;
+    }
+    let mut pages = Vec::with_capacity(chunks.len());
+    let mut rel = index_len as u64;
+    for chunk in &chunks {
+        let at = u64::from(r.u32().ok()?);
+        let len = u64::from(r.u32().ok()?);
+        if at != rel || len != chunk.length {
+            return None;
+        }
+        pages.push((u32::try_from(at).ok()?, u32::try_from(len).ok()?));
+        rel += len;
+    }
+    // The pages must fill the chunk exactly; anything else is not a chunk this
+    // save can copy.
+    if rel != end - start {
+        return None;
+    }
+    Some(CopyThrough {
+        image,
+        start,
+        end,
+        pages,
     })
 }
 
@@ -4686,18 +4818,14 @@ pub fn decode_projected_columns(
                 }
             }
         }
-        out.push(crate::storage::Column {
-            name: name.clone(),
-            dtype: *dtype,
-            default: None,
+        out.push(crate::storage::Column::from_chunks(
+            name.clone(),
+            *dtype,
+            None,
             chunks,
-        });
+        )?);
     }
-    Ok(DataTable::from_columns(
-        table.table.clone(),
-        out,
-        total_rows,
-    ))
+    DataTable::from_columns(table.table.clone(), out, total_rows)
 }
 
 /// The bytes of one column chunk, sliced out of the reader's windows.
@@ -4979,6 +5107,14 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
                 let mut row_groups = Vec::with_capacity(n_groups);
                 for _ in 0..n_groups {
                     let rows = r.u64()?;
+                    let chunk_count = r.u32()? as usize;
+                    if chunk_count > r.remaining() / 4 {
+                        return r.err("the row group's chunk count exceeds the remaining file");
+                    }
+                    let mut chunk_rows = Vec::with_capacity(chunk_count);
+                    for _ in 0..chunk_count {
+                        chunk_rows.push(r.u32()?);
+                    }
                     let mut columns = Vec::with_capacity(n_cols);
                     for _ in 0..n_cols {
                         let offset = r.u64()?;
@@ -5002,7 +5138,21 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
                             max,
                         });
                     }
-                    row_groups.push(RowGroupDir { rows, columns });
+                    if columns
+                        .iter()
+                        .any(|c| c.page_count as usize != chunk_rows.len())
+                        || chunk_rows.iter().map(|&n| n as u64).sum::<u64>() != rows
+                    {
+                        return Err(PinkDbError::Execution(
+                            "corrupt file: a row group's chunk row counts disagree with its pages"
+                                .to_string(),
+                        ));
+                    }
+                    row_groups.push(RowGroupDir {
+                        rows,
+                        chunk_rows,
+                        columns,
+                    });
                 }
                 let (tstats, tzones) = read_table_stats(&mut r, n_cols, row_count)?;
                 tables.push(TableDir {
@@ -5089,17 +5239,28 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
     })
 }
 
-/// Load one table's data region: every column chunk is read, its CRC32C is
-/// verified and its pages are decoded. The columns are decoded in parallel.
-fn load_table_data(data: &[u8], db: &mut PinkDb, ns: &SchemaPath, tdir: &TableDir) -> Result<()> {
+/// Load one table's data region: verify every column chunk (CRC32C and page
+/// index) and install its handles while the pages stay encoded in the store
+/// image. A page is decoded the first time a read touches its chunk.
+///
+/// The verification sweep is what keeps a corrupt file failing at open: the
+/// checksum covers exactly the bytes the chunk will later decode from.
+fn load_table_data(
+    image: &Arc<crate::storage::StoreImage>,
+    db: &mut PinkDb,
+    ns: &SchemaPath,
+    tdir: &TableDir,
+) -> Result<()> {
+    let data = image.bytes();
     let n_cols = tdir.schema.len();
-    // The decoded pages per column: `pages[column][row group][page]`.
-    let decoded: Vec<Vec<Vec<Arc<Vector>>>> = (0..n_cols)
+    // The verified page ranges per column: `pages[column][row group][page]`,
+    // absolute `(offset, length)` pairs in the image.
+    let pages: Vec<Vec<Vec<(u64, u64)>>> = (0..n_cols)
         .into_par_iter()
         .map(|ci| {
             tdir.row_groups
                 .par_iter()
-                .map(|rg| decode_column_chunk(data, &rg.columns[ci], tdir.schema[ci].1))
+                .map(|rg| verify_column_chunk(data, &rg.columns[ci]))
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
@@ -5111,41 +5272,36 @@ fn load_table_data(data: &[u8], db: &mut PinkDb, ns: &SchemaPath, tdir: &TableDi
             tdir.name, tdir.row_count
         )));
     }
-    // Assemble the table chunk by chunk (every column shares the chunk
-    // boundaries: the writer's invariant).
-    let t = db.table_mut_in(ns, &tdir.name)?;
-    // The append merges a short page into a partly filled tail chunk, so the
-    // loaded chunks keep the writer's boundaries only when every page but
-    // the last is full. A table whose interior chunks shrank (deletes, small
-    // appends) reloads with different boundaries, and its persisted zone
-    // maps no longer line up: they are then rebuilt from the rows.
-    let mut page_rows: Vec<usize> = Vec::new();
-    for (g, rg) in tdir.row_groups.iter().enumerate() {
-        let n_pages = rg.columns[0].page_count as usize;
-        for p in 0..n_pages {
-            let chunk: Vec<Arc<Vector>> = decoded
-                .iter()
-                .map(|column| Arc::clone(&column[g][p]))
-                .collect();
-            page_rows.push(chunk.first().map(|c| c.len()).unwrap_or(0));
-            t.append_loaded_chunk(&chunk)?;
+    // Assemble the handles chunk by chunk: every column shares the boundaries
+    // the footer recorded, so nothing needs decoding here.
+    let mut columns: Vec<Vec<Arc<crate::storage::ChunkHandle>>> = Vec::with_capacity(n_cols);
+    for column_pages in &pages {
+        let mut handles = Vec::with_capacity(tdir.row_groups.len() * CHUNKS_PER_ROW_GROUP);
+        for (g, rg) in tdir.row_groups.iter().enumerate() {
+            for (p, &rows) in rg.chunk_rows.iter().enumerate() {
+                let (offset, length) = column_pages[g][p];
+                handles.push(Arc::new(crate::storage::ChunkHandle::new_encoded(
+                    Arc::clone(image),
+                    offset,
+                    length,
+                    rows as usize,
+                )));
+            }
         }
+        columns.push(handles);
     }
-    let zones_aligned = page_rows
-        .split_last()
-        .is_none_or(|(_, interior)| interior.iter().all(|&n| n == crate::vector::CHUNK_SIZE));
-    // The footer carries the statistics the writer observed, so a load
-    // restores them instead of hashing every value again.
-    t.set_loaded_stats(tdir.stats.clone(), tdir.zones.clone(), zones_aligned);
+    // The footer carries the statistics the writer observed, and its new
+    // per-chunk row counts are exactly the loaded boundaries, so a load
+    // restores both instead of reading a single row.
+    let t = db.table_mut_in(ns, &tdir.name)?;
+    t.set_loaded_chunks(columns, total_rows)?;
+    t.set_loaded_stats(tdir.stats.clone(), tdir.zones.clone(), true);
     Ok(())
 }
 
-/// Read one column chunk, verify its CRC32C and decode its pages.
-fn decode_column_chunk(
-    data: &[u8],
-    dir: &ColumnChunkDir,
-    dtype: DataType,
-) -> Result<Vec<Arc<Vector>>> {
+/// Verify one column chunk without decoding it: its bounds, its CRC32C and its
+/// page index. Returns every page's absolute byte range in the image.
+fn verify_column_chunk(data: &[u8], dir: &ColumnChunkDir) -> Result<Vec<(u64, u64)>> {
     let start = usize::try_from(dir.offset).map_err(|_| {
         PinkDbError::Execution("corrupt file: the column chunk offset is out of range".to_string())
     })?;
@@ -5160,7 +5316,55 @@ fn decode_column_chunk(
             "corrupt file: the column chunk is outside the file".to_string(),
         ));
     }
-    decode_chunk_bytes(&data[start..end], dir.page_count, dir.crc32c, dtype)
+    let bytes = &data[start..end];
+    if crc32c(bytes) != dir.crc32c {
+        return Err(PinkDbError::Execution(
+            "corrupt file: a column chunk fails its checksum (the file is damaged)".to_string(),
+        ));
+    }
+    // The page index, then the pages.
+    let mut r = Reader::new(bytes);
+    let page_count = r.u32()? as usize;
+    if page_count != dir.page_count as usize {
+        return Err(PinkDbError::Execution(
+            "corrupt file: the column chunk's page count disagrees with the footer".to_string(),
+        ));
+    }
+    // Each page-index entry is 8 bytes: never size an allocation from the
+    // unvalidated count.
+    if page_count > r.remaining() / 8 {
+        return r.err("the column chunk's page count exceeds the chunk");
+    }
+    let mut pages = Vec::with_capacity(page_count);
+    for _ in 0..page_count {
+        let off = r.u32()? as usize;
+        let len = r.u32()? as usize;
+        let end = off.checked_add(len).ok_or_else(|| {
+            PinkDbError::Execution("corrupt file: a page range overflows".to_string())
+        })?;
+        if end > bytes.len() {
+            return Err(PinkDbError::Execution(
+                "corrupt file: a page is outside the column chunk".to_string(),
+            ));
+        }
+        pages.push((dir.offset + off as u64, len as u64));
+    }
+    Ok(pages)
+}
+
+/// Decode one page's bytes: its encoding tag, then its payload. The enclosing
+/// chunk's CRC32C was verified when the store opened (or when the bytes were
+/// read).
+pub(crate) fn decode_page(bytes: &[u8], dtype: DataType) -> Result<Vector> {
+    let mut pr = Reader::new(bytes);
+    let tag = pr.u8()?;
+    let v = decode_chunk_typed(dtype, tag, &mut pr)?;
+    if !pr.end() {
+        return Err(PinkDbError::Execution(
+            "corrupt file: trailing bytes after a page".to_string(),
+        ));
+    }
+    Ok(v)
 }
 
 /// Decode one column chunk's bytes: verify its CRC32C, then decode its
@@ -5210,15 +5414,7 @@ fn decode_chunk_bytes(
                 "corrupt file: a page is outside the column chunk".to_string(),
             ));
         }
-        let mut pr = Reader::new(&bytes[off..end]);
-        let tag = pr.u8()?;
-        let v = decode_chunk_typed(dtype, tag, &mut pr)?;
-        if !pr.end() {
-            return Err(PinkDbError::Execution(
-                "corrupt file: trailing bytes after a page".to_string(),
-            ));
-        }
-        out.push(Arc::new(v));
+        out.push(Arc::new(decode_page(&bytes[off..end], dtype)?));
     }
     Ok(out)
 }
@@ -5948,15 +6144,22 @@ fn read_principal_grants(
 /// are ungated (`nan_count` and zero doubles are kept); `pink-lake` applies
 /// the one exactness gate shared with its footer path, so the two cannot
 /// drift apart.
-pub fn table_stats(db: &str, schema_name: &str, table: &str, src: &DataTable) -> SavedTableStats {
+/// Folds a table's statistics. The table is materialized first: the lake
+/// folds over tables it has just read, and a table cloned out of a lazily
+/// opened store still carries encoded chunks.
+pub fn table_stats(
+    db: &str,
+    schema_name: &str,
+    table: &str,
+    src: &DataTable,
+) -> Result<SavedTableStats> {
+    src.decode_all()?;
     let schema = src.schema();
     let mut accs: Vec<ChunkColumnStats> =
         schema.iter().map(|_| ChunkColumnStats::empty()).collect();
-    for c in 0..src.num_chunks() {
-        if let Some(chunk) = src.scan_chunk(c) {
-            for (acc, v) in accs.iter_mut().zip(chunk.columns.iter()) {
-                acc.merge(&crate::stats::Zone::of_vector(v));
-            }
+    for (ci, column) in src.columns.iter().enumerate() {
+        for chunk in column.chunks_decoded() {
+            accs[ci].merge(&crate::stats::Zone::of_vector(&chunk));
         }
     }
     let mut saved = SavedTableStats {
@@ -5979,7 +6182,7 @@ pub fn table_stats(db: &str, schema_name: &str, table: &str, src: &DataTable) ->
             .collect(),
     };
     variant_path_stats(src, &mut saved);
-    saved
+    Ok(saved)
 }
 
 /// Fill in every VARIANT column's per-path statistics: one policy pass over
@@ -5997,7 +6200,7 @@ fn variant_path_stats(src: &DataTable, saved: &mut SavedTableStats) {
             continue;
         }
         let mut values: Vec<std::sync::Arc<Variant>> = Vec::new();
-        for chunk in &column.chunks {
+        for chunk in column.chunks_decoded() {
             let VectorData::Variant(items) = chunk.data() else {
                 continue;
             };
@@ -6018,7 +6221,7 @@ fn variant_path_stats(src: &DataTable, saved: &mut SavedTableStats) {
             continue;
         }
         let mut acc = crate::variant_shred::PathStatsAcc::new(&policy);
-        for chunk in &src.columns[index].chunks {
+        for chunk in src.columns[index].chunks_decoded() {
             let VectorData::Variant(items) = chunk.data() else {
                 continue;
             };
@@ -6293,9 +6496,9 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
 /// The pinned length and footer checksum of the golden corpus's `PINKDB06`
 /// image (see `golden_pinkdb06_bytes_are_pinned`).
 #[cfg(test)]
-const GOLDEN_V6_LEN: usize = 143_742;
+const GOLDEN_V6_LEN: usize = 143_770;
 #[cfg(test)]
-const GOLDEN_V6_FOOTER_CRC: u32 = 376_858_327;
+const GOLDEN_V6_FOOTER_CRC: u32 = 2_044_228_477;
 
 #[cfg(test)]
 mod tests {
@@ -6346,7 +6549,11 @@ mod tests {
     fn all_values(db: &PinkDb, table: &str) -> Vec<Vec<Value>> {
         let t = db.table(table).unwrap();
         (0..t.num_rows())
-            .map(|r| (0..t.num_cols()).map(|c| t.get(r, c).unwrap()).collect())
+            .map(|r| {
+                (0..t.num_cols())
+                    .map(|c| t.get(r, c).unwrap().unwrap())
+                    .collect()
+            })
             .collect()
     }
 
@@ -6466,8 +6673,9 @@ mod tests {
 
     /// Wave 124: footer version 3 records every database's storage. A
     /// version-2 footer (no storage) is refused as an older pinkdb's; later
-    /// waves bumped the footer for schemas (4) and default expressions (5),
-    /// so it refuses 2 the same way.
+    /// waves bumped the footer for schemas (4), default expressions (5),
+    /// secret sections and the lake data-file format (6) and per-chunk row
+    /// counts (7), so it refuses 2 the same way.
     #[test]
     fn a_version_two_footer_is_refused_as_an_older_pinkdbs() {
         let mut db = PinkDb::new();
@@ -6480,6 +6688,26 @@ mod tests {
             err,
             format!(
                 "this .pink file was written by an older pinkdb (footer version 2); this build \
+                 reads footer version {FOOTER_VERSION} only"
+            )
+        );
+    }
+
+    /// Wave 136b-2: a version-6 footer has no per-chunk row counts, which the
+    /// lazy open needs to place a chunk's rows. There is no reader for v6 and
+    /// no conversion: it is refused as an older pinkdb's.
+    #[test]
+    fn a_version_six_footer_is_refused_as_an_older_pinkdbs() {
+        let mut db = PinkDb::new();
+        db.create_table("t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        let mut bytes = db.to_bytes().unwrap();
+        relabel_footer_version(&mut bytes, 6);
+        let err = PinkDb::load_bytes(&bytes).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "this .pink file was written by an older pinkdb (footer version 6); this build \
                  reads footer version {FOOTER_VERSION} only"
             )
         );
@@ -7366,7 +7594,7 @@ mod tests {
         assert_eq!(back.list_tables_in("analytics"), vec!["t", "u"]);
         assert_eq!(back.table_in("analytics", "u").unwrap().num_rows(), 1);
         assert_eq!(
-            back.table_in("analytics", "t").unwrap().get(0, 0),
+            back.table_in("analytics", "t").unwrap().get(0, 0).unwrap(),
             Some(Value::Double(1.5))
         );
         assert!(back.list_tables_in("empty").is_empty());
@@ -7726,7 +7954,10 @@ mod tests {
                 let tb = back.table("t").unwrap();
                 for r in 0..n {
                     for c in 0..9 {
-                        assert_bits_equal(&ta.get(r, c).unwrap(), &tb.get(r, c).unwrap());
+                        assert_bits_equal(
+                            &ta.get(r, c).unwrap().unwrap(),
+                            &tb.get(r, c).unwrap().unwrap(),
+                        );
                     }
                 }
             }
@@ -8298,7 +8529,7 @@ mod tests {
         }
         // The chunks really do use the frame.
         let t = db.table("t").unwrap();
-        let chunk = t.scan_chunk(0).unwrap();
+        let chunk = t.scan_chunk(0).unwrap().unwrap();
         assert_eq!(
             encode_chunk_typed(&chunk.columns[0]).0,
             ENC_LZ_FRAME,
@@ -8578,7 +8809,7 @@ mod tests {
         }
         let t = db.table("t").unwrap();
         for chunk_idx in 0..t.num_chunks() {
-            let chunk = t.scan_chunk(chunk_idx).unwrap();
+            let chunk = t.scan_chunk(chunk_idx).unwrap().unwrap();
             for (col, vec) in chunk.columns.iter().enumerate() {
                 let (tag_a, payload_a) = encode_chunk_typed(vec);
                 let values: Vec<Value> = (0..vec.len()).map(|i| vec.get(i)).collect();
@@ -8622,7 +8853,7 @@ mod tests {
         }
         let t = db.table("z").unwrap();
         assert_eq!(
-            encode_chunk_typed(&t.scan_chunk(0).unwrap().columns[0]).0,
+            encode_chunk_typed(&t.scan_chunk(0).unwrap().unwrap().columns[0]).0,
             ENC_LZ_FRAME,
             "the identity corpus must exercise the compression frame"
         );
@@ -8699,10 +8930,11 @@ mod tests {
         assert_eq!(t.indexes.len(), 1);
         assert_eq!(t.indexes[0].name, "i_c_pid");
         assert_eq!(t.indexes[0].column, 1);
+        t.indexes[0].ensure_map(&t.columns[1]).unwrap();
         assert_eq!(
-            t.indexes[0].map,
-            crate::storage::index_map_for(&t.columns[1]),
-            "the map is rebuilt from the rows"
+            *t.indexes[0].map(),
+            Some(crate::storage::index_map_for(&t.columns[1]).unwrap()),
+            "the map is built from the rows"
         );
         // The materialized view.
         assert!(back.materialized_view_in("main", "mv").is_ok());
@@ -8737,7 +8969,7 @@ mod tests {
         {
             let db = PinkDb::open_durable(ckpt.to_str().unwrap()).unwrap();
             assert_eq!(db.table("t").unwrap().num_rows(), 2);
-            assert_eq!(db.table("t").unwrap().get(1, 1), Some(Value::Null));
+            assert_eq!(db.table("t").unwrap().get(1, 1).unwrap(), Some(Value::Null));
             // The checkpoint is a PINKDB06 image.
             let bytes = std::fs::read(&ckpt).unwrap();
             assert!(is_pinkdb06(&bytes), "the checkpoint must be PINKDB06");
@@ -8845,7 +9077,7 @@ mod tests {
             for tname in db.list_tables_in(&dbname) {
                 let t = db.table_in(&dbname, &tname).unwrap();
                 for c in 0..t.num_chunks() {
-                    let chunk = t.scan_chunk(c).unwrap();
+                    let chunk = t.scan_chunk(c).unwrap().unwrap();
                     for v in chunk.columns.iter() {
                         if let VectorData::VarChar(_) = v.data() {
                             payloads.push(enc_strs_plain(&varchar_payload(v)));
@@ -8893,7 +9125,7 @@ mod tests {
         )
         .unwrap();
         let t = db.table_in("main", "t").unwrap();
-        let stats = table_stats("main", "main", "t", t);
+        let stats = table_stats("main", "main", "t", t).unwrap();
         let col = &stats.columns[0];
         assert_eq!(col.min, Some(Value::Boolean(true)), "{col:?}");
         assert_eq!(col.max, Some(Value::Boolean(true)), "{col:?}");
@@ -8901,7 +9133,7 @@ mod tests {
         db.execute("CREATE TABLE f (b BOOLEAN); INSERT INTO f VALUES (false), (false);")
             .unwrap();
         let f = db.table_in("main", "f").unwrap();
-        let stats = table_stats("main", "main", "f", f);
+        let stats = table_stats("main", "main", "f", f).unwrap();
         let col = &stats.columns[0];
         assert_eq!(col.min, Some(Value::Boolean(false)), "{col:?}");
         assert_eq!(col.max, Some(Value::Boolean(false)), "{col:?}");
@@ -8909,7 +9141,7 @@ mod tests {
         db.execute("CREATE TABLE n (b BOOLEAN); INSERT INTO n VALUES (NULL);")
             .unwrap();
         let n = db.table_in("main", "n").unwrap();
-        let stats = table_stats("main", "main", "n", n);
+        let stats = table_stats("main", "main", "n", n).unwrap();
         let col = &stats.columns[0];
         assert_eq!(col.min, None, "{col:?}");
         assert_eq!(col.max, None, "{col:?}");
@@ -9010,7 +9242,7 @@ mod tests {
                 let mut nan_count = 0u64;
                 let (mut min, mut max): (Option<Value>, Option<Value>) = (None, None);
                 for row in 0..decoded.num_rows() {
-                    let v = decoded.get(row, i).unwrap();
+                    let v = decoded.get(row, i).unwrap().unwrap();
                     if v.is_null() {
                         nulls += 1;
                         continue;
@@ -9399,9 +9631,11 @@ mod tests {
         let t = loaded.table_in("main", "t").unwrap();
         assert_eq!(t.indexes.len(), 1);
         assert!(!t.indexes_stale);
+        assert!(t.indexes[0].map().is_none(), "a lazy open builds no map");
+        t.indexes[0].ensure_map(&t.columns[0]).unwrap();
         assert_eq!(
-            t.indexes[0].map,
-            crate::storage::index_map_for(&t.columns[0])
+            *t.indexes[0].map(),
+            Some(crate::storage::index_map_for(&t.columns[0]).unwrap())
         );
     }
 
@@ -9483,5 +9717,183 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("out of name order"), "{err}");
+    }
+
+    // ---------- lazy open (wave 136b-2) ----------
+
+    fn wide_db(rows: usize) -> PinkDb {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE w (a INTEGER, b INTEGER, c VARCHAR);")
+            .unwrap();
+        db.execute(&format!(
+            "INSERT INTO w SELECT i::INTEGER, (i % 7)::INTEGER, 'v' || i::VARCHAR \
+             FROM range(0, {rows}) t(i);"
+        ))
+        .unwrap();
+        db
+    }
+
+    fn select(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
+        match db.execute(sql).unwrap().pop().unwrap() {
+            crate::QueryResult::Selected { rows, .. } => rows,
+            other => panic!("expected rows from {sql}, got {other:?}"),
+        }
+    }
+
+    /// Opening decodes nothing; a projected read decodes that column's chunks
+    /// only, and a zone-pruned scan decodes the surviving chunk only.
+    #[test]
+    fn open_is_lazy_and_projected_scans_decode_only_what_they_read() {
+        let db = wide_db(5000);
+        let bytes = db.to_bytes().unwrap();
+
+        // A fresh open for each query: a chunk stays decoded once touched.
+        let mut pruned = PinkDb::load_bytes(&bytes).unwrap();
+        assert_eq!(
+            pruned.table("w").unwrap().decoded_chunks(),
+            0,
+            "an open must not decode a chunk"
+        );
+        assert_eq!(
+            select(&mut pruned, "SELECT a FROM w WHERE a = 0;"),
+            vec![vec![Value::Integer(0)]]
+        );
+        assert_eq!(
+            pruned.table("w").unwrap().decoded_chunks(),
+            1,
+            "the zone map prunes the other two chunks before they are decoded"
+        );
+
+        let mut projected = PinkDb::load_bytes(&bytes).unwrap();
+        assert_eq!(select(&mut projected, "SELECT a FROM w;").len(), 5000);
+        assert_eq!(
+            projected.table("w").unwrap().columns[0].decoded_chunks(),
+            3,
+            "5000 rows are three chunks of the projected column"
+        );
+    }
+
+    /// A lazily opened store answers exactly like one whose chunks were all
+    /// decoded up front.
+    #[test]
+    fn lazy_open_answers_like_a_fully_decoded_open() {
+        let mut db = wide_db(5000);
+        db.execute("CREATE TABLE d (k INTEGER, w INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO d SELECT i::INTEGER, (i % 50)::INTEGER FROM range(0, 1000) t(i);")
+            .unwrap();
+        db.execute("CREATE INDEX i_d_k ON d(k);").unwrap();
+        let bytes = db.to_bytes().unwrap();
+        let queries = [
+            "SELECT a, count(*) FROM w GROUP BY a ORDER BY a;",
+            "SELECT sum(b) FROM w WHERE a BETWEEN 100 AND 900;",
+            "SELECT c FROM w WHERE a = 4242;",
+            "SELECT count(*) FROM w WHERE b = 3;",
+            "SELECT d.k, d.w FROM d JOIN w ON w.a = d.k WHERE d.k < 20 ORDER BY d.k;",
+            "SELECT k FROM d WHERE k = 777;",
+        ];
+        let mut lazy = PinkDb::load_bytes(&bytes).unwrap();
+        let expected: Vec<Vec<Vec<Value>>> = queries.iter().map(|q| select(&mut lazy, q)).collect();
+
+        let mut eager = PinkDb::load_bytes(&bytes).unwrap();
+        for name in ["w", "d"] {
+            let t = eager.table(name).unwrap();
+            for col in &t.columns {
+                for i in 0..col.num_chunks() {
+                    col.chunk(i).unwrap();
+                }
+            }
+        }
+        let got: Vec<Vec<Vec<Value>>> = queries.iter().map(|q| select(&mut eager, q)).collect();
+        assert_eq!(got, expected, "lazy and eager opens must agree");
+    }
+
+    /// A v3 footer is refused with the older-version message (no reader).
+    #[test]
+    fn footer_v3_is_refused_with_the_older_version_message() {
+        let db = wide_db(10);
+        let bytes = db.to_bytes().unwrap();
+        let (start, len) = footer_span(&bytes).unwrap();
+        let (start, len) = (start as usize, len as usize);
+        let mut old = bytes.clone();
+        old[start..start + 4].copy_from_slice(&3u32.to_le_bytes());
+        let crc = crc32c(&old[start..start + len]);
+        let n = old.len();
+        old[n - TRAILER_LEN..n - TRAILER_LEN + 4].copy_from_slice(&crc.to_le_bytes());
+        let err = PinkDb::load_bytes(&old)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("older pinkdb (footer version 3)"),
+            "v3 footer: {err}"
+        );
+    }
+
+    /// The open-time CRC sweep catches a damaged chunk without decoding it.
+    #[test]
+    fn a_corrupt_chunk_fails_at_open() {
+        let db = wide_db(100);
+        let bytes = db.to_bytes().unwrap();
+        let footer = read_store_footer(&bytes).unwrap();
+        let dir = &footer.databases[0].schemas[0].tables[0].row_groups[0].columns[0];
+        let mut bad = bytes.clone();
+        bad[dir.offset as usize + 4] ^= 0xff;
+        let err = PinkDb::load_bytes(&bad)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fails its checksum"), "corrupt chunk: {err}");
+    }
+
+    /// An index map is built on first use (decoding only the indexed column)
+    /// and unloaded by a mutation instead of being rebuilt eagerly.
+    #[test]
+    fn an_index_map_is_lazy_and_unloaded_by_a_mutation() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (k INTEGER, v VARCHAR);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(2,'bb'),(3,'c');")
+            .unwrap();
+        db.execute("CREATE INDEX i ON t(k);").unwrap();
+        let bytes = db.to_bytes().unwrap();
+
+        let mut back = PinkDb::load_bytes(&bytes).unwrap();
+        {
+            let t = back.table("t").unwrap();
+            assert!(t.indexes[0].map().is_none(), "an open keeps it unloaded");
+            let mut key = Vec::new();
+            crate::exec::aggregate::encode_value(&mut key, &Value::Integer(2));
+            assert_eq!(t.indexes[0].lookup(&t.columns[0], &key).unwrap(), [1, 2]);
+        }
+        assert!(
+            back.table("t").unwrap().indexes[0].map().is_some(),
+            "the first use builds the map"
+        );
+        assert_eq!(
+            back.table("t").unwrap().decoded_chunks(),
+            1,
+            "building the map decodes the indexed column only"
+        );
+        assert_eq!(
+            select(&mut back, "SELECT v FROM t WHERE k = 2;"),
+            vec![
+                vec![Value::Varchar("b".into())],
+                vec![Value::Varchar("bb".into())]
+            ]
+        );
+
+        back.execute("UPDATE t SET v = 'b2' WHERE k = 2;").unwrap();
+        assert!(
+            back.table("t").unwrap().indexes[0].map().is_none(),
+            "a mutation unloads the map instead of rebuilding it"
+        );
+        assert_eq!(
+            select(&mut back, "SELECT v FROM t WHERE k = 2 ORDER BY v;"),
+            vec![
+                vec![Value::Varchar("b2".into())],
+                vec![Value::Varchar("b2".into())]
+            ]
+        );
     }
 }

@@ -542,12 +542,18 @@ pub fn scan_whole_file<F: LakeFormat + ?Sized>(
     let (_db, table) = crate::only_table(&store, file.rel(), file.path())?;
     let mut offset = 0u64;
     for index in 0..table.num_chunks() {
-        let chunk = table.scan_chunk(index).ok_or_else(|| LakeError::Internal {
-            message: format!(
-                "chunk {index} of \"{}\" disappeared while scanning",
-                file.rel()
-            ),
-        })?;
+        let chunk = table
+            .scan_chunk(index)
+            .map_err(|source| LakeError::Engine {
+                context: format!("scan of \"{}\"", file.rel()),
+                source,
+            })?
+            .ok_or_else(|| LakeError::Internal {
+                message: format!(
+                    "chunk {index} of \"{}\" disappeared while scanning",
+                    file.rel()
+                ),
+            })?;
         let rows = chunk.num_rows() as u64;
         sink(offset, chunk)?;
         offset += rows;
@@ -1010,6 +1016,10 @@ fn build_pink_store(
         for index in 0..decoded.num_chunks() {
             let chunk = decoded
                 .scan_chunk(index)
+                .map_err(|e| LakeError::Engine {
+                    context: format!("decoding chunk {index} of \"{db}.{table}\""),
+                    source: e,
+                })?
                 .ok_or_else(|| LakeError::Internal {
                     message: format!(
                         "chunk {index} of \"{db}.{table}\" disappeared while decoding"

@@ -124,6 +124,8 @@ pub(crate) struct FlatPartial {
     ix: Vec<u32>,
     /// Where each merge partition's run of `ix` starts.
     starts: Vec<usize>,
+    /// Wave 136a: this partial's bytes reserved from the statement's pool.
+    held: crate::memory::Reservation,
 }
 
 /// What every chunk's fold shares: the GROUP BY, the accumulators a new
@@ -362,6 +364,7 @@ impl Spec<'_> {
             accs: Vec::new(),
             ix: Vec::new(),
             starts: Vec::new(),
+            held: cx.budget.memory().empty_reservation(),
         };
         let new_group = |part: &mut FlatPartial, key: &[u64], h: u64, k: usize| -> u32 {
             let g = part.len() as u32;
@@ -459,6 +462,14 @@ impl Spec<'_> {
             );
         }
         part.index_buckets(self.buckets);
+        // Approximate bytes the folded chunk's groups hold (wave 136a): the
+        // per-group words and accumulator slots plus the VARCHAR key bytes.
+        let strs: usize = part.strs.iter().map(|s| s.len() + 8).sum();
+        part.held.resize(
+            part.len() * (8 + 8 + 8 + 4 + std::mem::size_of::<Acc>())
+                + part.accs.len() * std::mem::size_of::<Acc>()
+                + strs,
+        )?;
         Ok(Some(part))
     }
 }
@@ -585,7 +596,12 @@ fn merge_and_emit(
     key_types: &[DataType],
     aggs: &[BoundAgg],
     ordered: bool,
+    account: &crate::memory::Account,
 ) -> Result<Vec<DataChunk>> {
+    // The merge copies the partials' groups; charge the copy while it exists
+    // (wave 136a).
+    let merged_bytes: usize = partials.iter().map(|p| p.held.bytes()).sum();
+    let _held = account.reserve(merged_bytes)?;
     let width = kinds.len() + 1;
     let naggs = aggs.len();
     let nstr = kinds.iter().filter(|k| **k == KeyKind::Varchar).count();
@@ -822,7 +838,8 @@ pub(crate) fn aggregate(
     let Some(partials) = partials else {
         return Ok(None);
     };
-    sink.merge(partials, !cx.unordered).map(Some)
+    sink.merge(partials, !cx.unordered, cx.budget.memory())
+        .map(Some)
 }
 
 /// The flat fold one chunk at a time, for the pipeline executor: it folds
@@ -869,13 +886,19 @@ impl<'a> FlatSink<'a> {
         }
     }
 
-    pub(crate) fn merge(self, partials: Vec<FlatPartial>, ordered: bool) -> Result<Vec<DataChunk>> {
+    pub(crate) fn merge(
+        self,
+        partials: Vec<FlatPartial>,
+        ordered: bool,
+        account: &crate::memory::Account,
+    ) -> Result<Vec<DataChunk>> {
         merge_and_emit(
             partials,
             &self.spec.kinds,
             &self.key_types,
             self.spec.aggs,
             ordered,
+            account,
         )
     }
 }

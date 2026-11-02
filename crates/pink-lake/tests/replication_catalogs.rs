@@ -112,7 +112,7 @@ fn data_rows(table: &DataTable) -> Vec<Vec<Value>> {
     (0..table.num_rows())
         .map(|row| {
             (0..table.num_cols())
-                .map(|column| table.get(row, column).unwrap_or(Value::Null))
+                .map(|column| table.get(row, column).unwrap().unwrap_or(Value::Null))
                 .collect()
         })
         .collect()

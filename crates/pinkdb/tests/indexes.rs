@@ -483,15 +483,15 @@ fn out_of_range_index_entry_is_skipped_without_panicking() {
     let db_name = db.current_db().to_string();
     {
         let t = db.table_mut_in(&db_name, "t").unwrap();
-        let idx = &mut t.indexes[0];
+        t.indexes[0].ensure_map(&t.columns[0]).unwrap();
+        let map = t.indexes[0].map_mut().as_mut().expect("built above");
         // The key whose only row is id = 2 (row 1).
-        let key = idx
-            .map
+        let key = map
             .iter()
             .find(|(_, rows)| rows.as_slice() == [1])
             .map(|(k, _)| k.clone())
             .expect("key for id = 2");
-        idx.map.get_mut(&key).unwrap().extend([9999, usize::MAX]);
+        map.get_mut(&key).unwrap().extend([9999, usize::MAX]);
     }
 
     assert_eq!(
@@ -514,15 +514,15 @@ fn filter_above_index_scan_rejects_wrong_candidates() {
     let db_name = db.current_db().to_string();
     {
         let t = db.table_mut_in(&db_name, "t").unwrap();
-        let idx = &mut t.indexes[0];
+        t.indexes[0].ensure_map(&t.columns[0]).unwrap();
+        let map = t.indexes[0].map_mut().as_mut().expect("built above");
         // Make the id = 2 key also claim row 0 (which holds id = 1).
-        let key = idx
-            .map
+        let key = map
             .iter()
             .find(|(_, rows)| rows.as_slice() == [1])
             .map(|(k, _)| k.clone())
             .expect("key for id = 2");
-        idx.map.get_mut(&key).unwrap().push(0);
+        map.get_mut(&key).unwrap().push(0);
     }
 
     assert_eq!(
@@ -871,7 +871,9 @@ fn flags_of(bytes: &[u8]) -> u32 {
 fn postings(db: &PinkDb, table: &str, index: &str) -> Vec<Vec<usize>> {
     let t = db.table_in("main", table).unwrap();
     let idx = t.indexes.iter().find(|i| i.name == index).unwrap();
-    let mut groups: Vec<Vec<usize>> = idx.map.values().cloned().collect();
+    idx.ensure_map(&t.columns[idx.column]).unwrap();
+    let map = idx.map();
+    let mut groups: Vec<Vec<usize>> = map.as_ref().unwrap().values().cloned().collect();
     groups.sort();
     groups
 }
@@ -1012,7 +1014,9 @@ fn pink_reload_replaces_a_damaged_in_memory_map() {
     db.execute("CREATE INDEX ix ON t(id);").unwrap();
     {
         let t = db.table_mut_in("main", "t").unwrap();
-        for rows in t.indexes[0].map.values_mut() {
+        t.indexes[0].ensure_map(&t.columns[0]).unwrap();
+        let map = t.indexes[0].map_mut().as_mut().expect("built above");
+        for rows in map.values_mut() {
             rows.push(9999);
         }
     }

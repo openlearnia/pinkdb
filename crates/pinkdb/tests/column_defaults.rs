@@ -452,7 +452,12 @@ fn a_version_four_footer_is_refused() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("footer version 4"), "{e}");
-    assert!(e.contains("reads footer version 6 only"), "{e}");
+    // The message names the version this build writes; the test only pins
+    // that the refusal is the documented older-version one.
+    assert!(
+        e.contains("this build reads footer version") && e.contains("only"),
+        "{e}"
+    );
 }
 
 /// Rewrite a `.pink` image's footer version word (and its trailer CRC), so the

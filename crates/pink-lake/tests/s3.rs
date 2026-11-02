@@ -143,7 +143,11 @@ fn full_cycle_create_save_open_versions_tables() {
         store_bytes(&db, &scratch, "original")
     );
     assert_eq!(
-        loaded.table_in("analytics", "a.b").unwrap().get(1, 0),
+        loaded
+            .table_in("analytics", "a.b")
+            .unwrap()
+            .get(1, 0)
+            .unwrap(),
         Some(Value::Double(-0.0))
     );
     // v1 is the create-time empty catalog.
@@ -272,11 +276,15 @@ fn prefixes_and_percent_encoded_table_names_round_trip() {
     let listed = open_s3_lake(mock_config(&mock, "odd-bucket", "odd")).unwrap();
     let loaded = listed.load(None).unwrap();
     assert_eq!(
-        loaded.table_in("main", "a/b").unwrap().get(0, 0),
+        loaded.table_in("main", "a/b").unwrap().get(0, 0).unwrap(),
         Some(Value::Integer(9))
     );
     assert_eq!(
-        loaded.table_in("main", "odd name").unwrap().get(0, 0),
+        loaded
+            .table_in("main", "odd name")
+            .unwrap()
+            .get(0, 0)
+            .unwrap(),
         Some(Value::Varchar("héllo".into()))
     );
     // `0000`-style Unicode table names are stored as their UTF-8 percent
@@ -733,7 +741,7 @@ fn attach_over_s3_is_statistics_only_and_matches_load() {
             // null_count must agree whenever the lake proved it.
             let mut nulls = 0u64;
             for row in 0..expected.num_rows() {
-                if expected.get(row, i).unwrap().is_null() {
+                if expected.get(row, i).unwrap().unwrap().is_null() {
                     nulls += 1;
                 }
             }

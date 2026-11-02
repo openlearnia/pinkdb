@@ -131,7 +131,8 @@ const DUCKDB_SETTINGS: &[&str] = &[
     "max_streaming_buffer_size",
     "max_temp_directory_size",
     "max_vacuum_tasks",
-    // wave 136a replaces the stored value with a real process-wide pool.
+    // Process-wide, wave 136a's memory pool: `SET`/`RESET` move the pool's
+    // limit (exec `set_setting`), `current_setting` reads it.
     "memory_limit",
     "merge_join_threshold",
     "nested_loop_join_threshold",
