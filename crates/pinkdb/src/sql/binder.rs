@@ -3752,7 +3752,13 @@ impl<'a> Binder<'a> {
             if crate::memory::is_limit_setting(canonical) {
                 return self.bind_current_setting(args);
             }
-            let value = crate::settings::current(&self.session, canonical).unwrap_or(Value::Null);
+            // A store setting (`wal_sync_method` on a durable store) reads back
+            // what the engine does, whatever the session holds.
+            let value = self
+                .db
+                .store_setting_value(canonical)
+                .or_else(|| crate::settings::current(&self.session, canonical))
+                .unwrap_or(Value::Null);
             return Ok(BoundExpr::Literal(value));
         }
         // Session-position functions (wave 131b): DuckDB answers the current
@@ -4036,7 +4042,14 @@ impl<'a> Binder<'a> {
             deps.push(dep);
         }
         drop(deps);
-        match self.session.get(name) {
+        // A store setting (`wal_sync_method`) reads back through the same
+        // spellings when the session does not override it, so what the query
+        // sees is what the engine does.
+        match self
+            .session
+            .get(name)
+            .or_else(|| self.db.store_setting_value(name))
+        {
             Some(v) => Ok(BoundExpr::Literal(v)),
             None if !strict => Ok(BoundExpr::Literal(Value::Null)),
             None => Err(PinkDbError::Catalog(format!(

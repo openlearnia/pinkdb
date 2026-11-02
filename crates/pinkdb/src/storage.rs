@@ -1375,27 +1375,39 @@ impl DataTable {
             .unwrap_or(&EMPTY)
     }
 
-    /// Recompute one column's table-level aggregates from its zone maps: the
-    /// exact repair after a mutation touched the chunk a bound came from.
     /// Per-column `(zone, folded sketch)` for one appended batch. Bulk
     /// ingestion is the write hot path and its columns are independent, so the
     /// min/max/NULL pass and the sketch's hashing run on the worker pool; the
     /// sketch is cloned per column and installed by the caller, which keeps
     /// the fold free of mutable table access. Small batches stay serial
     /// (the pool costs more than a few thousand cells).
-    fn fold_chunk_stats(&self, chunk: &[std::sync::Arc<Vector>]) -> Vec<(Zone, Option<Hll>)> {
+    ///
+    /// `split` is where the batch lands in a new chunk when it straddles a
+    /// chunk boundary: the second zone covers rows `split..`, so each chunk's
+    /// zone still describes only the rows it holds. The caller merges both
+    /// zones into the table-level bounds.
+    fn fold_chunk_stats(
+        &self,
+        chunk: &[std::sync::Arc<Vector>],
+        split: usize,
+    ) -> Vec<(Zone, Zone, Option<Hll>)> {
         use rayon::prelude::*;
         let cells = chunk.first().map(|c| c.len()).unwrap_or(0) * chunk.len();
-        let fold = |ci: usize, src: &Vector| -> (Zone, Option<Hll>) {
-            let zone = Zone::of_vector(src);
+        let fold = |ci: usize, src: &Vector| -> (Zone, Zone, Option<Hll>) {
+            let rows = src.len();
+            let split = split.min(rows);
+            let zone = Zone::of_vector_range(src, 0, split);
+            let rest = if split < rows {
+                Zone::of_vector_range(src, split, rows - split)
+            } else {
+                Zone::empty()
+            };
             let hll = self.stats.cols[ci].hll.as_ref().map(|hll| {
                 let mut hll = (**hll).clone();
-                for row in 0..src.len() {
-                    hll.insert_cell(src, row);
-                }
+                hll.fold_vector(src);
                 hll
             });
-            (zone, hll)
+            (zone, rest, hll)
         };
         if cells >= 4096 {
             chunk
@@ -1412,6 +1424,8 @@ impl DataTable {
         }
     }
 
+    /// Recompute one column's table-level aggregates from its zone maps: the
+    /// exact repair after a mutation touched the chunk a bound came from.
     fn rebuild_column_stats(&mut self, col: usize) {
         let mut st = ColStats {
             null_count: 0,
@@ -2045,7 +2059,8 @@ impl DataTable {
                     col.push_chunk(Arc::clone(src))?;
                 }
             }
-            for (ci, (zone, hll)) in self.fold_chunk_stats(chunk).into_iter().enumerate() {
+            let folded = self.fold_chunk_stats(chunk, rows);
+            for (ci, (zone, _, hll)) in folded.into_iter().enumerate() {
                 self.stats.cols[ci].absorb_zone(&zone);
                 self.stats.cols[ci].set_sketch(hll.map(std::sync::Arc::new));
                 if replacing {
@@ -2063,6 +2078,10 @@ impl DataTable {
         // Partial tail: merge, splitting at chunk boundaries as needed.
         let first_chunk = self.columns[0].num_chunks().saturating_sub(1);
         let mut offset = 0;
+        // Where the batch starts in a new chunk, once it straddles a boundary:
+        // the first `split` rows go to the chunk being filled, the rest to the
+        // one after it.
+        let mut split = rows;
         while offset < rows {
             let tail_full = self.columns[0]
                 .chunks
@@ -2085,22 +2104,25 @@ impl DataTable {
             for (col, src) in self.columns.iter_mut().zip(chunk) {
                 col.chunk_mut(tail)?.extend_from(src, offset, take);
             }
+            if offset == 0 {
+                split = take;
+            }
             offset += take;
             self.num_rows += take;
         }
         self.stats.rows += rows as u64;
-        // Only the touched chunks are re-derived, and only their appended
-        // source rows are hashed (folded from the whole chunk instead
-        // would count the existing rows twice).
-        for (ci, src) in chunk.iter().enumerate() {
-            for c in first_chunk..self.columns[0].num_chunks() {
-                self.refresh_zone(ci, c, false);
-            }
-            if let Some(hll) = &mut self.stats.cols[ci].hll {
-                let hll = Arc::make_mut(hll);
-                for row in 0..rows {
-                    hll.insert_cell(src, row);
-                }
+        // Only the touched chunks' zones are updated, from the zones of the
+        // rows that landed in them — re-deriving a whole chunk here would
+        // copy its existing rows again, which was most of an append's cost.
+        // The sketch is folded once over the whole batch either way.
+        let folded = self.fold_chunk_stats(chunk, split);
+        for (ci, (zone, rest, hll)) in folded.into_iter().enumerate() {
+            self.stats.cols[ci].absorb_zone(&zone);
+            self.stats.cols[ci].absorb_zone(&rest);
+            self.stats.cols[ci].set_sketch(hll.map(std::sync::Arc::new));
+            self.zones[ci][first_chunk].merge(&zone);
+            if split < rows {
+                self.zones[ci][first_chunk + 1] = rest;
             }
         }
         self.version = next_table_version();
@@ -4493,6 +4515,31 @@ impl PinkDb {
         self.lease.clone()
     }
 
+    /// The WAL sync method this process commits with (`None` in memory).
+    pub(crate) fn wal_sync_method(&self) -> Option<crate::wal::WalSyncMethod> {
+        self.lease.as_ref().map(|lease| lease.sync_method())
+    }
+
+    /// `SET wal_sync_method`: per process, not transactional, not persisted
+    /// (see [`crate::wal::WalSyncMethod`]). No-op in memory.
+    pub(crate) fn set_wal_sync_method(&self, method: crate::wal::WalSyncMethod) {
+        if let Some(lease) = &self.lease {
+            lease.set_sync_method(method);
+        }
+    }
+
+    /// A store-wide setting readable through `getvariable`/`$name` when the
+    /// session does not set it. Only `wal_sync_method`, which reflects what the
+    /// engine actually does: a session copy could disagree with the WAL.
+    pub(crate) fn store_setting_value(&self, name: &str) -> Option<Value> {
+        match name.to_ascii_lowercase().as_str() {
+            "wal_sync_method" => self
+                .wal_sync_method()
+                .map(|method| Value::Varchar(method.as_str().to_string())),
+            _ => None,
+        }
+    }
+
     /// Swap the catalog and data of `self` with `other` (a checkpoint loaded
     /// from disk), preserving every process-local facet of `self`: the WAL
     /// handle, the lease, loaded extensions, attached lakes, the encryption
@@ -4747,13 +4794,43 @@ impl PinkDb {
         secrets: Option<&[crate::secret::Secret]>,
         memo: &[crate::wal::ExtCall],
     ) -> Result<()> {
+        if let Some(pending) = self.wal_append_session_pending(
+            db_before,
+            db_after,
+            stmts,
+            touched_extensions,
+            loaded_extensions,
+            sets,
+            secrets,
+            memo,
+        )? {
+            pending.wait()?;
+        }
+        Ok(())
+    }
+
+    /// [`PinkDb::wal_append_session`] without the durable wait: the caller must
+    /// [`crate::wal::CommitSync::wait`] on the returned token after releasing
+    /// the store's write lock, so concurrent commits share one sync.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wal_append_session_pending(
+        &mut self,
+        db_before: &SchemaPath,
+        db_after: &SchemaPath,
+        stmts: &[String],
+        touched_extensions: &[String],
+        loaded_extensions: &[String],
+        sets: Option<&crate::wal::FrameSets>,
+        secrets: Option<&[crate::secret::Secret]>,
+        memo: &[crate::wal::ExtCall],
+    ) -> Result<Option<crate::wal::CommitSync>> {
         // Wave 124: a unit that changed lake databases commits there, and the
         // storage checks guarantee it wrote nothing local — so it is not
         // appended to the local WAL.
         if self.route_committed_unit()? {
-            return Ok(());
+            return Ok(None);
         }
-        self.wal_append_local(
+        self.wal_append_local_pending(
             db_before,
             db_after,
             stmts,
@@ -4782,6 +4859,36 @@ impl PinkDb {
         secrets: Option<&[crate::secret::Secret]>,
         memo: &[crate::wal::ExtCall],
     ) -> Result<()> {
+        if let Some(pending) = self.wal_append_local_pending(
+            db_before,
+            db_after,
+            stmts,
+            touched_extensions,
+            loaded_extensions,
+            sets,
+            secrets,
+            memo,
+        )? {
+            pending.wait()?;
+        }
+        Ok(())
+    }
+
+    /// [`PinkDb::wal_append_local`] without the durable wait (group commit: the
+    /// caller waits after releasing the store's write lock). A transaction
+    /// commit keeps the eager form — it must be durable before it merges.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wal_append_local_pending(
+        &self,
+        db_before: &SchemaPath,
+        db_after: &SchemaPath,
+        stmts: &[String],
+        touched_extensions: &[String],
+        loaded_extensions: &[String],
+        sets: Option<&crate::wal::FrameSets>,
+        secrets: Option<&[crate::secret::Secret]>,
+        memo: &[crate::wal::ExtCall],
+    ) -> Result<Option<crate::wal::CommitSync>> {
         if let Some(wal) = self.durable_handle() {
             let pins = self.lake_pins(sets);
             let memo: std::borrow::Cow<'_, [crate::wal::ExtCall]> = if pins.is_empty() {
@@ -4795,7 +4902,7 @@ impl PinkDb {
                 PinkDbError::Execution("internal lock error (poisoned)".to_string())
             })?;
             let before = self.schema_exists(db_before).then_some(db_before);
-            guard.append_in_session(
+            return guard.append_in_session(
                 before,
                 db_after,
                 stmts,
@@ -4804,9 +4911,9 @@ impl PinkDb {
                 sets,
                 secrets,
                 &memo,
-            )?;
+            );
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Open a transaction: refresh (a short lease only when something was
@@ -6295,5 +6402,62 @@ mod tests {
         assert!(db.rbac().allowed("alice", &table_grant, Privilege::Select));
         db.drop_schema(&s, false, true).unwrap();
         assert!(!db.rbac().allowed("alice", &table_grant, Privilege::Select));
+    }
+
+    /// Zones and the sketch are folded per appended batch, so they must not
+    /// depend on how the same rows were split into batches: the shared-chunk
+    /// path and the copy path over a partial tail have to agree.
+    #[test]
+    fn statistics_do_not_depend_on_how_rows_were_appended() {
+        let schema = vec![
+            ("k".to_string(), DataType::Integer),
+            ("s".to_string(), DataType::Varchar),
+            ("d".to_string(), DataType::Double),
+            ("b".to_string(), DataType::Bigint),
+        ];
+        let rows: Vec<Vec<Value>> = (0..5000usize)
+            .map(|row| {
+                vec![
+                    Value::Integer((row % 1000) as i32),
+                    Value::Varchar(format!("row-{}", row % 250)),
+                    Value::Double(row as f64 / 8.0),
+                    Value::Bigint(if row % 3 == 0 { -1 } else { row as i64 }),
+                ]
+            })
+            .collect();
+        let append = |t: &mut DataTable, block: &[Vec<Value>]| {
+            let mut columns = Vec::with_capacity(schema.len());
+            for (col, (_, ty)) in schema.iter().enumerate() {
+                let mut v = Vector::with_capacity(*ty, block.len());
+                for r in block {
+                    v.push_value(r[col].clone()).unwrap();
+                }
+                columns.push(Arc::new(v));
+            }
+            t.append_shared_chunk(&columns).unwrap();
+        };
+
+        let mut per_row = DataTable::new("per_row".to_string(), schema.clone()).unwrap();
+        let mut per_chunk = DataTable::new("per_chunk".to_string(), schema.clone()).unwrap();
+        let mut uneven = DataTable::new("uneven".to_string(), schema.clone()).unwrap();
+        for row in &rows {
+            per_row.append_row(row.clone()).unwrap();
+        }
+        for block in rows.chunks(CHUNK_SIZE) {
+            append(&mut per_chunk, block);
+        }
+        // 700-row pieces straddle CHUNK_SIZE boundaries, so these appends take
+        // the copy path and split into two chunks.
+        for block in rows.chunks(700) {
+            append(&mut uneven, block);
+        }
+
+        assert!(per_row.num_rows() > CHUNK_SIZE);
+        assert_eq!(per_chunk.num_rows(), per_row.num_rows());
+        assert_eq!(uneven.num_rows(), per_row.num_rows());
+        assert_eq!(per_chunk.stats, per_row.stats);
+        assert_eq!(uneven.stats, per_row.stats);
+        assert_eq!(per_chunk.zones, per_row.zones);
+        assert_eq!(uneven.zones, per_row.zones);
     }
 }

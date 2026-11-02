@@ -86,6 +86,10 @@ pinkdb-ext-loader = { path = "../pinkdb-ext-loader" }
 # `PASSWORD_HASH` need no randomness and keep working).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 getrandom = "0.2"
+# The WAL's sync primitives (`fsync`/`fdatasync`/`fcntl(F_FULLFSYNC)`) need the
+# raw syscalls: `File::sync_all` and `File::sync_data` are both F_FULLFSYNC on
+# macOS, so the cheaper `wal_sync_method` settings have no std spelling.
+libc = "0.2"
 
 # Single-process durable-path benchmark: `cargo bench -p pinkdb --bench durable`.
 [[bench]]

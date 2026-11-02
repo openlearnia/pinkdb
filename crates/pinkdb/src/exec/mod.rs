@@ -1113,9 +1113,12 @@ fn resolve_ns(db: &PinkDb, qdb: &Option<crate::storage::SchemaPath>) -> crate::s
     qdb.clone().unwrap_or_else(|| db.current_ns().clone())
 }
 
-/// `SET VARIABLE`: evaluate the value (a constant expression, like a `CALL`
-/// argument) and bind it in the running session. Never touches the store, so
-/// nothing is logged or persisted.
+/// `SET [VARIABLE] name = value`: evaluate the value (a constant expression,
+/// like a `CALL` argument) and bind it. Session variables never touch the
+/// store, so nothing is logged or persisted. `wal_sync_method` is the exception
+/// that is not a session variable: the WAL is shared by every session and
+/// process, so the method lives on the store's lease (an in-memory store has
+/// nothing to sync and keeps a session variable instead).
 fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
     let single = DataChunk {
         columns: Vec::new(),
@@ -1154,6 +1157,38 @@ fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
 /// `SET VARIABLE` — nothing is logged or persisted, and the value is checked
 /// against DuckDB's rules before it is stored. `RESET ALL` passes `"*"`.
 fn set_setting(cx: &Cx, name: &str, value: Option<&BoundExpr>) -> Result<QueryResult> {
+    // `wal_sync_method` (wave 136w4) is not session state either: the WAL is
+    // shared by every session and process, so a durable store keeps the method
+    // on its lease. An in-memory store has nothing to sync and stores it like
+    // any other setting. `RESET` restores `full`.
+    if name.eq_ignore_ascii_case("wal_sync_method") && cx.db.wal_sync_method().is_some() {
+        let method = match value {
+            Some(value) => {
+                let single = DataChunk {
+                    columns: Vec::new(),
+                    num_rows: 1,
+                    ordinal: 0,
+                };
+                let v = eval_expr(value, &single, cx)?;
+                let Value::Varchar(text) = v.get(0) else {
+                    return Err(PinkDbError::Type(
+                        "wal_sync_method takes a string: 'full', 'fsync' or 'fdatasync'"
+                            .to_string(),
+                    ));
+                };
+                crate::wal::WalSyncMethod::parse(&text).ok_or_else(|| {
+                    PinkDbError::Type(format!(
+                        "unknown wal_sync_method {text:?}: expected 'full', 'fsync' or 'fdatasync'"
+                    ))
+                })?
+            }
+            None => crate::wal::WalSyncMethod::default(),
+        };
+        cx.db.set_wal_sync_method(method);
+        return Ok(QueryResult::SetVariable {
+            name: name.to_string(),
+        });
+    }
     // `memory_limit` / `max_memory` are process-wide (wave 136a's pool), not
     // session state: they move the pool's limit, and `RESET` restores the
     // default. `RESET ALL` resets the session's settings only.

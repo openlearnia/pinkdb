@@ -1626,6 +1626,7 @@ dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
  "getrandom 0.2.17",
+ "libc",
  "lz4_flex",
  "peg",
  "pinkdb-ext-loader",
@@ -1856,6 +1857,7 @@ dependencies = [
  "parquet",
  "pinkdb",
  "pinkdb-httpfs",
+ "rayon",
 ]
 
 [[package]]

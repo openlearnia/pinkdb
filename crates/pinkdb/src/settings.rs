@@ -250,6 +250,7 @@ const PINKDB_SETTINGS: &[&str] = &[
     "hnsw_exact",
     "join_filter_pushdown",
     "pipeline_execution",
+    "wal_sync_method",
 ];
 
 /// The same, as the error path wants it: an unknown name is DuckDB's Catalog
@@ -350,6 +351,18 @@ pub(crate) fn current(session: &Session, name: &str) -> Option<Value> {
 /// spelling for the order settings), or DuckDB's error for a bad one.
 pub(crate) fn validate(name: &str, value: Value) -> Result<Value, PinkDbError> {
     match name {
+        // An in-memory store keeps it as a plain setting (nothing to sync),
+        // but the spelling is checked the same way as on a durable store.
+        "wal_sync_method" => {
+            let method = text(&value)
+                .and_then(crate::wal::WalSyncMethod::parse)
+                .ok_or_else(|| {
+                    PinkDbError::Type(format!(
+                        "unknown wal_sync_method {value}: expected 'full', 'fsync' or 'fdatasync'"
+                    ))
+                })?;
+            Ok(Value::Varchar(method.as_str().to_string()))
+        }
         "default_null_order" => {
             let text = text(&value).ok_or_else(|| bad_null_order(&format!("{value:?}")))?;
             let order = NullOrder::parse(text).ok_or_else(|| bad_null_order(text))?;
