@@ -172,6 +172,10 @@ pub(crate) struct AvgState {
     count: i64,
     scale: u8,
     float: bool,
+    /// The exact sum left the i128 range (possible for 128-bit inputs).
+    /// DuckDB raises `Overflow in HUGEINT addition` for the same case, so a
+    /// wrapped average is reported instead of returned.
+    overflow: bool,
 }
 
 impl AvgState {
@@ -192,7 +196,15 @@ impl AvgState {
 
     #[inline]
     pub(crate) fn add_int(&mut self, x: i128) {
-        self.add_decimal(x, 0);
+        if self.float || self.scale != 0 {
+            self.add_decimal(x, 0);
+            return;
+        }
+        match self.sum.checked_add(x) {
+            Some(sum) => self.sum = sum,
+            None => self.overflow = true,
+        }
+        self.count += 1;
     }
 
     #[inline]
@@ -253,6 +265,9 @@ impl AvgState {
     }
 
     pub(crate) fn merge(&mut self, other: AvgState) {
+        // A partial sum that already overflowed stays overflowed, however the
+        // finalize divides it.
+        self.overflow |= other.overflow;
         if self.float || other.float {
             let f = self.float_sum() + other.float_sum();
             self.set_float(f);
@@ -260,17 +275,25 @@ impl AvgState {
             let scale = self.scale.max(other.scale);
             self.align(scale);
             let b = other.sum * crate::types::POW10_I128[(scale - other.scale) as usize];
-            self.sum = self.sum.wrapping_add(b);
+            match self.sum.checked_add(b) {
+                Some(sum) => self.sum = sum,
+                None => self.overflow = true,
+            }
         }
         self.count += other.count;
     }
 
-    pub(crate) fn finalize(&self) -> Value {
+    pub(crate) fn finalize(&self) -> Result<Value> {
+        if self.overflow {
+            return Err(PinkDbError::Execution(
+                "Overflow in HUGEINT addition".to_string(),
+            ));
+        }
         if self.count == 0 {
-            return Value::Null;
+            return Ok(Value::Null);
         }
         if self.float {
-            return Value::Double(self.float_sum() / self.count as f64);
+            return Ok(Value::Double(self.float_sum() / self.count as f64));
         }
         // DuckDB's optimizer rewrites `avg(x)` to
         // `CAST(sum(x) AS DOUBLE) / CAST(count(x) AS DOUBLE)` (its plan shows
@@ -278,7 +301,7 @@ impl AvgState {
         // scale first and is then divided by the count. Dividing by
         // `count * 10^scale` in one step differs in the last bit.
         let sum = self.sum as f64 / crate::types::POW10_F64[self.scale as usize];
-        Value::Double(sum / self.count as f64)
+        Ok(Value::Double(sum / self.count as f64))
     }
 }
 
@@ -307,6 +330,15 @@ pub(crate) enum Acc {
         sum: i128,
         scale: u8,
         overflow: bool,
+        non_null: bool,
+    },
+    /// HUGEINT SUM: exact i128 accumulation with a checked add (DuckDB's
+    /// `sum_no_overflow`). `overflow` keeps the operands of the first
+    /// overflowing add — boxed so the accumulator stays as small as the other
+    /// fixed-size states — and `finalize` raises DuckDB's message.
+    SumHugeint {
+        sum: i128,
+        overflow: Option<Box<(i128, i128)>>,
         non_null: bool,
     },
     /// AVG: exact for INTEGER/BIGINT/DECIMAL like DuckDB (an i128 sum at the
@@ -483,6 +515,17 @@ fn exact_sum(sum: i64, wraps: i64) -> i128 {
     sum as i128 + ((wraps as i128) << 64)
 }
 
+/// Add `x` to a HUGEINT sum. The first overflowing add keeps its operands (for
+/// DuckDB's message); the error itself is raised by `finalize`, like DECIMAL's.
+#[inline]
+fn sum_add_hugeint(sum: &mut i128, overflow: &mut Option<Box<(i128, i128)>>, x: i128) {
+    match sum.checked_add(x) {
+        Some(next) => *sum = next,
+        None if overflow.is_none() => *overflow = Some(Box::new((*sum, x))),
+        None => {}
+    }
+}
+
 impl Acc {
     /// `direct` is the ordered-set aggregate's constant fraction
     /// (`percentile_cont(0.5)`); every other function ignores it.
@@ -566,6 +609,7 @@ impl Acc {
                 *sum += x as f64;
                 *non_null = true;
             }
+            Acc::SumHugeint { .. } => self.add_hugeint(x as i128),
             // A decimal SUM slot never sees an INTEGER cell (its argument
             // column is DECIMAL); route it through `update` for the same
             // conversion the generic path would apply.
@@ -593,6 +637,12 @@ impl Acc {
             Acc::SumFloat { sum, non_null } => {
                 *sum += x;
                 *non_null = true;
+            }
+            Acc::SumHugeint { sum, non_null, .. } => {
+                *self = Acc::SumFloat {
+                    sum: *sum as f64 + x,
+                    non_null: *non_null,
+                };
             }
             // A decimal SUM slot never sees a DOUBLE cell; route it through
             // `update` (which folds it like the generic path would).
@@ -639,6 +689,16 @@ impl Acc {
                     sum_add(sum, wraps, d[i]);
                     *non_null = true;
                 }
+                // A HUGEINT cell makes it a `SumHugeint`, as the first DECIMAL
+                // cell makes it a `SumDecimal`.
+                VectorData::Int128(d) => {
+                    *self = Acc::SumHugeint {
+                        sum: exact_sum(*sum, *wraps),
+                        overflow: None,
+                        non_null: *non_null,
+                    };
+                    self.add_hugeint(d[i]);
+                }
                 // A DOUBLE cell flips the accumulator to float (same rule as
                 // `update`).
                 VectorData::Float64(d) => {
@@ -671,9 +731,35 @@ impl Acc {
                     self.add_decimal(values[i], *scale);
                 }
             }
+            Acc::SumHugeint {
+                sum,
+                overflow,
+                non_null,
+            } => match v.data() {
+                VectorData::Int32(d) => {
+                    sum_add_hugeint(sum, overflow, d[i] as i128);
+                    *non_null = true;
+                }
+                VectorData::Int64(d) => {
+                    sum_add_hugeint(sum, overflow, d[i] as i128);
+                    *non_null = true;
+                }
+                VectorData::Int128(d) => {
+                    sum_add_hugeint(sum, overflow, d[i]);
+                    *non_null = true;
+                }
+                VectorData::Float64(d) => {
+                    *self = Acc::SumFloat {
+                        sum: *sum as f64 + d[i],
+                        non_null: true,
+                    };
+                }
+                _ => {}
+            },
             Acc::Avg(avg) => match v.data() {
                 VectorData::Int32(d) => avg.add_int(d[i] as i128),
                 VectorData::Int64(d) => avg.add_int(d[i] as i128),
+                VectorData::Int128(d) => avg.add_int(d[i]),
                 VectorData::Float64(d) => avg.add_f64(d[i]),
                 VectorData::Decimal { values, scale, .. } => avg.add_decimal(values[i], *scale),
                 _ => {}
@@ -718,12 +804,20 @@ impl Acc {
                     sum_add(sum, wraps, *i);
                     *non_null = true;
                 }
+                Some(Value::Hugeint(i)) => self.add_hugeint(*i),
                 Some(Value::Double(x)) => {
                     *self = Acc::SumFloat {
                         sum: exact_sum(*sum, *wraps) as f64 + *x,
                         non_null: true,
                     };
                 }
+                _ => {}
+            },
+            Acc::SumHugeint { .. } => match arg {
+                Some(Value::Hugeint(i)) => self.add_hugeint(*i),
+                Some(Value::Integer(i)) => self.add_hugeint(*i as i128),
+                Some(Value::Bigint(i)) => self.add_hugeint(*i as i128),
+                Some(Value::Double(x)) => self.add_f64(*x),
                 _ => {}
             },
             Acc::SumFloat { sum, non_null } => match arg {
@@ -752,6 +846,7 @@ impl Acc {
             Acc::Avg(avg) => match arg {
                 Some(Value::Integer(i)) => avg.add_int(*i as i128),
                 Some(Value::Bigint(i)) => avg.add_int(*i as i128),
+                Some(Value::Hugeint(i)) => avg.add_int(*i),
                 Some(Value::Double(x)) => avg.add_f64(*x),
                 Some(Value::Decimal {
                     value: x, scale, ..
@@ -802,6 +897,39 @@ impl Acc {
         match self {
             Acc::Avg(avg) => avg.add_decimal_n(sum, n, scale),
             _ => self.add_decimal(sum, scale),
+        }
+    }
+
+    /// A HUGEINT SUM cell: exact i128 add (see [`Acc::SumHugeint`]).
+    #[inline]
+    fn add_hugeint(&mut self, x: i128) {
+        // A fresh SUM accumulator starts as `SumInt` (no dtype at `Acc::new`
+        // time); the first HUGEINT cell converts it, like `add_decimal`.
+        if let Acc::SumInt {
+            sum,
+            wraps,
+            non_null,
+        } = self
+        {
+            let (exact, non_null) = (exact_sum(*sum, *wraps), *non_null);
+            *self = Acc::SumHugeint {
+                sum: exact,
+                overflow: None,
+                non_null,
+            };
+        }
+        match self {
+            Acc::SumHugeint {
+                sum,
+                overflow,
+                non_null,
+            } => {
+                sum_add_hugeint(sum, overflow, x);
+                *non_null = true;
+            }
+            // Any other accumulator sees a HUGEINT column only through a
+            // test-built partial; the generic path converts it as usual.
+            other => other.update(Some(&Value::Hugeint(x))),
         }
     }
 
@@ -902,6 +1030,24 @@ impl Acc {
                 *non_null |= *bn;
             }
             (Acc::Avg(a), Acc::Avg(b)) => a.merge(*b),
+            (
+                Acc::SumHugeint {
+                    sum,
+                    overflow,
+                    non_null,
+                },
+                Acc::SumHugeint {
+                    sum: b,
+                    overflow: bov,
+                    non_null: bn,
+                },
+            ) => {
+                sum_add_hugeint(sum, overflow, *b);
+                if overflow.is_none() {
+                    *overflow = bov.clone();
+                }
+                *non_null |= *bn;
+            }
             _ => self.merge(other.clone()),
         }
     }
@@ -1052,6 +1198,89 @@ impl Acc {
                 a.merge(b);
                 Acc::Avg(a)
             }
+            (
+                Acc::SumHugeint {
+                    sum: a,
+                    overflow: aov,
+                    non_null: an,
+                },
+                Acc::SumHugeint {
+                    sum: b,
+                    overflow: bov,
+                    non_null: bn,
+                },
+            ) => {
+                let mut sum = a;
+                let mut overflow = aov.or(bov);
+                sum_add_hugeint(&mut sum, &mut overflow, b);
+                Acc::SumHugeint {
+                    sum,
+                    overflow,
+                    non_null: an || bn,
+                }
+            }
+            // A fresh integer partial meeting a HUGEINT one (see the
+            // DECIMAL/`SumInt` pair above).
+            (
+                Acc::SumInt {
+                    sum: a,
+                    wraps: aw,
+                    non_null: an,
+                },
+                Acc::SumHugeint {
+                    sum: b,
+                    overflow: bov,
+                    non_null: bn,
+                },
+            )
+            | (
+                Acc::SumHugeint {
+                    sum: b,
+                    overflow: bov,
+                    non_null: bn,
+                },
+                Acc::SumInt {
+                    sum: a,
+                    wraps: aw,
+                    non_null: an,
+                },
+            ) => {
+                let mut sum = exact_sum(a, aw);
+                let mut overflow = bov;
+                sum_add_hugeint(&mut sum, &mut overflow, b);
+                Acc::SumHugeint {
+                    sum,
+                    overflow,
+                    non_null: an || bn,
+                }
+            }
+            // Mixed HUGEINT/float partials fold the integer side in as float,
+            // the same way `SumInt`/`SumFloat` do.
+            (
+                Acc::SumHugeint {
+                    sum: a,
+                    non_null: an,
+                    ..
+                },
+                Acc::SumFloat {
+                    sum: b,
+                    non_null: bn,
+                },
+            )
+            | (
+                Acc::SumFloat {
+                    sum: b,
+                    non_null: bn,
+                },
+                Acc::SumHugeint {
+                    sum: a,
+                    non_null: an,
+                    ..
+                },
+            ) => Acc::SumFloat {
+                sum: a as f64 + b,
+                non_null: an || bn,
+            },
             (Acc::MinMax { cur: a, is_min }, Acc::MinMax { cur: b, .. }) => {
                 let better = match (&a, &b) {
                     (_, None) => false,
@@ -1087,15 +1316,24 @@ impl Acc {
                 if !*non_null {
                     Value::Null
                 } else {
-                    let exact = exact_sum(*sum, *wraps);
-                    match dtype {
-                        DataType::Double => Value::Double(exact as f64),
-                        _ => Value::Bigint(i64::try_from(exact).map_err(|_| {
-                            PinkDbError::Execution(format!(
-                                "Overflow in SUM: {exact} is out of range for BIGINT"
-                            ))
-                        })?),
-                    }
+                    // SUM over an integer column is HUGEINT (DuckDB) and the
+                    // accumulator is already exact, so nothing overflows here.
+                    Value::Hugeint(exact_sum(*sum, *wraps))
+                }
+            }
+            Acc::SumHugeint {
+                sum,
+                overflow,
+                non_null,
+            } => {
+                if !*non_null {
+                    Value::Null
+                } else if let Some(&(a, b)) = overflow.as_deref() {
+                    return Err(PinkDbError::Execution(format!(
+                        "Overflow in HUGEINT addition: {a} + {b}"
+                    )));
+                } else {
+                    Value::Hugeint(*sum)
                 }
             }
             Acc::SumFloat { sum, non_null } => {
@@ -1122,7 +1360,7 @@ impl Acc {
                     Value::decimal(*sum, *scale)
                 }
             }
-            Acc::Avg(avg) => avg.finalize(),
+            Acc::Avg(avg) => avg.finalize()?,
             Acc::MinMax { cur, .. } => cur.clone().unwrap_or(Value::Null),
             Acc::Collect(c) => c.result(dtype)?,
         })
@@ -2690,14 +2928,17 @@ mod tests {
         // 5*MAX + 5*MIN + 7 = 7 - 5: exact despite multiple wraps both ways.
         acc.merge(other);
         assert_eq!(
-            acc.finalize_ref(DataType::Bigint).unwrap(),
-            Value::Bigint(2)
+            acc.finalize_ref(DataType::Hugeint).unwrap(),
+            Value::Hugeint(2)
         );
-        // Out of range at the end is an error, never a wrapped value.
+        // Past i64 is still exact: SUM over BIGINT widens to HUGEINT.
         let mut big = Acc::new(AggFunc::Sum, false, None);
         big.update(Some(&Value::Bigint(i64::MAX)));
         big.update(Some(&Value::Bigint(1)));
-        assert!(big.finalize_ref(DataType::Bigint).is_err());
+        assert_eq!(
+            big.finalize_ref(DataType::Hugeint).unwrap(),
+            Value::Hugeint(i64::MAX as i128 + 1)
+        );
         // Flipping to float keeps the exact integer prefix.
         big.update(Some(&Value::Double(0.5)));
         assert_eq!(
@@ -2783,7 +3024,7 @@ mod tests {
             mk(
                 AggFunc::Sum,
                 col(3, DataType::Bigint),
-                DataType::Bigint,
+                DataType::Hugeint,
                 None,
             ),
             mk(
@@ -2797,7 +3038,7 @@ mod tests {
             mk(
                 AggFunc::Sum,
                 col(3, DataType::Bigint),
-                DataType::Bigint,
+                DataType::Hugeint,
                 Some(BoundExpr::Binary {
                     op: crate::sql::ast::BinaryOp::Gt,
                     left: Box::new(BoundExpr::Column {

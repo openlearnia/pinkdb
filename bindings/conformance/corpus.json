@@ -665,6 +665,56 @@
           }
         }
       ]
+    },
+    {
+      "name": "hugeint_sum",
+      "description": "SUM over the integer types returns HUGEINT (exact decimal text), a 128-bit column round-trips through a table, and an overflowing SUM keeps DuckDB's message.",
+      "setup": [
+        "CREATE TABLE h (i INTEGER, g BIGINT)",
+        "INSERT INTO h VALUES (1, 9223372036854775807), (2, 9223372036854775807), (NULL, NULL)",
+        "CREATE TABLE wide (x HUGEINT)",
+        "INSERT INTO wide VALUES (170141183460469231731687303715884105727), (0)",
+        "CREATE TABLE big (x HUGEINT)",
+        "INSERT INTO big VALUES (170141183460469231731687303715884105727), (1)"
+      ],
+      "steps": [
+        {
+          "op": "query",
+          "sql": "SELECT sum(i) AS si, sum(g) AS sg, typeof(sum(i)) AS t FROM h",
+          "expect": {
+            "columns": ["si", "sg", "t"],
+            "types": ["hugeint", "hugeint", "varchar"],
+            "rows": [
+              [
+                ["hugeint", "3"],
+                ["hugeint", "18446744073709551614"],
+                ["varchar", "HUGEINT"]
+              ]
+            ]
+          }
+        },
+        {
+          "op": "query",
+          "sql": "SELECT sum(x) AS s, min(x) AS lo, max(x) AS hi FROM wide",
+          "expect": {
+            "columns": ["s", "lo", "hi"],
+            "types": ["hugeint", "hugeint", "hugeint"],
+            "rows": [
+              [
+                ["hugeint", "170141183460469231731687303715884105727"],
+                ["hugeint", "0"],
+                ["hugeint", "170141183460469231731687303715884105727"]
+              ]
+            ]
+          }
+        },
+        {
+          "op": "error",
+          "sql": "SELECT sum(x) FROM big",
+          "class": "execution",
+          "message_contains": "Overflow in HUGEINT addition"
+        }
+      ]
     }
   ]
 }

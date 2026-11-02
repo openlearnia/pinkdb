@@ -309,11 +309,11 @@ fn row_counts_round_decimals_like_duckdb() {
              AND CURRENT ROW) AS s FROM s ORDER BY i;"
         ),
         vec![
-            vec![Value::Integer(1), Value::Bigint(1)],
-            vec![Value::Integer(2), Value::Bigint(3)],
-            vec![Value::Integer(3), Value::Bigint(6)],
-            vec![Value::Integer(4), Value::Bigint(10)],
-            vec![Value::Integer(5), Value::Bigint(14)],
+            vec![Value::Integer(1), Value::Hugeint(1)],
+            vec![Value::Integer(2), Value::Hugeint(3)],
+            vec![Value::Integer(3), Value::Hugeint(6)],
+            vec![Value::Integer(4), Value::Hugeint(10)],
+            vec![Value::Integer(5), Value::Hugeint(14)],
         ]
     );
 }

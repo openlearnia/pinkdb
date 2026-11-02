@@ -87,7 +87,10 @@ use pinkdb::{DataType, Value};
 /// dtype carries an element byte and a `u32` length.
 /// v14: `CREATE/DROP SCHEMA` `Done` kinds (tags 27–28); `Used`'s `name` is
 /// `db\0schema` (wave 131b).
-pub const PROTOCOL_VERSION: u32 = 15;
+/// v15: `UUID` value (tag 12) and dtype (tag 11) tags.
+/// v16: `HUGEINT`/`UHUGEINT` value (tags 13/14) and dtype (tags 12/13) tags,
+/// 16-byte little endian like `UUID` (HUGEINT step 6).
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -169,6 +172,9 @@ mod value_tag {
     pub const ARRAY: u8 = 11;
     /// v15: `UUID(16 bytes)` — the unsigned 128-bit value, little endian.
     pub const UUID: u8 = 12;
+    /// v16: `HUGEINT(16 bytes)` / `UHUGEINT(16 bytes)`, little endian.
+    pub const HUGEINT: u8 = 13;
+    pub const UHUGEINT: u8 = 14;
 }
 
 /// DataType tag bytes (one per [`DataType`] variant).
@@ -190,6 +196,9 @@ mod dtype_tag {
     pub const ARRAY: u8 = 10;
     /// v15: no parameters.
     pub const UUID: u8 = 11;
+    /// v16: no parameters.
+    pub const HUGEINT: u8 = 12;
+    pub const UHUGEINT: u8 = 13;
 }
 
 // ---------- errors ----------
@@ -1011,13 +1020,13 @@ fn put_value(buf: &mut Vec<u8>, value: &Value) -> Result<(), ProtocolError> {
             put_u8(buf, value_tag::UUID);
             buf.extend_from_slice(&bits.to_le_bytes());
         }
-        // The wire format has no 128-bit value tag yet (step 6 of the
-        // HUGEINT plan); refusing keeps an older peer from mis-reading it.
-        Value::Hugeint(_) | Value::Uhugeint(_) => {
-            return Err(ProtocolError::Server(format!(
-                "{} is not yet supported in the wire protocol",
-                value.data_type().expect("non-null").name()
-            )));
+        Value::Hugeint(x) => {
+            put_u8(buf, value_tag::HUGEINT);
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::Uhugeint(x) => {
+            put_u8(buf, value_tag::UHUGEINT);
+            buf.extend_from_slice(&x.to_le_bytes());
         }
     }
     Ok(())
@@ -1037,14 +1046,8 @@ fn dtype_byte(dtype: DataType) -> Result<u8, ProtocolError> {
         DataType::Variant => dtype_tag::VARIANT,
         DataType::Array { .. } => dtype_tag::ARRAY,
         DataType::Uuid => dtype_tag::UUID,
-        // Likewise no data-type tag yet; a client that does not know it would
-        // truncate or mis-size the column.
-        DataType::Hugeint | DataType::Uhugeint => {
-            return Err(ProtocolError::Server(format!(
-                "{} is not yet supported in the wire protocol",
-                dtype.name()
-            )));
-        }
+        DataType::Hugeint => dtype_tag::HUGEINT,
+        DataType::Uhugeint => dtype_tag::UHUGEINT,
     })
 }
 
@@ -1187,6 +1190,18 @@ impl<'a> Reader<'a> {
                 x.copy_from_slice(b);
                 Value::Uuid(u128::from_le_bytes(x))
             }
+            value_tag::HUGEINT => {
+                let b = self.take(16, what)?;
+                let mut x = [0u8; 16];
+                x.copy_from_slice(b);
+                Value::Hugeint(i128::from_le_bytes(x))
+            }
+            value_tag::UHUGEINT => {
+                let b = self.take(16, what)?;
+                let mut x = [0u8; 16];
+                x.copy_from_slice(b);
+                Value::Uhugeint(u128::from_le_bytes(x))
+            }
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown value tag {other}"
@@ -1217,6 +1232,8 @@ impl<'a> Reader<'a> {
             dtype_tag::INTERVAL => DataType::Interval,
             dtype_tag::VARIANT => DataType::Variant,
             dtype_tag::UUID => DataType::Uuid,
+            dtype_tag::HUGEINT => DataType::Hugeint,
+            dtype_tag::UHUGEINT => DataType::Uhugeint,
             dtype_tag::ARRAY => {
                 let elem = self.u8(what)?;
                 let len = self.u32(what)?;
@@ -1252,16 +1269,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hugeint_results_name_the_wire_boundary() {
-        let response = Response::ResultSet {
-            names: vec!["h".to_string()],
-            types: vec![DataType::Hugeint],
-        };
-        let err = encode_response(&response).expect_err("the wire has no 128-bit tag");
-        assert_eq!(
-            err.to_string(),
-            "HUGEINT is not yet supported in the wire protocol"
-        );
+    fn hugeint_values_ride_as_16_byte_little_endian() {
+        for (value, tag) in [
+            (Value::Hugeint(i128::MIN), value_tag::HUGEINT),
+            (Value::Hugeint(-1), value_tag::HUGEINT),
+            (Value::Uhugeint(u128::MAX), value_tag::UHUGEINT),
+        ] {
+            let mut buf = Vec::new();
+            put_value(&mut buf, &value).expect("128-bit value tag");
+            assert_eq!(buf[0], tag);
+            assert_eq!(buf.len(), 17);
+            let mut r = Reader::new(&buf);
+            assert_eq!(r.value("test").expect("decode"), value);
+        }
+        // The dtype tags carry no parameters.
+        assert_eq!(dtype_byte(DataType::Hugeint).unwrap(), dtype_tag::HUGEINT);
+        assert_eq!(dtype_byte(DataType::Uhugeint).unwrap(), dtype_tag::UHUGEINT);
     }
 
     #[test]

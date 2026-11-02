@@ -2080,6 +2080,7 @@ fn decimal_operand(v: &Vector) -> Result<(std::borrow::Cow<'_, [i128]>, u8)> {
             std::borrow::Cow::Owned(src.iter().map(|&x| x as i128).collect()),
             0,
         ),
+        VectorData::Int128(src) => (std::borrow::Cow::Borrowed(src), 0),
         other => {
             return Err(PinkDbError::Execution(format!(
                 "decimal multiplication needs numeric operands, got {:?}",

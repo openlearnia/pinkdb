@@ -2625,6 +2625,8 @@ const VALUE_INTERVAL: u8 = 9;
 const VALUE_VARIANT: u8 = 10;
 const VALUE_ARRAY: u8 = 11;
 const VALUE_UUID: u8 = 12;
+const VALUE_HUGEINT: u8 = 13;
+const VALUE_UHUGEINT: u8 = 14;
 
 fn encode_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     let n = u32::try_from(bytes.len()).map_err(|_| {
@@ -2699,17 +2701,13 @@ fn encode_value(out: &mut Vec<u8>, value: &crate::types::Value) -> Result<()> {
             out.push(VALUE_UUID);
             out.extend_from_slice(&bits.to_le_bytes());
         }
-        // The WAL has no 128-bit value tag yet (step 5 of the HUGEINT plan).
-        // Refusing here keeps a replay from reading a tag it cannot know.
-        Value::Hugeint(_) => {
-            return Err(PinkDbError::Execution(
-                "HUGEINT is not yet supported in the WAL".to_string(),
-            ));
+        Value::Hugeint(v) => {
+            out.push(VALUE_HUGEINT);
+            out.extend_from_slice(&v.to_le_bytes());
         }
-        Value::Uhugeint(_) => {
-            return Err(PinkDbError::Execution(
-                "UHUGEINT is not yet supported in the WAL".to_string(),
-            ));
+        Value::Uhugeint(v) => {
+            out.push(VALUE_UHUGEINT);
+            out.extend_from_slice(&v.to_le_bytes());
         }
     }
     Ok(())
@@ -2828,6 +2826,13 @@ fn decode_value(r: &mut Payload<'_>) -> std::result::Result<Value, String> {
         VALUE_UUID => {
             let bytes = r.take(16)?;
             Value::Uuid(u128::from_le_bytes(
+                bytes.try_into().expect("16 bytes were read"),
+            ))
+        }
+        VALUE_HUGEINT => Value::Hugeint(r.i128()?),
+        VALUE_UHUGEINT => {
+            let bytes = r.take(16)?;
+            Value::Uhugeint(u128::from_le_bytes(
                 bytes.try_into().expect("16 bytes were read"),
             ))
         }
@@ -5791,6 +5796,8 @@ mod tests {
                 .map(|r| match &r[0] {
                     Value::Integer(i) => *i as i64,
                     Value::Bigint(i) => *i,
+                    // SUM returns HUGEINT; these tests only sum small values.
+                    Value::Hugeint(i) => i64::try_from(*i).expect("fits in i64"),
                     other => panic!("expected an integer, got {other:?}"),
                 })
                 .collect(),
@@ -5805,6 +5812,8 @@ mod tests {
                 .map(|r| match &r[0] {
                     Value::Integer(i) => *i as i64,
                     Value::Bigint(i) => *i,
+                    // SUM returns HUGEINT; these tests only sum small values.
+                    Value::Hugeint(i) => i64::try_from(*i).expect("fits in i64"),
                     other => panic!("expected an integer, got {other:?}"),
                 })
                 .collect(),

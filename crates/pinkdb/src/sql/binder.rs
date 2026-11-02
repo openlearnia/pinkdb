@@ -4887,21 +4887,22 @@ fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
                     "AVG needs a numeric argument".to_string(),
                 ));
             }
-            // The 128-bit accumulator is step 4 of the HUGEINT plan; until
-            // then the aggregate refuses instead of averaging through i64.
-            if matches!(t, DataType::Hugeint | DataType::Uhugeint) {
+            // The accumulator is 128-bit for every integer input and AVG's
+            // result is DOUBLE (DuckDB); UHUGEINT is step 8 of the plan.
+            if matches!(t, DataType::Uhugeint) {
                 return Err(PinkDbError::Type(format!(
-                    "AVG over {} is not yet supported (step 4 of the HUGEINT plan)",
+                    "AVG over {} is not yet supported (step 8 of the HUGEINT plan)",
                     t.name()
                 )));
             }
             Ok(DataType::Double)
         }
         AggFunc::Sum => match arg.expect("sum has an arg") {
-            DataType::Integer | DataType::Bigint => Ok(DataType::Bigint),
-            // Step 4 gives SUM a 128-bit accumulator and a HUGEINT result.
-            DataType::Hugeint | DataType::Uhugeint => Err(PinkDbError::Type(format!(
-                "SUM over {} is not yet supported (step 4 of the HUGEINT plan)",
+            // SUM over any integer is HUGEINT (DuckDB); the accumulator is
+            // exact in i128, so no intermediate total can overflow it.
+            DataType::Integer | DataType::Bigint | DataType::Hugeint => Ok(DataType::Hugeint),
+            DataType::Uhugeint => Err(PinkDbError::Type(format!(
+                "SUM over {} is not yet supported (step 8 of the HUGEINT plan)",
                 arg.expect("sum has an arg").name()
             ))),
             DataType::Double => Ok(DataType::Double),

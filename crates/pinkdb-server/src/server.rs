@@ -427,8 +427,6 @@ fn row_encoded_len(row: &[Value]) -> usize {
                 Value::Decimal { .. } => 16 + 1,
                 Value::Interval { .. } => 16,
                 Value::Uuid(_) => 16,
-                // No wire tag yet (step 6 of the HUGEINT plan); the encoder
-                // refuses it, so only the estimate needs a size.
                 Value::Hugeint(_) | Value::Uhugeint(_) => 16,
                 Value::Varchar(s) => 4 + s.len(),
                 // A VARIANT's wire length is its encoding's length; encoding

@@ -2097,7 +2097,7 @@ mod tests {
         // own decode.
         assert_eq!(
             query(&mut db, "SELECT SUM(a) FROM t AT (VERSION => 2);"),
-            vec![vec![Value::Bigint(3)]]
+            vec![vec![Value::Hugeint(3)]]
         );
         assert_eq!(lake.loads.load(Ordering::Relaxed), 1);
     }

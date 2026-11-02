@@ -136,6 +136,8 @@ _TYPE_DECIMAL = 8
 _TYPE_INTERVAL = 9
 _TYPE_ARRAY = 11
 _TYPE_ARRAY_FLOAT = 12
+_TYPE_HUGEINT = 13
+_TYPE_UHUGEINT = 14
 
 _TYPE_NAMES = {
     _TYPE_NULL: "null",
@@ -148,6 +150,8 @@ _TYPE_NAMES = {
     _TYPE_TIMESTAMP: "timestamp",
     _TYPE_DECIMAL: "decimal",
     _TYPE_INTERVAL: "interval",
+    _TYPE_HUGEINT: "hugeint",
+    _TYPE_UHUGEINT: "uhugeint",
 }
 
 def _type_name(tag: int) -> str:
@@ -486,9 +490,9 @@ def _value_to_python(v: _PinkValue):
         return list(
             _struct.unpack(f"<{count}{code}", ctypes.string_at(v.text_ptr, v.text_len))
         )
-    if tag in (_TYPE_DECIMAL, _TYPE_INTERVAL):
+    if tag in (_TYPE_DECIMAL, _TYPE_INTERVAL, _TYPE_HUGEINT, _TYPE_UHUGEINT):
         if not v.text_ptr or v.text_len == 0:
-            return "" if tag == _TYPE_INTERVAL else _decimal.Decimal(0)
+            return _decimal.Decimal(0) if tag == _TYPE_DECIMAL else ""
         text = ctypes.string_at(v.text_ptr, v.text_len).decode("utf-8")
         return _decimal.Decimal(text) if tag == _TYPE_DECIMAL else text
     raise Error(f"unknown value type tag {tag} from the native library")

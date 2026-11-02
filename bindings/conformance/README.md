@@ -33,6 +33,14 @@ The `type` string is exactly the pinkdb type name that the C ABI reports in
 | `timestamp` | `YYYY-MM-DD HH:MM:SS.ffffff` | always exactly six fractional digits; µs since the epoch on the wire, naive UTC |
 | `decimal` | canonical decimal string | scale-preserving text from the engine (`12.350`, `-0.01`) |
 | `interval` | canonical interval string | text from the engine (`1 day 02:00:00`, `-3 months`) |
+| `hugeint` | exact decimal string | the engine's text, e.g. `170141183460469231731687303715884105727`; never a JSON number (it would lose digits) |
+| `uhugeint` | exact decimal string | as `hugeint`, unsigned |
+
+The 128-bit integers cross the ABI as text cells (tags 13 and 14), the same
+channel as `decimal` and `interval`: no binding has a lossless numeric type on
+every path (a JS number is 53-bit, a Go `database/sql` value is 64-bit), so all
+three surface them as strings. A test converts with `int(...)` / `BigInt(...)`
+when it wants arithmetic.
 
 `decimal` and `interval` values are never bound as parameters in ABI v1 — the corpus
 binds their canonical text and `CAST(? AS DECIMAL(p,s))` / `CAST(? AS INTERVAL)`s it

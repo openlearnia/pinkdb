@@ -196,7 +196,7 @@ fn a_values_list_spans_several_chunks() {
         rows(out),
         vec![vec![
             Value::Bigint(5_000),
-            Value::Bigint(12_497_500),
+            Value::Hugeint(12_497_500),
             Value::Varchar("r999".into())
         ]]
     );

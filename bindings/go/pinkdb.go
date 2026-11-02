@@ -205,6 +205,11 @@ const (
 	// typeArrayFloat is a FLOAT[N] cell: 4-byte elements, count packed into
 	// the tag exactly like typeArray.
 	typeArrayFloat int32 = 12
+	// typeHugeint and typeUhugeint are 128-bit integer cells carried as
+	// exact decimal text (no Go value type in this ABI's value set can hold
+	// one, and the text is what the engine prints).
+	typeHugeint  int32 = 13
+	typeUhugeint int32 = 14
 )
 
 var typeNames = map[int32]string{
@@ -217,6 +222,8 @@ var typeNames = map[int32]string{
 	typeDate:      "date",
 	typeTimestamp: "timestamp",
 	typeDecimal:   "decimal",
+	typeHugeint:   "hugeint",
+	typeUhugeint:  "uhugeint",
 	typeInterval:  "interval",
 }
 
@@ -833,9 +840,10 @@ func valueToGo(v C.pink_value) (any, error) {
 		return dateFromDays(int64(v.int64))
 	case typeTimestamp:
 		return timestampFromMicros(int64(v.int64))
-	case typeDecimal, typeInterval:
-		// DECIMAL and INTERVAL arrive as text cells (the FFI's canonical
-		// text); Go has no built-in decimal, so both surface as strings.
+	case typeDecimal, typeInterval, typeHugeint, typeUhugeint:
+		// DECIMAL, INTERVAL and the 128-bit integers arrive as text cells
+		// (the FFI's canonical text); Go has no built-in decimal and
+		// database/sql values are 64-bit, so they surface as strings.
 		if v.text_ptr == nil || v.text_len == 0 {
 			return "", nil
 		}

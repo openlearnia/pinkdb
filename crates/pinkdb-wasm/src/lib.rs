@@ -153,11 +153,11 @@ fn push_value(out: &mut String, v: &Value) {
         | Value::Uuid(_) => {
             push_json_string(out, &v.to_string());
         }
-        // The JSON ABI has no 128-bit integer kind yet (step 6 of the HUGEINT
-        // plan); `pw_execute` refuses such a result instead of rounding it.
-        Value::Hugeint(_) | Value::Uhugeint(_) => {
-            unreachable!("pw_execute refuses 128-bit integer results")
-        }
+        // A 128-bit integer always crosses as text: even a small HUGEINT is
+        // outside the range a JS number can hold exactly without care, and a
+        // consumer that wants a BigInt can parse the string.
+        Value::Hugeint(x) => push_json_string(out, &x.to_string()),
+        Value::Uhugeint(x) => push_json_string(out, &x.to_string()),
     }
 }
 
@@ -319,17 +319,6 @@ fn push_result(out: &mut String, r: &QueryResult) {
     }
 }
 
-/// `{"ok":true,"results":[...]}` for a successful execution.
-fn wide_type_in(results: &[QueryResult]) -> Option<String> {
-    results.iter().find_map(|r| match r {
-        QueryResult::Selected { types, .. } => types
-            .iter()
-            .find(|t| matches!(t, pinkdb::DataType::Hugeint | pinkdb::DataType::Uhugeint))
-            .map(|t| format!("{} is not yet supported in the WASM binding", t.name())),
-        _ => None,
-    })
-}
-
 fn results_json(results: &[QueryResult]) -> String {
     let mut out = String::from("{\"ok\":true,\"results\":[");
     for (i, r) in results.iter().enumerate() {
@@ -472,10 +461,7 @@ pub extern "C" fn pw_exec(handle: u32, sql: *const u8, len: u32) -> *mut u8 {
         };
         match with_db(handle, |db| db.execute(sql)) {
             None => error_json(&format!("unknown handle {handle}")),
-            Some(Ok(results)) => match wide_type_in(&results) {
-                Some(e) => error_json(&e),
-                None => results_json(&results),
-            },
+            Some(Ok(results)) => results_json(&results),
             Some(Err(e)) => error_json(&e.to_string()),
         }
     }))
@@ -557,15 +543,15 @@ mod tests {
     }
 
     #[test]
-    fn hugeint_results_name_the_binding_boundary() {
-        let results = [QueryResult::Selected {
-            names: vec!["h".to_string()],
-            types: vec![pinkdb::DataType::Hugeint],
-            rows: Vec::new(),
-        }];
+    fn hugeint_values_cross_as_text() {
         assert_eq!(
-            wide_type_in(&results).as_deref(),
-            Some("HUGEINT is not yet supported in the WASM binding")
+            json_of(&Value::Hugeint(i128::MIN)),
+            "\"-170141183460469231731687303715884105728\""
+        );
+        assert_eq!(json_of(&Value::Hugeint(-1)), "\"-1\"");
+        assert_eq!(
+            json_of(&Value::Uhugeint(u128::MAX)),
+            "\"340282366920938463463374607431768211455\""
         );
     }
 
