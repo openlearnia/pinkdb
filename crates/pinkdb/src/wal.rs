@@ -2521,7 +2521,7 @@ impl Wal {
     pub(crate) fn checkpoint(
         &mut self,
         guard: &LeaseGuard,
-        save_tmp: impl FnOnce(&Path) -> Result<()>,
+        save: impl FnOnce(&Path, &Path, u64, u64) -> Result<super::persist::CheckpointSave>,
     ) -> Result<()> {
         self.absorb_sync_failure();
         if self.poisoned.is_some() {
@@ -2548,19 +2548,21 @@ impl Wal {
                 roll.display()
             )));
         }
-        // 1. Full state to `.tmp`, fsynced by the writer, then the directory:
-        //    a surviving roll is recovery's proof that `.tmp` is complete.
-        save_tmp(&tmp)?;
-        sync_parent_dir(&tmp);
+        let fresh_gen = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| PinkDbError::Execution("WAL generation counter overflow".to_string()))?;
+        // 1. Full state to `.tmp`, fsynced by the writer, or an in-place
+        //    checkpoint that already wrote its data, footer, and new slot.
+        let kind = save(&tmp, &self.checkpoint_path, self.generation, fresh_gen)?;
+        if kind == super::persist::CheckpointSave::Full {
+            sync_parent_dir(&tmp);
+        }
         // 2. Roll the generation: the old records move to a name carrying
         //    their generation (never overwritten), a fresh WAL starts at
         //    generation + 1 with a fresh `wal_id`. The fresh container cipher is
         //    prepared before the rename so a crypto failure cannot leave the
         //    WAL rolled.
-        let fresh_gen = self
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| PinkDbError::Execution("WAL generation counter overflow".to_string()))?;
         let fresh_cipher = match &self.cipher {
             Some(c) => Some(c.fork(fresh_gen)?),
             None => None,
@@ -2632,12 +2634,25 @@ impl Wal {
         // The roll rename and the fresh WAL must be durable before the
         // publish that supersedes them.
         sync_parent_dir(&self.path);
-        // 3. Publish the checkpoint atomically.
-        if let Err(e) = std::fs::rename(&tmp, &self.checkpoint_path) {
-            self.poisoned = Some(format!("failed to publish checkpoint: {e}"));
-            return Err(e.into());
+        // 3. A full rewrite publishes its `.tmp` atomically. An in-place
+        //    checkpoint published its other slot before this roll; its marker
+        //    is what recovery uses if the roll did not finish.
+        if kind == super::persist::CheckpointSave::Full {
+            if let Err(e) = std::fs::rename(&tmp, &self.checkpoint_path) {
+                self.poisoned = Some(format!("failed to publish checkpoint: {e}"));
+                return Err(e.into());
+            }
+            sync_parent_dir(&self.checkpoint_path);
+            // A full rewrite replaces the file, so any marker from a failed
+            // in-place attempt describes a slot that no longer exists.
+            let _ = remove_checkpoint_marker(&self.checkpoint_path);
+        } else if let Err(e) = remove_checkpoint_marker(&self.checkpoint_path) {
+            // The checkpoint is durable, but a marker left behind while this
+            // process keeps appending would make recovery discard the new
+            // records. Refuse further writes instead.
+            self.poisoned = Some(format!("failed to clear the checkpoint marker: {e}"));
+            return Err(e);
         }
-        sync_parent_dir(&self.checkpoint_path);
         guard.bump_epoch(0);
         self.applied.ckpt = ckpt_meta(&self.checkpoint_path);
         // 4. The old generation is now folded into the published `.pink`. A
@@ -4034,6 +4049,74 @@ fn tmp_path(checkpoint: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// The sidecar proving an in-place checkpoint reached its new header slot.
+/// It is written before the slot, so a valid marker plus a published slot
+/// means the old WAL generation is folded into the new checkpoint even if the
+/// process died before rolling it.
+const CHECKPOINT_MARKER_MAGIC: &[u8; 8] = b"PINKCPK1";
+const CHECKPOINT_MARKER_LEN: usize = 36;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CheckpointMarker {
+    pub iteration: u64,
+    pub wal_generation: u64,
+    pub next_generation: u64,
+}
+
+fn checkpoint_marker_path(checkpoint: &Path) -> PathBuf {
+    let mut s = checkpoint.as_os_str().to_os_string();
+    s.push(".ckpt");
+    PathBuf::from(s)
+}
+
+pub(crate) fn write_checkpoint_marker(checkpoint: &Path, marker: CheckpointMarker) -> Result<()> {
+    use std::io::Write;
+    let path = checkpoint_marker_path(checkpoint);
+    let mut bytes = Vec::with_capacity(CHECKPOINT_MARKER_LEN);
+    bytes.extend_from_slice(CHECKPOINT_MARKER_MAGIC);
+    bytes.extend_from_slice(&marker.iteration.to_le_bytes());
+    bytes.extend_from_slice(&marker.wal_generation.to_le_bytes());
+    bytes.extend_from_slice(&marker.next_generation.to_le_bytes());
+    let crc = crc32(&bytes);
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    let mut file = crate::fsutil::create_private(&path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    sync_parent_dir(&path);
+    Ok(())
+}
+
+fn read_checkpoint_marker(checkpoint: &Path) -> Result<Option<CheckpointMarker>> {
+    let path = checkpoint_marker_path(checkpoint);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if bytes.len() != CHECKPOINT_MARKER_LEN || &bytes[..8] != CHECKPOINT_MARKER_MAGIC {
+        return Ok(None);
+    }
+    let crc = u32::from_le_bytes(bytes[32..36].try_into().expect("4 bytes"));
+    if crc32(&bytes[..32]) != crc {
+        return Ok(None);
+    }
+    Ok(Some(CheckpointMarker {
+        iteration: u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes")),
+        wal_generation: u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes")),
+        next_generation: u64::from_le_bytes(bytes[24..32].try_into().expect("8 bytes")),
+    }))
+}
+
+fn remove_checkpoint_marker(checkpoint: &Path) -> Result<()> {
+    let path = checkpoint_marker_path(checkpoint);
+    match std::fs::remove_file(&path) {
+        Ok(()) => sync_parent_dir(&path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
 /// `<wal>.rewrite`: temp file for the atomic rewrite of a truncated encrypted
 /// WAL (never matched by `scan_rolls`, which only looks at `.roll` names).
 fn rewrite_path(wal: &Path) -> PathBuf {
@@ -4513,6 +4596,96 @@ fn check_recovery_mode(ckpt: &Path, tmp: &Path, key: Option<&EncryptionKey>) -> 
     Ok(())
 }
 
+/// Read the iteration the checkpoint names right now, without parsing the
+/// footer. A missing/corrupt pair of slots means no checkpoint is published.
+fn checkpoint_iteration(path: &Path) -> Result<Option<u64>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut header = vec![0u8; 2 * crate::persist::HEADER_SLOT_LEN];
+    if file.read_exact(&mut header).is_err() {
+        return Ok(None);
+    }
+    Ok(crate::persist::read_slots(&header).map(|(_, slot)| slot.iteration))
+}
+
+/// Finish the part of an in-place checkpoint that follows its header slot: the
+/// marker is written before the slot, so a marker plus a published slot proves
+/// the old WAL generation is already folded into the checkpoint even if the
+/// process died before rolling it. Returns true when it handled recovery.
+fn recover_incremental_checkpoint(
+    ckpt: &Path,
+    wal: &Path,
+    tmp: &Path,
+    rolls: &[Roll],
+    live_gen: Option<u64>,
+    info: &mut RecoveryInfo,
+    key: Option<&EncryptionKey>,
+) -> Result<bool> {
+    let Some(marker) = read_checkpoint_marker(ckpt)? else {
+        return Ok(false);
+    };
+    if key.is_some() {
+        // In-place checkpoints are plaintext-only; an encrypted open must not
+        // interpret a leftover plaintext sidecar.
+        let _ = remove_checkpoint_marker(ckpt);
+        return Ok(false);
+    }
+    if marker.next_generation != marker.wal_generation.saturating_add(1) {
+        let _ = remove_checkpoint_marker(ckpt);
+        return Ok(false);
+    }
+    let published = checkpoint_iteration(ckpt)? == Some(marker.iteration);
+    if !published {
+        // The slot is the commit point: without it the old checkpoint and the
+        // live WAL are still the authority, and the marker/damaged tail is
+        // ignored by readers.
+        let _ = remove_checkpoint_marker(ckpt);
+        return Ok(false);
+    }
+    if let Some(roll) = rolls
+        .iter()
+        .find(|r| r.generation >= marker.next_generation)
+    {
+        return Err(inconsistent_roll(
+            &roll.path,
+            roll.generation,
+            marker.next_generation,
+        ));
+    }
+    if live_gen.is_some_and(|g| g >= marker.next_generation) {
+        // The roll completed and this process kept committing afterwards.
+        // Those records are newer than the checkpoint; keep the live WAL.
+        info.stale_rolls_removed += remove_rolls(rolls);
+        let _ = std::fs::remove_file(tmp);
+        remove_checkpoint_marker(ckpt)?;
+        return Ok(true);
+    }
+    if let Some(g) = live_gen
+        && g != marker.wal_generation
+    {
+        return Err(PinkDbError::Execution(format!(
+            "checkpoint marker expects WAL generation {} but the live WAL is generation {g}",
+            marker.wal_generation
+        )));
+    }
+    // The live WAL still carries the generation the checkpoint folded in (or
+    // was torn/removed during the roll). Drop it and start the generation the
+    // roll would have created; its records are never replayed twice.
+    match std::fs::remove_file(wal) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    info.stale_rolls_removed += remove_rolls(rolls);
+    Wal::create_file(wal, marker.next_generation, None)?;
+    let _ = std::fs::remove_file(tmp);
+    remove_checkpoint_marker(ckpt)?;
+    Ok(true)
+}
+
 /// Finish an interrupted checkpoint (see the module docs for the full state
 /// machine). Never removes anything before the recovered state is durable.
 fn recover_checkpoint(
@@ -4527,6 +4700,9 @@ fn recover_checkpoint(
     check_recovery_mode(ckpt, tmp, key)?;
     let live_gen = probe.and_then(|p| p.generation);
     let live_records = probe.map(|p| p.has_records).unwrap_or(false);
+    if recover_incremental_checkpoint(ckpt, wal, tmp, rolls, live_gen, info, key)? {
+        return Ok(());
+    }
 
     if !tmp.exists() {
         if !rolls.is_empty() {
@@ -4740,9 +4916,16 @@ impl PinkDb {
         let mut mutated = false;
 
         // 1. Finish an interrupted checkpoint before loading anything.
-        let rolls = scan_rolls(&wal)?;
-        let probe = probe_wal(&wal, key)?;
+        let had_marker = checkpoint_marker_path(&ckpt).exists();
+        let mut rolls = scan_rolls(&wal)?;
+        let mut probe = probe_wal(&wal, key)?;
         recover_checkpoint(&ckpt, &wal, &tmp, &rolls, probe.as_ref(), &mut info, key)?;
+        if had_marker {
+            // Marker recovery may have replaced the live WAL, so the probe
+            // taken before it no longer describes the file to open.
+            rolls = scan_rolls(&wal)?;
+            probe = probe_wal(&wal, key)?;
+        }
         if info.checkpoints_completed > 0 || info.stale_rolls_removed > 0 {
             mutated = true;
         }
@@ -4936,7 +5119,11 @@ impl PinkDb {
         //    must not read the whole WAL (probe authenticates records).
         let rolls = scan_rolls(&wal_path)?;
         let mut info = RecoveryInfo::default();
-        if tmp.exists() || !rolls.is_empty() || wal_header_invalid(&wal_path)? {
+        if tmp.exists()
+            || !rolls.is_empty()
+            || checkpoint_marker_path(&ckpt).exists()
+            || wal_header_invalid(&wal_path)?
+        {
             let probe = probe_wal(&wal_path, key.as_ref())?;
             recover_checkpoint(
                 &ckpt,
@@ -5521,8 +5708,13 @@ impl PinkDb {
                 ));
             }
             match key {
-                Some(k) => guard_wal.checkpoint(guard, |tmp| self.save_sync_with_key(tmp, &k))?,
-                None => guard_wal.checkpoint(guard, |tmp| self.save_sync(tmp))?,
+                Some(k) => guard_wal.checkpoint(guard, |tmp, _, _, _| {
+                    self.save_sync_with_key(tmp, &k)?;
+                    Ok(crate::persist::CheckpointSave::Full)
+                })?,
+                None => guard_wal.checkpoint(guard, |tmp, target, generation, next| {
+                    self.save_checkpoint_sync(tmp, target, generation, next)
+                })?,
             }
         }
         #[cfg(not(feature = "encryption"))]
@@ -5530,7 +5722,9 @@ impl PinkDb {
             if self.encryption_key.is_some() {
                 return Err(crate::crypto::unavailable());
             }
-            guard_wal.checkpoint(guard, |tmp| self.save_sync(tmp))?;
+            guard_wal.checkpoint(guard, |tmp, target, generation, next| {
+                self.save_checkpoint_sync(tmp, target, generation, next)
+            })?;
         }
         // A fresh WAL generation replays from the checkpoint's session
         // default (the checkpoint does not store a session): reset the
@@ -7243,6 +7437,308 @@ mod tests {
         cleanup(&p);
     }
 
+    fn image_layout(p: &Path) -> Vec<(String, Vec<(u64, u64)>)> {
+        let data = std::fs::read(p).unwrap();
+        let (offset, len, _) = crate::persist::footer_location(&data, data.len() as u64).unwrap();
+        let layout = crate::persist::read_layout(
+            &data[offset as usize..(offset + len) as usize],
+            None,
+            offset,
+        )
+        .unwrap();
+        layout
+            .tables
+            .into_iter()
+            .map(|t| {
+                let spans = t
+                    .row_groups
+                    .iter()
+                    .flat_map(|g| g.columns.iter().map(|c| (c.offset, c.length)))
+                    .collect();
+                (format!("{}.{}", t.db, t.table), spans)
+            })
+            .collect()
+    }
+
+    fn iteration(p: &Path) -> u64 {
+        let data = std::fs::read(p).unwrap();
+        crate::persist::read_slots(&data[..2 * crate::persist::HEADER_SLOT_LEN])
+            .unwrap()
+            .1
+            .iteration
+    }
+
+    #[test]
+    fn incremental_checkpoints_round_trip_and_reuse_free_ranges() {
+        let p = tmp_ckpt("incremental");
+        let full = tmp_ckpt("incremental_full");
+        let inode_before;
+        {
+            let mut db = durable(&p);
+            db.execute("CREATE TABLE touched (a INTEGER, v VARCHAR);")
+                .unwrap();
+            db.execute("CREATE TABLE untouched (a INTEGER);").unwrap();
+            let values = (1..=200_000)
+                .map(|i| format!("({i}, 'v{i}')"))
+                .collect::<Vec<_>>()
+                .join(",");
+            db.execute(&format!("INSERT INTO touched VALUES {values};"))
+                .unwrap();
+            let values = (1..=20_000)
+                .map(|i| format!("({i})"))
+                .collect::<Vec<_>>()
+                .join(",");
+            db.execute(&format!("INSERT INTO untouched VALUES {values};"))
+                .unwrap();
+            db.checkpoint().unwrap();
+            inode_before = file_identity(&p);
+            let mut last_iteration = iteration(&p);
+            let layout_before = image_layout(&p);
+            let touched_before = layout_before
+                .iter()
+                .find(|(name, _)| name.ends_with(".touched"))
+                .unwrap()
+                .1
+                .clone();
+            let untouched_before = layout_before
+                .into_iter()
+                .find(|(name, _)| name.ends_with(".untouched"))
+                .unwrap()
+                .1;
+            let bytes_before = std::fs::read(&p).unwrap();
+            for round in 1..=8 {
+                db.execute(&format!("UPDATE touched SET v = 'x' WHERE a = {round};"))
+                    .unwrap();
+                db.checkpoint().unwrap();
+                let now = iteration(&p);
+                let free: u64 = crate::persist::footer_free_ranges_for_test(&p)
+                    .unwrap()
+                    .iter()
+                    .map(|&(_, len)| len)
+                    .sum();
+                assert!(
+                    now > last_iteration,
+                    "iteration must advance round={round} free={free} len={} last={last_iteration} now={now}",
+                    std::fs::metadata(&p).unwrap().len()
+                );
+                last_iteration = now;
+                let layout = image_layout(&p);
+                let untouched = layout
+                    .iter()
+                    .find(|(name, _)| name.ends_with(".untouched"))
+                    .unwrap()
+                    .1
+                    .clone();
+                assert_eq!(
+                    untouched, untouched_before,
+                    "a clean table's row groups must not move"
+                );
+                let bytes_after = std::fs::read(&p).unwrap();
+                for (offset, len) in &untouched {
+                    let span = *offset as usize..(*offset + *len) as usize;
+                    assert_eq!(
+                        &bytes_after[span.clone()],
+                        &bytes_before[span],
+                        "a clean table's bytes must not be rewritten"
+                    );
+                }
+                let free_ranges = crate::persist::footer_free_ranges_for_test(&p).unwrap();
+                assert!(
+                    !free_ranges.is_empty(),
+                    "the superseded group and footer must leave free ranges"
+                );
+                if round == 2 {
+                    let touched_now = layout
+                        .iter()
+                        .find(|(name, _)| name.ends_with(".touched"))
+                        .unwrap()
+                        .1
+                        .clone();
+                    assert_eq!(
+                        touched_now.first(),
+                        touched_before.first(),
+                        "the next checkpoint must reuse the first group's freed range"
+                    );
+                }
+            }
+            assert_eq!(
+                file_identity(&p),
+                inode_before,
+                "in place means the file is not replaced"
+            );
+            // A schema change in the middle of the sequence.
+            db.execute("ALTER TABLE touched ADD COLUMN b INTEGER DEFAULT 42;")
+                .unwrap();
+            db.checkpoint().unwrap();
+            db.execute("DELETE FROM touched WHERE a % 2 = 0;").unwrap();
+            db.checkpoint().unwrap();
+        }
+        let mut back = durable(&p);
+        let rows = ints(&mut back, "SELECT SUM(a) FROM touched;");
+        back.save(full.to_str().unwrap()).unwrap();
+        drop(back);
+        let mut rewritten = durable(&full);
+        assert_eq!(
+            rows,
+            ints(&mut rewritten, "SELECT SUM(a) FROM touched;"),
+            "incremental and full rewrite must agree"
+        );
+        assert_eq!(
+            ints(&mut rewritten, "SELECT SUM(a) FROM untouched;"),
+            vec![200_010_000]
+        );
+        cleanup(&p);
+        cleanup(&full);
+    }
+
+    #[test]
+    fn checkpoint_crashes_recover_one_complete_state() {
+        for (tag, fault) in [
+            ("afterdata", crate::persist::CheckpointFault::AfterData),
+            ("aftersync", crate::persist::CheckpointFault::AfterFirstSync),
+            ("tornslot", crate::persist::CheckpointFault::TornSlot),
+            ("afterslot", crate::persist::CheckpointFault::AfterSlot),
+        ] {
+            let p = tmp_ckpt(tag);
+            {
+                let mut db = durable(&p);
+                db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+                db.execute("INSERT INTO t VALUES (1);").unwrap();
+                db.checkpoint().unwrap();
+                db.execute("INSERT INTO t VALUES (2);").unwrap();
+                crate::persist::set_checkpoint_fault(Some(fault));
+                let err = db.checkpoint().unwrap_err();
+                assert!(err.to_string().contains("injected"), "{err}");
+                crate::persist::set_checkpoint_fault(None);
+                assert!(
+                    scan_rolls(&wal_path(&p)).unwrap().is_empty(),
+                    "{tag}: the WAL must not roll before the slot is durable"
+                );
+            }
+            let (mut back, info) =
+                PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+            assert_eq!(
+                ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+                vec![1, 2],
+                "{tag}: reopen must see the committed insert exactly once"
+            );
+            if fault == crate::persist::CheckpointFault::AfterSlot {
+                assert_eq!(
+                    info.replayed_records, 0,
+                    "{tag}: the marker must fold the unrolled generation"
+                );
+            } else {
+                assert_eq!(
+                    info.replayed_records, 1,
+                    "{tag}: the old slot plus WAL replay must be the state"
+                );
+            }
+            assert!(
+                !checkpoint_marker_path(&p).exists(),
+                "{tag}: recovery must clear the marker"
+            );
+            drop(back);
+            let mut again = durable(&p);
+            assert_eq!(
+                ints(&mut again, "SELECT a FROM t ORDER BY a;"),
+                vec![1, 2],
+                "{tag}: a second open must not replay anything again"
+            );
+            cleanup(&p);
+        }
+    }
+
+    #[test]
+    fn a_torn_newer_incremental_slot_loses_to_the_older_one() {
+        let p = tmp_ckpt("tornnewer");
+        {
+            let mut db = durable(&p);
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            db.execute("INSERT INTO t VALUES (1);").unwrap();
+            db.checkpoint().unwrap();
+            db.execute("INSERT INTO t VALUES (2);").unwrap();
+            db.checkpoint().unwrap();
+            db.execute("INSERT INTO t VALUES (3);").unwrap();
+            crate::persist::set_checkpoint_fault(Some(crate::persist::CheckpointFault::TornSlot));
+            db.checkpoint().unwrap_err();
+            crate::persist::set_checkpoint_fault(None);
+        }
+        let (mut back, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        assert_eq!(info.replayed_records, 1);
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+            vec![1, 2, 3]
+        );
+        cleanup(&p);
+    }
+
+    #[test]
+    fn a_large_free_list_triggers_a_compacting_full_rewrite() {
+        let p = tmp_ckpt("compact");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE big (a INTEGER, v VARCHAR);")
+            .unwrap();
+        db.execute("CREATE TABLE keep (a INTEGER);").unwrap();
+        let values = (1..=20_000)
+            .map(|i| format!("({i}, 'some-text-{i}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        db.execute(&format!("INSERT INTO big VALUES {values};"))
+            .unwrap();
+        db.execute("INSERT INTO keep VALUES (7);").unwrap();
+        db.checkpoint().unwrap();
+        let before = std::fs::metadata(&p).unwrap().len();
+        db.execute("DROP TABLE big;").unwrap();
+        db.checkpoint().unwrap();
+        assert!(
+            crate::persist::footer_free_ranges_for_test(&p)
+                .unwrap()
+                .iter()
+                .map(|&(_, len)| len)
+                .sum::<u64>()
+                * 2
+                > std::fs::metadata(&p).unwrap().len(),
+            "the dropped table must leave over half the file free"
+        );
+        db.checkpoint().unwrap();
+        assert_eq!(iteration(&p), 1, "a compaction resets the iteration");
+        assert!(
+            crate::persist::footer_free_ranges_for_test(&p)
+                .unwrap()
+                .is_empty(),
+            "a full rewrite writes an empty free list"
+        );
+        assert!(std::fs::metadata(&p).unwrap().len() < before);
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT a FROM keep;"), vec![7]);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn bytes_past_the_published_file_len_are_ignored_and_reclaimed() {
+        let p = tmp_ckpt("pastlen");
+        {
+            let mut db = durable(&p);
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            db.execute("INSERT INTO t VALUES (1);").unwrap();
+            db.checkpoint().unwrap();
+        }
+        let mut with_junk = std::fs::read(&p).unwrap();
+        with_junk.extend_from_slice(b"JUNK-PAST-FILE-LEN");
+        std::fs::write(&p, &with_junk).unwrap();
+        let mut db = durable(&p);
+        assert_eq!(ints(&mut db, "SELECT a FROM t;"), vec![1]);
+        db.checkpoint().unwrap();
+        let after = std::fs::read(&p).unwrap();
+        assert!(
+            !after.ends_with(b"JUNK-PAST-FILE-LEN"),
+            "the next checkpoint must truncate or overwrite stale bytes"
+        );
+        cleanup(&p);
+    }
+
     /// H2: a refresh replays another process's `USE` in the WAL lineage
     /// session but must never let it hijack this process's local session.
     #[test]
@@ -8897,6 +9393,29 @@ mod tests {
             assert!(!tmp_path(&p).exists());
             assert!(scan_rolls(&wal_path(&p)).unwrap().is_empty());
             drop(again);
+            cleanup(&p);
+        }
+
+        #[test]
+        fn an_encrypted_checkpoint_is_a_full_rewrite() {
+            let p = tmp_ckpt("encincremental");
+            let mut db = durable_keyed(&p);
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            db.execute("INSERT INTO t VALUES (1);").unwrap();
+            db.checkpoint().unwrap();
+            let first = file_identity(&p);
+            assert!(!checkpoint_marker_path(&p).exists());
+            db.execute("INSERT INTO t VALUES (2);").unwrap();
+            db.checkpoint().unwrap();
+            assert_ne!(
+                file_identity(&p),
+                first,
+                "encrypted checkpoints still publish a new file"
+            );
+            assert!(!checkpoint_marker_path(&p).exists());
+            drop(db);
+            let mut back = durable_keyed(&p);
+            assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
             cleanup(&p);
         }
 
