@@ -3438,3 +3438,31 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   recorded, with the remaining aggregate, delim-join and ingest work as rows 111b1,
   111c and 111b4. Default CLI +37.8 kB (+0.68 %), no new dependencies. Plan:
   [docs/wave-111ab-plan.md](docs/wave-111ab-plan.md).
+- 2026-11-01 — Wave 136 (steps w1–w2): the `.pink` **v7 layout** on the streamed
+  writer (stream A's `Sink`, stream C's open/load and layout). Two 4 KiB header
+  slots at offsets 0 and 4096 (`PINKDB07 | iteration | footer offset | footer
+  length | footer CRC32C | file length | slot CRC32C`, zero-padded), the data
+  region at 8192 and the footer after it; no trailer. The reader validates both
+  slots, ignores one whose `file_len` exceeds the actual file, takes the valid
+  slot with the higher iteration, and needs two ranged requests — the first
+  8 KiB and the footer — while the lake catalog's recorded footer location
+  still costs one. The footer gains a `free_ranges` section (sorted,
+  non-overlapping data-region ranges no row group references), written empty by
+  the full rewrite and range-checked then ignored by readers, for 136w3's
+  append-only checkpoints (documented, not implemented: append data + footer,
+  fsync, write the *other* slot with `iteration + 1`, fsync; `write_slot` and
+  `read_slots` are `pub(crate)`). `.save`/`CHECKPOINT` stream the data region
+  one row group at a time through a positioned `Sink`, copying clean chunks
+  byte for byte (same length, pages, encodings, CRC, stats, zone) and
+  re-encoding only dirty chunks and ALTERed tables; re-encoded chunks are
+  repointed at a per-save carry image so they become clean and evictable, while
+  chunks built in memory stay dirty so a bulk load never retains its data
+  region. `MAGIC_V6`, `TRAILER_LEN`, `parse_trailer`, the trailer-span helpers
+  and the trailer sniffers are gone (`is_pinkdb` checks the magic at offset 0);
+  a v6 file gets the older-pinkdb error. Golden pin regenerated. TPC-H SF 1
+  (own store per binary, release CLI, 6 interleaved runs): store 323,458,661 B
+  (v6 323,450,485 B); open 0.08 s / 356 MB peak RSS on both; save of an
+  unchanged store 0.34 s / 363 MB peak (v6 0.54 s / 688 MB), i.e. +7 MB over
+  open instead of +333 MB; checkpoint after a one-row update 0.31 s (v6
+  0.45 s), whole-process peak 1712 MB (v6 2036 MB); 22-query 3-round A/B
+  geomean 1.02, sum 563 → 580 ms (parity, load average 5.9–7.8).

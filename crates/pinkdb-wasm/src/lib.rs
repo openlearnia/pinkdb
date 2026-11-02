@@ -658,7 +658,7 @@ mod tests {
         let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
         // SAFETY: `snap` is valid for `4 + len` bytes.
         let bytes = unsafe { std::slice::from_raw_parts(snap.add(4), len) };
-        assert!(pinkdb::persist::is_pinkdb06(bytes));
+        assert!(pinkdb::persist::is_pinkdb(bytes));
         let h2 = pw_open();
         assert!(h2 > 0);
         let restore = pw_restore(h2, bytes.as_ptr(), bytes.len() as u32);

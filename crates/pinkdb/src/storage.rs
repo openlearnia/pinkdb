@@ -407,6 +407,15 @@ impl ChunkHandle {
         state.encoded.clone()
     }
 
+    /// Whether the chunk has a stored form to point at after a save.
+    ///
+    /// A chunk that came from an image keeps one when a save re-encodes it; a
+    /// chunk built in memory has none, so a save leaves it dirty (holding its
+    /// bytes would hold the whole data region of a bulk load).
+    fn has_stored_form(&self) -> bool {
+        self.lock().encoded.is_some()
+    }
+
     /// Point the chunk at the image a save just wrote, at bytes that are its
     /// stored form. Returns whether the chunk was dirty: a saved write is
     /// stored now, so the cache may evict it.
@@ -769,16 +778,27 @@ impl Column {
         Some((image, encoded))
     }
 
-    /// Point the column's chunks at the image a save wrote: `ranges` holds each
-    /// chunk's `(offset, length, rows)` there, in chunk order. A chunk that was
-    /// dirty is stored now, so it becomes an eviction candidate.
-    pub(crate) fn repoint(&self, image: &Arc<StoreImage>, ranges: &[(u64, u64, usize)]) {
+    /// Point one chunk at the image a save wrote: `offset` and `length` are
+    /// its page there. A dirty chunk is stored now, so it becomes an eviction
+    /// candidate.
+    pub(crate) fn repoint_chunk(
+        &self,
+        i: usize,
+        image: &Arc<StoreImage>,
+        offset: u64,
+        length: u64,
+        rows: usize,
+    ) {
         install_evictor();
-        for (handle, &(offset, length, rows)) in self.chunks.iter().zip(ranges) {
-            if handle.repoint(image, offset, length, rows) {
-                let _ = register;
-            }
+        let handle = &self.chunks[i];
+        if handle.repoint(image, offset, length, rows) {
+            register(&Arc::downgrade(handle));
         }
+    }
+
+    /// Whether chunk `i` has a stored form to point at after a save.
+    pub(crate) fn has_stored_form(&self, i: usize) -> bool {
+        self.chunks[i].has_stored_form()
     }
 }
 

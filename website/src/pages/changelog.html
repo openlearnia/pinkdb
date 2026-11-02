@@ -18,6 +18,13 @@ progress log</a>.</p>
 <li><strong>Copy-through <code>.save</code>:</strong> a checkpoint re-encodes only the chunks changed since the last save and copies the rest byte for byte.</li>
 <li><strong><code>COMMIT</code> that cannot take the store's lease</strong> now aborts the transaction, so the caller's retry can <code>BEGIN</code> again instead of tripping over "already in a transaction".</li>
 </ul>
+<h3>Wave 136 (steps w1–w2) — the <code>.pink</code> v7 layout: two header slots, streamed writes ✅</h3>
+<p>A <code>.pink</code> file no longer ends with a trailer, and a save no longer builds the whole file in memory. Existing v7 files are unreadable after this change — the layout is the v7 format; a v6 file is refused with the older-pinkdb error.</p>
+<ul>
+<li><strong>Layout:</strong> offsets 0 and 4096 hold two 4 KiB header slots (magic <code>PINKDB07</code>, iteration, footer offset/length/CRC32C, file length, slot CRC32C); the data region starts at 8192 and the footer follows it. A reader takes the valid slot with the higher iteration, so a torn write leaves the previous state readable, and a ranged reader (the lake) needs two requests — the first 8 KiB, then the footer. Where the lake catalog already records the footer location, its single request still works.</li>
+<li><strong>Streamed save:</strong> <code>.save</code> and <code>CHECKPOINT</code> write the data region one row group at a time through a positioned writer, copy unchanged chunks byte for byte, then the footer, then slot 0 — so the writer's peak memory is a row group rather than the whole file. A save of an unchanged store is still byte-identical.</li>
+<li><strong><code>free_ranges</code>:</strong> the footer gains a sorted list of data-region ranges no row group references (empty today; the append-only checkpoint fills it). Readers parse it, range-check it and otherwise ignore it.</li>
+</ul>
 <h3>Wave 135 (steps a–d) — pipelines, string keys, big GROUP BYs ✅</h3>
 <p>QuackLab's mart refresh SELECTs run 1.5–2.9× faster than after wave 140, and the refresh's peak memory fell by about a third. Results are unchanged.</p>
 <ul>
