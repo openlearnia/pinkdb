@@ -191,6 +191,12 @@ def pink_query(setup, sql):
     return tables[-1]
 
 
+def duck_refused(d):
+    """True when DuckDB itself raised an error for the case; a harness failure
+    (output the harness could not read) is not an expected error."""
+    return d[0] == "error" and not d[1].startswith("harness:")
+
+
 def duck_query(setup, sql):
     """Returns ("rows", rows) | ("error", msg)."""
     p = subprocess.run(["duckdb", "-json"], input=setup + "\n" + sql + "\n",
@@ -202,9 +208,16 @@ def duck_query(setup, sql):
     docs = []
     for chunk in re.split(r"\n(?=\[)", p.stdout.strip()):
         if chunk.strip():
-            docs.append(json.loads(chunk))
+            # Output that is not JSON (a DuckDB build printing a notice or a
+            # plain-text result) fails this case, naming the SQL; it must not
+            # stop the battery.
+            try:
+                docs.append(json.loads(chunk))
+            except json.JSONDecodeError as e:
+                return ("error", f"harness: DuckDB printed non-JSON output ({e}) "
+                                 f"for {sql[:80]!r}: {chunk[:120]!r}")
     if not docs:
-        return ("error", "harness: no SELECT output")
+        return ("error", f"harness: DuckDB printed no SELECT output for {sql[:80]!r}")
     doc = docs[-1]
     cols = list(doc[0].keys()) if doc else []
     return ("rows", [[r.get(c) for c in cols] for r in doc])
@@ -1547,7 +1560,7 @@ def run_attach():
 
     def both_error(label, sql):
         got, d = probe("pink", label, sql), probe("duck", label, sql)
-        ok = got[0] == "error" and d[0] == "error"
+        ok = got[0] == "error" and duck_refused(d)
         check(label, ok, "" if ok else f"\npink={got}\nduck={d}")
 
     same("attach-memory-round-trip",
@@ -2060,8 +2073,8 @@ def run_case(label, sql, ordered, expect_error, setup, duck_setup=SETUP):
     got = pink_query(setup, sql)
     if expect_error:
         d = duck_query(duck_setup, sql)
-        check(label, got[0] == "error" and d[0] == "error",
-              f"pink={got[0]} duck={d[0]}")
+        check(label, got[0] == "error" and duck_refused(d),
+              f"pink={got[0]} duck={d[0]}: {d[1] if d[0] == 'error' else ''}")
         return
     if got[0] == "error":
         check(label, False, f"pinkdb error: {got[1]}")
@@ -2275,8 +2288,8 @@ def run_csv():
             sql = template.replace("{f}", path).replace("{gz}", gz_path)
             got = pink_query("", sql)
             d = duck_query("", sql)
-            check(label, got[0] == "error" and d[0] == "error",
-                  f"pink={got[0]} duck={d[0]}")
+            check(label, got[0] == "error" and duck_refused(d),
+                  f"pink={got[0]} duck={d[0]}: {d[1] if d[0] == 'error' else ''}")
     finally:
         shutil.rmtree(directory, ignore_errors=True)
 

@@ -382,23 +382,21 @@ jobs:
       - name: make the CLI executable
         run: chmod +x target/release/pinkdb
 
-      # The probes are pinned against the DuckDB 2.0 alpha (the project's
-      # parity target — the final 2.0 release is expected soon). `latest`
-      # stable disagrees on version-sensitive behavior (e.g. `lag(x, 1.5)`
-      # offset typing, `mod(x, 0)`), so install that exact alpha **without
-      # piping a remote installer into a shell**: the artifact URL is pinned
-      # to the staging commit/version and its SHA-256 is verified before use.
-      - name: install the DuckDB CLI (pinned alpha — the parity reference)
+      # The probes are pinned against the DuckDB v2.0.0 release (the project's
+      # parity target), installed **without piping a remote installer into a
+      # shell**: the release asset URL is pinned and its SHA-256 (GitHub's
+      # asset digest) is verified before use.
+      - name: install the DuckDB CLI (pinned v2.0.0 — the parity reference)
         run: |
           set -euo pipefail
-          url='https://duckdb-staging.duckdb.org/d54cbbe3df/v2.0.0-alpha49225/duckdb/duckdb/github_release/duckdb-cli-linux-amd64.tar.gz'
-          sha256='e82c214d805a42aa39c12ffbd022e4ffd37c0cbb536edd0ae8c1c3b5d5782596'
+          url='https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz'
+          sha256='c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc'
           curl -fL --retry 3 -o /tmp/duckdb-cli.tar.gz "$url"
           echo "$sha256  /tmp/duckdb-cli.tar.gz" | sha256sum -c -
           tar -xzf /tmp/duckdb-cli.tar.gz -C /tmp duckdb
           sudo install -m 0755 /tmp/duckdb /usr/local/bin/duckdb
           duckdb --version | tee /tmp/duckdb-version
-          grep -q '^v2\.' /tmp/duckdb-version
+          grep -q '^v2\.0\.0 ' /tmp/duckdb-version
 
       - name: python3 bench/duckdiff.py
         run: python3 bench/duckdiff.py
