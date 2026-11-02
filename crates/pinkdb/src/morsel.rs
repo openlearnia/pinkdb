@@ -15,11 +15,11 @@
 //! thread, and a decode that used the same pool (pink-lake's per-row-group
 //! reads do) then starved the workers waiting for its rows.
 //!
-//! Nothing here knows what a morsel is: a table's chunk, a Parquet row group
-//! or page range, a data file, a table function's next batch all arrive
-//! through the same interface. [`ScanIo`] is the generic read-vs-pruned report
-//! behind `EXPLAIN ANALYZE` and `pinkdb_scan_io()`, for the sources that have
-//! object-storage reads to report.
+//! Nothing here knows what a morsel is: a run of a store table's chunks, a
+//! Parquet row group or page range, a data file, a table function's next batch
+//! all arrive through the same interface. [`ScanIo`] is the generic
+//! read-vs-pruned report behind `EXPLAIN ANALYZE` and `pinkdb_scan_io()`, for
+//! the sources that have object-storage reads to report.
 //!
 //! The source state is shared, like DuckDB's global source state
 //! (`src/execution/operator/scan/physical_table_scan.cpp`, `GetData`): every

@@ -2,12 +2,13 @@
 //!
 //! An executor that materializes every plan node pays a barrier at each
 //! operator boundary: the pool waits while one operator runs, then starts the
-//! next. Here a *morsel* — one chunk of the source — flows through the filter,
-//! projection and hash-join probes above it into the sink, and no intermediate
-//! result is ever collected. The sink keeps one partial per chunk it folded;
-//! the partials merge once, in morsel order. That is what keeps the answer the
-//! materialized path's answer: the same rows in the same order, hence the same
-//! first-seen group order and the same floating-point accumulation order.
+//! next. Here a *morsel* — one independently decodable piece of the source —
+//! flows through the filter, projection and hash-join probes above it into the
+//! sink, and no intermediate result is ever collected. The sink keeps one
+//! partial per chunk it folded; the partials merge once, in morsel order. That
+//! is what keeps the answer the materialized path's answer: the same rows in
+//! the same order, hence the same first-seen group order and the same
+//! floating-point accumulation order.
 //!
 //! The shape follows DuckDB's push-based pipeline (`src/parallel/pipeline.cpp`,
 //! `src/parallel/pipeline_executor.cpp`, `src/parallel/meta_pipeline.cpp`, and
@@ -37,12 +38,12 @@
 //! # The source
 //!
 //! A scan is a [`MorselSource`]: the workers pull the next morsel and decode
-//! it themselves — a store table's chunk, a Parquet row group or page range —
-//! push it through the same steps and fold it, so the scan's memory is the
-//! morsels in flight (one per worker), not the table. Partials are kept by
-//! morsel index, so a streamed scan merges in exactly the order the
-//! materialized one would have. Every other source is a subtree `eval`
-//! materializes first, and its chunks are the morsels.
+//! it themselves — a run of up to [`CHUNKS_PER_TASK`] store chunks, a Parquet
+//! row group or page range — push it through the same steps and fold it, so
+//! the scan's memory is the morsels in flight (one per worker), not the table.
+//! Partials are kept by morsel index, so a streamed scan merges in exactly the
+//! order the materialized one would have. Every other source is a subtree
+//! `eval` materializes first, and its chunks are the morsels.
 //!
 //! Every shape this module does not compile — a full join, a semi/anti/mark
 //! join the materialized path decides to build the preserved side for, an
@@ -62,7 +63,7 @@ use rayon::prelude::*;
 use super::aggregate::{self, Partial};
 use super::group_table::{FlatPartial, FlatSink};
 use super::{
-    Cx, MARK_NAME, MarkJoin, Output, ProbePlan, build_on_left, chunk_approx_bytes,
+    CHUNKS_PER_TASK, Cx, MARK_NAME, MarkJoin, Output, ProbePlan, build_on_left, chunk_approx_bytes,
     derive_join_filters, estimate_rows, eval, expr, filter_pays, mark_probe_chunk, project_chunk,
     project_mask, scan_targets, selection, swap_join_space,
 };
@@ -895,8 +896,10 @@ fn source_of<'a>(cx: &'a Cx, plan: &'a LogicalPlan, fused: bool) -> Result<Optio
     eval(cx, plan).map(|out| Some(Source::Chunks(out)))
 }
 
-/// A store scan as a [`MorselSource`]: the worker that claims a chunk decodes
-/// it itself, so no pool thread waits for another thread's chunk.
+/// A store scan as a [`MorselSource`]: the worker that claims a run of chunks
+/// decodes them itself, so no pool thread waits for another thread's chunks.
+/// A run is a morsel for the same reason [`StoreScan::par_chunks`] folds runs:
+/// a task per chunk pays dispatch on every chunk of a long scan.
 #[derive(Debug)]
 struct StoreSource<'a> {
     scan: super::StoreScan<'a>,
@@ -908,7 +911,7 @@ struct StoreSource<'a> {
 impl<'a> StoreSource<'a> {
     fn new(scan: super::StoreScan<'a>) -> Self {
         let (names, types) = scan.schema();
-        let cursor = MorselCursor::new(scan.len() as u64);
+        let cursor = MorselCursor::new(scan.len().div_ceil(CHUNKS_PER_TASK) as u64);
         StoreSource {
             scan,
             names,
@@ -940,8 +943,12 @@ impl MorselSource for StoreSource<'_> {
     }
 
     fn decode(&self, morsel: u64, sink: &mut dyn FnMut(DataChunk) -> Result<()>) -> Result<()> {
-        if let Some(chunk) = self.scan.chunk(morsel as usize)? {
-            sink(chunk)?;
+        let first = morsel as usize * CHUNKS_PER_TASK;
+        let last = (first + CHUNKS_PER_TASK).min(self.scan.len());
+        for index in first..last {
+            if let Some(chunk) = self.scan.chunk(index)? {
+                sink(chunk)?;
+            }
         }
         Ok(())
     }

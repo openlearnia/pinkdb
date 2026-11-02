@@ -844,7 +844,7 @@ impl LakeFormat for PinkFormat {
                 source: e,
             })?;
         // 6. The one-database/one-table store the lake's loaders expect.
-        let store = build_pink_store(file, &table.db, &table.table, decoded)?;
+        let store = build_pink_store(&table.db, &table.table, decoded)?;
         let mut present = vec![false; table.schema.len()];
         for &column in columns {
             if column < present.len() {
@@ -998,12 +998,7 @@ fn chunk_spans(
 
 /// Build the one-database/one-table store the lake's loaders expect out of
 /// a decoded `.pink` file.
-fn build_pink_store(
-    file: &DataFile<'_>,
-    db: &str,
-    table: &str,
-    decoded: DataTable,
-) -> Result<PinkDb> {
+fn build_pink_store(db: &str, table: &str, decoded: DataTable) -> Result<PinkDb> {
     let mut store = PinkDb::new();
     if !db.eq_ignore_ascii_case("main") {
         store.create_database(db).map_err(|e| LakeError::Engine {
@@ -1021,33 +1016,24 @@ fn build_pink_store(
             context: format!("creating table \"{db}.{table}\""),
             source: e,
         })?;
-    {
-        let dst = store
-            .table_mut_in(db, table)
-            .map_err(|e| LakeError::Engine {
-                context: format!("opening table \"{db}.{table}\""),
+    // Move the decoded columns into the store's table rather than appending
+    // them as fresh shared chunks: appending would wrap every vector in a new
+    // `ChunkHandle` and charge the memory pool a second time for bytes the
+    // decode already reserved.
+    let rows = decoded.num_rows();
+    let built =
+        DataTable::from_columns(table.to_string(), decoded.into_columns(), rows).map_err(|e| {
+            LakeError::Engine {
+                context: format!("assembling decoded table \"{db}.{table}\""),
                 source: e,
-            })?;
-        for index in 0..decoded.num_chunks() {
-            let chunk = decoded
-                .scan_chunk(index)
-                .map_err(|e| LakeError::Engine {
-                    context: format!("decoding chunk {index} of \"{db}.{table}\""),
-                    source: e,
-                })?
-                .ok_or_else(|| LakeError::Internal {
-                    message: format!(
-                        "chunk {index} of \"{db}.{table}\" disappeared while decoding"
-                    ),
-                })?;
-            dst.append_shared_chunk(&chunk.columns)
-                .map_err(|e| LakeError::Engine {
-                    context: format!("appending rows to \"{db}.{table}\""),
-                    source: e,
-                })?;
-        }
-    }
-    let _ = file;
+            }
+        })?;
+    *store
+        .table_mut_in(db, table)
+        .map_err(|e| LakeError::Engine {
+            context: format!("opening table \"{db}.{table}\""),
+            source: e,
+        })? = built;
     Ok(store)
 }
 

@@ -1167,6 +1167,13 @@ impl DataTable {
         self.num_rows
     }
 
+    /// Move the columns out, their chunk handles and memory charges included.
+    /// A caller rebuilding a table around columns it already holds this way
+    /// does not wrap — and charge the pool for — the same vectors twice.
+    pub fn into_columns(self) -> Vec<Column> {
+        self.columns
+    }
+
     /// Build a table directly from pre-built columns: every column must have
     /// the same per-chunk lengths, summing to `num_rows` (the projection-aware
     /// lake reader assembles partially materialized tables without going

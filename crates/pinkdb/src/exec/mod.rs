@@ -3149,7 +3149,8 @@ impl<'a> StoreScan<'a> {
 }
 
 /// How many chunks of a scan one task folds before the next task takes over.
-const CHUNKS_PER_TASK: usize = 8;
+/// The pipeline's store source claims the same run as one morsel.
+pub(crate) const CHUNKS_PER_TASK: usize = 8;
 
 /// The columns a projection keeps, `None` when it keeps all of them (or names a
 /// column the table does not have, which reads everything and fails when the
