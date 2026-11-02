@@ -1,0 +1,37 @@
+[package]
+name = "pinkdb-sqllogictest"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "DuckDB sqllogictest corpus runner for pinkdb"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "pinkdb-slt"
+path = "src/main.rs"
+
+[dependencies]
+pinkdb = { path = "../../crates/pinkdb" }
+pinkdb-json = { path = "../../extensions/json", optional = true }
+pinkdb-datetime = { path = "../../extensions/datetime", optional = true }
+pinkdb-math = { path = "../../extensions/math", optional = true }
+pinkdb-ext-string = { path = "../../extensions/string", optional = true }
+pinkdb-parquet = { path = "../../extensions/parquet", optional = true }
+md-5 = "0.11"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+glob = "0.3"
+
+[features]
+# The linked extensions the corpus `require`s most (json 183 files, parquet
+# 317). Each maps 1:1 to a DuckDB extension name in the runner's `require`
+# table, so turning one off turns the matching tests into file skips rather
+# than failures.
+default = ["json", "datetime", "math", "string", "parquet"]
+json = ["dep:pinkdb-json"]
+datetime = ["dep:pinkdb-datetime"]
+math = ["dep:pinkdb-math"]
+string = ["dep:pinkdb-ext-string"]
+parquet = ["dep:pinkdb-parquet"]

@@ -1,0 +1,16 @@
+statement ok
+CREATE TABLE t(i INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1), (2)
+
+query I rowsort
+SELECT i FROM t
+----
+1
+2
+
+query II
+SELECT 1, 'a'
+----
+1	a

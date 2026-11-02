@@ -1,0 +1,4 @@
+require nonexistent_extension
+
+statement ok
+SELECT 1

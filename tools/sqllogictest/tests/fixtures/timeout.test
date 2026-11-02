@@ -1,0 +1,2 @@
+# Run with a short --file-timeout; the runner stops at the deadline.
+sleep 10 seconds

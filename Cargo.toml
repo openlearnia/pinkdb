@@ -92,6 +92,9 @@ members = [
     # Browser playground (wave 85): the wasm32-unknown-unknown ABI over the
     # engine, a cdylib loaded by the docs site's playground.
     "crates/pinkdb-wasm",
+    # DuckDB sqllogictest corpus runner (slt-1): a measurement tool, never a
+    # dependency of a pinkdb binary or of the engine.
+    "tools/sqllogictest",
 ]
 resolver = "2"
 
