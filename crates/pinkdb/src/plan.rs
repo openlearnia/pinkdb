@@ -426,9 +426,11 @@ pub enum LogicalPlan {
     Describe {
         columns: Vec<DescribeColumn>,
     },
-    /// `EXPLAIN <select>`: a printable textual plan (never executed).
+    /// `EXPLAIN <select>`: a printable textual plan (never executed);
+    /// `EXPLAIN ANALYZE` runs it first and appends the scan sources' reads.
     Explain {
         plan: Box<LogicalPlan>,
+        analyze: bool,
     },
     /// `CREATE [OR REPLACE] PROCEDURE ...` (wave 44): store the parsed
     /// definition in the target database's catalog. A name that already names
@@ -1302,7 +1304,7 @@ pub(crate) fn collect_tables_read(
                 ));
             }
         }
-        LogicalPlan::Explain { plan } => collect_tables_read(plan, default_ns, out),
+        LogicalPlan::Explain { plan, .. } => collect_tables_read(plan, default_ns, out),
         LogicalPlan::CreateTableAs { query, .. } => collect_tables_read(query, default_ns, out),
         LogicalPlan::Values { rows, sources, .. } => {
             for (database, table) in sources {
@@ -1596,7 +1598,7 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
         }
         LogicalPlan::CreateTableAs { query, .. }
         | LogicalPlan::CreateMaterializedView { query, .. }
-        | LogicalPlan::Explain { plan: query } => contains_table_function(query),
+        | LogicalPlan::Explain { plan: query, .. } => contains_table_function(query),
         LogicalPlan::Cte { query, body, .. } => {
             contains_table_function(query) || contains_table_function(body)
         }
@@ -2000,7 +2002,7 @@ fn walk_scan_filters(
                 walk_expr_subquery_filters(a, out);
             }
         }
-        LogicalPlan::Explain { plan } => walk_scan_filters(plan, &[], out),
+        LogicalPlan::Explain { plan, .. } => walk_scan_filters(plan, &[], out),
         LogicalPlan::CreateTableAs { query, .. } => walk_scan_filters(query, &[], out),
         LogicalPlan::Insert { .. }
         | LogicalPlan::InsertSelect { .. }
@@ -2466,7 +2468,7 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut Vec<String>) {
             children.extend(p);
         }
         LogicalPlan::RefreshMaterializedView { .. } => {}
-        LogicalPlan::Explain { plan } => children.push(plan),
+        LogicalPlan::Explain { plan, .. } => children.push(plan),
         LogicalPlan::SetOp { left, right, .. } => {
             children.push(left);
             children.push(right);
@@ -2853,7 +2855,7 @@ fn walk_scan_projections(
         LogicalPlan::CreateTableAs { query, .. } => {
             walk_scan_projections(query, &Needed::All, out);
         }
-        LogicalPlan::Explain { plan } => {
+        LogicalPlan::Explain { plan, .. } => {
             walk_scan_projections(plan, &Needed::All, out);
         }
         LogicalPlan::CreateTable { .. }

@@ -48,11 +48,13 @@ lake databases and runs `kpi_totals`, median of 5.
 - Release builds (from the repo root):
 
 ```sh
-cargo build --release -p pinkdb-cli --features pinklake,s3,catalog-postgres,httpfs
-cargo build --release -p pinkdb-server --features catalog-postgres,lake-s3 --example chart_load
+cargo build --release -p pinkdb-cli --features pinklake,parquetlake,s3,catalog-postgres,httpfs
+cargo build --release -p pinkdb-server --features catalog-postgres,lake-s3,parquetlake --example chart_load
 ```
 
-  - CLI: `pinklake` = lake databases, `s3` = stage files from `s3://`,
+  - CLI: `pinklake` = lake databases, `parquetlake` = the Parquet data files a
+    `ducklake:` catalog stores (the lake mode below attaches one), `s3` = stage
+    files from `s3://`,
     `catalog-postgres` = lake catalogs in Postgres, `httpfs` = `read_csv` over
     `s3://` (and its SigV4 transport, shared with `pink-lake/s3`).
   - Server: `catalog-postgres,lake-s3` opens the same wave-124 lake databases;

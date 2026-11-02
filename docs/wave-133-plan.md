@@ -85,5 +85,25 @@ SF 1; the QuackLab bench's lake path agreeing with DuckDB.
 
 ## Measured
 
+Interleaved A/B, TPC-H SF 1, 133b (`dd69c2f` on `841e3f8`) against `main` `841e3f8`, release CLIs
+with the gate's features (`~/Desktop/projects/pinkdb-wt/ab-133b/`):
+
+| storage | rounds | 133b / main (geomean) |
+|---|---|---|
+| Parquet pinkdb lake (`ATTACH 'lake:…' (READ_ONLY)`) | 5, under load | **0.372** (2.7× faster; Q14 4.3 → 0.55 s, Q10 4.5 → 0.82 s; only Q4 slower, 1.21) |
+| store tables | 7, under load | 1.031 |
+| store tables | 9, swapped, clean store | 0.924 (0.977 without the warm-up queries Q1–Q3) |
+| store tables, both passes | — | 0.976; no query slower than 1.05 in both |
+
+Still far from DuckDB on the lake: a single cold SF 1 pass reads the Parquet lake at 3–77× DuckDB's
+time (its own store), against 2–7× from pinkdb store tables. Every lineitem scan decodes Parquet again
+by design (no table cache); the next lake-read work is profiling where that time goes.
+
 Before (wave 130, workaround lake path): cold start 4.51 s (DuckDB 0.118), chart server RSS at 16
-clients 2.18 GB (0.47), refresh peak 5.5 GB (1.11). After: to fill in.
+clients 2.18 GB (0.47), refresh peak 5.5 GB (1.11). The QuackLab lake smoke after 133b: attach 1.31 s,
+first query 1.29 s (DuckDB 0.10 / 0.12); refresh still 10–16× (the write side, wave 134).
+
+Gates: full gate `tmerge133b` on `841e3f8` (86/90; the 4 lake failures were disk-full and contention,
+rerun clean: `logs/rerun133b-lake-*.log`, EXIT=0), targeted gate `t133b` on `9529227` (18/19; the
+Postgres interop failure was a time-zone flake in a wave-132 test, fixed in `ca2edae` and rerun
+inside the failing window: `logs/t133b-pgfix.log`, EXIT=0).

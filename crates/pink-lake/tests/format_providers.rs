@@ -234,7 +234,10 @@ fn an_unknown_format_refuses_only_its_own_table() {
         .find(|t| t.table == "u")
         .expect("the unavailable table is listed");
     assert_eq!(outage.rows, pink_lake::UNAVAILABLE_ROWS);
-    let text = attachment.lake.load("main", "u").unwrap_err().to_string();
+    let text = Arc::clone(&attachment.lake)
+        .scan_source("main", "u", None, &[])
+        .unwrap_err()
+        .to_string();
     assert!(text.contains("main.u"), "{text}");
     assert!(text.contains("nosuch"), "{text}");
     assert!(

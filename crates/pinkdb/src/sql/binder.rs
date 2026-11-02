@@ -3752,7 +3752,13 @@ impl<'a> Binder<'a> {
             if crate::memory::is_limit_setting(canonical) {
                 return self.bind_current_setting(args);
             }
-            let value = crate::settings::current(&self.session, canonical).unwrap_or(Value::Null);
+            // A store setting (`wal_sync_method` on a durable store) reads back
+            // what the engine does, whatever the session holds.
+            let value = self
+                .db
+                .store_setting_value(canonical)
+                .or_else(|| crate::settings::current(&self.session, canonical))
+                .unwrap_or(Value::Null);
             return Ok(BoundExpr::Literal(value));
         }
         // Session-position functions (wave 131b): DuckDB answers the current
@@ -4036,7 +4042,14 @@ impl<'a> Binder<'a> {
             deps.push(dep);
         }
         drop(deps);
-        match self.session.get(name) {
+        // A store setting (`wal_sync_method`) reads back through the same
+        // spellings when the session does not override it, so what the query
+        // sees is what the engine does.
+        match self
+            .session
+            .get(name)
+            .or_else(|| self.db.store_setting_value(name))
+        {
             Some(v) => Ok(BoundExpr::Literal(v)),
             None if !strict => Ok(BoundExpr::Literal(Value::Null)),
             None => Err(PinkDbError::Catalog(format!(
@@ -8676,7 +8689,10 @@ fn bind_tracked_plan(
         Statement::Describe { qual: qdb, name } => {
             bind_describe(db, default_ns, qdb, name, session)
         }
-        Statement::Explain(inner) => {
+        Statement::Explain {
+            statement: inner,
+            analyze,
+        } => {
             // EXPLAIN never executes its inner statement, so a DML plan is
             // safe to render; DDL and the other session statements have no
             // plan shape worth showing (and would bypass their own gates).
@@ -8694,13 +8710,21 @@ fn bind_tracked_plan(
                     "EXPLAIN supports a query or a DML statement".to_string(),
                 ));
             }
+            // `EXPLAIN ANALYZE` runs the statement, so it takes a query: a
+            // DML plan has no rows to account for and would run its writes.
+            if *analyze && !matches!(**inner, Statement::Select(_)) {
+                return Err(PinkDbError::Parse(
+                    "EXPLAIN ANALYZE supports a query; EXPLAIN alone shows a DML plan".to_string(),
+                ));
+            }
             // Bind the inner statement fully (errors surface here) and wrap
-            // it — EXPLAIN never executes it.
+            // it — plain EXPLAIN never executes it.
             let (plan, dynamic) =
                 bind_tracked_plan(db, inner, default_ns, params.clone(), session)?;
             Ok((
                 LogicalPlan::Explain {
                     plan: Box::new(plan),
+                    analyze: *analyze,
                 },
                 dynamic,
             ))
@@ -13172,8 +13196,8 @@ fn bind_table_function(
     if name.eq_ignore_ascii_case("pinkdb_column_stats") {
         return bind_column_stats(db, binder, args, alias);
     }
-    if name.eq_ignore_ascii_case("pinkdb_lake_decodes") {
-        return bind_lake_decodes(db, args, alias);
+    if name.eq_ignore_ascii_case("pinkdb_scan_io") {
+        return bind_scan_io(db, args, alias);
     }
     if name.eq_ignore_ascii_case("pinkdb_catalog") {
         return bind_catalog(db, binder, args, alias);
@@ -16840,54 +16864,95 @@ fn bind_plain_attach(
     )))
 }
 
-/// `pinkdb_lake_decodes()` (wave 124): the data-file decode counters of every
-/// read-only lake database (and session attachment) — `database` (NULL for a
-/// session attachment), `location`, `loads`, `columns`, `files` — the
-/// diagnostics behind "a statistics-only query decodes nothing" and "a
-/// pruned scan decodes only the matching files" (`.lake attached` printed
-/// them before lakes became databases).
-fn bind_lake_decodes(
+/// `pinkdb_scan_io()` (wave 133b): what the previous statement's scan
+/// sources read and pruned — `source`, `unit`, `read`, `pruned`, `requests`,
+/// `bytes`, `in_flight`, one row per pruning unit of each source in scan
+/// order (a source that prunes no units gets one row with a NULL unit).
+///
+/// `requests` and `bytes` are object-storage numbers for the whole source, so
+/// they sit on its first row only and `SUM()` over the table is exact. The
+/// benchmark reads it to attribute object-storage reads to a query; plain
+/// `EXPLAIN` never scans, `EXPLAIN ANALYZE` prints the same numbers as lines.
+fn bind_scan_io(
     db: &PinkDb,
     args: &[TableFunctionArg],
     alias: &Option<String>,
 ) -> Result<(ScopeTable, LogicalPlan)> {
     if !args.is_empty() {
         return Err(PinkDbError::Type(
-            "pinkdb_lake_decodes() takes no arguments".to_string(),
+            "pinkdb_scan_io() takes no arguments".to_string(),
         ));
     }
-    let names: Vec<String> = ["database", "location", "loads", "columns", "files"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let names: Vec<String> = [
+        "source",
+        "unit",
+        "read",
+        "pruned",
+        "requests",
+        "bytes",
+        "in_flight",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
     let types = vec![
         DataType::Varchar,
         DataType::Varchar,
         DataType::Bigint,
         DataType::Bigint,
         DataType::Bigint,
+        DataType::Bigint,
+        DataType::Bigint,
     ];
     let lit = |v: Value| BoundExpr::Literal(v);
-    let rows: Vec<Vec<BoundExpr>> = db
-        .lake_decode_stats()
-        .into_iter()
-        .map(|(database, location, loads, columns, files)| {
-            vec![
-                database
-                    .map(Value::Varchar)
-                    .map(lit)
-                    .unwrap_or(lit(Value::Null)),
-                lit(Value::Varchar(location)),
-                lit(Value::Bigint(loads as i64)),
-                lit(Value::Bigint(columns as i64)),
-                lit(Value::Bigint(files as i64)),
-            ]
-        })
-        .collect();
+    let mut rows: Vec<Vec<BoundExpr>> = Vec::new();
+    for record in db.scan_records() {
+        let source = lit(Value::Varchar(record.source));
+        let totals = [
+            lit(Value::Bigint(record.io.requests as i64)),
+            lit(Value::Bigint(record.io.bytes as i64)),
+            lit(Value::Bigint(record.io.in_flight_peak as i64)),
+        ];
+        if record.io.units.is_empty() {
+            rows.push(vec![
+                source.clone(),
+                lit(Value::Null),
+                lit(Value::Null),
+                lit(Value::Null),
+                totals[0].clone(),
+                totals[1].clone(),
+                totals[2].clone(),
+            ]);
+        }
+        for (i, unit) in record.io.units.iter().enumerate() {
+            let first = i == 0;
+            rows.push(vec![
+                source.clone(),
+                lit(Value::Varchar(unit.unit.to_string())),
+                lit(Value::Bigint(unit.read as i64)),
+                lit(Value::Bigint(unit.pruned as i64)),
+                if first {
+                    totals[0].clone()
+                } else {
+                    lit(Value::Bigint(0))
+                },
+                if first {
+                    totals[1].clone()
+                } else {
+                    lit(Value::Bigint(0))
+                },
+                if first {
+                    totals[2].clone()
+                } else {
+                    lit(Value::Bigint(0))
+                },
+            ]);
+        }
+    }
     let scope = ScopeTable {
         name: alias
             .clone()
-            .unwrap_or_else(|| "pinkdb_lake_decodes".to_string())
+            .unwrap_or_else(|| "pinkdb_scan_io".to_string())
             .to_ascii_lowercase(),
         original: None,
         ns: None,

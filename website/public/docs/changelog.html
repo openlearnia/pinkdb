@@ -194,7 +194,23 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2 id="2026-11-03">2026-11-03<a class="anchor" href="#2026-11-03" aria-label="Permalink: 2026-11-03">#</a></h2>
+<h3>Wave 136 (step c-0) — GROUP BY state bounded by groups for wide keys ✅</h3>
+<p>A GROUP BY on VARCHAR keys whose state would grow with the input rows now keeps one entry per group.</p>
+<ul>
+<li><strong>Memory</strong>: QuackLab's <code>od_pairs_rollup</code> (245,570 rows, 30,303 groups, two VARCHAR keys) peaks at 13.4 MiB instead of 91 MiB; pinkdb-server on the QuackLab chart load (16 clients x 10 rounds) peaks at 412 MB instead of 1,060 MB.</li>
+<li><strong>Known regression, to be fixed by step c-0b</strong>: the bounded path is serial, so <code>od_pairs_rollup</code> at 12 threads takes 63 ms instead of 13–21 ms (1 thread: 47 -&gt; 66 ms). Integer-key aggregates (all of TPC-H) are unchanged, and results are bit-identical.</li>
+</ul>
 <h2 id="2026-11-02">2026-11-02<a class="anchor" href="#2026-11-02" aria-label="Permalink: 2026-11-02">#</a></h2>
+<h3>Wave 133 — lake scans stream, prune to pages, and stay within the memory limit ✅</h3>
+<p>A query on a lake database reads only what it needs, in parallel, and never holds a whole table.</p>
+<ul>
+<li><strong>Streaming</strong>: every lake scan (plain, aggregate, sort, both join sides, <code>AT (VERSION =&gt; …)</code>) runs through the pipeline executor one row group at a time; the engine no longer decodes and caches a whole table on first use. Store scans and lake scans share one pull-based source.</li>
+<li><strong>Pruning</strong>: files by catalog statistics, row groups by Parquet footers, and pages by the Parquet page index, which pinkdb now writes and reads; projections, filters and join-filter bounds all reach the scan.</li>
+<li><strong>Reads</strong>: only the projected columns' byte ranges, coalesced, from local disk or object storage, several files in parallel.</li>
+<li><strong>Memory</strong>: decoded lake data is charged to the memory pool like store data, so <code>memory_limit</code> bounds a lake query and fails it cleanly when exceeded.</li>
+<li><strong><code>EXPLAIN ANALYZE</code></strong> prints each scan's reads, and <code>pinkdb_scan_io()</code> reports the last statement's per-source reads and bytes (replacing <code>pinkdb_lake_decodes()</code>).</li>
+</ul>
 <h3>DuckDB's own test corpus, and what it found first ✅</h3>
 <ul>
 <li><strong><code>pinkdb-slt</code></strong> (<code>tools/sqllogictest</code>) runs DuckDB's sqllogictest files against pinkdb and reports pass rates per area; a committed baseline makes a regression fail the gate. 444 → 451 of DuckDB's 4,233 <code>test/sql</code> files pass so far ([docs/sqllogictest-baseline.md](docs/sqllogictest-baseline.md)).</li>
@@ -1355,6 +1371,7 @@ progress log</a>.</p>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
 <ul>
+  <li><a href="#2026-11-03">2026-11-03</a></li>
   <li><a href="#2026-11-02">2026-11-02</a></li>
   <li><a href="#2026-11-01">2026-11-01</a></li>
   <li><a href="#2026-10-31">2026-10-31</a></li>

@@ -92,19 +92,19 @@ pub fn assert_script_exit(status: ExitStatus) {
     );
 }
 
-/// The query that prints a read-only lake database's data-file decode
-/// counters, one `decodes: L loads, C columns, F files` line per lake (wave
-/// 124: `pinkdb_lake_decodes()` replaced `.lake attached`'s report).
+/// The query that prints, for each scan source of the previous statement,
+/// what it read and pruned — one `scan: <unit> N read, M pruned` line per
+/// (source, unit) row (the report is per statement, not cumulative).
 #[allow(dead_code)]
-pub const DECODES: &str = "SELECT 'decodes: ' || loads || ' loads, ' || columns || ' columns, ' \
-                           || files || ' files' AS d FROM pinkdb_lake_decodes();\n";
+pub const SCAN_IO: &str = "SELECT 'scan: ' || unit || ' ' || read || ' read, ' || pruned \
+                           || ' pruned' AS d FROM pinkdb_scan_io() WHERE unit IS NOT NULL;\n";
 
-/// The `decodes: …` lines of a transcript, in order.
+/// The `scan: …` lines of a transcript, in order.
 #[allow(dead_code)]
-pub fn decode_lines(out: &str) -> Vec<String> {
+pub fn scan_io_lines(out: &str) -> Vec<String> {
     out.lines()
         .filter_map(|l| {
-            let at = l.find("decodes: ")?;
+            let at = l.find("scan: ")?;
             Some(l[at..].trim_end_matches(['│', ' ']).to_string())
         })
         .filter(|l| !l.contains("||"))

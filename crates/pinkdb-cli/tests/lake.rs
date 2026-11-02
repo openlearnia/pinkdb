@@ -1016,12 +1016,12 @@ fn attach_answers_equal_open_and_in_memory() {
     cleanup(&dir);
 }
 
-/// `pinkdb_lake_decodes()` reports data-file decodes end to end:
-/// statistics-only queries decode nothing, projection pushdown decodes
-/// exactly the referenced columns, and nothing is kept between queries
-/// (wave 133a dropped the session's materialized table).
+/// `pinkdb_scan_io()` reports what each query's lake scan read: attach and a
+/// statistics-only aggregate open no data file, every data query reads its
+/// table's one file, and nothing is kept between queries (wave 133a dropped
+/// the session's materialized table; wave 133b reports per statement).
 #[test]
-fn attach_decode_stats_show_projection_pushdown() {
+fn attach_scan_io_reports_what_each_query_read() {
     let dir = scratch("attach_stats");
     let lake = dir.join("lake");
     run(&format!(
@@ -1030,7 +1030,7 @@ fn attach_decode_stats_show_projection_pushdown() {
          .lake save {lake}\n.quit\n",
         lake = lake.display()
     ));
-    let d = common::DECODES;
+    let d = common::SCAN_IO;
     let out = run(&format!(
         "{attach}{d}\
          SELECT COUNT(*), COUNT(b), MIN(a), MAX(a), MIN(c), MAX(c) FROM t;\n{d}\
@@ -1041,15 +1041,15 @@ fn attach_decode_stats_show_projection_pushdown() {
          .quit\n",
         attach = attach_ro(&lake),
     ));
+    // The first two `{d}` runs print nothing: attach reads footers only and
+    // every aggregate came from statistics, so neither ran a scan.
     assert_eq!(
-        common::decode_lines(&out),
+        common::scan_io_lines(&out),
         vec![
-            "decodes: 0 loads, 0 columns, 0 files", // attach reads footers only
-            "decodes: 0 loads, 0 columns, 0 files", // every aggregate came from statistics
-            "decodes: 1 loads, 1 columns, 1 files", // ORDER BY b: b only
-            "decodes: 2 loads, 2 columns, 2 files", // + c (the file decodes again)
-            "decodes: 3 loads, 3 columns, 3 files", // + a
-            "decodes: 4 loads, 6 columns, 4 files", // SELECT *: all three columns
+            "scan: files 1 read, 0 pruned", // ORDER BY b (b's column only)
+            "scan: files 1 read, 0 pruned", // ORDER BY c (the file scans again)
+            "scan: files 1 read, 0 pruned", // ORDER BY a
+            "scan: files 1 read, 0 pruned", // SELECT *
         ],
         "{out}"
     );
@@ -1632,7 +1632,7 @@ fn partition_spec_splits_commits_prunes_and_clears() {
 
     // Session 2: a read-only lake database: predicates prune whole files
     // from the zone maps, and the counters show exactly which files decoded.
-    let d = common::DECODES;
+    let d = common::SCAN_IO;
     let out = run(&format!(
         "{attach}{d}\
          SELECT 'north' AS m, id AS v FROM t WHERE region = 'north';\n{d}\
@@ -1641,17 +1641,14 @@ fn partition_spec_splits_commits_prunes_and_clears() {
          .quit\n",
         attach = attach_ro(&lake),
     ));
+    // The attach and MIN/MAX runs print nothing: no scan ran. Each predicate
+    // reads v2's unpartitioned file (region range east..west) plus its
+    // partition's file and prunes the other partition's file.
     assert_eq!(
-        common::decode_lines(&out),
+        common::scan_io_lines(&out),
         vec![
-            "decodes: 0 loads, 0 columns, 0 files",
-            // v2's unpartitioned file (region range east..west) plus the
-            // north file: the south file is pruned by its partition value.
-            "decodes: 1 loads, 2 columns, 2 files",
-            // Same shape for south; the north file is pruned.
-            "decodes: 2 loads, 4 columns, 4 files",
-            // MIN/MAX answer from the published statistics (no deletes).
-            "decodes: 2 loads, 4 columns, 4 files",
+            "scan: files 2 read, 1 pruned",
+            "scan: files 2 read, 1 pruned",
         ],
         "{out}"
     );
@@ -1661,6 +1658,26 @@ fn partition_spec_splits_commits_prunes_and_clears() {
         "{out}"
     ); // the north row
     assert!(out.contains("│ 3 ") && out.contains("│ 4 "), "{out}");
+
+    // The same report reaches SQL through EXPLAIN ANALYZE, which runs the
+    // query and then lists what each scan source read and pruned (wave 133b);
+    // a statistics-only query runs no scan and prints no such line.
+    let out = run(&format!(
+        "{attach}\
+         EXPLAIN ANALYZE SELECT id FROM t WHERE region = 'north';\n\
+         EXPLAIN ANALYZE SELECT MIN(id), MAX(id) FROM t;\n\
+         .quit\n",
+        attach = attach_ro(&lake),
+    ));
+    assert!(
+        out.contains("Scan io") && out.contains("files 2 read / 1 pruned"),
+        "{out}"
+    );
+    assert_eq!(
+        out.matches("Scan io").count(),
+        1,
+        "only the scanning statement reports I/O: {out}"
+    );
 
     // Session 3: clear the spec, then a new commit is one unpartitioned file
     // (inlining off: this pins the file shape).

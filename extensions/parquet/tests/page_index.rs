@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pinkdb::{DataTable, DataType, PruneOp, PrunePredicate, Value};
-use pinkdb_parquet::{RangeSource, RemoteReadStats, scan_source, scan_source_streamed};
+use pinkdb_parquet::{RangeSource, RemoteReadStats, plan_row_groups, scan_source};
 
 /// A positional source over an in-memory file that counts what it served.
 #[derive(Debug, Default)]
@@ -65,31 +65,24 @@ fn band(page: u64) -> u64 {
     (page % 4) * 240_000 + (page / 4) * 15_000
 }
 
-/// Read a whole file through the page-aware streamed scan.
+/// Read a whole file through the page-aware morsel plan, one morsel at a time.
 fn scan_all(
     source: Arc<dyn RangeSource>,
     filters: &[PrunePredicate],
 ) -> (Vec<Value>, RemoteReadStats, u64, u64) {
+    let plan = plan_row_groups("page_index.parquet", source, Some(&[0]), filters).unwrap();
     let mut values = Vec::new();
-    let streamed = scan_source_streamed(
-        "page_index.parquet",
-        source,
-        Some(&[0]),
-        filters,
-        &mut |chunk| {
+    for index in 0..plan.count() {
+        plan.decode(index, &mut |chunk| {
             for row in 0..chunk.num_rows() {
                 values.push(chunk.columns[0].get(row));
             }
             Ok(())
-        },
-    )
-    .unwrap();
-    (
-        values,
-        streamed.stats,
-        streamed.pages.pages,
-        streamed.pages.pages_pruned,
-    )
+        })
+        .unwrap();
+    }
+    let counters = plan.counters();
+    (values, plan.stats(), counters.pages, counters.pages_pruned)
 }
 
 /// Matches the first row of every band-3 page: band 1 spans 50_000..66_383.
@@ -228,42 +221,38 @@ fn a_duckdb_file_prunes_at_row_group_granularity() {
         bytes: bytes.clone(),
         ..CountedRange::default()
     });
+    let plan = plan_row_groups("duckdb.parquet", pruned_source, Some(&[0]), &only_last).unwrap();
     let mut kept = Vec::new();
-    let streamed = scan_source_streamed(
-        "duckdb.parquet",
-        pruned_source,
-        Some(&[0]),
-        &only_last,
-        &mut |chunk| {
+    for index in 0..plan.count() {
+        plan.decode(index, &mut |chunk| {
             for row in 0..chunk.num_rows() {
                 kept.push(chunk.columns[0].get(row));
             }
             Ok(())
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
+    }
     std::fs::remove_dir_all(&dir).ok();
-    let row_groups_pruned = streamed.output.row_groups_pruned;
+    let counters = plan.counters();
+    let row_groups_pruned = counters.row_groups_pruned;
     // The DuckDB build this environment ships (v2.0.0-alpha46057, the
     // ducklake-vortex reference) writes no page index — its writer has no
     // column/offset index at all — so page pruning cannot apply and the scan
     // falls back to row-group granularity, still exact.
+    assert_eq!(counters.pages_pruned, 0, "no page index to prune with");
     assert_eq!(
-        streamed.pages.pages_pruned, 0,
-        "no page index to prune with"
-    );
-    assert_eq!(
-        streamed.pages.pages, full_pages,
+        counters.pages, full_pages,
         "every page is read when none can be pruned"
     );
     assert!(
         row_groups_pruned > 0,
         "a selective predicate still prunes DuckDB row groups"
     );
+    let stats = plan.stats();
     assert!(
-        streamed.stats.bytes < full_stats.bytes,
+        stats.bytes < full_stats.bytes,
         "pruned scan read {} of {} bytes",
-        streamed.stats.bytes,
+        stats.bytes,
         full_stats.bytes
     );
     assert!(

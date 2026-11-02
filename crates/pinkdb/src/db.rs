@@ -906,6 +906,18 @@ impl Connection {
         &mut self,
         stmt: &crate::sql::ast::Statement,
         sql_text: Option<&str>,
+        profile: Option<&mut ProfileDraft>,
+    ) -> Result<QueryResult> {
+        // The previous statement's scan log is what `pinkdb_scan_io()`
+        // reports; this statement records into a fresh one (wave 133b).
+        self.with_bind_store(|db| db.finish_scan_records());
+        self.execute_statement(stmt, sql_text, profile)
+    }
+
+    fn execute_statement(
+        &mut self,
+        stmt: &crate::sql::ast::Statement,
+        sql_text: Option<&str>,
         mut profile: Option<&mut ProfileDraft>,
     ) -> Result<QueryResult> {
         // One budget per statement: the deadline starts here (before bind)
@@ -1196,10 +1208,11 @@ impl Connection {
                             "database \"{after}\" not found"
                         )));
                     }
+                    let mut pending = None;
                     if let Some(text) = sql_text {
                         // `USE` touches no table: a known-empty set.
                         let sets = crate::wal::FrameSets::default();
-                        shared.wal_append_local(
+                        pending = shared.wal_append_local_pending(
                             &pre_ns,
                             &after,
                             &[text.to_string()],
@@ -1210,11 +1223,18 @@ impl Connection {
                             &[],
                         )?;
                     }
-                    if let Some(p) = profile {
-                        p.log += log_start.map(|s| s.elapsed()).unwrap_or_default();
-                    }
+                    let log = log_start.map(|s| s.elapsed()).unwrap_or_default();
                     drop(shared);
                     drop(lease);
+                    // Group commit: wait only once no store lock is held, so a
+                    // concurrent commit's record shares the sync.
+                    let wait_start = profile.as_ref().map(|_| Instant::now());
+                    if let Some(pending) = pending {
+                        pending.wait()?;
+                    }
+                    if let Some(p) = profile {
+                        p.log += log + wait_start.map(|s| s.elapsed()).unwrap_or_default();
+                    }
                 }
                 // Apply the session transition.
                 let after = session_after(
@@ -1318,7 +1338,7 @@ impl Connection {
             let result = result?;
             let execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
             let log_start = profile.as_ref().map(|_| Instant::now());
-            self.log_autocommit(
+            let pending = self.log_autocommit(
                 &mut shared,
                 &plan,
                 &dynamic_functions_used,
@@ -1336,6 +1356,15 @@ impl Connection {
             }
             drop(shared);
             drop(lease);
+            // Group commit: the record is written; the sync is awaited with no
+            // store lock held, so concurrent commits share it.
+            let wait_start = profile.as_ref().map(|_| Instant::now());
+            if let Some(pending) = pending {
+                pending.wait()?;
+            }
+            if let Some(p) = profile.as_deref_mut() {
+                p.log += wait_start.map(|s| s.elapsed()).unwrap_or_default();
+            }
             return Ok(result);
         }
         // Optimistic fast path.
@@ -1375,7 +1404,7 @@ impl Connection {
             shared.note_optimistic_success_for_test();
             let execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
             let log_start = profile.as_ref().map(|_| Instant::now());
-            self.log_autocommit(
+            let pending = self.log_autocommit(
                 &mut shared,
                 &plan,
                 &dynamic_functions_used,
@@ -1393,6 +1422,13 @@ impl Connection {
             }
             drop(shared);
             drop(lease);
+            let wait_start = profile.as_ref().map(|_| Instant::now());
+            if let Some(pending) = pending {
+                pending.wait()?;
+            }
+            if let Some(p) = profile.as_deref_mut() {
+                p.log += wait_start.map(|s| s.elapsed()).unwrap_or_default();
+            }
             return Ok(result);
         }
         // Conflict: undo the never-logged effect, then re-execute under the
@@ -1420,7 +1456,7 @@ impl Connection {
             })?;
         let execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
         let log_start = profile.as_ref().map(|_| Instant::now());
-        self.log_autocommit(
+        let pending = self.log_autocommit(
             &mut shared,
             &plan,
             &dynamic_functions_used,
@@ -1432,12 +1468,19 @@ impl Connection {
             &budget,
         )?;
         let log = log_start.map(|start| start.elapsed()).unwrap_or_default();
-        if let Some(p) = profile {
+        if let Some(p) = profile.as_deref_mut() {
             p.execute += execute;
             p.log += log;
         }
         drop(shared);
         drop(lease);
+        let wait_start = profile.as_ref().map(|_| Instant::now());
+        if let Some(pending) = pending {
+            pending.wait()?;
+        }
+        if let Some(p) = profile {
+            p.log += wait_start.map(|s| s.elapsed()).unwrap_or_default();
+        }
         Ok(result)
     }
 
@@ -1446,6 +1489,9 @@ impl Connection {
     /// held, then the auto-checkpoint hook. `sets` is the statement's
     /// precomputed (canonical) touched set when the caller already has it.
     #[allow(clippy::too_many_arguments)]
+    /// Log the statement's committed unit and hand back its commit token: the
+    /// caller waits on it (`wal_sync_method`'s sync) after releasing the store
+    /// lock, so concurrent commits share one sync.
     fn log_autocommit(
         &self,
         shared: &mut PinkDb,
@@ -1457,7 +1503,7 @@ impl Connection {
         lease: Option<&LeaseGuard>,
         sets: Option<&crate::wal::FrameSets>,
         budget: &Arc<crate::exec::ExecBudget>,
-    ) -> Result<()> {
+    ) -> Result<Option<crate::wal::CommitSync>> {
         let pre_ns = crate::storage::SchemaPath::new(pre, &self.current_schema);
         // The statement's recorded external-call results travel in its record:
         // a replay serves them and never calls the provider (wave 107c). A
@@ -1487,10 +1533,20 @@ impl Connection {
                     .any(|(ns, _)| ns.temp_id().is_none())
             {
                 let sets = shared.proc_frame.touched();
-                shared.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets), None, &memo)?;
+                let pending = shared.wal_append_session_pending(
+                    &db,
+                    &db,
+                    &stmts,
+                    &[],
+                    &[],
+                    Some(&sets),
+                    None,
+                    &memo,
+                )?;
                 shared.maybe_auto_checkpoint(lease);
+                return Ok(pending);
             }
-            return Ok(());
+            return Ok(None);
         }
         if let Some(text) = sql_text
             && crate::plan::writes_persistent_tables(plan, &pre_ns)
@@ -1505,7 +1561,7 @@ impl Connection {
                 Some(s) => s.clone(),
                 None => shared.plan_sets_store(plan, &pre_ns),
             };
-            shared.wal_append_session(
+            let pending = shared.wal_append_session_pending(
                 &pre_ns,
                 &after,
                 &[text.to_string()],
@@ -1516,8 +1572,9 @@ impl Connection {
                 &memo,
             )?;
             shared.maybe_auto_checkpoint(lease);
+            return Ok(pending);
         }
-        Ok(())
+        Ok(None)
     }
 
     fn txn_begin(&mut self) -> Result<QueryResult> {
@@ -1689,7 +1746,8 @@ impl Connection {
         let lake_routed = !txn.work.dirty_lake_databases()?.is_empty();
         // Validation passed: make the transaction durable first, then merge
         // (the merge itself cannot fail). A conflict abort returns above and
-        // therefore never logs.
+        // therefore never logs. The commit syncs inline — it still holds the
+        // store lock the merge needs, so it cannot hand the sync to a group.
         if !txn.wal_stmts.is_empty() && !lake_routed {
             let before = txn
                 .wal_db_before

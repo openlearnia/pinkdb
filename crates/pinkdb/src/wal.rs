@@ -192,8 +192,8 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::crypto::{self, EncryptionKey, RecordCipher, TAG_LEN};
@@ -616,6 +616,10 @@ pub(crate) struct Lease {
     /// The next epoch seq this process will write; synced from the slots on
     /// every outermost acquisition so concurrent writers never regress seq.
     next_epoch_seq: AtomicU64,
+    /// [`WalSyncMethod`] of this process's commits (`SET wal_sync_method`),
+    /// stored here because every session of the process shares one lease and
+    /// the setting is reachable from the read path with a shared borrow.
+    sync_method: AtomicU8,
     /// Test-only fast-path evidence (wave 45n gap d): statement-boundary
     /// prechecks, how many of them skipped the refresh because the cached
     /// epoch was unchanged, and how many entered a refresh pass. Per handle,
@@ -662,6 +666,7 @@ impl Lease {
             busy_timeout_ms: AtomicU64::new(ms),
             epoch_cache: AtomicU64::new(0),
             next_epoch_seq: AtomicU64::new(1),
+            sync_method: AtomicU8::new(WalSyncMethod::Full.code()),
             #[cfg(test)]
             prechecks: AtomicU64::new(0),
             #[cfg(test)]
@@ -674,6 +679,15 @@ impl Lease {
     pub(crate) fn set_busy_timeout(&self, timeout: Duration) {
         let ms = timeout.as_millis().min(u64::MAX as u128) as u64;
         self.busy_timeout_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// The sync method committed records use (see [`WalSyncMethod`]).
+    pub(crate) fn sync_method(&self) -> WalSyncMethod {
+        WalSyncMethod::from_code(self.sync_method.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set_sync_method(&self, method: WalSyncMethod) {
+        self.sync_method.store(method.code(), Ordering::Relaxed);
     }
 
     fn busy_timeout(&self) -> Duration {
@@ -1010,18 +1024,32 @@ fn publish_block_crc(wal_id: &WalId, generation: u64, version: u32) -> u32 {
     crc32(&v)
 }
 
-/// Hand-rolled CRC-32 (IEEE, reflected polynomial 0xEDB88320) — no deps.
+/// CRC-32 (IEEE, reflected polynomial 0xEDB88320) — a const table, no deps.
+/// Per-bit would be 8 table-free rounds per byte, on the commit path.
 pub fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in bytes {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+        crc = CRC32_TABLE[((crc as u8) ^ b) as usize] ^ (crc >> 8);
     }
     !crc
 }
+
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
 
 /// When committed records are fsynced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1033,6 +1061,331 @@ pub enum SyncPolicy {
     /// Records are written but not fsynced; [`PinkDb::flush_wal`] and
     /// checkpoint make them durable.
     Batch,
+}
+
+/// Which syscall makes a committed WAL record durable (wave 136w4).
+///
+/// Exactly one of these calls sits between a commit and its return, and it
+/// dominates the cost of a small commit: on macOS `full` is
+/// `fcntl(F_FULLFSYNC)`, which also flushes the drive's own write cache
+/// (~3.9 ms on an APFS volume), while plain `fsync(2)` only reaches the OS
+/// cache (~0.02 ms). DuckDB has no choice to make: it always calls `fsync`.
+///
+/// `SET wal_sync_method = 'full' | 'fsync' | 'fdatasync'` switches it for the
+/// running store. The value is per process, not persisted (a reopen starts at
+/// [`Default`]): another process sharing the file syncs by its own method, and
+/// the stronger method still makes the shared file durable. The epoch slot and
+/// the checkpoint publication keep `File::sync_all`, because a rolled WAL
+/// relies on the published checkpoint surviving the crash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum WalSyncMethod {
+    /// Flush the OS cache *and* the drive's write cache (`F_FULLFSYNC` on
+    /// macOS, `fsync` elsewhere — Postgres spells this `fsync_writethrough`).
+    /// Survives a power cut. The default.
+    #[default]
+    Full,
+    /// `fsync(2)`: the record is on stable storage as far as the OS knows, but
+    /// a drive that lies about its write cache can still lose it. What DuckDB
+    /// asks for.
+    Fsync,
+    /// `fdatasync(2)`: like `fsync` without the metadata flush. Falls back to
+    /// `fsync` where it does not exist (macOS).
+    Fdatasync,
+}
+
+impl WalSyncMethod {
+    /// The `SET wal_sync_method` spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Fsync => "fsync",
+            Self::Fdatasync => "fdatasync",
+        }
+    }
+
+    /// Parse a `SET wal_sync_method` value.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "full" => Some(Self::Full),
+            "fsync" => Some(Self::Fsync),
+            "fdatasync" => Some(Self::Fdatasync),
+            _ => None,
+        }
+    }
+
+    fn code(self) -> u8 {
+        self as u8
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Fsync,
+            2 => Self::Fdatasync,
+            _ => Self::Full,
+        }
+    }
+}
+
+/// Sync `file` with `method`. `File::sync_all` and `File::sync_data` are both
+/// `F_FULLFSYNC` on macOS, so the cheaper methods must call the syscall.
+fn sync_file(method: WalSyncMethod, file: &File) -> std::io::Result<()> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::os::fd::AsRawFd;
+
+        let fd = file.as_raw_fd();
+        // SAFETY: `fd` is owned by `file`, which outlives the call. macOS has no
+        // `fdatasync(2)`: `fsync` is the cheapest data sync there.
+        let rc = unsafe {
+            match method {
+                #[cfg(target_os = "macos")]
+                WalSyncMethod::Full => libc::fcntl(fd, libc::F_FULLFSYNC),
+                #[cfg(not(target_os = "macos"))]
+                WalSyncMethod::Full => libc::fsync(fd),
+                WalSyncMethod::Fsync => libc::fsync(fd),
+                #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+                WalSyncMethod::Fdatasync => libc::fdatasync(fd),
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_os = "freebsd"
+                )))]
+                WalSyncMethod::Fdatasync => libc::fsync(fd),
+            }
+        };
+        if rc < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // No syscall to reach; wasm hosts are not durable stores.
+        let _ = method;
+        file.sync_all()
+    }
+}
+
+/// The error a failed WAL sync is reported with: every waiting committer fails
+/// (fail-stop), and the handle is poisoned like after a failed append.
+fn sync_failure(msg: &str) -> PinkDbError {
+    PinkDbError::Io(std::io::Error::other(format!("WAL sync failed ({msg})")))
+}
+
+/// Group commit: one sync makes every WAL record written before it started
+/// durable, so concurrent committers share it (wave 136w4).
+///
+/// A committer writes its record under the WAL lock and then waits for the
+/// token *after* dropping the store's write lock, so other sessions' records
+/// join the group. The first waiter with no sync in flight leads: it syncs up
+/// to the end of everything written so far and repeats while writers keep
+/// arriving, so a burst of committers costs about one sync per wave, and a
+/// committer whose record a leader already covered returns with no syscall.
+///
+/// Durability: a record's bytes are written before the leader reads
+/// `written_end`, and the leader's sync starts after that read, so the record
+/// is covered. The sync runs on a `dup` of the WAL fd (`fsync` acts on the
+/// file, not the descriptor) and outside the WAL lock, so a leader blocks no
+/// writer. A record is only reported durable when its own [`CommitSync::wait`]
+/// returned `Ok`.
+
+#[derive(Debug)]
+pub(crate) struct SyncGroup {
+    file: File,
+    lease: Arc<Lease>,
+    state: Mutex<SyncState>,
+    ready: Condvar,
+}
+
+#[derive(Debug)]
+struct SyncState {
+    /// File end after the last record a committer wrote.
+    written_end: u64,
+    /// File end known to be on stable storage.
+    synced_end: u64,
+    /// A committer is inside the sync; the others wait on `ready`.
+    in_flight: bool,
+    /// The first failure: every later committer fails with it.
+    failed: Option<String>,
+    #[cfg(test)]
+    syncs: u64,
+    #[cfg(test)]
+    last_method: WalSyncMethod,
+    /// Test hook: fail this many syncs without calling the syscall.
+    #[cfg(test)]
+    fail_next: usize,
+}
+
+impl SyncGroup {
+    fn new(file: &File, lease: Arc<Lease>) -> std::io::Result<Arc<Self>> {
+        // Everything already in the file was written by an earlier
+        // incarnation whose own commit waited for its own sync.
+        let end = file.metadata()?.len();
+        Ok(Arc::new(Self {
+            file: file.try_clone()?,
+            lease,
+            state: Mutex::new(SyncState {
+                written_end: end,
+                synced_end: end,
+                in_flight: false,
+                failed: None,
+                #[cfg(test)]
+                syncs: 0,
+                #[cfg(test)]
+                last_method: WalSyncMethod::Full,
+                #[cfg(test)]
+                fail_next: 0,
+            }),
+            ready: Condvar::new(),
+        }))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SyncState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Record that a record ending at `end` was written. Called under the WAL
+    /// lock, before its sync.
+    fn written(&self, end: u64) {
+        self.lock().written_end = end;
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.lock().failed.clone()
+    }
+
+    /// Follow the file after a scan repaired its tail: the group must never
+    /// claim more than the file holds, or a waiter would return for bytes that
+    /// are no longer there.
+    fn rebase(&self, end: u64) {
+        let mut st = self.lock();
+        if end < st.synced_end {
+            st.written_end = end;
+            st.synced_end = end;
+        }
+    }
+
+    /// Wait until `end` is on stable storage, leading a sync if none is in
+    /// flight.
+    fn wait(self: &Arc<Self>, end: u64) -> Result<()> {
+        let mut st = self.lock();
+        loop {
+            if let Some(msg) = &st.failed {
+                return Err(sync_failure(msg));
+            }
+            if st.synced_end >= end {
+                return Ok(());
+            }
+            if st.in_flight {
+                st = self.ready.wait(st).unwrap_or_else(|p| p.into_inner());
+                continue;
+            }
+            st.in_flight = true;
+            drop(st);
+            let failed = self.lead(end);
+            st = self.lock();
+            st.in_flight = false;
+            self.ready.notify_all();
+            if let Some(msg) = failed {
+                return Err(sync_failure(&msg));
+            }
+            // Our own end can be past what the leader round covered (records
+            // written while it synced): loop, and lead again if so.
+        }
+    }
+
+    /// Sync everything written so far, repeating while writers keep arriving.
+    /// Records a failure for every waiter and returns it.
+    ///
+    /// `floor` is the leader's own record end: a watermark below it would spin
+    /// the waiter that asked for it, so the sync covers at least that far (the
+    /// bytes are written before the token exists).
+    fn lead(&self, floor: u64) -> Option<String> {
+        loop {
+            let target = {
+                let st = self.lock();
+                if let Some(msg) = &st.failed {
+                    return Some(msg.clone());
+                }
+                let target = st.written_end.max(floor);
+                if target <= st.synced_end {
+                    return None;
+                }
+                target
+            };
+            let method = self.lease.sync_method();
+            let result = self.sync_once(method);
+            let mut st = self.lock();
+            match result {
+                Ok(()) => {
+                    #[cfg(test)]
+                    {
+                        st.syncs += 1;
+                        st.last_method = method;
+                    }
+                    st.synced_end = st.synced_end.max(target);
+                    drop(st);
+                    self.ready.notify_all();
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    st.failed = Some(msg.clone());
+                    drop(st);
+                    self.ready.notify_all();
+                    return Some(msg);
+                }
+            }
+        }
+    }
+
+    fn sync_once(&self, method: WalSyncMethod) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            let mut st = self.lock();
+            if st.fail_next > 0 {
+                st.fail_next -= 1;
+                return Err(std::io::Error::other("injected WAL sync failure"));
+            }
+        }
+        sync_file(method, &self.file)
+    }
+
+    #[cfg(test)]
+    fn syncs(&self) -> (u64, WalSyncMethod) {
+        let st = self.lock();
+        (st.syncs, st.last_method)
+    }
+
+    #[cfg(test)]
+    fn fail_next_syncs(&self, count: usize) {
+        self.lock().fail_next = count;
+    }
+}
+
+/// A written WAL record whose durable sync has not been confirmed yet: until
+/// [`wait`](Self::wait) returns `Ok`, a crash may still lose it.
+///
+/// The committing statement waits on this after releasing the store lock (so
+/// concurrent commits share one sync), which means another session can read
+/// the change while its sync is in flight — InnoDB's behaviour, not
+/// Postgres's. No client has been told such a commit succeeded, and any write
+/// that depends on it lands later in the WAL and waits for a sync that covers
+/// both, so a crash in that window loses only unacknowledged work; a
+/// read-only query may have returned it.
+#[derive(Debug)]
+pub(crate) struct CommitSync {
+    group: Arc<SyncGroup>,
+    end: u64,
+}
+
+impl CommitSync {
+    /// Wait until this record — and every record written before it — is on
+    /// stable storage (one sync may cover many commits).
+    pub(crate) fn wait(self) -> Result<()> {
+        self.group.wait(self.end)
+    }
 }
 
 /// What an [`PinkDb::open_durable`] call saw and did while recovering.
@@ -1181,6 +1534,14 @@ pub struct Wal {
     portable_records: Vec<Vec<u8>>,
     /// The write lease of the owning durable store (shared with the store).
     lease: Arc<Lease>,
+    /// Group commit for this WAL incarnation: record writes hand it their end
+    /// offset, and every committer waits on it after dropping the store lock.
+    sync: Arc<SyncGroup>,
+    /// A positioned handle for the header's commit slot ([`Wal::publish`]).
+    /// Opened on the first publish and reused; a plain `open` per commit was a
+    /// measurable share of the non-sync cost. Dropped whenever `file` is
+    /// replaced, so it never writes a rolled generation.
+    slot_file: Option<File>,
     /// What the owning store's memory already includes of this file.
     applied: Applied,
     /// Frames applied or appended since the last full reload, with their
@@ -1649,6 +2010,7 @@ impl Wal {
     ) -> Result<(Wal, Vec<Record>, u64)> {
         let opened = scan_wal(path, key, recreate_gen, true)?;
         let truncated = opened.truncated;
+        let sync = SyncGroup::new(&opened.file, lease.clone())?;
         let wal = Wal {
             file: opened.file,
             path: path.to_path_buf(),
@@ -1667,6 +2029,8 @@ impl Wal {
             auto_checkpoint_bytes: Some(DEFAULT_AUTO_CHECKPOINT_BYTES),
             bytes_appended_since_gen_start: 0,
             portable_records: Vec::new(),
+            sync,
+            slot_file: None,
             lease,
             applied: Applied::default(),
             journal: Vec::new(),
@@ -1747,8 +2111,21 @@ impl Wal {
     }
 
     /// Why the WAL stopped accepting writes, if it did (see `poisoned`).
-    pub(crate) fn failure(&self) -> Option<&str> {
-        self.poisoned.as_deref()
+    /// Why this handle stopped (`None` = healthy), including a failed commit
+    /// group sync: the group records it before any waiter returns, and reads
+    /// must already fail while the next write poisons `poisoned`.
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.poisoned.clone().or_else(|| self.sync.failure())
+    }
+
+    /// Fold a failed group sync into `poisoned`, so appends are refused even if
+    /// this handle never waited on the commit that failed.
+    fn absorb_sync_failure(&mut self) {
+        if self.poisoned.is_none()
+            && let Some(msg) = self.sync.failure()
+        {
+            self.poisoned = Some(msg);
+        }
     }
 
     /// Publish the durable commit position to other processes: write the next
@@ -1762,28 +2139,36 @@ impl Wal {
         // appends; it must NOT be used for positioned writes: on Linux,
         // `pwrite` on an O_APPEND descriptor ignores the offset and appends
         // to EOF (macOS honours the offset), which silently strands the
-        // commit slot at the end of the file. Open a positioned handle for
-        // the header slot — a hint write on the commit path, one extra open,
-        // never an fsync.
-        let wrote = OpenOptions::new()
-            .write(true)
-            .open(&self.path)
-            .and_then(|f| match &self.cipher {
-                Some(cipher) => {
-                    let meta = publish_meta(&self.wal_id, self.generation);
-                    let slot = if seq.is_multiple_of(2) { 1 } else { 0 };
-                    let bytes = encode_publish_slot(cipher, &meta, slot, seq, self.last_lsn)
-                        .map_err(std::io::Error::other)?;
-                    let offset = self.slots_at
-                        + if slot == 0 {
-                            0
-                        } else {
-                            ENC_PUBLISH_SLOT_LEN as u64
-                        };
-                    file_write_all_at(&f, &bytes, offset)
-                }
-                None => write_slot(&f, self.slots_at, seq, self.last_lsn, WAL_SLOT_DOMAIN),
-            });
+        // commit slot at the end of the file. A positioned handle is reused
+        // for the header slot — a hint write on the commit path, one open per
+        // incarnation, never an fsync. It is dropped whenever `file` is
+        // replaced, so it can never write a rolled generation.
+        if self.slot_file.is_none() {
+            self.slot_file = OpenOptions::new().write(true).open(&self.path).ok();
+            if self.slot_file.is_none() {
+                warn_slot_once("WAL commit slot");
+            }
+        }
+        let wrote = match (self.slot_file.as_ref(), self.cipher.as_ref()) {
+            (Some(f), Some(cipher)) => {
+                let meta = publish_meta(&self.wal_id, self.generation);
+                let slot = if seq.is_multiple_of(2) { 1 } else { 0 };
+                encode_publish_slot(cipher, &meta, slot, seq, self.last_lsn)
+                    .map_err(std::io::Error::other)
+                    .and_then(|bytes| {
+                        let offset = self.slots_at
+                            + if slot == 0 {
+                                0
+                            } else {
+                                ENC_PUBLISH_SLOT_LEN as u64
+                            };
+                        file_write_all_at(f, &bytes, offset)
+                    })
+            }
+            (Some(f), None) => write_slot(f, self.slots_at, seq, self.last_lsn, WAL_SLOT_DOMAIN),
+            // The open failed and warned above.
+            (None, _) => Ok(()),
+        };
         if wrote.is_err() {
             warn_slot_once("WAL commit slot");
         }
@@ -1804,6 +2189,14 @@ impl Wal {
             .map(|m| m.len())
             .unwrap_or(opened.records_start);
         self.file = opened.file;
+        if opened.generation != self.generation {
+            // A rolled file restarts its offsets, so the group's watermarks do
+            // not describe it (and everything in it was synced by its writer).
+            self.sync = SyncGroup::new(&self.file, self.lease.clone())?;
+            self.slot_file = None;
+        } else {
+            self.sync.rebase(end);
+        }
         self.generation = opened.generation;
         self.wal_id = opened.wal_id;
         self.records_start = opened.records_start;
@@ -1893,10 +2286,15 @@ impl Wal {
         Ok(Some((records, end)))
     }
 
-    /// Append one committed unit of statements as a single record. `sets` is
-    /// the frame's touched-object set (payload v4): `None` is reserved for
-    /// legacy re-encodes during an upgrade; every live append knows its set,
-    /// so optimistic commits can validate against this record later.
+    /// Append one committed unit of statements as a single record and wait for
+    /// its durable sync. `sets` is the frame's touched-object set (payload v4):
+    /// `None` is reserved for legacy re-encodes during an upgrade; every live
+    /// append knows its set, so optimistic commits can validate against this
+    /// record later.
+    ///
+    /// Callers that can release the store's write lock before waiting (the
+    /// autocommit path) use [`Wal::append_pending`] instead, so the sync covers
+    /// the records of every session committing at the same time.
     pub(crate) fn append(
         &mut self,
         stmts: &[String],
@@ -1904,6 +2302,23 @@ impl Wal {
         secrets: Option<&[crate::secret::Secret]>,
         memo: &[ExtCall],
     ) -> Result<()> {
+        match self.append_pending(stmts, sets, secrets, memo)? {
+            Some(pending) => pending.wait(),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Wal::append`] without the wait: the record is written and the returned
+    /// token must be waited on (`Ok`) or dropped (`None`, `SyncPolicy::Batch`)
+    /// by the caller *after* releasing the store's write lock, never earlier.
+    fn append_pending(
+        &mut self,
+        stmts: &[String],
+        sets: Option<&FrameSets>,
+        secrets: Option<&[crate::secret::Secret]>,
+        memo: &[ExtCall],
+    ) -> Result<Option<CommitSync>> {
+        self.absorb_sync_failure();
         if let Some(msg) = &self.poisoned {
             return Err(PinkDbError::Execution(format!(
                 "WAL is unusable after an earlier write failure ({msg})"
@@ -1947,10 +2362,7 @@ impl Wal {
         rec.extend_from_slice(&lsn.to_le_bytes());
         rec.extend_from_slice(&crc.to_le_bytes());
         rec.extend_from_slice(&body);
-        let result = self.file.write_all(&rec).and_then(|()| match self.policy {
-            SyncPolicy::Sync => self.file.sync_all(),
-            SyncPolicy::Batch => Ok(()),
-        });
+        let result = self.file.write_all(&rec);
         match result {
             Ok(()) => {
                 self.last_lsn = lsn;
@@ -1967,7 +2379,19 @@ impl Wal {
                 self.journal_push(lsn, sets);
                 self.portable_records.push(portable);
                 self.publish();
-                Ok(())
+                // The bytes are in the file: every append registers its end
+                // with the group, so a later `flush` (a `Batch` commit that
+                // skips the sync) knows what is there to sync.
+                self.sync.written(self.applied.applied_end);
+                match self.policy {
+                    // Publishing the epoch slot first is safe — it is a refresh
+                    // hint, and only `CommitSync::wait` reports durability.
+                    SyncPolicy::Sync => Ok(Some(CommitSync {
+                        group: self.sync.clone(),
+                        end: self.applied.applied_end,
+                    })),
+                    SyncPolicy::Batch => Ok(None),
+                }
             }
             Err(e) => {
                 self.poisoned = Some(e.to_string());
@@ -1976,16 +2400,18 @@ impl Wal {
         }
     }
 
-    /// fsync everything written so far (no-op after a clean `Sync` append).
+    /// Make everything written so far durable (no-op after a clean `Sync`
+    /// append; one sync for a batch of `Batch` appends).
     pub(crate) fn flush(&mut self) -> Result<()> {
+        self.absorb_sync_failure();
         if let Some(msg) = &self.poisoned {
             return Err(PinkDbError::Execution(format!(
                 "WAL is unusable after an earlier write failure ({msg})"
             )));
         }
         self.lease.verify_lock_identity()?;
-        self.file.sync_all()?;
-        Ok(())
+        let end = self.applied.applied_end;
+        self.sync.wait(end)
     }
 
     /// Record the replay-session database after the records appended so far.
@@ -2031,6 +2457,10 @@ impl Wal {
     /// statement against a vanished database would have failed at execution).
     /// The tracked replay session then becomes unknown, so the next append
     /// prefixes unconditionally.
+    ///
+    /// Returns the record's commit token: the caller waits on it (or drops it,
+    /// `SyncPolicy::Batch`) after releasing the store's write lock, so
+    /// concurrent commits share one sync (see [`CommitSync`]).
     // The arguments are the record's fields, one per column of the payload.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_in_session(
@@ -2043,7 +2473,7 @@ impl Wal {
         sets: Option<&FrameSets>,
         secrets: Option<&[crate::secret::Secret]>,
         memo: &[ExtCall],
-    ) -> Result<()> {
+    ) -> Result<Option<CommitSync>> {
         let mut rec: Vec<String> = Vec::with_capacity(stmts.len() + touched_extensions.len() + 1);
         if let Some(before) = db_before
             && self.session_db.as_ref() != Some(before)
@@ -2068,7 +2498,7 @@ impl Wal {
             rec.push(format!("LOAD EXTENSION '{}'", path.replace('\'', "''")));
         }
         rec.extend_from_slice(stmts);
-        self.append(&rec, sets, secrets, memo)?;
+        let pending = self.append_pending(&rec, sets, secrets, memo)?;
         // Covered only after a successful append.
         self.tracked_extensions
             .extend(touched_extensions.iter().cloned());
@@ -2078,7 +2508,7 @@ impl Wal {
             Some(_) => self.session_db = Some(db_after.clone()),
             None => self.session_db = None,
         }
-        Ok(())
+        Ok(pending)
     }
 
     /// Crash-safe checkpoint: publish the state `save_tmp` writes to `tmp` as
@@ -2091,8 +2521,9 @@ impl Wal {
     pub(crate) fn checkpoint(
         &mut self,
         guard: &LeaseGuard,
-        save_tmp: impl FnOnce(&Path) -> Result<()>,
+        save: impl FnOnce(&Path, &Path, u64, u64) -> Result<super::persist::CheckpointSave>,
     ) -> Result<()> {
+        self.absorb_sync_failure();
         if self.poisoned.is_some() {
             return Err(PinkDbError::Execution(
                 "cannot checkpoint: the WAL failed earlier in this session".to_string(),
@@ -2117,19 +2548,21 @@ impl Wal {
                 roll.display()
             )));
         }
-        // 1. Full state to `.tmp`, fsynced by the writer, then the directory:
-        //    a surviving roll is recovery's proof that `.tmp` is complete.
-        save_tmp(&tmp)?;
-        sync_parent_dir(&tmp);
+        let fresh_gen = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| PinkDbError::Execution("WAL generation counter overflow".to_string()))?;
+        // 1. Full state to `.tmp`, fsynced by the writer, or an in-place
+        //    checkpoint that already wrote its data, footer, and new slot.
+        let kind = save(&tmp, &self.checkpoint_path, self.generation, fresh_gen)?;
+        if kind == super::persist::CheckpointSave::Full {
+            sync_parent_dir(&tmp);
+        }
         // 2. Roll the generation: the old records move to a name carrying
         //    their generation (never overwritten), a fresh WAL starts at
         //    generation + 1 with a fresh `wal_id`. The fresh container cipher is
         //    prepared before the rename so a crypto failure cannot leave the
         //    WAL rolled.
-        let fresh_gen = self
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| PinkDbError::Execution("WAL generation counter overflow".to_string()))?;
         let fresh_cipher = match &self.cipher {
             Some(c) => Some(c.fork(fresh_gen)?),
             None => None,
@@ -2137,11 +2570,24 @@ impl Wal {
         std::fs::rename(&self.path, &roll)?;
         match Self::create_file(&self.path, fresh_gen, fresh_cipher) {
             Ok((fresh, cipher, wal_id)) => {
+                // The roll already happened: if the new incarnation cannot be
+                // prepared, nothing may write this handle again.
+                let sync = match SyncGroup::new(&fresh, self.lease.clone()) {
+                    Ok(sync) => sync,
+                    Err(e) => {
+                        self.poisoned = Some(format!("failed to prepare the fresh WAL: {e}"));
+                        return Err(e.into());
+                    }
+                };
                 // Readers will now see a new incarnation: bump before/at the
                 // rename visibility (a crash before this bump leaves the
                 // identity re-check in `refresh` to catch it).
                 guard.bump_epoch(self.last_lsn);
                 self.file = fresh;
+                // Fresh generation, fresh offsets: a new commit group, and no
+                // cached slot handle for the rolled file.
+                self.sync = sync;
+                self.slot_file = None;
                 self.cipher = cipher;
                 self.generation = fresh_gen;
                 self.wal_id = wal_id;
@@ -2188,12 +2634,25 @@ impl Wal {
         // The roll rename and the fresh WAL must be durable before the
         // publish that supersedes them.
         sync_parent_dir(&self.path);
-        // 3. Publish the checkpoint atomically.
-        if let Err(e) = std::fs::rename(&tmp, &self.checkpoint_path) {
-            self.poisoned = Some(format!("failed to publish checkpoint: {e}"));
-            return Err(e.into());
+        // 3. A full rewrite publishes its `.tmp` atomically. An in-place
+        //    checkpoint published its other slot before this roll; its marker
+        //    is what recovery uses if the roll did not finish.
+        if kind == super::persist::CheckpointSave::Full {
+            if let Err(e) = std::fs::rename(&tmp, &self.checkpoint_path) {
+                self.poisoned = Some(format!("failed to publish checkpoint: {e}"));
+                return Err(e.into());
+            }
+            sync_parent_dir(&self.checkpoint_path);
+            // A full rewrite replaces the file, so any marker from a failed
+            // in-place attempt describes a slot that no longer exists.
+            let _ = remove_checkpoint_marker(&self.checkpoint_path);
+        } else if let Err(e) = remove_checkpoint_marker(&self.checkpoint_path) {
+            // The checkpoint is durable, but a marker left behind while this
+            // process keeps appending would make recovery discard the new
+            // records. Refuse further writes instead.
+            self.poisoned = Some(format!("failed to clear the checkpoint marker: {e}"));
+            return Err(e);
         }
-        sync_parent_dir(&self.checkpoint_path);
         guard.bump_epoch(0);
         self.applied.ckpt = ckpt_meta(&self.checkpoint_path);
         // 4. The old generation is now folded into the published `.pink`. A
@@ -3585,6 +4044,74 @@ fn tmp_path(checkpoint: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// The sidecar proving an in-place checkpoint reached its new header slot.
+/// It is written before the slot, so a valid marker plus a published slot
+/// means the old WAL generation is folded into the new checkpoint even if the
+/// process died before rolling it.
+const CHECKPOINT_MARKER_MAGIC: &[u8; 8] = b"PINKCPK1";
+const CHECKPOINT_MARKER_LEN: usize = 36;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CheckpointMarker {
+    pub iteration: u64,
+    pub wal_generation: u64,
+    pub next_generation: u64,
+}
+
+fn checkpoint_marker_path(checkpoint: &Path) -> PathBuf {
+    let mut s = checkpoint.as_os_str().to_os_string();
+    s.push(".ckpt");
+    PathBuf::from(s)
+}
+
+pub(crate) fn write_checkpoint_marker(checkpoint: &Path, marker: CheckpointMarker) -> Result<()> {
+    use std::io::Write;
+    let path = checkpoint_marker_path(checkpoint);
+    let mut bytes = Vec::with_capacity(CHECKPOINT_MARKER_LEN);
+    bytes.extend_from_slice(CHECKPOINT_MARKER_MAGIC);
+    bytes.extend_from_slice(&marker.iteration.to_le_bytes());
+    bytes.extend_from_slice(&marker.wal_generation.to_le_bytes());
+    bytes.extend_from_slice(&marker.next_generation.to_le_bytes());
+    let crc = crc32(&bytes);
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    let mut file = crate::fsutil::create_private(&path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    sync_parent_dir(&path);
+    Ok(())
+}
+
+fn read_checkpoint_marker(checkpoint: &Path) -> Result<Option<CheckpointMarker>> {
+    let path = checkpoint_marker_path(checkpoint);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if bytes.len() != CHECKPOINT_MARKER_LEN || &bytes[..8] != CHECKPOINT_MARKER_MAGIC {
+        return Ok(None);
+    }
+    let crc = u32::from_le_bytes(bytes[32..36].try_into().expect("4 bytes"));
+    if crc32(&bytes[..32]) != crc {
+        return Ok(None);
+    }
+    Ok(Some(CheckpointMarker {
+        iteration: u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes")),
+        wal_generation: u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes")),
+        next_generation: u64::from_le_bytes(bytes[24..32].try_into().expect("8 bytes")),
+    }))
+}
+
+fn remove_checkpoint_marker(checkpoint: &Path) -> Result<()> {
+    let path = checkpoint_marker_path(checkpoint);
+    match std::fs::remove_file(&path) {
+        Ok(()) => sync_parent_dir(&path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
 /// `<wal>.rewrite`: temp file for the atomic rewrite of a truncated encrypted
 /// WAL (never matched by `scan_rolls`, which only looks at `.roll` names).
 fn rewrite_path(wal: &Path) -> PathBuf {
@@ -4064,6 +4591,96 @@ fn check_recovery_mode(ckpt: &Path, tmp: &Path, key: Option<&EncryptionKey>) -> 
     Ok(())
 }
 
+/// Read the iteration the checkpoint names right now, without parsing the
+/// footer. A missing/corrupt pair of slots means no checkpoint is published.
+fn checkpoint_iteration(path: &Path) -> Result<Option<u64>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut header = vec![0u8; 2 * crate::persist::HEADER_SLOT_LEN];
+    if file.read_exact(&mut header).is_err() {
+        return Ok(None);
+    }
+    Ok(crate::persist::read_slots(&header).map(|(_, slot)| slot.iteration))
+}
+
+/// Finish the part of an in-place checkpoint that follows its header slot: the
+/// marker is written before the slot, so a marker plus a published slot proves
+/// the old WAL generation is already folded into the checkpoint even if the
+/// process died before rolling it. Returns true when it handled recovery.
+fn recover_incremental_checkpoint(
+    ckpt: &Path,
+    wal: &Path,
+    tmp: &Path,
+    rolls: &[Roll],
+    live_gen: Option<u64>,
+    info: &mut RecoveryInfo,
+    key: Option<&EncryptionKey>,
+) -> Result<bool> {
+    let Some(marker) = read_checkpoint_marker(ckpt)? else {
+        return Ok(false);
+    };
+    if key.is_some() {
+        // In-place checkpoints are plaintext-only; an encrypted open must not
+        // interpret a leftover plaintext sidecar.
+        let _ = remove_checkpoint_marker(ckpt);
+        return Ok(false);
+    }
+    if marker.next_generation != marker.wal_generation.saturating_add(1) {
+        let _ = remove_checkpoint_marker(ckpt);
+        return Ok(false);
+    }
+    let published = checkpoint_iteration(ckpt)? == Some(marker.iteration);
+    if !published {
+        // The slot is the commit point: without it the old checkpoint and the
+        // live WAL are still the authority, and the marker/damaged tail is
+        // ignored by readers.
+        let _ = remove_checkpoint_marker(ckpt);
+        return Ok(false);
+    }
+    if let Some(roll) = rolls
+        .iter()
+        .find(|r| r.generation >= marker.next_generation)
+    {
+        return Err(inconsistent_roll(
+            &roll.path,
+            roll.generation,
+            marker.next_generation,
+        ));
+    }
+    if live_gen.is_some_and(|g| g >= marker.next_generation) {
+        // The roll completed and this process kept committing afterwards.
+        // Those records are newer than the checkpoint; keep the live WAL.
+        info.stale_rolls_removed += remove_rolls(rolls);
+        let _ = std::fs::remove_file(tmp);
+        remove_checkpoint_marker(ckpt)?;
+        return Ok(true);
+    }
+    if let Some(g) = live_gen
+        && g != marker.wal_generation
+    {
+        return Err(PinkDbError::Execution(format!(
+            "checkpoint marker expects WAL generation {} but the live WAL is generation {g}",
+            marker.wal_generation
+        )));
+    }
+    // The live WAL still carries the generation the checkpoint folded in (or
+    // was torn/removed during the roll). Drop it and start the generation the
+    // roll would have created; its records are never replayed twice.
+    match std::fs::remove_file(wal) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    info.stale_rolls_removed += remove_rolls(rolls);
+    Wal::create_file(wal, marker.next_generation, None)?;
+    let _ = std::fs::remove_file(tmp);
+    remove_checkpoint_marker(ckpt)?;
+    Ok(true)
+}
+
 /// Finish an interrupted checkpoint (see the module docs for the full state
 /// machine). Never removes anything before the recovered state is durable.
 fn recover_checkpoint(
@@ -4078,6 +4695,9 @@ fn recover_checkpoint(
     check_recovery_mode(ckpt, tmp, key)?;
     let live_gen = probe.and_then(|p| p.generation);
     let live_records = probe.map(|p| p.has_records).unwrap_or(false);
+    if recover_incremental_checkpoint(ckpt, wal, tmp, rolls, live_gen, info, key)? {
+        return Ok(());
+    }
 
     if !tmp.exists() {
         if !rolls.is_empty() {
@@ -4291,9 +4911,16 @@ impl PinkDb {
         let mut mutated = false;
 
         // 1. Finish an interrupted checkpoint before loading anything.
-        let rolls = scan_rolls(&wal)?;
-        let probe = probe_wal(&wal, key)?;
+        let had_marker = checkpoint_marker_path(&ckpt).exists();
+        let mut rolls = scan_rolls(&wal)?;
+        let mut probe = probe_wal(&wal, key)?;
         recover_checkpoint(&ckpt, &wal, &tmp, &rolls, probe.as_ref(), &mut info, key)?;
+        if had_marker {
+            // Marker recovery may have replaced the live WAL, so the probe
+            // taken before it no longer describes the file to open.
+            rolls = scan_rolls(&wal)?;
+            probe = probe_wal(&wal, key)?;
+        }
         if info.checkpoints_completed > 0 || info.stale_rolls_removed > 0 {
             mutated = true;
         }
@@ -4487,7 +5114,11 @@ impl PinkDb {
         //    must not read the whole WAL (probe authenticates records).
         let rolls = scan_rolls(&wal_path)?;
         let mut info = RecoveryInfo::default();
-        if tmp.exists() || !rolls.is_empty() || wal_header_invalid(&wal_path)? {
+        if tmp.exists()
+            || !rolls.is_empty()
+            || checkpoint_marker_path(&ckpt).exists()
+            || wal_header_invalid(&wal_path)?
+        {
             let probe = probe_wal(&wal_path, key.as_ref())?;
             recover_checkpoint(
                 &ckpt,
@@ -5072,8 +5703,13 @@ impl PinkDb {
                 ));
             }
             match key {
-                Some(k) => guard_wal.checkpoint(guard, |tmp| self.save_sync_with_key(tmp, &k))?,
-                None => guard_wal.checkpoint(guard, |tmp| self.save_sync(tmp))?,
+                Some(k) => guard_wal.checkpoint(guard, |tmp, _, _, _| {
+                    self.save_sync_with_key(tmp, &k)?;
+                    Ok(crate::persist::CheckpointSave::Full)
+                })?,
+                None => guard_wal.checkpoint(guard, |tmp, target, generation, next| {
+                    self.save_checkpoint_sync(tmp, target, generation, next)
+                })?,
             }
         }
         #[cfg(not(feature = "encryption"))]
@@ -5081,7 +5717,9 @@ impl PinkDb {
             if self.encryption_key.is_some() {
                 return Err(crate::crypto::unavailable());
             }
-            guard_wal.checkpoint(guard, |tmp| self.save_sync(tmp))?;
+            guard_wal.checkpoint(guard, |tmp, target, generation, next| {
+                self.save_checkpoint_sync(tmp, target, generation, next)
+            })?;
         }
         // A fresh WAL generation replays from the checkpoint's session
         // default (the checkpoint does not store a session): reset the
@@ -6790,6 +7428,308 @@ mod tests {
         cleanup(&p);
     }
 
+    fn image_layout(p: &Path) -> Vec<(String, Vec<(u64, u64)>)> {
+        let data = std::fs::read(p).unwrap();
+        let (offset, len, _) = crate::persist::footer_location(&data, data.len() as u64).unwrap();
+        let layout = crate::persist::read_layout(
+            &data[offset as usize..(offset + len) as usize],
+            None,
+            offset,
+        )
+        .unwrap();
+        layout
+            .tables
+            .into_iter()
+            .map(|t| {
+                let spans = t
+                    .row_groups
+                    .iter()
+                    .flat_map(|g| g.columns.iter().map(|c| (c.offset, c.length)))
+                    .collect();
+                (format!("{}.{}", t.db, t.table), spans)
+            })
+            .collect()
+    }
+
+    fn iteration(p: &Path) -> u64 {
+        let data = std::fs::read(p).unwrap();
+        crate::persist::read_slots(&data[..2 * crate::persist::HEADER_SLOT_LEN])
+            .unwrap()
+            .1
+            .iteration
+    }
+
+    #[test]
+    fn incremental_checkpoints_round_trip_and_reuse_free_ranges() {
+        let p = tmp_ckpt("incremental");
+        let full = tmp_ckpt("incremental_full");
+        let inode_before;
+        {
+            let mut db = durable(&p);
+            db.execute("CREATE TABLE touched (a INTEGER, v VARCHAR);")
+                .unwrap();
+            db.execute("CREATE TABLE untouched (a INTEGER);").unwrap();
+            let values = (1..=200_000)
+                .map(|i| format!("({i}, 'v{i}')"))
+                .collect::<Vec<_>>()
+                .join(",");
+            db.execute(&format!("INSERT INTO touched VALUES {values};"))
+                .unwrap();
+            let values = (1..=20_000)
+                .map(|i| format!("({i})"))
+                .collect::<Vec<_>>()
+                .join(",");
+            db.execute(&format!("INSERT INTO untouched VALUES {values};"))
+                .unwrap();
+            db.checkpoint().unwrap();
+            inode_before = file_identity(&p);
+            let mut last_iteration = iteration(&p);
+            let layout_before = image_layout(&p);
+            let touched_before = layout_before
+                .iter()
+                .find(|(name, _)| name.ends_with(".touched"))
+                .unwrap()
+                .1
+                .clone();
+            let untouched_before = layout_before
+                .into_iter()
+                .find(|(name, _)| name.ends_with(".untouched"))
+                .unwrap()
+                .1;
+            let bytes_before = std::fs::read(&p).unwrap();
+            for round in 1..=8 {
+                db.execute(&format!("UPDATE touched SET v = 'x' WHERE a = {round};"))
+                    .unwrap();
+                db.checkpoint().unwrap();
+                let now = iteration(&p);
+                let free: u64 = crate::persist::footer_free_ranges_for_test(&p)
+                    .unwrap()
+                    .iter()
+                    .map(|&(_, len)| len)
+                    .sum();
+                assert!(
+                    now > last_iteration,
+                    "iteration must advance round={round} free={free} len={} last={last_iteration} now={now}",
+                    std::fs::metadata(&p).unwrap().len()
+                );
+                last_iteration = now;
+                let layout = image_layout(&p);
+                let untouched = layout
+                    .iter()
+                    .find(|(name, _)| name.ends_with(".untouched"))
+                    .unwrap()
+                    .1
+                    .clone();
+                assert_eq!(
+                    untouched, untouched_before,
+                    "a clean table's row groups must not move"
+                );
+                let bytes_after = std::fs::read(&p).unwrap();
+                for (offset, len) in &untouched {
+                    let span = *offset as usize..(*offset + *len) as usize;
+                    assert_eq!(
+                        &bytes_after[span.clone()],
+                        &bytes_before[span],
+                        "a clean table's bytes must not be rewritten"
+                    );
+                }
+                let free_ranges = crate::persist::footer_free_ranges_for_test(&p).unwrap();
+                assert!(
+                    !free_ranges.is_empty(),
+                    "the superseded group and footer must leave free ranges"
+                );
+                if round == 2 {
+                    let touched_now = layout
+                        .iter()
+                        .find(|(name, _)| name.ends_with(".touched"))
+                        .unwrap()
+                        .1
+                        .clone();
+                    assert_eq!(
+                        touched_now.first(),
+                        touched_before.first(),
+                        "the next checkpoint must reuse the first group's freed range"
+                    );
+                }
+            }
+            assert_eq!(
+                file_identity(&p),
+                inode_before,
+                "in place means the file is not replaced"
+            );
+            // A schema change in the middle of the sequence.
+            db.execute("ALTER TABLE touched ADD COLUMN b INTEGER DEFAULT 42;")
+                .unwrap();
+            db.checkpoint().unwrap();
+            db.execute("DELETE FROM touched WHERE a % 2 = 0;").unwrap();
+            db.checkpoint().unwrap();
+        }
+        let mut back = durable(&p);
+        let rows = ints(&mut back, "SELECT SUM(a) FROM touched;");
+        back.save(full.to_str().unwrap()).unwrap();
+        drop(back);
+        let mut rewritten = durable(&full);
+        assert_eq!(
+            rows,
+            ints(&mut rewritten, "SELECT SUM(a) FROM touched;"),
+            "incremental and full rewrite must agree"
+        );
+        assert_eq!(
+            ints(&mut rewritten, "SELECT SUM(a) FROM untouched;"),
+            vec![200_010_000]
+        );
+        cleanup(&p);
+        cleanup(&full);
+    }
+
+    #[test]
+    fn checkpoint_crashes_recover_one_complete_state() {
+        for (tag, fault) in [
+            ("afterdata", crate::persist::CheckpointFault::AfterData),
+            ("aftersync", crate::persist::CheckpointFault::AfterFirstSync),
+            ("tornslot", crate::persist::CheckpointFault::TornSlot),
+            ("afterslot", crate::persist::CheckpointFault::AfterSlot),
+        ] {
+            let p = tmp_ckpt(tag);
+            {
+                let mut db = durable(&p);
+                db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+                db.execute("INSERT INTO t VALUES (1);").unwrap();
+                db.checkpoint().unwrap();
+                db.execute("INSERT INTO t VALUES (2);").unwrap();
+                crate::persist::set_checkpoint_fault(Some(fault));
+                let err = db.checkpoint().unwrap_err();
+                assert!(err.to_string().contains("injected"), "{err}");
+                crate::persist::set_checkpoint_fault(None);
+                assert!(
+                    scan_rolls(&wal_path(&p)).unwrap().is_empty(),
+                    "{tag}: the WAL must not roll before the slot is durable"
+                );
+            }
+            let (mut back, info) =
+                PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+            assert_eq!(
+                ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+                vec![1, 2],
+                "{tag}: reopen must see the committed insert exactly once"
+            );
+            if fault == crate::persist::CheckpointFault::AfterSlot {
+                assert_eq!(
+                    info.replayed_records, 0,
+                    "{tag}: the marker must fold the unrolled generation"
+                );
+            } else {
+                assert_eq!(
+                    info.replayed_records, 1,
+                    "{tag}: the old slot plus WAL replay must be the state"
+                );
+            }
+            assert!(
+                !checkpoint_marker_path(&p).exists(),
+                "{tag}: recovery must clear the marker"
+            );
+            drop(back);
+            let mut again = durable(&p);
+            assert_eq!(
+                ints(&mut again, "SELECT a FROM t ORDER BY a;"),
+                vec![1, 2],
+                "{tag}: a second open must not replay anything again"
+            );
+            cleanup(&p);
+        }
+    }
+
+    #[test]
+    fn a_torn_newer_incremental_slot_loses_to_the_older_one() {
+        let p = tmp_ckpt("tornnewer");
+        {
+            let mut db = durable(&p);
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            db.execute("INSERT INTO t VALUES (1);").unwrap();
+            db.checkpoint().unwrap();
+            db.execute("INSERT INTO t VALUES (2);").unwrap();
+            db.checkpoint().unwrap();
+            db.execute("INSERT INTO t VALUES (3);").unwrap();
+            crate::persist::set_checkpoint_fault(Some(crate::persist::CheckpointFault::TornSlot));
+            db.checkpoint().unwrap_err();
+            crate::persist::set_checkpoint_fault(None);
+        }
+        let (mut back, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        assert_eq!(info.replayed_records, 1);
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+            vec![1, 2, 3]
+        );
+        cleanup(&p);
+    }
+
+    #[test]
+    fn a_large_free_list_triggers_a_compacting_full_rewrite() {
+        let p = tmp_ckpt("compact");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE big (a INTEGER, v VARCHAR);")
+            .unwrap();
+        db.execute("CREATE TABLE keep (a INTEGER);").unwrap();
+        let values = (1..=20_000)
+            .map(|i| format!("({i}, 'some-text-{i}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        db.execute(&format!("INSERT INTO big VALUES {values};"))
+            .unwrap();
+        db.execute("INSERT INTO keep VALUES (7);").unwrap();
+        db.checkpoint().unwrap();
+        let before = std::fs::metadata(&p).unwrap().len();
+        db.execute("DROP TABLE big;").unwrap();
+        db.checkpoint().unwrap();
+        assert!(
+            crate::persist::footer_free_ranges_for_test(&p)
+                .unwrap()
+                .iter()
+                .map(|&(_, len)| len)
+                .sum::<u64>()
+                * 2
+                > std::fs::metadata(&p).unwrap().len(),
+            "the dropped table must leave over half the file free"
+        );
+        db.checkpoint().unwrap();
+        assert_eq!(iteration(&p), 1, "a compaction resets the iteration");
+        assert!(
+            crate::persist::footer_free_ranges_for_test(&p)
+                .unwrap()
+                .is_empty(),
+            "a full rewrite writes an empty free list"
+        );
+        assert!(std::fs::metadata(&p).unwrap().len() < before);
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT a FROM keep;"), vec![7]);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn bytes_past_the_published_file_len_are_ignored_and_reclaimed() {
+        let p = tmp_ckpt("pastlen");
+        {
+            let mut db = durable(&p);
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            db.execute("INSERT INTO t VALUES (1);").unwrap();
+            db.checkpoint().unwrap();
+        }
+        let mut with_junk = std::fs::read(&p).unwrap();
+        with_junk.extend_from_slice(b"JUNK-PAST-FILE-LEN");
+        std::fs::write(&p, &with_junk).unwrap();
+        let mut db = durable(&p);
+        assert_eq!(ints(&mut db, "SELECT a FROM t;"), vec![1]);
+        db.checkpoint().unwrap();
+        let after = std::fs::read(&p).unwrap();
+        assert!(
+            !after.ends_with(b"JUNK-PAST-FILE-LEN"),
+            "the next checkpoint must truncate or overwrite stale bytes"
+        );
+        cleanup(&p);
+    }
+
     /// H2: a refresh replays another process's `USE` in the WAL lineage
     /// session but must never let it hijack this process's local session.
     #[test]
@@ -8447,6 +9387,29 @@ mod tests {
             cleanup(&p);
         }
 
+        #[test]
+        fn an_encrypted_checkpoint_is_a_full_rewrite() {
+            let p = tmp_ckpt("encincremental");
+            let mut db = durable_keyed(&p);
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            db.execute("INSERT INTO t VALUES (1);").unwrap();
+            db.checkpoint().unwrap();
+            let first = file_identity(&p);
+            assert!(!checkpoint_marker_path(&p).exists());
+            db.execute("INSERT INTO t VALUES (2);").unwrap();
+            db.checkpoint().unwrap();
+            assert_ne!(
+                file_identity(&p),
+                first,
+                "encrypted checkpoints still publish a new file"
+            );
+            assert!(!checkpoint_marker_path(&p).exists());
+            drop(db);
+            let mut back = durable_keyed(&p);
+            assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+            cleanup(&p);
+        }
+
         /// A checkpoint rolls into a fresh encrypted generation whose records
         /// still replay (forked cipher: same key, fresh nonce prefix).
         #[test]
@@ -10054,5 +11017,193 @@ mod tests {
             drop.conflict_with(&sets_of_ns(&[("db2", "s", "t")], &[], &[])),
             None
         );
+    }
+
+    /// Group commit: concurrent committers of one store share a sync. Every
+    /// commit is durable when its statement returns, so all of them are
+    /// visible after a reopen, but fewer syncs than commits were needed.
+    #[test]
+    fn group_commit_shares_one_sync_across_concurrent_committers() {
+        use std::sync::Barrier;
+
+        let p = TempCkpt::new("group_commit");
+        let mut store = durable(&p);
+        store.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let observer = store.clone();
+        let db = crate::Database::from_store(store);
+        let threads = 16;
+        let per = 4;
+        // All threads enter the commit path together, which is the shape
+        // group commit is for: one writer's sync is in flight while the
+        // others append.
+        let start = std::sync::Arc::new(Barrier::new(threads));
+        let mut joined = Vec::new();
+        for t in 0..threads {
+            let db = db.clone();
+            let start = start.clone();
+            joined.push(std::thread::spawn(move || {
+                let mut c = db.connect();
+                start.wait();
+                for i in 0..per {
+                    c.execute(&format!("INSERT INTO t VALUES ({});", t * per + i))
+                        .unwrap();
+                }
+            }));
+        }
+        for h in joined {
+            h.join().unwrap();
+        }
+        let commits = (threads * per) as u64;
+        let (syncs, method) = {
+            let wal = observer.durable_handle().unwrap();
+            let wal = wal.lock().unwrap();
+            wal.sync.syncs()
+        };
+        assert_eq!(method, WalSyncMethod::Full, "the default method syncs");
+        assert!(
+            syncs < commits,
+            "group commit must share syncs: {syncs} syncs for {commits} commits"
+        );
+        // Every commit was durable when its statement returned.
+        drop(db);
+        drop(observer);
+        let mut back = durable(&p);
+        assert_eq!(
+            ints(&mut back, "SELECT count(*) FROM t;"),
+            vec![commits as i64]
+        );
+    }
+
+    /// A failed sync is fail-stop: the committer whose sync failed and every
+    /// committer waiting on it fail, and the store refuses further work
+    /// instead of running on a WAL whose tail may be lost.
+    #[test]
+    fn a_failed_sync_fails_every_waiting_committer() {
+        use std::sync::Barrier;
+
+        let p = TempCkpt::new("sync_failure");
+        let mut store = durable(&p);
+        store.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let observer = store.clone();
+        {
+            let wal = observer.durable_handle().unwrap();
+            wal.lock().unwrap().sync.fail_next_syncs(1);
+        }
+        let db = crate::Database::from_store(store);
+        let start = std::sync::Arc::new(Barrier::new(2));
+        let mut joined = Vec::new();
+        for i in 0..2 {
+            let db = db.clone();
+            let start = start.clone();
+            joined.push(std::thread::spawn(move || {
+                let mut c = db.connect();
+                start.wait();
+                c.execute(&format!("INSERT INTO t VALUES ({i});"))
+            }));
+        }
+        let mut errors = Vec::new();
+        for h in joined {
+            if let Err(e) = h.join().unwrap() {
+                errors.push(e.to_string());
+            }
+        }
+        assert_eq!(
+            errors.len(),
+            2,
+            "the failing committer and its waiters must all fail: {errors:?}"
+        );
+        // Fail-stop until reopen.
+        let mut c = db.connect();
+        let err = c
+            .execute("SELECT count(*) FROM t;")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WAL write failure"), "{err}");
+        drop(c);
+        drop(db);
+        drop(observer);
+        // Reopening recovers what reached the file (a failed sync does not
+        // take back a record the page cache already holds, and recovery
+        // replays whole records only) and the store takes new commits.
+        let mut back = durable(&p);
+        let recovered = ints(&mut back, "SELECT count(*) FROM t;")[0];
+        assert!(
+            (0..=2).contains(&recovered),
+            "only whole records may survive a failed sync: {recovered}"
+        );
+        back.execute("INSERT INTO t VALUES (99);").unwrap();
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM t ORDER BY a;").last(),
+            Some(&99)
+        );
+    }
+
+    /// `SET wal_sync_method` selects the sync call each commit uses.
+    #[test]
+    fn wal_sync_method_picks_the_sync_primitive() {
+        let p = TempCkpt::new("sync_method");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        for method in [
+            WalSyncMethod::Fsync,
+            WalSyncMethod::Fdatasync,
+            WalSyncMethod::Full,
+        ] {
+            db.execute(&format!("SET wal_sync_method = '{}';", method.as_str()))
+                .unwrap();
+            assert_eq!(db.wal_sync_method(), Some(method));
+            let (before, _) = {
+                let wal = db.durable_handle().unwrap();
+                let wal = wal.lock().unwrap();
+                wal.sync.syncs()
+            };
+            db.execute("INSERT INTO t VALUES (1);").unwrap();
+            let (after, last) = {
+                let wal = db.durable_handle().unwrap();
+                let wal = wal.lock().unwrap();
+                wal.sync.syncs()
+            };
+            assert_eq!(after, before + 1, "one commit, one sync");
+            assert_eq!(last, method, "the commit used the selected method");
+        }
+    }
+
+    /// The setting round-trips through SQL (and is readable from a session),
+    /// and unknown or non-string values are refused without changing it.
+    #[test]
+    fn wal_sync_method_setting_round_trips_and_refuses_unknown_values() {
+        let p = TempCkpt::new("sync_method_sql");
+        let mut db = durable(&p);
+        db.execute("SET wal_sync_method = 'Fdatasync';").unwrap();
+        assert_eq!(db.wal_sync_method(), Some(WalSyncMethod::Fdatasync));
+        match db
+            .execute("SELECT getvariable('wal_sync_method');")
+            .unwrap()
+            .pop()
+            .unwrap()
+        {
+            QueryResult::Selected { rows, .. } => assert_eq!(
+                rows,
+                vec![vec![Value::Varchar("fdatasync".to_string())]],
+                "a store setting is readable from every session"
+            ),
+            other => panic!("expected rows, got {other:?}"),
+        }
+        // `sync_data` is C's name for fdatasync; not a value here.
+        for bad in ["'nope'", "'sync_data'", "1"] {
+            let err = db
+                .execute(&format!("SET wal_sync_method = {bad};"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("wal_sync_method"),
+                "the error must name the setting: {err}"
+            );
+            assert_eq!(
+                db.wal_sync_method(),
+                Some(WalSyncMethod::Fdatasync),
+                "a refused value leaves the setting unchanged"
+            );
+        }
     }
 }

@@ -70,3 +70,8 @@ postgres = { version = "0.19", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"], optional = true }
 tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"], optional = true }
 webpki-roots = { version = "1", optional = true }
+
+[dev-dependencies]
+# The deadlock regression runs its query inside a two-thread pool (see
+# `tests/streaming_scan.rs`); the library itself never schedules on rayon.
+rayon = "1.12.0"
