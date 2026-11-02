@@ -1311,6 +1311,44 @@ impl Partial {
     /// free, on the merging thread) a multi-hundred-kilobyte table. A chunk
     /// that outgrows this is high-cardinality and pays one jump to the full
     /// size instead (see the insert in [`group_ids`]).
+    /// Merge `other`'s groups into this table, walking them in their own
+    /// first-seen order. A group's accumulators then take the same sequence of
+    /// `Acc::merge` calls the per-partial merge takes, so sums over floats
+    /// come out bit-identical to it, while the table holds one row per group
+    /// instead of one row per chunk the group appeared in.
+    pub(crate) fn absorb(&mut self, other: Partial) -> Result<()> {
+        for (enc, group) in other.groups {
+            let enc_len = enc.len();
+            match self.index.entry(enc) {
+                std::collections::hash_map::Entry::Occupied(slot) => {
+                    let target = &mut self.groups[*slot.get()].1;
+                    for (acc, other) in target.accs.iter_mut().zip(group.accs) {
+                        acc.merge(other);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    // The same footprint `new_group` charges.
+                    self.bytes += enc_len
+                        + 2 * std::mem::size_of::<Vec<u8>>()
+                        + std::mem::size_of::<Group>()
+                        + 4 * std::mem::size_of::<Acc>()
+                        + 16;
+                    let at = self.groups.len();
+                    let enc = slot.key().clone();
+                    slot.insert(at);
+                    self.groups.push((enc, group));
+                }
+            }
+        }
+        self.held.resize(self.bytes)
+    }
+
+    /// The statement memory this partial holds, for the pipeline's density
+    /// sample.
+    pub(crate) fn bytes(&self) -> usize {
+        self.held.bytes()
+    }
+
     pub(crate) fn for_rows(rows: usize, account: &crate::memory::Account) -> Partial {
         Partial {
             groups: Vec::new(),

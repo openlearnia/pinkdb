@@ -79,6 +79,8 @@ pub(crate) trait Sink {
         sel: Option<&[u32]>,
     ) -> Result<Option<Self::Partial>>;
     fn finish(self, items: Vec<Self::Partial>, cx: &Cx) -> Result<Vec<DataChunk>>;
+    /// The bytes of statement memory a partial holds, for [`dense`]'s sample.
+    fn state(part: &Self::Partial) -> usize;
 }
 
 /// Groups by encoded key with the general accumulators: the fallback for the
@@ -134,6 +136,10 @@ impl Sink for GeneralSink<'_> {
         let key_types: Vec<DataType> = self.keys.iter().map(BoundExpr::dtype).collect();
         aggregate::merge_and_emit(items, &key_types, self.aggs, cx.budget.memory())
     }
+
+    fn state(part: &Partial) -> usize {
+        part.bytes()
+    }
 }
 
 impl Sink for FlatSink<'_> {
@@ -150,6 +156,10 @@ impl Sink for FlatSink<'_> {
 
     fn finish(self, items: Vec<FlatPartial>, cx: &Cx) -> Result<Vec<DataChunk>> {
         FlatSink::merge(self, items, !cx.unordered, cx.budget.memory())
+    }
+
+    fn state(part: &FlatPartial) -> usize {
+        part.bytes()
     }
 }
 
@@ -407,7 +417,13 @@ pub(crate) fn aggregate(
     let Some(compiled) = compile(cx, input)? else {
         return Ok(None);
     };
-    let chunks = match FlatSink::new(keys, aggs, compiled.rows, compiled.types.len()) {
+    let flat = FlatSink::new(keys, aggs, compiled.rows, compiled.types.len());
+    let chunks = match flat {
+        // One entry per group instead of one per group per chunk, for the group
+        // shapes whose state grows with the rows (wave 136c).
+        Some(flat) if dense(cx, &compiled, &flat, keys, aggs)? => {
+            general_serial(cx, &compiled, keys, aggs)?
+        }
         Some(flat) => match run(cx, &compiled, &flat)? {
             Some(items) => flat.finish(items, cx)?,
             // A key column whose payload is not the one its type promises:
@@ -489,6 +505,10 @@ impl Sink for CollectSink {
     fn finish(self, items: Vec<DataChunk>, _cx: &Cx) -> Result<Vec<DataChunk>> {
         Ok(items)
     }
+
+    fn state(part: &DataChunk) -> usize {
+        chunk_approx_bytes(part)
+    }
 }
 
 /// A compiled pipeline: the materialized source, every join's completed build
@@ -531,6 +551,115 @@ impl Source<'_> {
     }
 }
 
+/// Partial state a folded row may leave before the aggregate is treated as
+/// holding state per row rather than per group. `od_pairs_rollup` keeps one
+/// group per input row and 421 bytes of key strings per group, so a chunk's
+/// partial costs ~300 bytes a row; the widest TPC-H aggregate holds 50, and a
+/// VARCHAR key of small domain under 15. Only a string-valued group shape is
+/// sampled at all, so nothing else pays for the check.
+const DENSE_BYTES_PER_ROW: usize = 64;
+
+/// Whether one folded chunk says the aggregate's state grows with the rows: its
+/// partials cost [`DENSE_BYTES_PER_ROW`] or more per row folded. A string group
+/// key is what makes that possible — an integer key's partial is a fixed number
+/// of bytes per distinct value, and TPC-H's widest stays far below the bound.
+fn dense<S: Sink + Sync>(
+    cx: &Cx,
+    compiled: &Compiled<'_>,
+    sink: &S,
+    keys: &[BoundExpr],
+    aggs: &[BoundAgg],
+) -> Result<bool>
+where
+    S::Partial: Send,
+{
+    let strings = keys.iter().any(|key| key.dtype() == DataType::Varchar)
+        || aggs.iter().any(|agg| {
+            agg.distinct
+                && agg
+                    .arg
+                    .as_ref()
+                    .is_some_and(|arg| arg.dtype() == DataType::Varchar)
+        });
+    if !strings {
+        return Ok(false);
+    }
+    let first = match &compiled.source {
+        Source::Materialized(source) => source.chunks.first().cloned(),
+        Source::Store(scan) => scan.chunk(0)?,
+    };
+    let Some(first) = first else {
+        return Ok(false);
+    };
+    let rows = first.num_rows();
+    let steps = steps(cx, &compiled.builds, &compiled.ops)?;
+    let Some(partials) = flow(cx, &steps, sink, &first)? else {
+        return Ok(false);
+    };
+    let state: usize = partials.iter().map(S::state).sum();
+    Ok(rows > 0 && state / rows >= DENSE_BYTES_PER_ROW)
+}
+
+/// Fold the source into one `Partial` per aggregate, serially: the state is one
+/// entry per group instead of one per group per chunk. The shapes [`dense`]
+/// selects are the ones whose per-chunk partials hold a group per row, so the
+/// walk loses nothing they were not already paying for.
+fn general_serial(
+    cx: &Cx,
+    compiled: &Compiled<'_>,
+    keys: &[BoundExpr],
+    aggs: &[BoundAgg],
+) -> Result<Vec<DataChunk>> {
+    let steps = steps(cx, &compiled.builds, &compiled.ops)?;
+    let mut table: Option<Partial> = None;
+    let fold = |table: &mut Option<Partial>, chunk: &DataChunk| -> Result<()> {
+        for morsel in morsels(cx, &steps, chunk)? {
+            // A selection is compacted first: a row it dropped must not raise,
+            // the rule `GeneralSink::fold_into` keeps.
+            let mut part = Partial::for_rows(super::CHUNK_SIZE, cx.budget.memory());
+            match morsel.sel {
+                None => aggregate::fold_chunk(cx, &mut part, &morsel.chunk, None, keys, aggs)?,
+                Some(sel) => aggregate::fold_chunk(
+                    cx,
+                    &mut part,
+                    &morsel.chunk.take(&sel),
+                    None,
+                    keys,
+                    aggs,
+                )?,
+            }
+            match table {
+                Some(table) => table.absorb(part)?,
+                None => *table = Some(part),
+            }
+        }
+        Ok(())
+    };
+    match &compiled.source {
+        Source::Materialized(source) => {
+            for chunk in &source.chunks {
+                fold(&mut table, chunk)?;
+            }
+        }
+        Source::Store(scan) => {
+            for i in 0..scan.len() {
+                if i % CHECK_DEADLINE_EVERY == 0 {
+                    cx.check_deadline()?;
+                }
+                if let Some(chunk) = scan.chunk(i)? {
+                    fold(&mut table, &chunk)?;
+                }
+            }
+        }
+    }
+    let key_types: Vec<DataType> = keys.iter().map(BoundExpr::dtype).collect();
+    // One partial is already one entry per group: merging it again would
+    // reserve its bytes a second time, which is the peak this lane exists to
+    // avoid.
+    let groups = aggregate::merge_partials(table.into_iter().collect(), !keys.is_empty(), aggs);
+    aggregate::emit_groups(groups, &key_types, aggs)
+}
+
 /// The materialized shape's own fallback for a shape the flat table declined
 /// mid-stream. Re-running costs one extra pass over the source, which only
 /// happens for a group key whose encoded layout differs from its bound type.
@@ -541,6 +670,9 @@ fn general(
     aggs: &[BoundAgg],
 ) -> Result<Vec<DataChunk>> {
     let sink = GeneralSink::new(keys, aggs);
+    if dense(cx, compiled, &sink, keys, aggs)? {
+        return general_serial(cx, compiled, keys, aggs);
+    }
     match run(cx, compiled, &sink)? {
         Some(items) => sink.finish(items, cx),
         None => Err(PinkDbError::Execution(
@@ -898,15 +1030,9 @@ where
     Ok(Some(items))
 }
 
-fn flow<S: Sink + Sync>(
-    cx: &Cx,
-    steps: &[Step<'_>],
-    sink: &S,
-    chunk: &DataChunk,
-) -> Result<Option<Vec<S::Partial>>>
-where
-    S::Partial: Send,
-{
+/// The morsels one source chunk becomes after the operators above it: the chunk
+/// itself plus whatever a probe adds.
+fn morsels(cx: &Cx, steps: &[Step<'_>], chunk: &DataChunk) -> Result<Vec<Morsel>> {
     let mut morsels = vec![Morsel {
         chunk: chunk.clone(),
         sel: None,
@@ -924,6 +1050,19 @@ where
             break;
         }
     }
+    Ok(morsels)
+}
+
+fn flow<S: Sink + Sync>(
+    cx: &Cx,
+    steps: &[Step<'_>],
+    sink: &S,
+    chunk: &DataChunk,
+) -> Result<Option<Vec<S::Partial>>>
+where
+    S::Partial: Send,
+{
+    let morsels = morsels(cx, steps, chunk)?;
     // One source chunk can fan out into every output chunk of a wide probe, so
     // the fold spreads over the pool too. `collect` keeps the order the chunks
     // reach the sink, which is what fixes first-seen group order and float

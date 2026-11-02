@@ -166,6 +166,12 @@ impl<'a> Spec<'a> {
 }
 
 impl FlatPartial {
+    /// The statement memory this partial holds, for the pipeline's density
+    /// sample.
+    pub(crate) fn bytes(&self) -> usize {
+        self.held.bytes()
+    }
+
     #[inline]
     fn key(&self, g: usize) -> &[u64] {
         &self.keys[g * self.width..(g + 1) * self.width]
