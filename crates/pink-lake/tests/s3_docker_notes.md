@@ -52,22 +52,21 @@ The catalog never lives in S3: the only objects under a split lake's prefix
 are data files and the `lake-data.json` ownership marker (lake id) that
 cleanup verifies before deleting anything.
 
-The harness reads that state with `pinkdb-cli`'s own commands (all of which
-accept the catalog and print catalog state, never S3 metadata):
+The harness reads that state with `pinkdb-cli`'s own commands and DuckLake's
+file functions on an attached lake (all of them print catalog state, never S3
+metadata):
 
 | command | what the harness asserts from it |
 |---|---|
 | `.lake versions <catalog>` | one line per version, `N` or `N (current)`; exactly `1..FINAL`, no gaps |
 | `.lake info <catalog>` | `Lake <data location>`, `current version:`, `snapshots:       N (1, …, N)`, `tables (N):` and `    <table> (<rows> row[s])` |
 | `.lake tables <catalog>` | `main.<table> (<rows> rows)` per table |
-| `.lake files <catalog> [all]` | `data/…: table=… rows=… size=… schema_version=…` lines and (with `all`) a `N files (R referenced, U unreferenced)` summary; `all` adds every `data/` object no retained version references |
-| `.lake orphans <catalog> [all] [dry-run\|confirm]` | `would delete <path>` / `deleted <path>` lines, `Deleted N object(s) from … (B bytes freed; still-referenced versions are untouched)`, or `Nothing to orphans in …` |
+| `SELECT … FROM ducklake_list_files('lk', '<table>')` | one row per head data file (absolute `data_file` path) |
+| `CALL ducklake_delete_orphaned_files('lk', cleanup_all => true, dry_run => true\|false)` | one `path` row per `data/` object **no retained version** references (dry run: would delete; otherwise: deleted) |
 
-`referenced` in `.lake files all` means the file is in the listed (head)
-manifest; `unreferenced` means **no retained version** references the object —
-exactly the set `.lake orphans` deletes. The harness checks the head's one file
-against the REST listing and compares the `unreferenced` count with the orphan
-dry-run's `would delete` lines.
+The harness checks the head's one file against the REST listing, and that the
+bucket holds exactly the retained versions' files plus the orphan dry run's
+paths.
 
 ## The three servers: capability matrix and enforcement policy
 
@@ -252,17 +251,15 @@ metadata object from S3:
 5. **The S3 side is data only.** Under `conc/` the harness asserts every key
    is a data object or the `lake-data.json` marker,
    that `lake-data.json` is present, that the data objects match
-   `data/main.<table>/<uuid>.pink`, and that `.lake files` names exactly the
-   head's one data file, which is in the listing.
-6. **Leftovers are cleaned exactly.** `.lake files all` must agree with the
-   bucket: exactly one `referenced` file, and its `unreferenced` objects are
-   exactly the lines `.lake orphans all dry-run` would delete (the bucket holds
-   `FINAL - 1` files of retained versions plus those leftovers). `all confirm`
-   then reports exactly that many deletions and a second dry-run says
-   `Nothing to orphans`. After that `conc/data/` holds exactly `FINAL - 1`
-   objects — one per version above the empty v1 — `.lake files all` reports
-   `1` file (`1 referenced, 0 unreferenced`), and `.lake versions` is
-   unchanged.
+   `data/main.<table>/<uuid>.pink`, and that `ducklake_list_files` names
+   exactly the head's one data file, which is in the listing.
+6. **Leftovers are cleaned exactly.** The bucket holds the `FINAL - 1` files
+   of retained versions plus exactly the orphans the
+   `ducklake_delete_orphaned_files` dry run lists (never the head's file).
+   The real run then deletes exactly that many and a second dry run lists
+   none. After that `conc/data/` holds exactly `FINAL - 1` objects — one per
+   version above the empty v1 — the head still lists its one file, and
+   `.lake versions` is unchanged.
 7. **The slow-vs-quick pair** (below) still asserts exactly one winner of v3
    and the loser's documented conflict; both writers' data objects may remain
    (the loser's upload is a documented orphan) and the catalog must show
@@ -342,9 +339,9 @@ mock's conditional-PUT support.
 | race: win-xor-conflict per attempt, documented conflict forms | enforced | enforced |
 | race: exactly one winner per version (catalog transaction) | enforced | enforced |
 | race: head = final claimant's single table, its row count | enforced | enforced |
-| `.lake files` head file ∈ REST listing; `.lake files all` unreferenced == orphan dry-run | enforced | enforced |
+| `ducklake_list_files` head file ∈ REST listing; bucket = retained files + orphan dry run | enforced | enforced |
 | leftover objects: dry-run count == confirmed deletes, second dry-run empty | enforced | enforced |
-| after cleanup: `FINAL - 1` data objects; `.lake files all` = 1 referenced, 0 unreferenced | enforced | enforced |
+| after cleanup: `FINAL - 1` data objects; the head lists its one file | enforced | enforced |
 | slow-vs-quick: exactly one winner of v3 + loser conflict | enforced | enforced |
 | settle save: new version, single claimant, `main.settle` in the head | enforced | enforced |
 | refusal: `s3://` alone is not a catalog; split form publishes | enforced | enforced |
@@ -362,7 +359,7 @@ every encrypted `enc/data/` object is a `PNKLAKE1` container.
   conflict with the slow-vs-quick pair.
 * A conflicted writer may leave its already-uploaded data object behind
   (unreferenced, no retained version uses it). The concurrency section
-  cleans those with `.lake orphans` and asserts the exact count; the
+  cleans those with `ducklake_delete_orphaned_files` and asserts the exact count; the
   slow-vs-quick prefix keeps them, documented.
 * The first save into a fresh catalog publishes **version 2**: the CLI's
   `open_or_create` publishes the empty version 1 first.

@@ -1570,3 +1570,47 @@ fn materialized_view_refresh_policies_round_trip() {
     assert!(err.contains("not_there"), "{err}");
     assert_server_healthy(&addr);
 }
+
+/// A store whose log ends on `USE` reopens with the default database as its
+/// session; every client then starts there too — `USE` is per-connection
+/// session state, not store state (DuckDB).
+#[test]
+fn clients_start_in_the_default_database_after_a_logged_use() {
+    let dir = std::env::temp_dir().join(format!("pinkdb_server_startdb_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("store.pink");
+    let path = path.to_str().unwrap();
+    {
+        let mut store = PinkDb::open_durable(path).unwrap();
+        store
+            .execute("CREATE DATABASE db1; CREATE TABLE db1.t (v VARCHAR);")
+            .unwrap();
+        store.execute("INSERT INTO db1.t VALUES ('a');").unwrap();
+        store.execute("USE db1;").unwrap();
+    }
+
+    let store = PinkDb::open_durable(path).unwrap();
+    let server = Server::bind("127.0.0.1:0", Database::from_store(store)).expect("bind");
+    let addr = server.local_addr().to_string();
+    let handle = server.spawn().expect("spawn server");
+
+    let mut a = Client::connect(&addr).expect("connect a");
+    assert_eq!(
+        rows(a.execute("SELECT current_database();").unwrap()),
+        vec![vec![varchar("main")]]
+    );
+    // A live client's `USE` does not move the next client either.
+    a.execute("USE db1;").unwrap();
+    let mut b = Client::connect(&addr).expect("connect b");
+    assert_eq!(
+        rows(b.execute("SELECT current_database();").unwrap()),
+        vec![vec![varchar("main")]]
+    );
+    assert_eq!(
+        rows(b.execute("SELECT v FROM db1.t;").unwrap()),
+        vec![vec![varchar("a")]]
+    );
+    handle.join();
+    let _ = std::fs::remove_dir_all(&dir);
+}

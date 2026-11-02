@@ -179,11 +179,15 @@ fn a_pinkdb_file_reads_only_the_pages_a_predicate_leaves() {
 fn a_duckdb_file_prunes_at_row_group_granularity() {
     let duckdb =
         std::path::Path::new(&std::env::var("HOME").unwrap_or_default()).join(".local/bin/duckdb");
-    assert!(
-        duckdb.exists(),
-        "the reference binary {} is required",
-        duckdb.display()
-    );
+    // Like the other interop tests, skip where the reference binary is absent
+    // (CI's core and macOS jobs install no DuckDB).
+    if !duckdb.exists() {
+        eprintln!(
+            "skipping: the DuckDB reference binary {} is absent",
+            duckdb.display()
+        );
+        return;
+    }
     let dir = std::env::temp_dir().join(format!(
         "pinkdb_page_index_duckdb_{}_{}",
         std::process::id(),
