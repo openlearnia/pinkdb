@@ -865,30 +865,35 @@ assert_contains "$TMP/enc_open.log" "Opened lake version 2"
 assert_contains "$TMP/enc_open.log" "the lake is encrypted at rest with PINKDB_KEY"
 assert_contains "$TMP/enc_open.log" "main.t (3 rows)"
 
-# Attach is statistics-only on an encrypted lake too: it unseals the catalog
-# and its statistics and reads no data object, and COUNT(*) is answered from
-# the catalog.
+# A read-only ATTACH of an encrypted lake is statistics-only too: it unseals
+# the catalog and its statistics and reads no data object, and COUNT(*) is
+# answered from the catalog (`pinkdb_scan_io()` reports no scan for it).
 {
-    echo ".lake attach $ENC_CAT"
-    echo "SELECT COUNT(*) FROM t;"
+    echo "ATTACH 'lake:$ENC_CAT' AS lk (READ_ONLY);"
+    echo "USE lk;"
+    echo "SELECT COUNT(*) AS n FROM t;"
+    echo "SELECT 'scan: ' || unit || ' ' || read || ' read' AS d FROM pinkdb_scan_io() WHERE unit IS NOT NULL;"
     echo ".quit"
 } | cli_run_keyed "$TMP/enc_attach.log" "$ENC_KEY"
 assert_status_zero "$TMP/enc_attach.log" "$?"
-assert_contains "$TMP/enc_attach.log" "(1 table, statistics-only)"
-assert_contains "$TMP/enc_attach.log" "attach unsealed the catalog and its statistics blocks and read no data file"
-assert_contains "$TMP/enc_attach.log" "│ 3        │"
+assert_contains "$TMP/enc_attach.log" "│ 3 "
+if grep -qF "scan: " "$TMP/enc_attach.log"; then
+    fail "the statistics-only COUNT(*) on an attached encrypted lake read a data file"
+fi
 
-# A keyed incremental commit on the encrypted prefix publishes a delete file
-# and a new data file as containers; S3 still holds data only.
+# Keyed writes through a writable ATTACH on the encrypted prefix (each
+# statement commits) publish a delete file and a new data file as
+# containers; S3 still holds data only.
 {
-    echo ".lake attach $ENC_CAT write"
+    echo "ATTACH 'lake:$ENC_CAT' AS lk;"
+    echo "USE lk;"
     echo "DELETE FROM t WHERE i = 1;"
     echo "INSERT INTO t VALUES (true, 4, 40, 0.5, 'delta', NULL, NULL);"
-    echo ".lake commit $ENC_CAT"
+    echo "SELECT 'rows ' || count(*) || ' sum ' || sum(i) AS d FROM t;"
     echo ".quit"
 } | cli_run_keyed "$TMP/enc_commit.log" "$ENC_KEY"
 assert_status_zero "$TMP/enc_commit.log" "$?"
-assert_contains "$TMP/enc_commit.log" "Committed lake version 3"
+assert_contains "$TMP/enc_commit.log" "rows 3 sum 2147483646"   # -5 + 4 + 2147483647: i = 1 deleted, 4 inserted
 ENC_KEYS="$(list_keys "enc/")" || fail "listing enc/ failed"
 printf '%s\n' "$ENC_KEYS" | grep -qE '^enc/data/main\.t/[0-9a-f-]+\.pinkdel$' \
     || fail "the encrypted commit's delete file is missing"
@@ -1147,99 +1152,80 @@ DATA_COUNT="$(printf '%s\n' "$CONC_KEYS" | grep -cE '^conc/data/')"
 assert_listing_count "$CONC_KEYS" "conc/" "$((1 + DATA_COUNT))"
 ok "conc/: $DATA_COUNT data object(s) + the lake-data.json marker, no catalog metadata"
 
-# `.lake files` lists the head manifest's files; `all` adds every `data/`
-# object **no retained version references** — the same scan `.lake orphans`
-# deletes. So the head run must name one file that exists in S3, and the two
-# views must agree on the leftovers: the catalog database decides what
-# belongs to the lake, not an S3 metadata object.
+# `ducklake_list_files` lists the head's files, and
+# `ducklake_delete_orphaned_files` (a dry run first) lists every `data/` object
+# **no retained version references**. So the head must name one file that
+# exists in S3, and the bucket must hold exactly the retained files plus the
+# orphans: the catalog database decides what belongs to the lake, not an S3
+# metadata object. Paths print absolute; the harness keeps the part from
+# `data/main.` on, as the bucket listing (under conc/) does.
 printf '%s\n' "$CONC_KEYS" | grep -E '^conc/data/' | sed 's|^conc/||' >"$TMP/conc_objects.txt"
-{ echo ".lake files $CONC_CAT"; echo ".quit"; } | cli_run "$TMP/conc_files.log"
+conc_files() { # <log>: the head's files, as `file <path>` lines
+    { echo "ATTACH 'lake:$CONC_CAT' AS lk (READ_ONLY);"
+      echo "SELECT 'file ' || data_file AS d FROM ducklake_list_files('lk', 'settle');"
+      echo ".quit"; } | cli_run "$1"
+}
+conc_orphans() { # <log> <dry_run>: the orphans, one `path` row each
+    { echo "ATTACH 'lake:$CONC_CAT' AS lk;"
+      echo "CALL ducklake_delete_orphaned_files('lk', cleanup_all => true, dry_run => $2);"
+      echo ".quit"; } | cli_run "$1"
+}
+conc_files "$TMP/conc_files.log"
 assert_status_zero "$TMP/conc_files.log" "$?"
-assert_re "$TMP/conc_files.log" '^data/main\.settle/[0-9a-f-]+\.(pink|parquet): table=main\.settle rows=1 '
-{ echo ".lake files $CONC_CAT all"; echo ".quit"; } | cli_run "$TMP/conc_files_all.log"
-assert_status_zero "$TMP/conc_files_all.log" "$?"
-python3 - "$TMP/conc_files.log" "$TMP/conc_files_all.log" "$TMP/conc_objects.txt" "$FINAL" "$TMP/conc.leftover" <<'PY' || fail "the catalog's files and the S3 objects disagree"
+conc_orphans "$TMP/conc_orphans.log" true
+assert_status_zero "$TMP/conc_orphans.log" "$?"
+python3 - "$TMP/conc_files.log" "$TMP/conc_orphans.log" "$TMP/conc_objects.txt" "$FINAL" "$TMP/conc.leftover" <<'PY' || fail "the catalog's files and the S3 objects disagree"
 import re, sys
 
-head_text = open(sys.argv[1], encoding="utf-8").read()
-all_text = open(sys.argv[2], encoding="utf-8").read()
+def paths(log):
+    return re.findall(r"(data/main\.[^\s│]+)", open(log, encoding="utf-8").read())
+
+head = paths(sys.argv[1])
+orphans = paths(sys.argv[2])
 objects = {l.strip() for l in open(sys.argv[3], encoding="utf-8") if l.strip()}
 final = int(sys.argv[4])
-
-line_re = re.compile(r"^(data/\S+): (.*)$")
-head = []
-for line in head_text.splitlines():
-    m = line_re.match(line)
-    if m:
-        head.append((m.group(1), m.group(2)))
-listed = {}
-summary = None
-for line in all_text.splitlines():
-    m = line_re.match(line)
-    if m:
-        listed[m.group(1)] = "unreferenced" in m.group(2)
-        continue
-    m = re.match(r"^(\d+) files? \((\d+) referenced, (\d+) unreferenced\)$", line)
-    if m:
-        summary = tuple(int(x) for x in m.groups())
 
 problems = []
 if len(head) != 1:
     problems.append(f"the head lists {len(head)} file(s), expected the settle save's one")
-for path, fields in head:
+for path in head:
     if path not in objects:
         problems.append(f"the head file {path} is not in the bucket")
-    if "table=main.settle" not in fields or "rows=1" not in fields:
-        problems.append(f"the head file line does not say table=main.settle rows=1: {path}: {fields}")
-if summary is None:
-    problems.append("no `.lake files all` summary line found")
-else:
-    total, referenced, unreferenced = summary
-    if total != len(listed):
-        problems.append(f"summary counts {total} files, listed {len(listed)}")
-    if referenced != 1:
-        problems.append(f"{referenced} files are referenced at the head, expected 1")
-    if unreferenced != sum(1 for p in listed.values() if p):
-        problems.append(f"summary says {unreferenced} unreferenced, listed {sum(1 for p in listed.values() if p)}")
-    if sum(1 for p in listed.values() if not p) != 1:
-        problems.append("`all` must mark exactly the head's file as referenced")
-    claimed = {p for p, unref in listed.items() if not unref}
-    if not claimed <= objects:
-        problems.append(f"referenced but missing from the bucket: {sorted(claimed - objects)[:4]}")
-    if len(objects) != (final - 1) + unreferenced:
-        problems.append(f"the bucket holds {len(objects)} object(s), expected {final - 1} retained file(s) + {unreferenced} leftover(s)")
+    if path in orphans:
+        problems.append(f"the head file {path} is listed as an orphan")
+if not set(orphans) <= objects:
+    problems.append(f"orphans missing from the bucket: {sorted(set(orphans) - objects)[:4]}")
+if len(objects) != (final - 1) + len(orphans):
+    problems.append(f"the bucket holds {len(objects)} object(s), expected {final - 1} retained file(s) + {len(orphans)} orphan(s)")
 if problems:
-    print("`.lake files` vs the conc/ listing:", file=sys.stderr)
+    print("the head's files and orphans vs the conc/ listing:", file=sys.stderr)
     for p in problems:
         print("  " + p, file=sys.stderr)
     sys.exit(1)
-open(sys.argv[5], "w", encoding="utf-8").write(f"{unreferenced}\n")
-print(f"  ok: the head names its one data file; {len(objects)} object(s) = {final - 1} retained + {unreferenced} leftover")
+open(sys.argv[5], "w", encoding="utf-8").write(f"{len(orphans)}\n")
+print(f"  ok: the head names its one data file; {len(objects)} object(s) = {final - 1} retained + {len(orphans)} orphan(s)")
 PY
 CONC_ORPHANS="$(cat "$TMP/conc.leftover")"
 
-# Orphans cleanup: `all` skips the age gate. The dry-run must list exactly the
-# leftovers `.lake files all` reported, the confirm deletes exactly those, and
-# a second dry-run proves that cleanup is idempotent. The catalog's versions
-# and head file must survive both.
-{ echo ".lake orphans $CONC_CAT all dry-run"; echo ".quit"; } | cli_run "$TMP/conc_orphans.log"
-assert_status_zero "$TMP/conc_orphans.log" "$?"
-CONC_LEFTOVER="$(grep -c '^would delete ' "$TMP/conc_orphans.log")"
-[ "$CONC_LEFTOVER" = "$CONC_ORPHANS" ] \
-    || fail ".lake files all saw $CONC_ORPHANS leftover(s), the orphan dry-run would delete $CONC_LEFTOVER"
-if [ "$CONC_LEFTOVER" != "0" ]; then
-    { echo ".lake orphans $CONC_CAT all confirm"; echo ".quit"; } | cli_run "$TMP/conc_orphans_confirm.log"
+# Orphans cleanup: `cleanup_all` skips the age gate. The confirm deletes
+# exactly the dry run's orphans, and a second dry run proves that cleanup is
+# idempotent. The catalog's versions and head file must survive both.
+if [ "$CONC_ORPHANS" != "0" ]; then
+    conc_orphans "$TMP/conc_orphans_confirm.log" false
     assert_status_zero "$TMP/conc_orphans_confirm.log" "$?"
-    assert_re "$TMP/conc_orphans_confirm.log" "^Deleted $CONC_LEFTOVER objects? from "
-    ok "deleted the $CONC_LEFTOVER leftover data object(s)"
+    DELETED="$(grep -c 'data/main\.' "$TMP/conc_orphans_confirm.log")"
+    [ "$DELETED" = "$CONC_ORPHANS" ] \
+        || fail "the dry run listed $CONC_ORPHANS orphan(s), the cleanup deleted $DELETED"
+    ok "deleted the $CONC_ORPHANS leftover data object(s)"
 else
-    assert_contains "$TMP/conc_orphans.log" "Nothing to orphans"
     ok "no leftover from the losing writers"
 fi
-{ echo ".lake orphans $CONC_CAT all dry-run"; echo ".quit"; } | cli_run "$TMP/conc_orphans_after.log"
+conc_orphans "$TMP/conc_orphans_after.log" true
 assert_status_zero "$TMP/conc_orphans_after.log" "$?"
-assert_contains "$TMP/conc_orphans_after.log" "Nothing to orphans"
-ok "a second dry-run finds no orphan (cleanup is exact and idempotent)"
+if grep -q 'data/main\.' "$TMP/conc_orphans_after.log"; then
+    fail "a second dry run still lists orphans (cleanup must be exact and idempotent)"
+fi
+ok "a second dry run finds no orphan (cleanup is exact and idempotent)"
 
 CONC_KEYS="$(list_keys "conc/")" || fail "listing conc/ after cleanup failed"
 DATA_COUNT="$(printf '%s\n' "$CONC_KEYS" | grep -cE '^conc/data/')"
@@ -1247,17 +1233,18 @@ DATA_COUNT="$(printf '%s\n' "$CONC_KEYS" | grep -cE '^conc/data/')"
     || fail "after cleanup conc/data has $DATA_COUNT object(s); every version above the empty v1 owns exactly one"
 assert_listing_count "$CONC_KEYS" "conc/" "$((1 + FINAL - 1))"
 printf '%s\n' "$CONC_KEYS" | grep -E '^conc/data/' | sed 's|^conc/||' >"$TMP/conc_objects.txt"
-{ echo ".lake versions $CONC_CAT"; echo ".lake files $CONC_CAT all"; echo ".quit"; } | cli_run "$TMP/conc_after.log"
+{ echo ".lake versions $CONC_CAT"; echo ".quit"; } | cli_run "$TMP/conc_after.log"
 assert_status_zero "$TMP/conc_after.log" "$?"
-python3 - "$TMP/conc_after.log" "$TMP/conc_objects.txt" "$FINAL" <<'PY' || fail "cleanup disturbed the catalog"
+conc_files "$TMP/conc_after_files.log"
+assert_status_zero "$TMP/conc_after_files.log" "$?"
+python3 - "$TMP/conc_after.log" "$TMP/conc_after_files.log" "$TMP/conc_objects.txt" "$FINAL" <<'PY' || fail "cleanup disturbed the catalog"
 import re, sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
-objects = {l.strip() for l in open(sys.argv[2], encoding="utf-8") if l.strip()}
-final = int(sys.argv[3])
+files = re.findall(r"(data/main\.[^\s│]+)", open(sys.argv[2], encoding="utf-8").read())
+objects = {l.strip() for l in open(sys.argv[3], encoding="utf-8") if l.strip()}
+final = int(sys.argv[4])
 versions = [int(m.group(1)) for m in re.finditer(r"^(\d+)( \(current\))?$", text, re.M)]
-listed = {m.group(1) for m in re.finditer(r"^(data/\S+): ", text, re.M)}
-summary = re.search(r"^(\d+) files? \((\d+) referenced, (\d+) unreferenced\)$", text, re.M)
 problems = []
 if versions != list(range(1, final + 1)):
     problems.append(f".lake versions listed {versions}, expected 1..{final}")
@@ -1265,14 +1252,8 @@ if f"{final} (current)" not in text:
     problems.append(f".lake versions did not mark {final} as current")
 if len(objects) != final - 1:
     problems.append(f"the bucket holds {len(objects)} data object(s), expected {final - 1}")
-if summary is None:
-    problems.append("no `.lake files all` summary line found")
-else:
-    total, referenced, unreferenced = (int(x) for x in summary.groups())
-    if (total, referenced, unreferenced) != (1, 1, 0):
-        problems.append(f"after cleanup expected 1 file (1 referenced, 0 unreferenced), got {total}/{referenced}/{unreferenced}")
-if not listed <= objects:
-    problems.append(f"listed but missing from the bucket: {sorted(listed - objects)[:4]}")
+if len(files) != 1 or not set(files) <= objects:
+    problems.append(f"the head's file list after cleanup is {files}, expected one file in the bucket")
 if problems:
     print("after cleanup:", file=sys.stderr)
     for p in problems:
@@ -1468,7 +1449,7 @@ printf '                 versions 1..%s gapless; head = final claimant table; se
     "$RACE_FINAL" "$FINAL"
 printf '                 slow-vs-quick: exactly one winner of v3 (the %s save), loser conflicted\n' "$WINNER"
 printf '                 conc/data: %s retained file(s); %s leftover(s) from losing writers cleaned\n' \
-    "$((FINAL - 1))" "$CONC_LEFTOVER"
+    "$((FINAL - 1))" "$CONC_ORPHANS"
 printf '  refusal:       s3:// alone refused (not a catalog); second save -> v3; split form -> v4\n'
 if [ "$ENC_SUPPORTED" = "1" ]; then
     printf '  encrypted:     PINKDB_KEY save/commit/open/attach round trip; ciphertext-only objects;\n'
