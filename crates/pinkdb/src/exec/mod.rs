@@ -1015,7 +1015,7 @@ impl<'a> Cx<'a> {
     /// input node by node. `SET pipeline_execution = false` forces the
     /// materialized path; the differential tests use it to compare the two.
     pub(crate) fn pipeline_execution(&self) -> bool {
-        match self.session.get("pipeline_execution") {
+        match crate::settings::current(&self.session, "pipeline_execution") {
             None => true,
             Some(Value::Boolean(b)) => b,
             Some(Value::Bigint(n)) => n != 0,

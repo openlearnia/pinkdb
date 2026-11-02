@@ -241,9 +241,15 @@ pub(crate) fn canonical(name: &str) -> Option<&'static str> {
 
 /// pinkdb's own switches. They are settings rather than `SET VARIABLE`
 /// variables so that `SET name = value` means one thing, and they have no
-/// DuckDB counterpart: `join_filter_pushdown` and the two HNSW search knobs
-/// are debugging switches here.
-const PINKDB_SETTINGS: &[&str] = &["hnsw_ef_search", "hnsw_exact", "join_filter_pushdown"];
+/// DuckDB counterpart: `join_filter_pushdown`, `pipeline_execution` (wave 135:
+/// `false` forces the materialized path) and the two HNSW search knobs are
+/// debugging switches here.
+const PINKDB_SETTINGS: &[&str] = &[
+    "hnsw_ef_search",
+    "hnsw_exact",
+    "join_filter_pushdown",
+    "pipeline_execution",
+];
 
 /// The same, as the error path wants it: an unknown name is DuckDB's Catalog
 /// Error, which is what the corpus' `statement error` tests expect.
