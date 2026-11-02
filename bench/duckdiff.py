@@ -228,6 +228,15 @@ CREATE TABLE jy (x INTEGER, z VARCHAR);
 INSERT INTO jy VALUES (2, 'two'), (3, 'three'), (6, 'six');
 CREATE TABLE jz (x INTEGER, w INTEGER);
 INSERT INTO jz VALUES (2, 200), (3, 300);
+-- wave 135b: VARCHAR keys of every string-view length (empty, 1 byte,
+-- 12 = last inline, 13 = first heap, longer), a pair differing only past
+-- the 4-byte stored prefix, a duplicate and a NULL key.
+CREATE TABLE svk (k VARCHAR, n INTEGER);
+INSERT INTO svk VALUES ('', 0), ('a', 1), ('abcdefghijkl', 12), ('abcdefghijklm', 13),
+ ('abcd0000', 4), ('abcd0001', 5), ('abcdefghijkl0001', 16), (NULL, 99), ('', 100);
+CREATE TABLE svk2 (k VARCHAR, n INTEGER);
+INSERT INTO svk2 VALUES ('', 0), ('a', 1), ('abcdefghijkl', 12), ('abcdefghijklm', 13),
+ ('abcd0000', 4), ('abcd0001', 5), ('abcdefghijkl0001', 17), (NULL, 99);
 CREATE TABLE pn (k INTEGER, v INTEGER);
 INSERT INTO pn VALUES (2, 20), (2, 21), (3, 30), (1, 10), (3, 31);
 CREATE TABLE nn (x INTEGER);
@@ -353,6 +362,10 @@ QUERIES = [
     # ---- wave 58: SQL completeness (joins / set ops / DML-DDL / windows) ----
     ("multi-join", "SELECT a.x AS ax, b.x AS bx, c.x AS cx FROM jx a JOIN jy b ON a.x < b.x JOIN jz c ON b.x < c.x ORDER BY 1, 2, 3;", True, False),
     ("multi-join-left-chain", "SELECT a.x, b.z, c.w FROM jx a LEFT JOIN jy b ON a.x = b.x LEFT JOIN jz c ON b.x = c.x ORDER BY 1, 2, 3;", True, False),
+    # Wave 135c: one pipeline over a mixed probe chain — inner, left and semi
+    # as the statement root, and inner, left and anti under a projection.
+    ("pipeline-mixed-chain", "SELECT a.x, b.z, c.w FROM jx a JOIN jy b ON a.x = b.x LEFT JOIN jz c ON b.x = c.x WHERE EXISTS (SELECT 1 FROM jz e WHERE e.x = a.x) ORDER BY 1, 2, 3;", True, False),
+    ("pipeline-mixed-chain-anti", "SELECT a.x, b.z FROM jx a LEFT JOIN jy b ON a.x = b.x WHERE NOT EXISTS (SELECT 1 FROM jz e WHERE e.x = a.x) ORDER BY 1, 2;", True, False),
     ("join-composite-on", "SELECT a.x AS ax, b.x AS bx FROM jx a JOIN jy b ON a.x = b.x AND a.y = b.x * 10;", True, False),
     ("join-composite-null-keys", "SELECT COUNT(*) FROM jn a JOIN jn b ON a.x = b.x AND a.y = b.y;", False, False),
     ("join-single-null-keys", "SELECT COUNT(*) FROM jn a JOIN jn b ON a.x = b.x;", False, False),
@@ -581,6 +594,29 @@ QUERIES = [
     ("macro-drop", "CREATE MACRO m_gone(x) AS x; DROP MACRO m_gone; DROP MACRO IF EXISTS m_gone; SELECT 7;", False, False),
     ("macro-self-recursion", "CREATE MACRO m_fact(n) AS n * m_fact(n - 1); SELECT m_fact(3);", False, True),
     ("macro-table-as-scalar", "CREATE MACRO m_t(x) AS TABLE SELECT x AS v; SELECT m_t(1);", False, True),
+    # ---- wave 135b: string views for keys, vectorized COALESCE ----
+    ("view-join-count", "SELECT count(*) FROM svk JOIN svk2 ON svk.k = svk2.k;", False, False),
+    ("view-join-rows", "SELECT svk.n AS a, svk2.n AS b FROM svk JOIN svk2 ON svk.k = svk2.k ORDER BY 1, 2;", True, False),
+    ("view-join-past-prefix", "SELECT svk.n AS a, svk2.n AS b FROM svk JOIN svk2 ON svk.k = svk2.k WHERE svk.k IN ('abcd0000', 'abcd0001', 'abcdefghijkl0001') ORDER BY 1;", True, False),
+    ("view-join-empty-vs-no-key", "SELECT svk.n FROM svk JOIN svk2 ON svk.k = svk2.k WHERE svk.k = '' ORDER BY 1;", True, False),
+    ("view-join-left", "SELECT svk.n AS a, svk2.n AS b FROM svk LEFT JOIN svk2 ON svk.k = svk2.k ORDER BY 1, 2 NULLS FIRST;", True, False),
+    ("view-join-mixed-keys", "SELECT svk.n FROM svk JOIN svk2 ON svk.k = svk2.k AND svk.n + 100 = svk2.n + 100 ORDER BY 1;", True, False),
+    ("view-semi", "SELECT n FROM svk WHERE EXISTS (SELECT 1 FROM svk2 WHERE svk2.k = svk.k) ORDER BY n;", True, False),
+    ("view-anti", "SELECT n FROM svk WHERE NOT EXISTS (SELECT 1 FROM svk2 WHERE svk2.k = svk.k) ORDER BY n;", True, False),
+    ("view-distinct", "SELECT count(DISTINCT k), count(k), count(*) FROM svk;", False, False),
+    ("view-group", "SELECT k, count(*), sum(n) FROM svk GROUP BY k ORDER BY k NULLS LAST;", True, False),
+    ("view-group-first-seen", "SELECT k, count(*) FROM svk GROUP BY k;", False, False),
+    ("view-group-empty-vs-null", "SELECT count(*) FROM (SELECT DISTINCT k FROM svk) t WHERE k = '' ;", False, False),
+    ("view-group-null-count", "SELECT count(*) FROM (SELECT DISTINCT k FROM svk) t WHERE k IS NULL;", False, False),
+    ("view-order", "SELECT k FROM svk ORDER BY k NULLS LAST;", True, False),
+    ("coalesce-zero-fill", "SELECT COALESCE(x, 0) FROM nn ORDER BY 1;", True, False),
+    ("coalesce-three", "SELECT COALESCE(NULL, x, 7) FROM nn ORDER BY 1;", True, False),
+    ("coalesce-varchar", "SELECT COALESCE(z, 'none') FROM jy ORDER BY 1;", True, False),
+    ("coalesce-cast-double", "SELECT COALESCE(x, 1.5) FROM nn ORDER BY 1;", True, False),
+    ("coalesce-date", "SELECT COALESCE(hired, DATE '2000-01-01') FROM emp ORDER BY 1;", True, False),
+    ("coalesce-decimal", "SELECT COALESCE(x, 0) FROM dt ORDER BY 1;", True, False),
+    ("coalesce-all-null", "SELECT COALESCE(NULL, NULL) AS c;", False, False),
+    ("coalesce-lazy-branch", "SELECT COALESCE(x, 1 / (x - x)) FROM nn ORDER BY 1 NULLS LAST;", True, False),
 ]
 
 # ---- wave 53: core string extension (`extensions/string`) ----
@@ -2118,6 +2154,11 @@ BIG_QUERIES = [
     ("big-group", "SELECT region, COUNT(*), AVG(total), SUM(total), MIN(total), MAX(total) FROM sales GROUP BY region ORDER BY region;", True, False),
     ("big-filter", "SELECT COUNT(*) FROM sales WHERE total > 500;", True, False),
     ("big-having", "SELECT region, AVG(total) FROM sales WHERE active GROUP BY region HAVING COUNT(*) > 100000 ORDER BY 2 DESC LIMIT 3;", True, False),
+    # wave 135d: a million groups, one per row, through the flat group table.
+    # The outer row pins the group count and each group's value without
+    # shipping a million rows; MIN/MAX are order-free, unlike a float SUM.
+    ("big-group-million", "SELECT COUNT(*), SUM(c), MIN(s), MAX(s), MIN(a), MAX(a) FROM (SELECT id, COUNT(*) AS c, SUM(total) AS s, AVG(total) AS a FROM sales GROUP BY id) g;", False, False),
+    ("big-group-million-text", "SELECT COUNT(*), MIN(s), MAX(s) FROM (SELECT 'k' || id::VARCHAR || '-tail' AS k, SUM(total) AS s FROM sales GROUP BY k) g;", False, False),
 ]
 
 
@@ -2455,9 +2496,96 @@ DIALECT3_QUERIES = [
 ]
 
 
+# ---- wave 135a: the pipeline's aggregate-rooted mart shape ----
+#
+# QuackLab's mart refresh — a fact joined to small dimensions, grouped by the
+# dimensions' VARCHAR columns — is what the pipeline executor was built for.
+# 6000 fact rows span three engine chunks, so the per-morsel partials and their
+# merge order are exercised; every case runs on both engines, so the streaming
+# path must also match DuckDB value for value.
+_mart_fact = ",".join(
+    f"({i}, {i % 97}, {i % 31}, {i % 500}, {i % 7}.5)" for i in range(6000)
+)
+_mart_cust = ",".join(f"({i}, 'region-{i % 5}', {i % 3}.25)" for i in range(97))
+_mart_prod = ",".join(f"({i}, 'cat-{i % 4}', {i % 6})" for i in range(31))
+_mart_month = ",".join(f"({i}, 'month-{i:02d}')" for i in range(12))
+
+MART_SETUP = f"""
+CREATE TABLE mart_fact (id INTEGER, cust_key INTEGER, prod_key INTEGER, qty INTEGER, amount DOUBLE);
+INSERT INTO mart_fact VALUES {_mart_fact};
+CREATE TABLE mart_cust (k INTEGER, region VARCHAR, factor DOUBLE);
+INSERT INTO mart_cust VALUES {_mart_cust};
+CREATE TABLE mart_prod (k INTEGER, category VARCHAR, size INTEGER);
+INSERT INTO mart_prod VALUES {_mart_prod};
+CREATE TABLE mart_month (k INTEGER, month VARCHAR);
+INSERT INTO mart_month VALUES {_mart_month};
+"""
+
+MART_QUERIES = [
+    # fact ⋈ dim ⋈ dim, GROUP BY two dimension VARCHAR columns
+    ("mart-two-dims",
+     "SELECT c.region, p.category, COUNT(*), SUM(f.qty), SUM(f.amount) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k "
+     "GROUP BY c.region, p.category ORDER BY c.region, p.category;", True, False),
+    # three joins, filtering the streamed side above the second join
+    ("mart-three-dims",
+     "SELECT c.region, p.category, d.month, COUNT(*), SUM(f.qty) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k "
+     "JOIN mart_month d ON f.id % 12 = d.k "
+     "GROUP BY c.region, p.category, d.month ORDER BY c.region, p.category, d.month;", True, False),
+    # a filter on the fact side and one on a dimension side
+    ("mart-fact-filter",
+     "SELECT c.region, p.category, COUNT(*), SUM(f.qty) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k "
+     "WHERE f.qty > 100 GROUP BY c.region, p.category ORDER BY c.region, p.category;", True, False),
+    ("mart-dim-filter",
+     "SELECT c.region, p.category, COUNT(*), SUM(f.amount) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k "
+     "WHERE c.factor > 1.0 AND p.size > 1 "
+     "GROUP BY c.region, p.category ORDER BY c.region, p.category;", True, False),
+    # FILTER (WHERE ...) accumulators over the chain
+    ("mart-aggregate-filter",
+     "SELECT c.region, COUNT(*) FILTER (WHERE f.qty > 250), "
+     "SUM(f.amount) FILTER (WHERE p.size < 3), COUNT(*) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k "
+     "GROUP BY c.region ORDER BY c.region;", True, False),
+    # DISTINCT accumulators and AVG over the joined stream
+    ("mart-distinct-avg",
+     "SELECT c.region, COUNT(DISTINCT p.category), COUNT(DISTINCT f.prod_key), "
+     "AVG(f.amount), MIN(f.qty), MAX(f.qty) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k "
+     "GROUP BY c.region ORDER BY c.region;", True, False),
+    # a fact INTEGER group key beside a dimension VARCHAR key
+    ("mart-fact-int-key",
+     "SELECT f.prod_key % 5, c.region, COUNT(*), SUM(f.qty) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k "
+     "GROUP BY f.prod_key % 5, c.region ORDER BY 1, 2;", True, False),
+    # one group, no keys: the global accumulator over the chain
+    ("mart-global",
+     "SELECT COUNT(*), SUM(f.qty), SUM(f.amount), AVG(f.amount) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k;", False, False),
+]
+
+
+def run_mart():
+    print("== mart battery (wave 135a: pipeline aggregates) ==")
+    for label, sql, ordered, expect_error in MART_QUERIES:
+        run_case(label, sql, ordered, expect_error, MART_SETUP, MART_SETUP)
+
+
 def main():
     import sys
     run_small()
+    run_mart()
+
     run_literals()
     run_expression_names()
     run_csv()

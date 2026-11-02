@@ -18,6 +18,14 @@ progress log</a>.</p>
 <li><strong><code>read_csv(…, types={'col': 'DATE'})</code></strong>, <code>dtypes</code>, <code>column_types</code> and <code>columns={…}</code>.</li>
 <li><strong>Subqueries in <code>FROM</code> need no alias</strong> (<code>unnamed_subquery</code>, …), and an unaliased <code>count(*)</code> is named <code>count_star()</code> as in DuckDB.</li>
 </ul>
+<h3>Wave 135 (steps a–d) — pipelines, string keys, big GROUP BYs ✅</h3>
+<p>QuackLab's mart refresh SELECTs run 1.5–2.9× faster than after wave 140, and the refresh's peak memory fell by about a third. Results are unchanged.</p>
+<ul>
+<li><strong>Pipelines:</strong> aggregates and every other query root now push chunks through filters, projections and join probes (inner, left, right, semi, anti, mark) in parallel without materializing intermediate join results. <code>SET pipeline_execution = false</code> runs the previous executor, for comparison.</li>
+<li><strong>VARCHAR join and GROUP BY keys</strong> of up to 12 bytes are hashed and compared as their 16-byte string views, without touching the string bytes.</li>
+<li><strong><code>COALESCE</code></strong> is evaluated a vector at a time.</li>
+<li><strong>GROUP BY with millions of groups</strong> merges per-chunk partial tables without copying their keys and without a final sort: 17–21 % faster on QuackLab's 1.9M-group fact roll-up, 250 MB less memory.</li>
+</ul>
 <h3>Wave 132 — DuckLake interop ✅</h3>
 <p>pinkdb opens the DuckLakes stock DuckDB writes and writes ones DuckDB reads, with QuackLab's own attach sequence.</p>
 <ul>

@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use parquet::basic::Type as PhysicalType;
 use parquet::file::metadata::ParquetMetaData;
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::Type;
@@ -68,7 +69,7 @@ pub struct ChunkInfo {
 }
 
 /// One resolved file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileMeta {
     /// The path as the scan displays it (`filename`).
     pub path: String,
@@ -264,6 +265,129 @@ fn read_footer_size(path: &str, file_size: u64) -> u64 {
         return 0;
     }
     u64::from(u32::from_le_bytes(buf))
+}
+
+/// One page's statistics from the column index (Parquet's `ColumnIndex`),
+/// projected into engine values. The bounds are exact by construction: the
+/// writer stored that page's own min/max, so nothing is widened.
+pub(crate) fn page_stats(
+    index: &ColumnIndexMetaData,
+    page: usize,
+    column: &FileColumn,
+) -> ColStats {
+    let null_count = index.null_count(page).map(|n| n.max(0) as u64);
+    let (min, max) = if index.is_null_page(page) {
+        (None, None)
+    } else {
+        (
+            page_value(index, page, column, true),
+            page_value(index, page, column, false),
+        )
+    };
+    ColStats {
+        min,
+        max,
+        null_count,
+        min_exact: true,
+        max_exact: true,
+    }
+}
+
+/// One side of a page's statistics, in the engine's type for the column. The
+/// page index stores raw values (not `Statistics`), so this mirrors
+/// [`stat_value`] per physical type.
+fn page_value(
+    index: &ColumnIndexMetaData,
+    page: usize,
+    column: &FileColumn,
+    min: bool,
+) -> Option<Value> {
+    if !prunable_column(column) {
+        return None;
+    }
+    let scale = match column.ty {
+        DataType::Decimal { scale, .. } => scale,
+        _ => 0,
+    };
+    match index {
+        ColumnIndexMetaData::BOOLEAN(i) => {
+            let v = *if min {
+                i.min_value(page)
+            } else {
+                i.max_value(page)
+            }?;
+            Some(Value::Boolean(v))
+        }
+        ColumnIndexMetaData::INT32(i) => {
+            let v = *if min {
+                i.min_value(page)
+            } else {
+                i.max_value(page)
+            }?;
+            Some(match column.ty {
+                DataType::Integer => Value::Integer(v),
+                DataType::Date => Value::Date(v),
+                DataType::Decimal { .. } => int_decimal_value(v as i64, scale),
+                _ => return None,
+            })
+        }
+        ColumnIndexMetaData::INT64(i) => {
+            let v = *if min {
+                i.min_value(page)
+            } else {
+                i.max_value(page)
+            }?;
+            Some(match column.ty {
+                DataType::Bigint => Value::Bigint(v),
+                DataType::Timestamp => Value::Timestamp(v),
+                DataType::Decimal { .. } => int_decimal_value(v, scale),
+                _ => return None,
+            })
+        }
+        ColumnIndexMetaData::FLOAT(i) => {
+            let v = *if min {
+                i.min_value(page)
+            } else {
+                i.max_value(page)
+            }?;
+            Some(Value::Double(v as f64))
+        }
+        ColumnIndexMetaData::DOUBLE(i) => {
+            let v = *if min {
+                i.min_value(page)
+            } else {
+                i.max_value(page)
+            }?;
+            Some(Value::Double(v))
+        }
+        ColumnIndexMetaData::BYTE_ARRAY(i) => {
+            let v = if min {
+                i.min_value(page)
+            } else {
+                i.max_value(page)
+            }?;
+            let text = std::str::from_utf8(v).ok()?;
+            Some(Value::Varchar(text.to_string()))
+        }
+        ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(i) => {
+            let v = if min {
+                i.min_value(page)
+            } else {
+                i.max_value(page)
+            }?;
+            match column.ty {
+                DataType::Decimal { .. } => {
+                    Some(fixed_decimal_value(v)).map(|u| Value::decimal(u, scale))
+                }
+                DataType::Uuid => {
+                    let bytes: [u8; 16] = v.try_into().ok()?;
+                    Some(Value::Uuid(u128::from_be_bytes(bytes)))
+                }
+                _ => None,
+            }
+        }
+        ColumnIndexMetaData::INT96(_) => None,
+    }
 }
 
 /// Project one column chunk's statistics into engine values, or `None` when

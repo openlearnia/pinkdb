@@ -172,7 +172,8 @@ fn lean_save_open_versions_tables_info() {
 
 /// A read-only lake database answers exact COUNT/COUNT(col)/MIN/MAX from the published
 /// statistics without decoding (decode counters stay at zero), and a fallback
-/// query materializes the table exactly once and caches it.
+/// query decodes only the columns it references, per query (wave 133a dropped
+/// the session's materialized table).
 #[test]
 fn lean_attach_answers_from_statistics_without_decoding() {
     let dir = scratch("attach");
@@ -210,14 +211,15 @@ fn lean_attach_answers_from_statistics_without_decoding() {
     // The fast paths decoded nothing; each fallback decoded only the columns
     // it needed.
     // `.pink` files decode only the columns a query needs (wave 102): the
-    // first fallback reads one column, the second a further one.
+    // first fallback reads one column, the second the two it sums. Nothing is
+    // cached between queries (wave 133a), so each column is decoded again.
     let decodes = common::decode_lines(&out);
     assert_eq!(
         decodes,
         vec![
             "decodes: 0 loads, 0 columns, 0 files",
             "decodes: 1 loads, 1 columns, 1 files",
-            "decodes: 2 loads, 2 columns, 2 files",
+            "decodes: 2 loads, 3 columns, 2 files",
         ],
         "fast paths must not decode; projected decodes, one column at a time:\n{out}"
     );
@@ -264,7 +266,7 @@ fn lean_attach_answers_equal_open_and_in_memory() {
     );
 
     // The fast paths are statistics-only: after COUNT/COUNT(col)/MIN/MAX the
-    // decode counters stay at zero, and the first fallback materializes once.
+    // decode counters stay at zero, and each fallback decodes its column.
     let d = common::DECODES;
     let stats_arm = run(&format!(
         "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake.lake;\n\
@@ -280,10 +282,10 @@ fn lean_attach_answers_equal_open_and_in_memory() {
         vec![
             "decodes: 0 loads, 0 columns, 0 files",
             "decodes: 1 loads, 1 columns, 1 files",
-            "decodes: 1 loads, 1 columns, 1 files",
+            "decodes: 2 loads, 2 columns, 2 files",
         ],
-        "fast paths must not decode; the fallback decodes only its column once \
-         (wave 102), then the cache serves it:\n{stats_arm}"
+        "fast paths must not decode; each fallback decodes only its column \
+         (wave 102) and nothing is kept between queries (wave 133a):\n{stats_arm}"
     );
     cleanup(&dir);
 }

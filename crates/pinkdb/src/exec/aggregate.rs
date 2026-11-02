@@ -10,7 +10,6 @@ use crate::types::FastSet;
 
 use super::Cx;
 use super::expr::eval_expr;
-use super::selection::Selected;
 use crate::plan::{compare_values, num_cmp};
 use crate::sql::ast::BinaryOp;
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr};
@@ -1681,61 +1680,6 @@ pub(crate) fn aggregate(
     merge_and_emit(partials, &key_types, aggs)
 }
 
-/// [`aggregate`] over chunks that carry a selection: every partial folds only
-/// the rows its filter kept, reading the key and argument columns through the
-/// selection instead of from a materialized filtered copy.
-pub(crate) fn aggregate_selected(
-    cx: &Cx,
-    inputs: &[Selected],
-    keys: &[BoundExpr],
-    aggs: &[BoundAgg],
-) -> Result<Vec<DataChunk>> {
-    debug_assert!(!aggs.is_empty(), "the DISTINCT path stays in `aggregate`");
-    if let Some(out) = super::group_table::aggregate_selected(cx, inputs, keys, aggs)? {
-        return Ok(out);
-    }
-    let partials: Vec<Partial> = inputs
-        .par_iter()
-        .map(|input| {
-            let mut partial = Partial::for_rows(input.sel.len());
-            match fold_chunk(cx, &mut partial, &input.chunk, Some(&input.sel), keys, aggs) {
-                Ok(()) => Ok(partial),
-                Err(_) => fold_kept_rows(cx, input, keys, aggs),
-            }
-        })
-        .collect::<Result<_>>()?;
-    let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
-    merge_and_emit(partials, &key_types, aggs)
-}
-
-/// The selection fold evaluates keys and arguments over the whole chunk, so
-/// a row the filter dropped can raise an error (a decimal overflow, a
-/// division by zero) that no kept row would. On an error, fold the kept rows
-/// alone: the error stands only if one of them raises it, as in DuckDB.
-/// `fold_chunk` evaluates everything before it touches the partial, so the
-/// retry starts from a clean one. Kept out of line: it is the rare path, and
-/// inlining a second `fold_chunk` into the per-chunk closure measurably slows
-/// the common one.
-#[cold]
-#[inline(never)]
-fn fold_kept_rows(
-    cx: &Cx,
-    input: &Selected,
-    keys: &[BoundExpr],
-    aggs: &[BoundAgg],
-) -> Result<Partial> {
-    let mut partial = Partial::for_rows(input.sel.len());
-    fold_chunk(
-        cx,
-        &mut partial,
-        &input.chunk.take(&input.sel),
-        None,
-        keys,
-        aggs,
-    )?;
-    Ok(partial)
-}
-
 /// Distinct keys a single-VARCHAR-key chunk resolves by linear scan before
 /// switching to the hash map (a short scan of short strings beats hashing
 /// plus an encoded-key compare for low-cardinality keys like `region`).
@@ -2823,6 +2767,27 @@ mod tests {
             .collect()
     }
 
+    /// Fold `sel`'s rows of `chunk` the way an aggregate sink does — the flat
+    /// table and the general accumulators — one partial per chunk, merged.
+    fn fold_selected(
+        cx: &Cx,
+        chunk: &DataChunk,
+        sel: &[u32],
+        keys: &[BoundExpr],
+        aggs: &[BoundAgg],
+    ) -> [Vec<DataChunk>; 2] {
+        use crate::exec::pipeline::{GeneralSink, Sink};
+        let flat =
+            crate::exec::group_table::FlatSink::new(keys, aggs, chunk.num_rows(), chunk.num_cols())
+                .expect("flat table");
+        let partial = flat.fold(cx, chunk, Some(sel)).unwrap().unwrap();
+        let flat = flat.merge(vec![partial], true).unwrap();
+        let general = GeneralSink::new(keys, aggs);
+        let partial = general.fold_into(cx, chunk, Some(sel)).unwrap().unwrap();
+        let general = general.finish(vec![partial], cx).unwrap();
+        [flat, general]
+    }
+
     #[test]
     fn folding_through_a_selection_matches_folding_a_compacted_copy() {
         // The selection path indexes the key/argument vectors instead of
@@ -2858,17 +2823,9 @@ mod tests {
             // unfiltered aggregate.
             let all: Vec<u32> = (0..chunk.num_rows() as u32).collect();
             let plain = aggregate(&cx, std::slice::from_ref(&chunk), keys, &aggs).unwrap();
-            let via_selection = aggregate_selected(
-                &cx,
-                &[Selected {
-                    chunk: chunk.clone(),
-                    sel: all.clone(),
-                }],
-                keys,
-                &aggs,
-            )
-            .unwrap();
-            assert_eq!(rows_of(&via_selection), rows_of(&plain));
+            for got in fold_selected(&cx, &chunk, &all, keys, &aggs) {
+                assert_eq!(rows_of(&got), rows_of(&plain));
+            }
             // A sparse selection, with holes and a NULL-key row dropped.
             let mut sel: Vec<u32> = all
                 .iter()
@@ -2878,17 +2835,9 @@ mod tests {
             sel.sort_unstable();
             let compacted = chunk.take(&sel);
             let want = aggregate(&cx, &[compacted], keys, &aggs).unwrap();
-            let got = aggregate_selected(
-                &cx,
-                &[Selected {
-                    chunk: chunk.clone(),
-                    sel: sel.clone(),
-                }],
-                keys,
-                &aggs,
-            )
-            .unwrap();
-            assert_eq!(rows_of(&got), rows_of(&want), "keys {keys:?} sel {sel:?}");
+            for got in fold_selected(&cx, &chunk, &sel, keys, &aggs) {
+                assert_eq!(rows_of(&got), rows_of(&want), "keys {keys:?} sel {sel:?}");
+            }
         }
     }
 }

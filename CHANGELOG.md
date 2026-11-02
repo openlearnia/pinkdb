@@ -24,6 +24,23 @@ one-liners below.
 - **Subqueries in `FROM` need no alias** (`unnamed_subquery`, …), and an
   unaliased `count(*)` is named `count_star()` as in DuckDB.
 
+### Wave 135 (steps a–d) — pipelines, string keys, big GROUP BYs ✅
+
+QuackLab's mart refresh SELECTs run 1.5–2.9× faster than after wave 140,
+and the refresh's peak memory fell by about a third. Results are unchanged.
+
+- **Pipelines:** aggregates and every other query root now push chunks
+  through filters, projections and join probes (inner, left, right, semi,
+  anti, mark) in parallel without materializing intermediate join results.
+  `SET pipeline_execution = false` runs the previous executor, for
+  comparison.
+- **VARCHAR join and GROUP BY keys** of up to 12 bytes are hashed and
+  compared as their 16-byte string views, without touching the string bytes.
+- **`COALESCE`** is evaluated a vector at a time.
+- **GROUP BY with millions of groups** merges per-chunk partial tables
+  without copying their keys and without a final sort: 17–21 % faster on
+  QuackLab's 1.9M-group fact roll-up, 250 MB less memory.
+
 ### Wave 132 — DuckLake interop ✅
 
 pinkdb opens the DuckLakes stock DuckDB writes and writes ones DuckDB reads,

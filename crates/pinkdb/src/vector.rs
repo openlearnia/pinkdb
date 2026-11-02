@@ -1074,6 +1074,70 @@ impl Vector {
             }
         }
     }
+    /// Overwrite slot `dst[k]` with `src`'s row `src_rows[k]`, which must be
+    /// valid, keeping `self`'s length: a result vector is patched where an
+    /// earlier argument left it NULL (COALESCE) instead of being rebuilt.
+    /// The two vectors must have the same layout.
+    pub(crate) fn set_rows_from(
+        &mut self,
+        dst: &[usize],
+        src: &Vector,
+        src_rows: &[usize],
+    ) -> Result<()> {
+        debug_assert_eq!(dst.len(), src_rows.len());
+        debug_assert!(
+            src_rows.iter().all(|&s| src.is_valid(s)),
+            "set_rows_from writes valid source rows"
+        );
+        if matches!(src.data(), VectorData::Array { .. }) {
+            // A fixed-width ARRAY cell cannot be written in place; the rare
+            // path pays a `Value` per cell.
+            for (&d, &s) in dst.iter().zip(src_rows) {
+                let value = src.get(s);
+                self.set_value(d, value)?;
+            }
+            return Ok(());
+        }
+        macro_rules! copy {
+            ($into:expr, $from:expr) => {
+                for (&d, &s) in dst.iter().zip(src_rows) {
+                    $into[d] = $from[s];
+                }
+            };
+        }
+        match (&mut self.data, src.data()) {
+            (VectorData::Boolean(d), VectorData::Boolean(s)) => copy!(d, s),
+            (VectorData::Int32(d), VectorData::Int32(s)) => copy!(d, s),
+            (VectorData::Int64(d), VectorData::Int64(s)) => copy!(d, s),
+            (VectorData::Float64(d), VectorData::Float64(s)) => copy!(d, s),
+            (VectorData::Date32(d), VectorData::Date32(s)) => copy!(d, s),
+            (VectorData::TimestampMicros(d), VectorData::TimestampMicros(s)) => copy!(d, s),
+            (VectorData::Decimal { values: d, .. }, VectorData::Decimal { values: s, .. }) => {
+                copy!(d, s)
+            }
+            (VectorData::Interval(d), VectorData::Interval(s)) => copy!(d, s),
+            (VectorData::VarChar(d), VectorData::VarChar(s)) => {
+                for (&k, &j) in dst.iter().zip(src_rows) {
+                    d.set(k, &s[j]);
+                }
+            }
+            (VectorData::Variant(d), VectorData::Variant(s)) => {
+                for (&k, &j) in dst.iter().zip(src_rows) {
+                    d[k] = Arc::clone(&s[j]);
+                }
+            }
+            _ => {
+                return Err(PinkDbError::Execution(
+                    "set_rows_from needs matching vector types".to_string(),
+                ));
+            }
+        }
+        for &d in dst {
+            bit_set(&mut self.validity, d);
+        }
+        Ok(())
+    }
+
     /// Copy element `idx` from `other` into `self` (for UPDATE-adjacent
     /// bulk moves: filter/project/sort/join/distinct outputs). Types must
     /// match; strings share the `Arc` (no allocation).

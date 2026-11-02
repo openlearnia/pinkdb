@@ -312,7 +312,7 @@ impl RangedFile for StorageRange {
 
 /// The schema and identity a data file carries itself, read without decoding
 /// any column data (the `.pink` footer, a Parquet footer).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileFooter {
     /// The database the file's metadata names.
     pub db: String,
@@ -487,6 +487,72 @@ pub trait LakeFormat: fmt::Debug + Send + Sync {
     ) -> Result<Option<(PinkDb, Vec<bool>)>> {
         Ok(None)
     }
+
+    /// Stream one data file's projected columns, one morsel at a time.
+    ///
+    /// `sink` receives `(row offset of the morsel inside the file, chunk)`;
+    /// the chunk holds the file's full physical schema, with unrequested (and
+    /// absent) columns as NULL placeholders. A provider that can read page
+    /// ranges overrides this so a scan never holds more than the in-flight
+    /// morsel and reads only the pages the predicates leave alive; the
+    /// default decodes the whole file with [`LakeFormat::read_projected`] and
+    /// pushes its chunks, which is what a `.pink` file does.
+    ///
+    /// Pruning may shrink the pushed rows; a provider that prunes must say so
+    /// through [`LakeFormat::prunes_row_groups`], and only when the file has
+    /// no positional deletes (delete positions address the file's rows).
+    /// Returns the rows pushed and the scan's pruning counters.
+    fn scan(
+        &self,
+        file: &DataFile<'_>,
+        columns: &[usize],
+        filters: &[pinkdb::PrunePredicate],
+        sink: &mut dyn FnMut(u64, pinkdb::DataChunk) -> Result<()>,
+    ) -> Result<(u64, ScanCounters)> {
+        scan_whole_file(self, file, columns, filters, sink)
+    }
+}
+
+/// Per-file pruning counters a [`LakeFormat::scan`] reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanCounters {
+    /// Row groups decoded and row groups whose statistics proved no match.
+    pub row_groups: u64,
+    pub row_groups_pruned: u64,
+    /// Data pages read and pages whose statistics proved no match. A format
+    /// without a page index reports zero here.
+    pub pages: u64,
+    pub pages_pruned: u64,
+}
+
+/// The default [`LakeFormat::scan`]: decode the whole file through the
+/// provider's projected reader (or its full reader) and push the chunks in
+/// file order.
+pub fn scan_whole_file<F: LakeFormat + ?Sized>(
+    format: &F,
+    file: &DataFile<'_>,
+    columns: &[usize],
+    filters: &[pinkdb::PrunePredicate],
+    sink: &mut dyn FnMut(u64, pinkdb::DataChunk) -> Result<()>,
+) -> Result<(u64, ScanCounters)> {
+    let store = match format.read_projected(file, columns, filters)? {
+        Some((store, _present)) => store,
+        None => format.read(file)?,
+    };
+    let (_db, table) = crate::only_table(&store, file.rel(), file.path())?;
+    let mut offset = 0u64;
+    for index in 0..table.num_chunks() {
+        let chunk = table.scan_chunk(index).ok_or_else(|| LakeError::Internal {
+            message: format!(
+                "chunk {index} of \"{}\" disappeared while scanning",
+                file.rel()
+            ),
+        })?;
+        let rows = chunk.num_rows() as u64;
+        sink(offset, chunk)?;
+        offset += rows;
+    }
+    Ok((offset, ScanCounters::default()))
 }
 
 /// The process-global registry, seeded lazily with the built-in providers.
