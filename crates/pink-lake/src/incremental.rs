@@ -604,6 +604,9 @@ fn mix_value(h: &mut u64, v: &Value) {
             mix(h, 11, &b);
         }
         Value::Uuid(bits) => mix(h, 12, &bits.to_le_bytes()),
+        // Distinct tags: a 128-bit value never collides with a narrower one.
+        Value::Hugeint(i) => mix(h, 13, &i.to_le_bytes()),
+        Value::Uhugeint(u) => mix(h, 14, &u.to_le_bytes()),
     }
 }
 

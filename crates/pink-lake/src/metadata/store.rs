@@ -5755,7 +5755,9 @@ fn canonical_sql_value(
         | DataType::Interval
         | DataType::Variant
         | DataType::Array { .. }
-        | DataType::Uuid => match canonical_to_ducklake(dtype, canonical) {
+        | DataType::Uuid
+        | DataType::Hugeint
+        | DataType::Uhugeint => match canonical_to_ducklake(dtype, canonical) {
             Some(text) => SqlValue::Text(text),
             None => SqlValue::Text(canonical.to_string()),
         },
@@ -6186,7 +6188,10 @@ fn canonical_to_ducklake(dtype: pinkdb::DataType, canonical: &str) -> Option<Str
         pinkdb::DataType::Decimal { .. }
         | pinkdb::DataType::Interval
         | pinkdb::DataType::Variant
-        | pinkdb::DataType::Array { .. } => canonical.to_string(),
+        | pinkdb::DataType::Array { .. }
+        // No ducklake type of its own yet: the canonical text passes through.
+        | pinkdb::DataType::Hugeint
+        | pinkdb::DataType::Uhugeint => canonical.to_string(),
     })
 }
 
@@ -6219,7 +6224,9 @@ fn ducklake_to_canonical(dtype: pinkdb::DataType, ducklake: &str) -> Option<Stri
         // written for it); its JSON text passes through unchanged.
         pinkdb::DataType::Variant => ducklake.to_string(),
         // Likewise an ARRAY, which writes no statistics at all.
-        pinkdb::DataType::Array { .. } => ducklake.to_string(),
+        pinkdb::DataType::Array { .. } | pinkdb::DataType::Hugeint | pinkdb::DataType::Uhugeint => {
+            ducklake.to_string()
+        }
     })
 }
 

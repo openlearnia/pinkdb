@@ -442,6 +442,8 @@ pub(crate) fn dtype_name(dtype: DataType) -> String {
         DataType::Interval => "interval",
         DataType::Variant => "variant",
         DataType::Uuid => "uuid",
+        DataType::Hugeint => "hugeint",
+        DataType::Uhugeint => "uhugeint",
         DataType::Decimal { .. } | DataType::Array { .. } => unreachable!("handled above"),
     }
     .to_string()
@@ -469,6 +471,8 @@ pub(crate) fn dtype_from_name(name: &str) -> Option<DataType> {
         "interval" => DataType::Interval,
         "variant" => DataType::Variant,
         "uuid" => DataType::Uuid,
+        "hugeint" => DataType::Hugeint,
+        "uhugeint" => DataType::Uhugeint,
         _ => return None,
     })
 }
@@ -522,6 +526,8 @@ pub(crate) fn decode_value(dtype: DataType, s: &str) -> Option<Value> {
         },
         DataType::Integer => Value::Integer(s.parse().ok()?),
         DataType::Bigint => Value::Bigint(s.parse().ok()?),
+        DataType::Hugeint => Value::Hugeint(s.parse().ok()?),
+        DataType::Uhugeint => Value::Uhugeint(s.parse().ok()?),
         DataType::Date => Value::Date(s.parse().ok()?),
         DataType::Timestamp => Value::Timestamp(s.parse().ok()?),
         DataType::Double => {

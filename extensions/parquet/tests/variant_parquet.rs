@@ -100,6 +100,7 @@ fn read_rows(path: &Path) -> Vec<Vec<Value>> {
         args: vec![TableFunctionArg {
             name: None,
             value: Value::Varchar(path.display().to_string()),
+            literal: None,
         }],
     };
     let schema = source.bind(&call).unwrap().expect("read_parquet binds");

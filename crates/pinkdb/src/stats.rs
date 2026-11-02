@@ -86,6 +86,10 @@ pub(crate) fn key_hash(v: &Vector, row: usize) -> u64 {
             let x = d[row];
             mix(x as u64 ^ ((x >> 64) as u64).rotate_left(17) ^ 0x60)
         }
+        // 128-bit integers hash by value, so every row of the column reaches
+        // the bloom probe's hash unchanged.
+        VectorData::Int128(d) => hash_int128(d[row]),
+        VectorData::UInt128(d) => hash_int128(d[row] as i128),
         VectorData::Variant(_) | VectorData::Array { .. } => value_hash(&v.get(row)),
     }
 }
@@ -104,6 +108,8 @@ pub(crate) fn value_hash(v: &Value) -> u64 {
         Value::Double(x) => mix(double_bits(*x)),
         Value::Varchar(s) => hash_bytes(s.as_bytes()),
         Value::Uuid(x) => mix(*x as u64 ^ ((*x >> 64) as u64).rotate_left(17) ^ 0x60),
+        Value::Hugeint(x) => hash_int128(*x),
+        Value::Uhugeint(x) => hash_int128(*x as i128),
         Value::Decimal {
             value: x, scale, ..
         } => mix(*x as u64 ^ ((*x >> 64) as u64).rotate_left(17) ^ ((*scale as u64) << 56)),
@@ -118,6 +124,15 @@ pub(crate) fn value_hash(v: &Value) -> u64 {
             hash_bytes(&buf)
         }
     }
+}
+
+/// The hash of one 128-bit integer. The narrower widths keep the per-width
+/// salt their persisted HLL sketches were built with (a storage fact this
+/// step cannot change), so 128-bit cells hash by value alone: the high half is
+/// folded in, so values that differ only above bit 63 land in different
+/// buckets.
+fn hash_int128(x: i128) -> u64 {
+    mix((x as u64) ^ ((x >> 64) as u64).rotate_left(17))
 }
 
 /// `-0.0` and every NaN collapse to one bit pattern, exactly as equality (and
@@ -490,6 +505,16 @@ impl Zone {
                 let (min, max) = int_stats(v, values);
                 zone.min = min.map(|x| Value::decimal(x, *scale));
                 zone.max = max.map(|x| Value::decimal(x, *scale));
+            }
+            VectorData::Int128(data) => {
+                let (min, max) = int_stats(v, data);
+                zone.min = min.map(Value::Hugeint);
+                zone.max = max.map(Value::Hugeint);
+            }
+            VectorData::UInt128(data) => {
+                let (min, max) = int_stats(v, data);
+                zone.min = min.map(Value::Uhugeint);
+                zone.max = max.map(Value::Uhugeint);
             }
             VectorData::Interval(data) => {
                 let (mut min, mut max): (Option<Interval>, Option<Interval>) = (None, None);
@@ -1009,6 +1034,52 @@ mod tests {
             }
         }
         v
+    }
+
+    /// The column hash and the value hash agree for 128-bit cells, and values
+    /// that differ only above bit 63 do not collide.
+    #[test]
+    fn hugeint_hashes_agree_and_keep_all_128_bits() {
+        let mut wide = Vector::new_empty(DataType::Hugeint);
+        wide.push_i128(1).expect("push");
+        let mut uwide = Vector::new_empty(DataType::Uhugeint);
+        uwide.push_valid(Value::Uhugeint(1)).expect("push");
+        assert_eq!(key_hash(&wide, 0), value_hash(&Value::Hugeint(1)));
+        assert_eq!(key_hash(&uwide, 0), value_hash(&Value::Uhugeint(1)));
+        // The narrower widths keep their persisted per-width salt, so they are
+        // not compared here; GROUP BY keys agree through `encode_key_into`.
+        assert_ne!(
+            value_hash(&Value::Hugeint(1)),
+            value_hash(&Value::Hugeint(1 << 100))
+        );
+        assert_ne!(
+            value_hash(&Value::Uhugeint(1)),
+            value_hash(&Value::Uhugeint(1 << 100))
+        );
+        assert_ne!(
+            value_hash(&Value::Hugeint(-1)),
+            value_hash(&Value::Hugeint(i128::MIN))
+        );
+    }
+
+    /// Zone maps keep the full 128-bit bounds; a truncated (or f64) bound
+    /// would prune rows that still match.
+    #[test]
+    fn hugeint_zone_maps_keep_the_full_range() {
+        let mut v = Vector::new_empty(DataType::Hugeint);
+        for x in [i128::MAX, i128::MIN, 0, 5, i128::MIN + 1] {
+            v.push_i128(x).expect("push");
+        }
+        let zone = Zone::of_vector(&v);
+        assert_eq!(zone.min, Some(Value::Hugeint(i128::MIN)));
+        assert_eq!(zone.max, Some(Value::Hugeint(i128::MAX)));
+        let mut u = Vector::new_empty(DataType::Uhugeint);
+        for x in [u128::MAX, 0, 1 << 100] {
+            u.push_valid(Value::Uhugeint(x)).expect("push");
+        }
+        let zone = Zone::of_vector(&u);
+        assert_eq!(zone.min, Some(Value::Uhugeint(0)));
+        assert_eq!(zone.max, Some(Value::Uhugeint(u128::MAX)));
     }
 
     /// The chunk-at-a-time test agrees with the per-row one on every integer

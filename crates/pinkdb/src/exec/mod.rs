@@ -1030,11 +1030,11 @@ impl<'a> Cx<'a> {
     }
 
     /// Whether this statement may prune probe scans with join filters. The
-    /// `join_filter_pushdown` session variable turns it off; kept as a
+    /// `join_filter_pushdown` setting turns it off; kept as a
     /// debugging and differential-testing switch, never as a hint that
     /// changes a result.
     pub(crate) fn join_filter_pushdown(&self) -> bool {
-        match self.session.get("join_filter_pushdown") {
+        match crate::settings::current(&self.session, "join_filter_pushdown") {
             None => true,
             Some(Value::Boolean(b)) => b,
             Some(Value::Bigint(n)) => n != 0,
@@ -1050,7 +1050,7 @@ impl<'a> Cx<'a> {
     /// input node by node. `SET pipeline_execution = false` forces the
     /// materialized path; the differential tests use it to compare the two.
     pub(crate) fn pipeline_execution(&self) -> bool {
-        match self.session.get("pipeline_execution") {
+        match crate::settings::current(&self.session, "pipeline_execution") {
             None => true,
             Some(Value::Boolean(b)) => b,
             Some(Value::Bigint(n)) => n != 0,
@@ -1145,6 +1145,64 @@ fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
         });
     }
     cx.session.set(name, v.get(0));
+    Ok(QueryResult::SetVariable {
+        name: name.to_string(),
+    })
+}
+
+/// `SET <setting> = <value>` / `RESET <setting>`: session state only, like
+/// `SET VARIABLE` — nothing is logged or persisted, and the value is checked
+/// against DuckDB's rules before it is stored. `RESET ALL` passes `"*"`.
+fn set_setting(cx: &Cx, name: &str, value: Option<&BoundExpr>) -> Result<QueryResult> {
+    // `memory_limit` / `max_memory` are process-wide (wave 136a's pool), not
+    // session state: they move the pool's limit, and `RESET` restores the
+    // default. `RESET ALL` resets the session's settings only.
+    if crate::memory::is_limit_setting(name) {
+        match value {
+            Some(value) => {
+                let single = DataChunk {
+                    columns: Vec::new(),
+                    num_rows: 1,
+                    ordinal: 0,
+                };
+                let v = eval_expr(value, &single, cx)?;
+                match v.get(0) {
+                    Value::Null => crate::memory::reset_limit(),
+                    Value::Varchar(text) => {
+                        crate::memory::set_limit(crate::memory::parse_limit(&text)?)
+                    }
+                    other => {
+                        return Err(PinkDbError::Type(format!(
+                            "memory_limit takes a string like '2GB', not {other}"
+                        )));
+                    }
+                }
+            }
+            None => crate::memory::reset_limit(),
+        }
+        return Ok(QueryResult::SetVariable {
+            name: name.to_string(),
+        });
+    }
+    match value {
+        Some(value) => {
+            let single = DataChunk {
+                columns: Vec::new(),
+                num_rows: 1,
+                ordinal: 0,
+            };
+            let v = eval_expr(value, &single, cx)?;
+            if v.len() != 1 {
+                return Err(PinkDbError::Execution(
+                    "a SET value did not evaluate to one value".to_string(),
+                ));
+            }
+            let v = crate::settings::validate(name, v.get(0))?;
+            cx.session.set_setting(name, v);
+        }
+        None if name == "*" => cx.session.reset_setting(None),
+        None => cx.session.reset_setting(Some(name)),
+    }
     Ok(QueryResult::SetVariable {
         name: name.to_string(),
     })
@@ -2377,16 +2435,29 @@ pub(crate) fn run_plain(
         }
         // Wave 124: `ATTACH` reports the database it created, `DETACH` the one
         // it removed (so a session on it falls back like after a DROP).
-        LogicalPlan::Attach { name, spec, secret } => {
-            if let Some(secret) = secret {
-                let session = db.session.clone();
-                db.put_secret(secret.clone(), true, true, false, &session)?;
+        LogicalPlan::Attach {
+            name,
+            source,
+            secret,
+        } => {
+            match source {
+                crate::lake_db::AttachSource::Memory => db.attach_memory_database(name)?,
+                crate::lake_db::AttachSource::Lake(spec) => {
+                    if let Some(secret) = secret {
+                        let session = db.session.clone();
+                        db.put_secret(secret.clone(), true, true, false, &session)?;
+                    }
+                    db.attach_lake_database(name, spec.clone())?;
+                }
             }
-            db.attach_lake_database(name, spec.clone())?;
             Ok(QueryResult::CreatedDatabase { name: name.clone() })
         }
         LogicalPlan::Detach { name, if_exists } => {
-            if db.detach_lake_database(name, *if_exists)? {
+            // An `:memory:` attachment is forgotten before the lake path,
+            // which refuses a local database.
+            let detached =
+                db.detach_attached_database(name)? || db.detach_lake_database(name, *if_exists)?;
+            if detached {
                 db.rbac_mut().remove_database(name);
             }
             Ok(QueryResult::DroppedDatabase { name: name.clone() })
@@ -2438,6 +2509,14 @@ pub(crate) fn run_plain(
         LogicalPlan::SetVariable { name, value } => {
             let cx = Cx::with_budget(db, budget.clone());
             set_variable(&cx, name, value)
+        }
+        LogicalPlan::SetSetting { name, value } => {
+            let cx = Cx::with_budget(db, budget.clone());
+            set_setting(&cx, name, Some(value))
+        }
+        LogicalPlan::ResetSetting { name } => {
+            let cx = Cx::with_budget(db, budget.clone());
+            set_setting(&cx, name.as_deref().unwrap_or("*"), None)
         }
         LogicalPlan::Checkpoint => {
             if db.is_durable() {
@@ -2835,6 +2914,12 @@ fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
     // (no lock upgrade, nothing logged) but must still run on the read path.
     if let LogicalPlan::SetVariable { name, value } = plan {
         return set_variable(cx, name, value);
+    }
+    if let LogicalPlan::SetSetting { name, value } = plan {
+        return set_setting(cx, name, Some(value));
+    }
+    if let LogicalPlan::ResetSetting { name } = plan {
+        return set_setting(cx, name.as_deref().unwrap_or("*"), None);
     }
     // `COPY … TO …` (wave 71) is read-only for the store (only an external
     // file is written) but produces DuckDB's `Count` result, not a row set —
@@ -3953,6 +4038,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::Analyze { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::SetSetting { .. }
+        | LogicalPlan::ResetSetting { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreateMaterializedView { .. }
@@ -4050,7 +4137,7 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     PinkDbError::Catalog(format!("vector index \"{index}\" not found"))
                 })?;
             let exact = matches!(
-                cx.session.get("hnsw_exact"),
+                crate::settings::current(&cx.session, "hnsw_exact"),
                 Some(Value::Boolean(true))
             );
             let rows = if exact {
@@ -4061,7 +4148,7 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     .as_ref()
                     .ok_or_else(|| def.pending_error(table))?;
                 let q = query_vector(query, *dim)?.0;
-                let ef = match cx.session.get("hnsw_ef_search") {
+                let ef = match crate::settings::current(&cx.session, "hnsw_ef_search") {
                     Some(Value::Integer(n)) => n.clamp(1, 16384) as usize,
                     Some(Value::Bigint(n)) => n.clamp(1, 16384) as usize,
                     _ => 0,
@@ -7929,6 +8016,15 @@ fn encode_key_into(v: &Vector, idx: usize, spec: SortSpec, out: &mut Vec<u8>) {
                 out.extend_from_slice(&be);
             }
         }
+        VectorData::Int128(d) => push_be_i128(out, d[idx], desc),
+        VectorData::UInt128(d) => {
+            let be = d[idx].to_be_bytes();
+            if desc {
+                out.extend(be.iter().map(|b| !b));
+            } else {
+                out.extend_from_slice(&be);
+            }
+        }
         // Unreachable: `encode_sort_keys` bails to the `Value` comparator for
         // VARIANT and ARRAY, whose byte order is not their sort order.
         VectorData::Variant(_) => unreachable!("VARIANT sort keys use the Value comparator"),
@@ -9034,6 +9130,13 @@ fn explain_into(
         LogicalPlan::SetVariable { name, value } => {
             format!("SetVariable {name} = {}", expr_text(value))
         }
+        LogicalPlan::SetSetting { name, value } => {
+            format!("SetSetting {name} = {}", expr_text(value))
+        }
+        LogicalPlan::ResetSetting { name } => match name {
+            Some(name) => format!("ResetSetting {name}"),
+            None => "ResetSetting".to_string(),
+        },
         LogicalPlan::LoadExtension { path } => format!("LoadExtension {path}"),
         LogicalPlan::InstallExtension { name, from, force } => {
             let force = if *force { " (force)" } else { "" };
@@ -9628,6 +9731,58 @@ mod tests {
         assert_send_sync::<DataChunk>();
         assert_send_sync::<Value>();
         assert_send_sync::<QueryResult>();
+    }
+
+    /// Sorting and grouping compare raw key bytes, so the encoding of a
+    /// 128-bit integer must order exactly like `compare_values`: the sign flip
+    /// has to cover all 128 bits, and the unsigned form must leave them alone.
+    #[test]
+    fn wide_integer_key_bytes_order_like_compare_values() {
+        let spec = SortSpec {
+            desc: false,
+            nulls_first: false,
+        };
+        let signed = [i128::MIN, i128::MIN + 1, -1, 0, 1, i128::MAX - 1, i128::MAX];
+        let mut v = Vector::new_empty(DataType::Hugeint);
+        for x in signed {
+            v.push_i128(x).expect("push");
+        }
+        assert_key_order(&v, spec);
+
+        let unsigned = [
+            0u128,
+            1,
+            i128::MAX as u128,
+            i128::MAX as u128 + 1,
+            u128::MAX,
+        ];
+        let mut u = Vector::new_empty(DataType::Uhugeint);
+        for x in unsigned {
+            u.push_valid(Value::Uhugeint(x)).expect("push");
+        }
+        assert_key_order(&u, spec);
+    }
+
+    /// Encode every row, sort by bytes and check the order agrees with the
+    /// value comparator (the invariant GROUP BY and ORDER BY rely on).
+    fn assert_key_order(v: &Vector, spec: SortSpec) {
+        let mut keys: Vec<(Vec<u8>, Value)> = (0..v.len())
+            .map(|i| {
+                let mut key = Vec::new();
+                encode_key_into(v, i, spec, &mut key);
+                (key, v.get(i))
+            })
+            .collect();
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        for pair in keys.windows(2) {
+            assert_eq!(
+                std::cmp::Ordering::Less,
+                crate::plan::compare_values(&pair[0].1, &pair[1].1),
+                "{:?} should sort before {:?}",
+                pair[0].1,
+                pair[1].1
+            );
+        }
     }
 
     /// The bulk write paths' staging: an oversized query chunk is split at the
@@ -11646,10 +11801,16 @@ mod tests {
         // NULL propagates.
         let rows = select(&mut db, "SELECT d + 1 FROM ev WHERE id = 3;");
         assert_eq!(rows, vec![vec![V::Null]]);
-        // Rejected: timestamp ± int, date ± date (non-minus), mixed compare.
+        // Rejected: timestamp ± int, date ± date (non-minus).
         assert!(db.execute("SELECT ts + 1 FROM ev;").is_err());
         assert!(db.execute("SELECT d + d FROM ev;").is_err());
-        assert!(db.execute("SELECT * FROM ev WHERE d = ts;").is_err());
+        // A DATE compares with a TIMESTAMP as its midnight timestamp, which is
+        // the date-range filter `ts >= d AND ts < d + INTERVAL 1 DAY`.
+        let rows = select(
+            &mut db,
+            "SELECT COUNT(*) FROM ev WHERE ts >= d AND ts < d + INTERVAL 1 DAY;",
+        );
+        assert_eq!(rows, vec![vec![V::Bigint(2)]]);
         assert!(
             db.execute("SELECT * FROM ev WHERE d = '2024-01-15';")
                 .is_err()
@@ -11691,8 +11852,25 @@ mod tests {
             &mut db,
             "SELECT date_trunc('month', d), date_trunc('day', ts) FROM ev WHERE id = 1;",
         );
-        assert_eq!(rows[0][0].to_string(), "2024-01-01");
+        assert_eq!(rows[0][0].to_string(), "2024-01-01 00:00:00");
         assert_eq!(rows[0][1].to_string(), "2024-01-15 00:00:00");
+        // DATE truncates as a midnight TIMESTAMP, weeks start on Monday, and
+        // quarters on their first month (DuckDB).
+        let rows = select(
+            &mut db,
+            "SELECT date_trunc('week', DATE '2024-01-17'), date_trunc('quarter', DATE '2024-05-06');",
+        );
+        assert_eq!(rows[0][0].to_string(), "2024-01-15 00:00:00");
+        assert_eq!(rows[0][1].to_string(), "2024-04-01 00:00:00");
+        // A row-dependent interval count runs per row and truncates.
+        let rows = select(
+            &mut db,
+            "SELECT INTERVAL (x) DAY, INTERVAL (x) HOUR, INTERVAL (x) MONTH FROM (VALUES (2), (2.5)) t(x) ORDER BY x;",
+        );
+        assert_eq!(rows[0][0].to_string(), "2 days");
+        assert_eq!(rows[0][1].to_string(), "02:00:00");
+        assert_eq!(rows[0][2].to_string(), "2 months");
+        assert_eq!(rows[1], rows[0]);
         let rows = select(
             &mut db,
             "SELECT date_trunc('year', TIMESTAMP '2024-05-06 07:08:09');",
@@ -11845,9 +12023,24 @@ mod tests {
     }
 
     #[test]
-    fn derived_table_needs_alias() {
+    fn derived_table_without_alias_is_unnamed_subquery() {
         let mut db = sub_db();
-        assert!(db.execute("SELECT * FROM (SELECT * FROM emp);").is_err());
+        // DuckDB names an alias-less derived table `unnamed_subquery` (then
+        // `unnamed_subquery2`, ... within one FROM list) and nothing else.
+        let rows = select(
+            &mut db,
+            "SELECT * FROM (SELECT name FROM emp WHERE id = 2);",
+        );
+        assert_eq!(rows, vec![vec![V::Varchar("bob".to_string())]]);
+        let rows = select(
+            &mut db,
+            "SELECT unnamed_subquery.name FROM (SELECT name FROM emp WHERE id = 2);",
+        );
+        assert_eq!(rows, vec![vec![V::Varchar("bob".to_string())]]);
+        assert!(
+            db.execute("SELECT unnamed_subquery1.name FROM (SELECT name FROM emp);")
+                .is_err()
+        );
         let rows = select(
             &mut db,
             "SELECT name FROM (SELECT * FROM emp WHERE id = 2) AS s;",

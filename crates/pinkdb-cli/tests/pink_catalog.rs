@@ -99,7 +99,7 @@ fn save_open_attach_and_commit_through_a_pink_catalog() {
          SELECT COUNT(*) FROM t;\n\
          .quit\n"
     ));
-    assert!(out.contains("│ 2        │"), "{out}");
+    assert!(out.contains("│ 2            │"), "{out}");
     assert!(out.contains("Database lk dropped."), "{out}");
     assert!(!out.contains("Error"), "{out}");
 
@@ -117,7 +117,7 @@ fn save_open_attach_and_commit_through_a_pink_catalog() {
         ".lake open {catalog}\nSELECT COUNT(*) FROM t;\n.quit\n"
     ));
     assert!(out.contains("Opened lake version 3"), "{out}");
-    assert!(out.contains("│ 3        │"), "{out}");
+    assert!(out.contains("│ 3            │"), "{out}");
 
     cleanup(&dir);
 }
@@ -151,7 +151,7 @@ fn a_pink_save_without_data_uses_the_default_data_root() {
         ".lake open {catalog}\nSELECT COUNT(*) FROM t;\n.quit\n"
     ));
     assert!(out.contains("Opened lake version 2"), "{out}");
-    assert!(out.contains("│ 1        │"), "{out}");
+    assert!(out.contains("│ 1            │"), "{out}");
     cleanup(&dir);
 }
 
@@ -272,7 +272,7 @@ fn two_cli_processes_commit_to_one_pink_catalog() {
          .quit\n"
     ));
     assert!(out.contains("Opened lake version 4"), "{out}");
-    assert!(out.contains("│ 3        │"), "{out}");
+    assert!(out.contains("│ 3            │"), "{out}");
     cleanup(&dir);
 }
 
@@ -304,7 +304,7 @@ fn maintenance_and_settings_commands_work() {
     // materializes the inlined ones into one more data file.
     assert!(out.contains("before=1"), "{out}");
     assert!(out.contains("after=2"), "{out}");
-    assert!(out.contains("│ 4        │"), "{out}");
+    assert!(out.contains("│ 4            │"), "{out}");
     assert!(out.contains("│ 4       │ four    │"), "{out}");
     assert!(!out.contains("Error"), "{out}");
 
@@ -345,7 +345,7 @@ fn maintenance_and_settings_commands_work() {
     assert!(out.contains("rows=4"), "{out}");
     assert!(out.contains("Partitioned"), "{out}");
     assert!(out.contains("5 rows are stored"), "{out}");
-    assert!(out.contains("│ 4        │"), "{out}");
+    assert!(out.contains("│ 4            │"), "{out}");
     assert!(!out.contains("Error"), "{out}");
 
     // Register an existing data file written by another lake.
@@ -386,8 +386,8 @@ fn maintenance_and_settings_commands_work() {
          .quit\n",
         std::path::Path::new(&target_data).join(&rel).display(),
     ));
-    assert!(out.contains("│ 2        │"), "{out}");
-    assert!(out.contains("│ 2        │"), "{out}");
+    assert!(out.contains("│ 2            │"), "{out}");
+    assert!(out.contains("│ 2            │"), "{out}");
     assert!(!out.contains("Error"), "{out}");
 
     cleanup(&dir);

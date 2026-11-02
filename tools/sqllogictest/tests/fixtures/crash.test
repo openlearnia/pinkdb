@@ -1,0 +1,4 @@
+# PINKDB_SLT_TEST_HOOK makes the runner panic on this function call, which is
+# how a crash is exercised without waiting for a real pinkdb bug.
+statement ok
+SELECT pinkdb_slt_crash()

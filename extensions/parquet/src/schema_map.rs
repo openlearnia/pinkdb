@@ -430,7 +430,9 @@ pub fn alpha_type_name(ty: DataType) -> Option<String> {
         | DataType::Interval
         | DataType::Array { .. }
         | DataType::Variant
-        | DataType::Uuid => ty.name(),
+        | DataType::Uuid
+        | DataType::Hugeint
+        | DataType::Uhugeint => ty.name(),
         DataType::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
     })
 }

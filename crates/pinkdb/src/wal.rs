@@ -2699,6 +2699,18 @@ fn encode_value(out: &mut Vec<u8>, value: &crate::types::Value) -> Result<()> {
             out.push(VALUE_UUID);
             out.extend_from_slice(&bits.to_le_bytes());
         }
+        // The WAL has no 128-bit value tag yet (step 5 of the HUGEINT plan).
+        // Refusing here keeps a replay from reading a tag it cannot know.
+        Value::Hugeint(_) => {
+            return Err(PinkDbError::Execution(
+                "HUGEINT is not yet supported in the WAL".to_string(),
+            ));
+        }
+        Value::Uhugeint(_) => {
+            return Err(PinkDbError::Execution(
+                "UHUGEINT is not yet supported in the WAL".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -5410,7 +5422,7 @@ mod tests {
         assert_eq!(
             results,
             vec![QueryResult::Selected {
-                names: vec!["count(*)".to_string()],
+                names: vec!["count_star()".to_string()],
                 types: vec![crate::types::DataType::Bigint],
                 rows: vec![vec![Value::Bigint(0)]],
             }]

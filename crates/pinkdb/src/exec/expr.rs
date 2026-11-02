@@ -977,6 +977,12 @@ fn eval_comparison(
                     &mut out,
                 )?;
             }
+            (VectorData::Int128(a), VectorData::Int128(b)) => {
+                cmp_loop(op, &l, &r, a, b, |x, y| x.cmp(y), &mut out)?;
+            }
+            (VectorData::UInt128(a), VectorData::UInt128(b)) => {
+                cmp_loop(op, &l, &r, a, b, |x, y| x.cmp(y), &mut out)?;
+            }
             (VectorData::Uuid(a), VectorData::Uuid(b)) => {
                 cmp_loop(op, &l, &r, a, b, |x, y| x.cmp(y), &mut out)?;
             }
@@ -1076,6 +1082,9 @@ enum CmpKind<'a> {
     Int32Float(&'a [i32], f64),
     Int64Int(&'a [i64], i128),
     Int64Float(&'a [i64], f64),
+    Int128Int(&'a [i128], i128),
+    Int128Float(&'a [i128], f64),
+    Int128Dec(&'a [i128], i128, u8),
     FloatInt(&'a [f64], i128),
     FloatFloat(&'a [f64], f64),
     FloatDec(&'a [f64], i128, u8),
@@ -1101,6 +1110,18 @@ impl<'a> ScalarCmp<'a> {
             (V::Int64(a), Value::Integer(s)) => CmpKind::Int64Int(a, *s as i128),
             (V::Int64(a), Value::Bigint(s)) => CmpKind::Int64Int(a, *s as i128),
             (V::Int64(a), Value::Double(s)) => CmpKind::Int64Float(a, *s),
+            (V::Int128(a), Value::Integer(s)) => CmpKind::Int128Int(a, *s as i128),
+            (V::Int128(a), Value::Bigint(s)) => CmpKind::Int128Int(a, *s as i128),
+            (V::Int128(a), Value::Hugeint(s)) => CmpKind::Int128Int(a, *s),
+            (V::Int128(a), Value::Double(s)) => CmpKind::Int128Float(a, *s),
+            (
+                V::Int128(a),
+                Value::Decimal {
+                    value: s,
+                    scale: ss,
+                    ..
+                },
+            ) => CmpKind::Int128Dec(a, *s, *ss),
             (V::Float64(a), Value::Integer(s)) => CmpKind::FloatInt(a, *s as i128),
             (V::Float64(a), Value::Bigint(s)) => CmpKind::FloatInt(a, *s as i128),
             (V::Float64(a), Value::Double(s)) => CmpKind::FloatFloat(a, *s),
@@ -1173,6 +1194,18 @@ impl<'a> ScalarCmp<'a> {
             CmpKind::Int64Float(a, s) => {
                 push_cmp(col, a, op, flipped, |x| num_cmp(*x as f64, *s), out)
             }
+            CmpKind::Int128Int(a, s) => push_cmp(col, a, op, flipped, |x| x.cmp(s), out),
+            CmpKind::Int128Float(a, s) => {
+                push_cmp(col, a, op, flipped, |x| num_cmp(*x as f64, *s), out)
+            }
+            CmpKind::Int128Dec(a, s, ss) => push_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| crate::types::decimal_cmp(*x, 0, *s, *ss),
+                out,
+            ),
             CmpKind::FloatInt(a, s) => {
                 push_cmp(col, a, op, flipped, |x| num_cmp(*x, *s as f64), out)
             }
@@ -1247,6 +1280,18 @@ impl<'a> ScalarCmp<'a> {
             CmpKind::Int64Float(a, s) => {
                 retain_cmp(col, a, op, flipped, |x| num_cmp(*x as f64, *s), sel)
             }
+            CmpKind::Int128Int(a, s) => retain_cmp(col, a, op, flipped, |x| x.cmp(s), sel),
+            CmpKind::Int128Float(a, s) => {
+                retain_cmp(col, a, op, flipped, |x| num_cmp(*x as f64, *s), sel)
+            }
+            CmpKind::Int128Dec(a, s, ss) => retain_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| crate::types::decimal_cmp(*x, 0, *s, *ss),
+                sel,
+            ),
             CmpKind::FloatInt(a, s) => {
                 retain_cmp(col, a, op, flipped, |x| num_cmp(*x, *s as f64), sel)
             }
@@ -1324,6 +1369,9 @@ impl ScalarCmp<'_> {
                 Ok(s) => retain_ordered(col, a, s, op, sel),
                 Err(_) => return false,
             },
+            // Same narrowing as BIGINT: the 128-bit literal needs no cast, so
+            // the filter never materializes a value per row.
+            CmpKind::Int128Int(a, s) => retain_ordered(col, a, *s, op, sel),
             CmpKind::DecDec(a, sa, s, ss) if sa >= ss => {
                 match s.checked_mul(crate::types::POW10_I128[(sa - ss) as usize]) {
                     Some(s) => retain_ordered(col, a, s, op, sel),
@@ -1622,6 +1670,24 @@ pub(crate) fn coerce_to(v: &Vector, target: DataType) -> Result<Vector> {
             let data = VectorData::Float64(src.iter().map(|&x| x as f64).collect());
             Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
         }
+        (VectorData::Int32(src), DataType::Hugeint) => {
+            let data = VectorData::Int128(src.iter().map(|&x| x as i128).collect());
+            Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
+        }
+        (VectorData::Int64(src), DataType::Hugeint) => {
+            let data = VectorData::Int128(src.iter().map(|&x| x as i128).collect());
+            Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
+        }
+        // HUGEINT with DECIMAL: mixed arithmetic coerces the integer side to
+        // the result scale once per chunk (the same `i * 10^scale`).
+        (VectorData::Int128(src), DataType::Decimal { precision, scale }) => {
+            decimal_from_int(v, src.iter().copied(), precision, scale)
+        }
+        // HUGEINT with DOUBLE: `/` and mixed float arithmetic widen to DOUBLE.
+        (VectorData::Int128(src), DataType::Double) => {
+            let data = VectorData::Float64(src.iter().map(|&x| x as f64).collect());
+            Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
+        }
         // DECIMAL → DOUBLE: `/` widens both sides to DOUBLE (DuckDB rule);
         // explicit casts and comparisons use the exact rescale rules.
         (VectorData::Decimal { values, scale, .. }, DataType::Double) => {
@@ -1698,6 +1764,22 @@ fn coerce_value(v: Value, target: DataType) -> Result<Value> {
     match (v, target) {
         (Value::Integer(i), DataType::Bigint) => Ok(Value::Bigint(i as i64)),
         (Value::Integer(i), DataType::Double) => Ok(Value::Double(i as f64)),
+        // 128-bit arithmetic coerces its narrower operands and its DOUBLE
+        // result here once per chunk; the `i128 as f64` conversion is what
+        // DuckDB's `MaxLogicalType` widening does too.
+        (Value::Integer(i), DataType::Hugeint) => Ok(Value::Hugeint(i as i128)),
+        (Value::Bigint(i), DataType::Hugeint) => Ok(Value::Hugeint(i as i128)),
+        (Value::Hugeint(x), DataType::Hugeint) => Ok(Value::Hugeint(x)),
+        (Value::Hugeint(x), DataType::Double) => Ok(Value::Double(x as f64)),
+        (Value::Hugeint(x), DataType::Decimal { precision, scale }) => {
+            crate::types::int_to_decimal(x, precision, scale)
+                .map(|v| Value::decimal(v, scale))
+                .ok_or_else(|| {
+                    PinkDbError::Execution(format!(
+                        "cannot coerce {x} to DECIMAL({precision},{scale}): value out of range"
+                    ))
+                })
+        }
         (Value::Bigint(i), DataType::Double) => Ok(Value::Double(i as f64)),
         (
             Value::Decimal {
@@ -1775,6 +1857,10 @@ fn negate_value(v: Value, dtype: DataType) -> Result<Value> {
             .checked_neg()
             .map(Value::Bigint)
             .ok_or_else(|| overflow_err("negation", "BIGINT", format_args!("-({i})"))),
+        (Value::Hugeint(i), DataType::Hugeint) => i
+            .checked_neg()
+            .map(Value::Hugeint)
+            .ok_or_else(wide_neg_overflow),
         (Value::Double(x), DataType::Double) => Ok(Value::Double(-x)),
         (
             Value::Decimal {
@@ -2018,6 +2104,12 @@ fn arith_typed(op: BinaryOp, int_div: bool, l: &Vector, r: &Vector) -> Result<Op
         (VectorData::Int64(a), VectorData::Int64(b)) => match op {
             BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Modulo => {
                 Ok(Some(arith_int64(op, l, r, a, b)?))
+            }
+            _ => Ok(None),
+        },
+        (VectorData::Int128(a), VectorData::Int128(b)) => match op {
+            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Modulo => {
+                Ok(Some(arith_int128(op, l, r, a, b)?))
             }
             _ => Ok(None),
         },
@@ -2276,6 +2368,33 @@ fn overflow_err(what: &str, ty: &str, detail: std::fmt::Arguments) -> PinkDbErro
     PinkDbError::Execution(format!("Overflow in {what} of {ty} ({detail})"))
 }
 
+/// DuckDB's 128-bit overflow text. Unlike the 32/64-bit spellings above it
+/// names the logical type INT128 and ends with `!`; the corpus asserts it.
+fn wide_overflow(op: BinaryOp, x: i128, y: i128) -> PinkDbError {
+    let (what, sign) = match op {
+        BinaryOp::Add => ("addition", '+'),
+        BinaryOp::Subtract => ("subtraction", '-'),
+        BinaryOp::Multiply => ("multiplication", '*'),
+        _ => unreachable!("wide_overflow called with {op:?}"),
+    };
+    PinkDbError::Execution(format!(
+        "Out of Range Error: Overflow in {what} of INT128 ({x} {sign} {y})!"
+    ))
+}
+
+/// `%`'s only 128-bit overflow is `MIN % -1`; DuckDB reports that one as a
+/// division.
+fn wide_rem_overflow(x: i128, y: i128) -> PinkDbError {
+    PinkDbError::Execution(format!(
+        "Out of Range Error: Overflow in division of {x} / {y}"
+    ))
+}
+
+/// `-(MIN HUGEINT)` leaves the signed range.
+fn wide_neg_overflow() -> PinkDbError {
+    PinkDbError::Execution("Out of Range Error: Overflow in negation of numeric value!".to_string())
+}
+
 /// Checked INTEGER/BIGINT binary arithmetic shared by the typed kernels and
 /// the per-value path: overflow is an error (DuckDB semantics), never a
 /// wrapped result. `%` keeps `wrapping_rem` (only `MIN % -1` wraps, and its
@@ -2328,6 +2447,36 @@ fn arith_int64(op: BinaryOp, l: &Vector, r: &Vector, a: &[i64], b: &[i64]) -> Re
         }
         let v = checked_int_arith!(op, x, y, "BIGINT");
         out.push_int64(v)?;
+    }
+    Ok(out)
+}
+
+/// HUGEINT `+`/`-`/`*`/`%`: checked like the narrower types, but with DuckDB's
+/// INT128 texts. `%` truncates toward zero like C, and `MIN % -1` overflows.
+fn arith_int128(op: BinaryOp, l: &Vector, r: &Vector, a: &[i128], b: &[i128]) -> Result<Vector> {
+    let mut out = Vector::with_capacity(DataType::Hugeint, a.len());
+    for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
+        if l.is_null(i) || r.is_null(i) {
+            out.push_null()?;
+            continue;
+        }
+        let v = match op {
+            BinaryOp::Add => x.checked_add(y).ok_or_else(|| wide_overflow(op, x, y))?,
+            BinaryOp::Subtract => x.checked_sub(y).ok_or_else(|| wide_overflow(op, x, y))?,
+            BinaryOp::Multiply => x.checked_mul(y).ok_or_else(|| wide_overflow(op, x, y))?,
+            BinaryOp::Modulo => {
+                if y == 0 {
+                    return Err(PinkDbError::Execution(format!(
+                        "Invalid Input Error: Division by zero in expression ({x} % {y}). Use \
+                         TRY(...) to return NULL for this expression, or SET \
+                         error_on_division_by_zero=false to return NULL for all divisions by zero."
+                    )));
+                }
+                x.checked_rem(y).ok_or_else(|| wide_rem_overflow(x, y))?
+            }
+            op => unreachable!("binder types {op:?} on HUGEINT"),
+        };
+        out.push_i128(v)?;
     }
     Ok(out)
 }
@@ -2553,6 +2702,27 @@ fn arith_values(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
         }
         (Value::Bigint(a), Value::Bigint(b)) => {
             Ok(Value::Bigint(checked_int_arith!(op, a, b, "BIGINT")))
+        }
+        (Value::Hugeint(a), Value::Hugeint(b)) => {
+            let v = match op {
+                BinaryOp::Add => a.checked_add(b),
+                BinaryOp::Subtract => a.checked_sub(b),
+                BinaryOp::Multiply => a.checked_mul(b),
+                BinaryOp::Modulo => {
+                    if b == 0 {
+                        return Err(PinkDbError::Execution(format!(
+                            "Invalid Input Error: Division by zero in expression ({a} % {b}). Use \
+                             TRY(...) to return NULL for this expression, or SET \
+                             error_on_division_by_zero=false to return NULL for all divisions by zero."
+                        )));
+                    }
+                    a.checked_rem(b)
+                        .ok_or_else(|| wide_rem_overflow(a, b))?
+                        .into()
+                }
+                op => unreachable!("binder types {op:?} on HUGEINT"),
+            };
+            v.map(Value::Hugeint).ok_or_else(|| wide_overflow(op, a, b))
         }
         (Value::Double(a), Value::Double(b)) => {
             let v = match op {
@@ -3111,6 +3281,20 @@ fn eval_scalar_fast(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Resul
                     }
                     Ok(Some(out))
                 }
+                (VectorData::Int128(s), DataType::Hugeint) => {
+                    for (i, &x) in s.iter().enumerate() {
+                        if v.is_null(i) {
+                            out.push_null()?;
+                        } else {
+                            out.push_i128(x.checked_abs().ok_or_else(|| {
+                                PinkDbError::Execution(format!(
+                                    "Out of Range Error: Overflow on abs({x})"
+                                ))
+                            })?)?;
+                        }
+                    }
+                    Ok(Some(out))
+                }
                 (VectorData::Float64(s), DataType::Double) => {
                     for (i, &x) in s.iter().enumerate() {
                         if v.is_null(i) {
@@ -3339,6 +3523,9 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
                 .checked_abs()
                 .map(Value::Bigint)
                 .ok_or_else(|| overflow_err("abs", "BIGINT", format_args!("abs({i})"))),
+            Value::Hugeint(i) => i.checked_abs().map(Value::Hugeint).ok_or_else(|| {
+                PinkDbError::Execution(format!("Out of Range Error: Overflow on abs({i})"))
+            }),
             Value::Double(x) => Ok(Value::Double(x.abs())),
             v => Err(PinkDbError::Execution(format!("abs of {v}"))),
         },
@@ -3421,52 +3608,77 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
                 Value::Varchar(s) => s.to_ascii_lowercase(),
                 v => return Err(PinkDbError::Execution(format!("date_trunc part {v}"))),
             };
-            match &row[1] {
-                Value::Date(d) => {
-                    let (y, m, _) = crate::types::civil_from_days(*d);
-                    let trunc = match part.as_str() {
-                        "year" => crate::types::days_from_civil(y, 1, 1),
-                        "month" => crate::types::days_from_civil(y, m, 1),
-                        "day" => *d,
-                        _ => {
-                            return Err(PinkDbError::Execution(format!(
-                                "date_trunc: bad part \"{part}\" for DATE (want year|month|day)"
-                            )));
-                        }
-                    };
-                    Ok(Value::Date(trunc))
+            // A DATE truncates at its midnight TIMESTAMP: DuckDB returns
+            // TIMESTAMP for both input types.
+            let us = match &row[1] {
+                Value::Date(d) => i64::from(*d) * 86_400_000_000,
+                Value::Timestamp(us) => *us,
+                v => return Err(PinkDbError::Execution(format!("date_trunc of {v}"))),
+            };
+            let (days, h, mi, s, _) = crate::types::split_timestamp(us);
+            let day_us = days as i64 * 86_400_000_000;
+            let trunc = match part.as_str() {
+                "year" => {
+                    let (y, _, _) = crate::types::civil_from_days(days);
+                    crate::types::days_from_civil(y, 1, 1) as i64 * 86_400_000_000
                 }
-                Value::Timestamp(us) => {
-                    let (days, h, mi, s, _) = crate::types::split_timestamp(*us);
-                    let day_us = days as i64 * 86_400_000_000;
-                    let trunc = match part.as_str() {
-                        "year" => {
-                            let (y, _, _) = crate::types::civil_from_days(days);
-                            crate::types::days_from_civil(y, 1, 1) as i64 * 86_400_000_000
-                        }
-                        "month" => {
-                            let (y, m, _) = crate::types::civil_from_days(days);
-                            crate::types::days_from_civil(y, m, 1) as i64 * 86_400_000_000
-                        }
-                        "day" => day_us,
-                        "hour" => day_us + h as i64 * 3_600_000_000,
-                        "minute" => day_us + h as i64 * 3_600_000_000 + mi as i64 * 60_000_000,
-                        "second" => {
-                            day_us
-                                + h as i64 * 3_600_000_000
-                                + mi as i64 * 60_000_000
-                                + s as i64 * 1_000_000
-                        }
-                        _ => {
-                            return Err(PinkDbError::Execution(format!(
-                                "date_trunc: bad part \"{part}\" (want year|month|day|hour|minute|second)"
-                            )));
-                        }
-                    };
-                    Ok(Value::Timestamp(trunc))
+                "quarter" => {
+                    let (y, m, _) = crate::types::civil_from_days(days);
+                    let m = (m - 1) / 3 * 3 + 1;
+                    crate::types::days_from_civil(y, m, 1) as i64 * 86_400_000_000
                 }
-                v => Err(PinkDbError::Execution(format!("date_trunc of {v}"))),
-            }
+                "month" => {
+                    let (y, m, _) = crate::types::civil_from_days(days);
+                    crate::types::days_from_civil(y, m, 1) as i64 * 86_400_000_000
+                }
+                // ISO weeks start on Monday.
+                "week" => {
+                    let iso_dow = (days as i64 + 3).rem_euclid(7);
+                    (days as i64 - iso_dow) * 86_400_000_000
+                }
+                "day" => day_us,
+                "hour" => day_us + h as i64 * 3_600_000_000,
+                "minute" => day_us + h as i64 * 3_600_000_000 + mi as i64 * 60_000_000,
+                "second" => {
+                    day_us
+                        + h as i64 * 3_600_000_000
+                        + mi as i64 * 60_000_000
+                        + s as i64 * 1_000_000
+                }
+                _ => {
+                    return Err(PinkDbError::Execution(format!(
+                        "date_trunc: bad part \"{part}\" (want year|quarter|month|week|day|hour|minute|second)"
+                    )));
+                }
+            };
+            Ok(Value::Timestamp(trunc))
+        }
+        ScalarFunc::IntervalCount => {
+            let Value::Varchar(unit) = &row[1] else {
+                return Err(PinkDbError::Execution(format!(
+                    "interval_count unit {}",
+                    row[1]
+                )));
+            };
+            let Some(unit) = crate::types::IntervalUnit::from_word(unit) else {
+                return Err(PinkDbError::Execution(format!(
+                    "interval_count: unknown interval unit \"{unit}\""
+                )));
+            };
+            let Value::Double(count) = &row[0] else {
+                return Err(PinkDbError::Execution(format!(
+                    "interval_count count {}",
+                    row[0]
+                )));
+            };
+            let iv = crate::types::interval_from_count(unit, *count).ok_or_else(|| {
+                PinkDbError::Execution("interval_count: interval out of range".to_string())
+            })?;
+            Ok(Value::Interval {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            })
         }
         ScalarFunc::Substr => {
             let s = match &row[0] {
@@ -3599,12 +3811,30 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
             Err(_) => Ok(Value::Null),
         },
         ScalarFunc::LikeEscape => match (&row[0], &row[1], &row[2]) {
+            (Value::Null, _, _) | (_, Value::Null, _) | (_, _, Value::Null) => Ok(Value::Null),
             (Value::Varchar(s), Value::Varchar(pat), Value::Varchar(esc)) => {
                 let escape = escape_char(esc)?;
                 Ok(Value::Boolean(like_match_escape(s, pat, escape)))
             }
             (s, pat, esc) => Err(PinkDbError::Execution(format!(
                 "like_escape of {s}, {pat} and {esc}"
+            ))),
+        },
+        // `ILIKE … ESCAPE`: the same match over case-folded text.
+        // (A NULL in any position makes the result NULL, like every other
+        // scalar.)
+        ScalarFunc::IlikeEscape => match (&row[0], &row[1], &row[2]) {
+            (Value::Null, _, _) | (_, Value::Null, _) | (_, _, Value::Null) => Ok(Value::Null),
+            (Value::Varchar(s), Value::Varchar(pat), Value::Varchar(esc)) => {
+                let escape = escape_char(&fold_case(esc))?.map(fold_case_char);
+                Ok(Value::Boolean(like_match_escape(
+                    &fold_case(s),
+                    &fold_case(pat),
+                    escape,
+                )))
+            }
+            (s, pat, esc) => Err(PinkDbError::Execution(format!(
+                "ilike_escape of {s}, {pat} and {esc}"
             ))),
         },
         ScalarFunc::Contains => match (&row[0], &row[1]) {
@@ -4051,6 +4281,16 @@ fn find_segment(hay: &str, needle: &str) -> Option<usize> {
 /// The escape must be a single char or none; the binder checks that.
 fn like_match_escape(s: &str, pat: &str, escape: Option<char>) -> bool {
     LikeMatcher::new(pat, escape).matches(s)
+}
+
+/// `ILIKE`'s case folding: lowercase one char at a time, so `ß` stays `ß`
+/// (DuckDB's `LOWER` would make it `ss`).
+fn fold_case(s: &str) -> String {
+    s.chars().map(fold_case_char).collect()
+}
+
+fn fold_case_char(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
 }
 
 /// `s[from:to]` over chars: 1-based, inclusive, negative = from the end, and
@@ -4583,6 +4823,68 @@ fn cast_out_of_range(v: &Value, target: DataType) -> PinkDbError {
     PinkDbError::Execution(format!("cannot CAST {v} AS {target}: value out of range"))
 }
 
+/// DuckDB's internal name for a logical type, as its conversion errors spell
+/// it (`BIGINT` is `INT64`, `HUGEINT` is `INT128`).
+fn duckdb_type_name(t: DataType) -> &'static str {
+    match t {
+        DataType::Integer => "INT32",
+        DataType::Bigint => "INT64",
+        DataType::Hugeint => "INT128",
+        DataType::Uhugeint => "UINT128",
+        DataType::Double => "DOUBLE",
+        _ => unreachable!("no DuckDB conversion text for {t:?}"),
+    }
+}
+
+/// DuckDB's out-of-range text for a cast into or out of a 128-bit integer.
+fn wide_out_of_range(v: &Value, target: DataType) -> PinkDbError {
+    let from = duckdb_type_name(v.data_type().expect("a typed value"));
+    let value = match v {
+        Value::Double(x) => duckdb_double_text(*x),
+        other => other.to_string(),
+    };
+    PinkDbError::Execution(format!(
+        "Conversion Error: Type {from} with value {value} can't be cast because the value is out \
+         of range for the destination type {}",
+        duckdb_type_name(target)
+    ))
+}
+
+/// DuckDB writes a DOUBLE's positive exponent with a sign (`1e+300`), and
+/// only ever in exponent form for the magnitudes a 128-bit cast refuses.
+fn duckdb_double_text(x: f64) -> String {
+    let s = format!("{x:e}");
+    match s.split_once('e') {
+        Some((mantissa, exp)) if !exp.starts_with(['+', '-']) => format!("{mantissa}e+{exp}"),
+        _ => s,
+    }
+}
+
+/// VARCHAR → HUGEINT, with DuckDB's "Could not convert string" text.
+fn parse_hugeint(s: &str) -> Result<Value> {
+    crate::types::parse_i128_str(s)
+        .map(Value::Hugeint)
+        .ok_or_else(|| {
+            PinkDbError::Execution(format!(
+                "Conversion Error: Could not convert string '{s}' to INT128"
+            ))
+        })
+}
+
+/// DOUBLE → HUGEINT: round half away from zero, refusing anything outside the
+/// i128 range (2^127 is exact in f64, so the bounds compare exactly).
+fn f64_to_hugeint(x: f64) -> Result<Value> {
+    let r = x.round();
+    let bound = (1u128 << 127) as f64;
+    // DuckDB's bounds are exclusive: ±2^127 as a DOUBLE is already out of range,
+    // even though -2^127 is a valid INT128 (corpus `hugeint_try_cast`).
+    if r > -bound && r < bound {
+        Ok(Value::Hugeint(r as i128))
+    } else {
+        Err(wide_out_of_range(&Value::Double(x), DataType::Hugeint))
+    }
+}
+
 /// Convert one non-NULL value to `target` (CAST semantics; NULL is handled by
 /// callers). Shared with the prepared-statement bind step, which converts a
 /// bound parameter to its inferred slot type.
@@ -4603,6 +4905,47 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
         (Value::Integer(i), DataType::Bigint) => Ok(Value::Bigint(i as i64)),
         (Value::Integer(i), DataType::Double) => Ok(Value::Double(i as f64)),
         (Value::Bigint(i), DataType::Double) => Ok(Value::Double(i as f64)),
+        // 128-bit integers: widen from every narrower integer and back with
+        // DuckDB's exact conversion texts (the corpus asserts them).
+        (Value::Integer(i), DataType::Hugeint) => Ok(Value::Hugeint(i as i128)),
+        (Value::Bigint(i), DataType::Hugeint) => Ok(Value::Hugeint(i as i128)),
+        (Value::Double(x), DataType::Hugeint) => f64_to_hugeint(x),
+        (Value::Varchar(s), DataType::Hugeint) => parse_hugeint(&s),
+        (Value::Hugeint(x), DataType::Integer) => i32::try_from(x)
+            .map(Value::Integer)
+            .map_err(|_| wide_out_of_range(&Value::Hugeint(x), DataType::Integer)),
+        (Value::Hugeint(x), DataType::Bigint) => i64::try_from(x)
+            .map(Value::Bigint)
+            .map_err(|_| wide_out_of_range(&Value::Hugeint(x), DataType::Bigint)),
+        (Value::Hugeint(x), DataType::Double) => Ok(Value::Double(x as f64)),
+        (Value::Hugeint(x), DataType::Boolean) => Ok(Value::Boolean(x != 0)),
+        // DECIMAL → HUGEINT rounds half away from zero, like the DOUBLE path
+        // (1.9 → 2, -2.5 → -3); 12.345 at scale 3 still lands on 12.
+        (
+            Value::Decimal {
+                value: x, scale, ..
+            },
+            DataType::Hugeint,
+        ) => {
+            let y = if scale == 0 {
+                x
+            } else {
+                let p = POW10_I128[scale as usize];
+                let (q, r) = (x / p, x % p);
+                if 2 * r.abs() >= p { q + r.signum() } else { q }
+            };
+            Ok(Value::Hugeint(y))
+        }
+        // HUGEINT → DECIMAL rescales exactly, then checks the precision.
+        (Value::Hugeint(x), DataType::Decimal { precision, scale }) => {
+            crate::types::int_to_decimal(x, precision, scale)
+                .map(|v| Value::decimal(v, scale))
+                .ok_or_else(|| {
+                    PinkDbError::Execution(format!(
+                        "Conversion Error: Could not cast value {x} to DECIMAL({precision},{scale})"
+                    ))
+                })
+        }
         (
             Value::Decimal {
                 value: x,
@@ -5198,6 +5541,36 @@ mod tests {
         // `-digits` would overflow for i64::MIN; the helper must not panic
         // (SQL caps the digit count at INTEGER, but the helper defends anyway).
         assert_eq!(decimal_round(15, 1, i64::MIN, 2).unwrap(), V::decimal(0, 0));
+    }
+
+    /// A filter on a HUGEINT column narrows the selection through the same
+    /// `retain_in_domain` → `retain_cmp` kernel as BIGINT: one 128-bit compare
+    /// per row, no `Value` materialized, NULLs dropped.
+    #[test]
+    fn hugeint_filter_uses_the_retain_kernel() {
+        let mut col = Vector::new_empty(DataType::Hugeint);
+        for x in [i128::MIN, -1, 0, 1, i128::MAX, 1] {
+            col.push_i128(x).unwrap();
+        }
+        col.push_null().unwrap();
+        let kernel = ScalarCmp::new(&col, &V::Hugeint(1), false).expect("a 128-bit kernel");
+        let mut sel: Vec<u32> = (0..7).collect();
+        assert!(
+            kernel.retain_in_domain(BinaryOp::Gt, &mut sel.clone()),
+            "HUGEINT > literal takes the domain path, like BIGINT"
+        );
+        kernel.retain(BinaryOp::Gt, &mut sel);
+        assert_eq!(sel, vec![4]);
+
+        let mut sel: Vec<u32> = (0..7).collect();
+        kernel.retain(BinaryOp::GtEq, &mut sel);
+        assert_eq!(sel, vec![3, 4, 5]);
+
+        // A DOUBLE literal uses the generic compare (still via retain_cmp).
+        let kernel = ScalarCmp::new(&col, &V::Double(0.5), false).expect("a kernel");
+        let mut sel: Vec<u32> = (0..7).collect();
+        kernel.retain(BinaryOp::Lt, &mut sel);
+        assert_eq!(sel, vec![0, 1, 2]);
     }
 
     fn chunk2() -> DataChunk {

@@ -911,6 +911,8 @@ def run_small():
         run_case(label, sql, ordered, expect_error, SETUP)
     for label, sql, ordered, expect_error in DIALECT_QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP)
+    for label, sql, ordered, expect_error in DIALECT3_QUERIES:
+        run_case(label, sql, ordered, expect_error, SETUP)
     for label, sql, ordered, expect_error in STRING_EXT_QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP + "\n" + STRING_EXT_SETUP)
     for label, sql, ordered, expect_error in NAN_QUERIES:
@@ -919,6 +921,10 @@ def run_small():
     run_three_part()
     run_catalog()
     run_defaults()
+    run_settings()
+    run_hugeint()
+    run_hugeint_arithmetic()
+    run_attach()
     run_arrow()
     run_parquet()
 
@@ -1431,6 +1437,299 @@ def run_defaults():
               f"\npink={pink_msg!r}\nduck={duck_msg!r}")
 
 
+# ---- slt-2: DuckDB PRAGMAs, settings and the small dialect items ----
+#
+# The cheap wide features the sqllogictest corpus asked for: `PRAGMA` forms,
+# `SET`/`RESET`/`current_setting`, `default_null_order`/`default_order`,
+# `GROUP BY ALL`/`ORDER BY ALL`, `count()` with no argument, `CHAR(n)` as
+# VARCHAR, type names as column names, and a table function's own column name
+# (`range`) usable in an expression.
+SETTINGS_SETUP = """
+CREATE TABLE n (x INTEGER);
+INSERT INTO n VALUES (2), (1), (NULL);
+CREATE TABLE g (a INTEGER, b INTEGER);
+INSERT INTO g VALUES (1, 10), (2, 20), (1, 30);
+"""
+
+SETTINGS_QUERIES = [
+    # PRAGMA and SET reach the same setting; both answer `current_setting`.
+    ("set-threads", "SET threads = 3; SELECT current_setting('threads');", False, False),
+    ("pragma-threads", "PRAGMA threads = 3; SELECT current_setting('threads');", False, False),
+    # DuckDB refuses SET LOCAL/SESSION for global-only settings (threads,
+    # memory_limit); pinkdb takes the scope for every setting, so the probe
+    # uses a setting DuckDB accepts both scopes for.
+    ("set-scopes", "SET SESSION default_order = 'DESC'; SET GLOBAL default_order = 'DESC'; "
+                   "SELECT current_setting('default_order');", False, False),
+    ("reset-threads", "SET threads = 3; RESET threads; SELECT current_setting('threads') > 0;", False, False),
+    ("set-unknown", "SET nosuchsetting = 1;", False, True),
+    ("pragma-unknown", "PRAGMA random_unknown_pragma;", False, True),
+    # A tuning pragma prints nothing and the next statement still runs. (The
+    # bare statement form answers a `Success` row like DuckDB, which the
+    # runner compares as a result, so this probe uses the assignment form.)
+    ("pragma-noop", "PRAGMA force_compression = 'rle'; SELECT 42;", False, False),
+    # NULL order: the session default for ORDER BY, window ORDER BY.
+    ("null-order-default", "SELECT x FROM n ORDER BY x;", True, False),
+    ("null-order-nulls-first", "SET default_null_order = 'NULLS FIRST'; SELECT x FROM n ORDER BY x;", True, False),
+    ("null-order-nulls-first-desc", "SET default_null_order = 'NULLS FIRST'; SELECT x FROM n ORDER BY x DESC;", True, False),
+    ("null-order-sqlite", "SET default_null_order = 'sqlite'; SELECT x FROM n ORDER BY x DESC;", True, False),
+    ("null-order-postgres-desc", "SET default_null_order = 'postgres'; SELECT x FROM n ORDER BY x DESC;", True, False),
+    ("null-order-on-asc-last-on-desc", "SET default_null_order = 'NULLS_FIRST_ON_ASC_LAST_ON_DESC'; SELECT x FROM n ORDER BY x;", True, False),
+    ("null-order-explicit-wins", "SET default_null_order = 'NULLS FIRST'; SELECT x FROM n ORDER BY x NULLS LAST;", True, False),
+    ("null-order-canonical", "SET default_null_order = 'sqlite'; SELECT current_setting('default_null_order');", False, False),
+    ("null-order-bad-value", "SET default_null_order = 'bogus';", False, True),
+    ("default-order-desc", "SET default_order = 'DESC'; SELECT x FROM n ORDER BY x;", True, False),
+    ("default-order-canonical", "SET default_order = 'descending'; SELECT current_setting('default_order');", False, False),
+    ("default-order-bad-value", "SET default_order = 'bogus';", False, True),
+    ("null-order-window", "SET default_null_order = 'NULLS FIRST'; SELECT x, row_number() OVER (ORDER BY x) FROM n ORDER BY 2;", True, False),
+    # ORDER BY ALL / GROUP BY ALL.
+    ("order-by-all", "SELECT a, b FROM g ORDER BY ALL DESC;", True, False),
+    ("group-by-all", "SELECT a, sum(b) FROM g GROUP BY ALL ORDER BY ALL;", True, False),
+    ("group-by-all-expr", "SELECT a + 1 AS k, count(*) FROM g GROUP BY ALL ORDER BY ALL;", True, False),
+    # count() with no argument counts rows.
+    ("count-no-arg", "SELECT count() FROM g;", False, False),
+    ("count-no-arg-group", "SELECT a, count() FROM g GROUP BY a ORDER BY a;", True, False),
+    ("count-no-arg-over", "SELECT count() OVER () FROM g LIMIT 1;", False, False),
+    # CHAR(n)/CHARACTER(n)/BPCHAR are VARCHAR, length ignored.
+    ("char-types",
+     "CREATE TABLE c (a CHAR(1), b CHARACTER(5), c BPCHAR, d VARCHAR(10)); "
+     "INSERT INTO c VALUES ('ab', 'cd', 'ef', 'gh'); "
+     "SELECT a, b, c, d, CAST('xyz' AS CHAR(1)) FROM c;", False, False),
+    ("char-typeof", "CREATE TABLE c2 (a CHAR(1)); SELECT typeof(a) FROM c2;", False, False),
+    # Type names are column names; `range` is the table function's column.
+    ("keyword-columns",
+     "CREATE TABLE k (date DATE, timestamp TIMESTAMP, range INTEGER, text VARCHAR); "
+     "INSERT INTO k VALUES (DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05', 7, 'x'); "
+     "SELECT date, timestamp, range, text FROM k ORDER BY range;", True, False),
+    ("range-column-ctas",
+     "CREATE TABLE r AS SELECT range % 10 AS g FROM range(20); "
+     "SELECT g, count(*) FROM r GROUP BY ALL ORDER BY ALL;", True, False),
+    # PRAGMA rows are DuckDB-shaped: cid counts from 0, `pk` marks a key.
+    # `notnull` needs quoting: DuckDB's parser reads the bare word as NOT NULL.
+    ("pragma-table-info",
+     'SELECT cid, name, type, "notnull", dflt_value, pk FROM pragma_table_info(\'n\');',
+     True, False),
+    ("pragma-table-info-key",
+     "CREATE TABLE pk (id INTEGER PRIMARY KEY, v VARCHAR NOT NULL); "
+     'SELECT name, "notnull", dflt_value, pk FROM pragma_table_info(\'pk\');',
+     True, False),
+]
+
+# ---- slt-2: ATTACH a plain (non-lake) database ----
+#
+# Each engine attaches its own scratch file (the two cannot share one), and a
+# fresh session re-attaches it, so the probes check DuckDB's ATTACH
+# semantics: `:memory:`, a file written at DETACH and read back, READ_ONLY,
+# and the refusal of a DuckDB-format file.
+def run_attach():
+    print("== ATTACH a plain database battery ==")
+    dirs = (
+        tempfile.mkdtemp(prefix="duckdiff_attach_pink_"),
+        tempfile.mkdtemp(prefix="duckdiff_attach_duck_"),
+    )
+
+    def probe(engine, label, sql):
+        which = 0 if engine == "pink" else 1
+        text = sql.replace("{path}", os.path.join(dirs[which], label + ".db"))
+        return pink_query("", text) if engine == "pink" else duck_query("", text)
+
+    def same(label, sql, ordered=True):
+        got, d = probe("pink", label, sql), probe("duck", label, sql)
+        if got[0] == "error":
+            check(label, False, f"pinkdb error: {got[1]}")
+            return
+        if d[0] == "error":
+            check(label, False, f"duckdb error: {d[1]}")
+            return
+        _, types, prows = got
+        prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
+        ok = rows_equal(prows_n, d[1], ordered)
+        check(label, ok, "" if ok else f"\npink={prows_n}\nduck={d[1]}")
+
+    def both_error(label, sql):
+        got, d = probe("pink", label, sql), probe("duck", label, sql)
+        ok = got[0] == "error" and d[0] == "error"
+        check(label, ok, "" if ok else f"\npink={got}\nduck={d}")
+
+    same("attach-memory-round-trip",
+         "ATTACH ':memory:' AS m; CREATE TABLE m.t (a INTEGER, b VARCHAR); "
+         "INSERT INTO m.t VALUES (7, 'x'); SELECT a, b FROM m.t;")
+    same("attach-memory-use",
+         "ATTACH ':memory:' AS m; CREATE TABLE m.t (a INTEGER); INSERT INTO m.t VALUES (7); "
+         "USE m; SELECT a FROM t;")
+    same("attach-memory-listed",
+         "ATTACH ':memory:' AS m; SELECT database_name FROM duckdb_databases() "
+         "WHERE database_name = 'm';")
+    both_error("attach-detach-removes",
+               "ATTACH ':memory:' AS m; CREATE TABLE m.t (a INTEGER); DETACH m; "
+               "SELECT a FROM m.t;")
+    both_error("attach-memory-read-only-refused",
+               "ATTACH ':memory:' AS r (READ_ONLY);")
+
+    # A plain database file is not a second store pinkdb can own (see
+    # docs/sql-conformance.md); DuckDB attaches it, so this is pinkdb-only.
+    plain = os.path.join(dirs[0], "plain.db")
+    got = pink_query("", f"ATTACH ':memory:' AS ok; ATTACH '{plain}' AS f; SELECT 1;")
+    check("attach-file-refused",
+          got[0] == "error" and "is not a lake" in got[1] and ":memory:" in got[1],
+          f"pinkdb answered {got}")
+
+    # A file DuckDB wrote is refused by its header, never opened as pinkdb.
+    duck_file = os.path.join(dirs[1], "duckformat.db")
+    duck_query("", f"ATTACH '{duck_file}' AS d; CREATE TABLE d.t (a INTEGER);")
+    got = pink_query("", f"ATTACH '{duck_file}' AS d; SELECT 42;")
+    check("attach-refuses-duckdb-file",
+          got[0] == "error" and "DuckDB database file" in got[1],
+          f"pinkdb answered {got}")
+
+
+
+
+def run_settings():
+    print("== settings and dialect battery (slt-2) ==")
+    for label, sql, ordered, expect_error in SETTINGS_QUERIES:
+        run_case(label, sql, ordered, expect_error, SETTINGS_SETUP, SETTINGS_SETUP)
+
+
+# ---- slt-3: HUGEINT literals, casts, typeof and DESCRIBE ----
+#
+# 128-bit integers are the widest DuckDB integer; the probes pin the width a
+# literal takes, the text/DOUBLE/DECIMAL conversions and their exact refusal
+# paths, so a regression in the promotion table shows up as a value mismatch.
+HUGEINT_SETUP = """
+CREATE TABLE hs (x HUGEINT);
+INSERT INTO hs VALUES (42), (-1), ('1267650600228229401496703205376'),
+    (170141183460469231731687303715884105727),
+    (-170141183460469231731687303715884105728);
+"""
+
+HUGEINT_QUERIES = [
+    # A literal takes the narrowest type that fits; 1e19 passed BIGINT.
+    ("dialect-hugeint-literal-width",
+     "SELECT 1, 10000000000, 10000000000000000000, typeof(1), typeof(10000000000), "
+     "typeof(10000000000000000000);", False, False),
+    ("dialect-hugeint-literals",
+     "SELECT 0::HUGEINT, -0::HUGEINT, 42::HUGEINT, -42::HUGEINT, "
+     "10000000000000000000000000000::HUGEINT;", False, False),
+    ("dialect-hugeint-bounds",
+     "SELECT 170141183460469231731687303715884105727::HUGEINT, "
+     "(-170141183460469231731687303715884105728)::HUGEINT;", False, False),
+    # CAST from text: spaces, a fraction, an exponent and `_` separators.
+    ("dialect-hugeint-text",
+     "SELECT '7'::HUGEINT, '  12  '::HUGEINT, '1.5'::HUGEINT, '3.6e2'::HUGEINT, "
+     "'1_000'::HUGEINT, '0x07'::HUGEINT, '0b101010'::HUGEINT;", False, False),
+    ("dialect-hugeint-text-garbage",
+     "SELECT 'abc'::HUGEINT;", False, True),
+    ("dialect-hugeint-text-range",
+     "SELECT '170141183460469231731687303715884105728'::HUGEINT;", False, True),
+    # DOUBLE rounds half away from zero, like DuckDB, not to even.
+    ("dialect-hugeint-double-rounds",
+     "SELECT 1.9::HUGEINT, -1.9::HUGEINT, 1.5::HUGEINT, 2.5::HUGEINT, "
+     "-2.5::HUGEINT, 1e18::HUGEINT;", False, False),
+    ("dialect-hugeint-double-range",
+     "SELECT 1e300::HUGEINT;", False, True),
+    # The ±2^127 bounds are exclusive for DOUBLE input: 2^127 is exactly
+    # representable as a DOUBLE but is not a HUGEINT DuckDB accepts.
+    ("dialect-hugeint-double-bound",
+     "SELECT (1.7014118346046923e38)::HUGEINT, (-1.7014118346046923e38)::HUGEINT;",
+     False, True),
+    # Text with more fractional digits than DuckDB's 38-digit decimal
+    # intermediate is a conversion error, not a rounding to zero.
+    ("dialect-hugeint-text-precision",
+     "SELECT '" + "1." + "0" * 300 + "1e5'::HUGEINT;", False, True),
+    ("dialect-hugeint-narrows",
+     "SELECT 42::HUGEINT::INTEGER, 42::HUGEINT::BIGINT, 42::HUGEINT::DOUBLE, "
+     "0::HUGEINT::BOOLEAN, 1::HUGEINT::BOOLEAN, (-1)::HUGEINT::BOOLEAN, "
+     "1::HUGEINT::VARCHAR;", False, False),
+    ("dialect-hugeint-narrow-range",
+     "SELECT 100000000000::HUGEINT::INTEGER;", False, True),
+    ("dialect-hugeint-bigint-range",
+     "SELECT 9223372036854775808::HUGEINT::BIGINT;", False, True),
+    # DECIMAL widens exactly; narrowing truncates toward zero and refuses
+    # values DECIMAL(38,s) cannot hold.
+    ("dialect-hugeint-decimal",
+     "SELECT 42::HUGEINT::DECIMAL(38,5), 12.345::DECIMAL(10,3)::HUGEINT, "
+     "(-12.345)::DECIMAL(10,3)::HUGEINT;", False, False),
+    ("dialect-hugeint-decimal-range",
+     "SELECT 170141183460469231731687303715884105727::HUGEINT::DECIMAL(38,1);",
+     False, True),
+    ("dialect-hugeint-typeof",
+     "SELECT typeof(42::HUGEINT), typeof(42::HUGEINT + 1), "
+     "typeof(42::HUGEINT / 2), typeof(min(x)), typeof(max(x)) FROM hs;",
+     False, False),
+    ("dialect-hugeint-describe", "DESCRIBE hs;", True, False),
+    ("dialect-hugeint-column", "SELECT x FROM hs ORDER BY x;", True, False),
+]
+
+
+# ---- slt-3: HUGEINT arithmetic, overflow and comparison ----
+#
+# DuckDB spells 128-bit overflow `Out of Range Error: Overflow in … of INT128`;
+# both sides must refuse the same expressions (and accept the same edges).
+HUGEINT_ARITH_QUERIES = [
+    ("dialect-hugeint-arith",
+     "SELECT 42::HUGEINT + 42::HUGEINT, 100::HUGEINT - 42::HUGEINT, "
+     "-42::HUGEINT + 100::HUGEINT, 3::HUGEINT - 5::HUGEINT, "
+     "-3::HUGEINT - 5::HUGEINT, 12::HUGEINT - (-12)::HUGEINT, "
+     "100::HUGEINT * 50::HUGEINT, -100::HUGEINT * (-50)::HUGEINT, "
+     "100::HUGEINT / 4::HUGEINT, 90::HUGEINT % 20::HUGEINT, "
+     "-90::HUGEINT % 20::HUGEINT, 90::HUGEINT % (-20)::HUGEINT;",
+     False, False),
+    ("dialect-hugeint-arith-wide",
+     "SELECT '1267650600228229401496703205376'::HUGEINT * 2, "
+     "100000000000000000000::HUGEINT + 100000000000000000000::HUGEINT, "
+     "'5'::HUGEINT + '-10000000000000000002'::HUGEINT, "
+     "-10000000000000000002::HUGEINT - (-10000000000000000002)::HUGEINT;",
+     False, False),
+    ("dialect-hugeint-add-overflow",
+     "SELECT 170141183460469231731687303715884105727 + 1;", False, True),
+    ("dialect-hugeint-sub-overflow",
+     "SELECT -170141183460469231731687303715884105728 - 1;", False, True),
+    ("dialect-hugeint-mul-overflow",
+     "SELECT 170141183460469231731687303715884105727 * 2;", False, True),
+    ("dialect-hugeint-mod-zero",
+     "SELECT 5::HUGEINT % 0;", False, True),
+    ("dialect-hugeint-neg-overflow",
+     "SELECT -x FROM hs WHERE x = '-170141183460469231731687303715884105728';",
+     False, True),
+    ("dialect-hugeint-mod-edges",
+     "SELECT 170141183460469231731687303715884105727 % -2, "
+     "-170141183460469231731687303715884105728 % 3, "
+     "170141183460469231731687303715884105727 % "
+     "170141183460469231731687303715884105726;", False, False),
+    ("dialect-hugeint-abs",
+     "SELECT ABS('-1329227995784915872903807060280344576'::HUGEINT), "
+     "ABS(0::HUGEINT), ABS('-100'::HUGEINT);", False, False),
+    ("dialect-hugeint-cmp",
+     "SELECT 1::HUGEINT = 1, 1::HUGEINT = 1.0, 1::HUGEINT < 2, "
+     "1::HUGEINT = 1::BIGINT, 5::HUGEINT <> 5::HUGEINT, "
+     "18446744073709551621::HUGEINT > 5::HUGEINT;", False, False),
+    ("dialect-hugeint-filter",
+     "SELECT x FROM hs WHERE x < '1267650600228229401496703205376' ORDER BY x;",
+     True, False),
+    ("dialect-hugeint-filter-widths",
+     "SELECT COUNT(*) FROM hs WHERE x > 42;", False, False),
+    ("dialect-hugeint-filter-eq",
+     "SELECT COUNT(*) FROM hs WHERE x = 42;", False, False),
+    ("dialect-hugeint-filter-ne",
+     "SELECT COUNT(*) FROM hs WHERE x <> -1;", False, False),
+    ("dialect-hugeint-group",
+     "SELECT x, COUNT(*) FROM hs GROUP BY x ORDER BY x;", True, False),
+    ("dialect-hugeint-minmax", "SELECT MIN(x), MAX(x) FROM hs;", False, False),
+]
+
+
+def run_hugeint():
+    print("== HUGEINT literals, casts and typeof battery (slt-3) ==")
+    for label, sql, ordered, expect_error in HUGEINT_QUERIES:
+        run_case(label, sql, ordered, expect_error, HUGEINT_SETUP, HUGEINT_SETUP)
+
+
+def run_hugeint_arithmetic():
+    print("== HUGEINT arithmetic and comparison battery (slt-3) ==")
+    for label, sql, ordered, expect_error in HUGEINT_ARITH_QUERIES:
+        run_case(label, sql, ordered, expect_error, HUGEINT_SETUP, HUGEINT_SETUP)
+
+
 # ---- unaliased expression names ----
 #
 # QuackLab reads result column names, so a select item without an alias must
@@ -1452,6 +1751,12 @@ NAME_QUERIES = [
     ("name-arith", "SELECT -x, x + 1, x % 2, x <> 1 FROM nt;"),
     ("name-cast", "SELECT CAST(x AS INT), x::INT, CAST(s AS VARCHAR) FROM nt;"),
     ("name-call", "SELECT substr(s, 2, 1), upper(s), coalesce(x, 0), 'it''s' FROM nt;"),
+    # dialect-3: DuckDB names the star form `count_star()`, keeps FILTER in the
+    # name, and spells `ILIKE` as its operator.
+    ("name-count-star", "SELECT COUNT(*), (COUNT(*) + 1), COUNT(1), SUM(1) FROM nt;"),
+    ("name-count-filter", "SELECT COUNT(*) FILTER (WHERE x > 1), COUNT(DISTINCT x) FILTER (WHERE x > 0), AVG(x) FILTER (WHERE x > 0) FROM nt;"),
+    ("name-count-over", "SELECT COUNT(*) OVER (), COUNT(*) OVER (PARTITION BY x), SUM(x) OVER (ORDER BY x) FROM nt;"),
+    ("name-ilike", "SELECT s ILIKE 'a%', s NOT ILIKE 'a%', s ILIKE 'a%' ESCAPE '\\', s NOT ILIKE 'a%' ESCAPE '\\' FROM nt;"),
 ]
 
 
@@ -1656,6 +1961,96 @@ DIALECT_QUERIES = [
     ("dialect-fk-grouped-derived", "SELECT c.did, (SELECT sum(s) FROM (SELECT k * 10 AS d, sum(v) AS s FROM pn GROUP BY k) g WHERE g.d = c.did) FROM emp c WHERE c.did IS NOT NULL ORDER BY c.did;", True, False),
     ("dialect-fk-null-keys", "SELECT c.id FROM emp c WHERE NOT EXISTS (SELECT 1 FROM (SELECT x FROM nn UNION SELECT did FROM dept) p WHERE p.x = c.did) ORDER BY c.id;", True, False),
     ("dialect-fk-correlation-under-limit", "SELECT c.id FROM emp c WHERE EXISTS (SELECT 1 FROM dept d WHERE d.did = c.did LIMIT 1) ORDER BY c.id;", True, False),
+    # Unquoted intervals (wave 141): DuckDB's `INTERVAL <count> <unit>`. The
+    # values are read back through timestamp arithmetic, where both engines
+    # yield an exact TIMESTAMP; an interval value itself prints differently.
+    ("dialect-interval-units", "SELECT " + ", ".join(
+        f"TIMESTAMP '2026-01-31 00:00:00' {op} INTERVAL 3 {u}"
+        for u in ("MICROSECOND", "MILLISECOND", "SECOND", "MINUTE", "HOUR",
+                  "DAY", "WEEK", "MONTH", "QUARTER", "YEAR", "DECADE")
+        for op in ("+", "-")
+    ) + ";", False, False),
+    # Century and millennium pass out of four-digit years, where the two
+    # engines print timestamps differently, so compare them as booleans.
+    ("dialect-interval-large-units", "SELECT TIMESTAMP '2026-01-31' + INTERVAL 3 CENTURY = TIMESTAMP '2326-01-31', "
+     "TIMESTAMP '2326-01-31' - INTERVAL 3 CENTURY = TIMESTAMP '2026-01-31', "
+     "TIMESTAMP '2026-01-31' + INTERVAL 3 MILLENNIUM = TIMESTAMP '5026-01-31', "
+     "TIMESTAMP '5026-01-31' - INTERVAL 3 MILLENNIUM = TIMESTAMP '2026-01-31';", False, False),
+    ("dialect-interval-unit-plurals", "SELECT " + ", ".join(
+        f"TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 2 {u}"
+        for u in ("MICROSECONDS", "MILLISECONDS", "SECONDS", "MINUTES", "HOURS",
+                  "DAYS", "WEEKS", "MONTHS", "QUARTERS", "YEARS", "DECADES",
+                  "CENTURIES", "MILLENNIA")
+    ) + ";", False, False),
+    ("dialect-interval-count-forms", "SELECT TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (2+1) HOUR, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL '5' MINUTE, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 1.5 DAY, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 1 DAYS, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 1.2345675 SECOND, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 1.5 SECOND, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 1.5 MILLISECOND, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (1.5) WEEK, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (2.5) MONTH, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (-2) DAY, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (-1.9) DAY, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 0 DAY, "
+     "TIMESTAMP '2026-01-31 00:00:00' + interval 2 hours;", False, False),
+    ("dialect-interval-table-rows", "SELECT DATE '2026-01-31' + INTERVAL 1 MONTH, "
+     "DATE '2026-03-01' - INTERVAL 1 DAY, "
+     "TIMESTAMP '2026-01-31 12:30:00' + INTERVAL 1 MONTH, "
+     "DATE '2026-01-31' + INTERVAL 1 QUARTER, "
+     "TIMESTAMP '2026-01-31 12:30:00' - INTERVAL 1 YEAR, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 90 SECOND, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 10 MILLISECOND, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 2 WEEK;", False, False),
+    ("dialect-interval-types", "SELECT typeof(INTERVAL 3 DAY), typeof(INTERVAL (NULL) DAY), "
+     "typeof(INTERVAL 1.5 SECOND), typeof(date_trunc('week', DATE '2026-05-17')), "
+     "typeof(date_trunc('month', DATE '2026-05-17')), typeof(current_date), "
+     "typeof(current_date - INTERVAL 6 DAY), typeof(current_date + INTERVAL 1 DAY), "
+     "typeof(date_trunc('month', current_date)), typeof(date_trunc('quarter', current_date)), "
+     "typeof(date_trunc('year', current_date)), typeof(DATE '2026-01-31' + INTERVAL 1 MONTH);", False, False),
+    ("dialect-interval-null-counts", "SELECT INTERVAL (NULL) DAY, INTERVAL (CAST(NULL AS INTEGER)) DAY, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (NULL) DAY, "
+     "date_trunc('month', CAST(NULL AS DATE)), "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (x) DAY FROM (VALUES (NULL)) t(x);", False, False),
+    ("dialect-interval-row-dependent", "SELECT TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (x) DAY, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (x) HOUR, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (x) WEEK, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (z) MINUTE, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (z) SECOND, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (x) QUARTER "
+     "FROM (VALUES (2, -1.7), (3, 1.7)) t(x, z) ORDER BY 1;", True, False),
+    ("dialect-interval-quacklab-relative", "SELECT "
+     "(DATE '2026-05-17' + INTERVAL 1 DAY), "
+     "(DATE '2026-05-17' - INTERVAL 1 DAY), "
+     "(DATE '2026-05-17' - INTERVAL 6 DAY), "
+     "(DATE '2026-05-17' - INTERVAL 29 DAY), "
+     "(DATE '2026-05-17' - INTERVAL 89 DAY), "
+     "date_trunc('week', DATE '2026-05-17'), "
+     "(date_trunc('week', DATE '2026-05-17') - INTERVAL 7 DAY), "
+     "date_trunc('month', DATE '2026-05-17'), "
+     "(date_trunc('month', DATE '2026-05-17') - INTERVAL 1 MONTH), "
+     "(date_trunc('month', DATE '2026-05-17') - INTERVAL 11 MONTH), "
+     "date_trunc('quarter', DATE '2026-05-17'), "
+     "(date_trunc('quarter', DATE '2026-05-17') - INTERVAL 3 MONTH), "
+     "date_trunc('year', DATE '2026-05-17'), "
+     "(date_trunc('year', DATE '2026-05-17') - INTERVAL 1 YEAR);", False, False),
+    ("dialect-interval-quacklab-filter", "SELECT (DATE '2026-05-17' >= DATE '2026-01-01'), "
+     "(DATE '2026-05-17' < (DATE '2026-01-31' + INTERVAL 1 DAY)), "
+     "(DATE '2026-05-17' >= (DATE '2026-05-17' - INTERVAL 6 DAY)), "
+     "COUNT(*) FROM emp WHERE hired >= DATE '2026-01-01' AND hired < (DATE '2024-01-31' + INTERVAL 1 DAY);", False, False),
+    ("dialect-interval-date-trunc-parts", "SELECT date_trunc('week', DATE '2026-05-17'), "
+     "date_trunc('quarter', DATE '2026-05-17'), "
+     "date_trunc('week', TIMESTAMP '2026-05-17 13:45:00'), "
+     "date_trunc('quarter', TIMESTAMP '2026-05-17 13:45:00'), "
+     "date_trunc('day', DATE '2026-05-17'), date_trunc('hour', DATE '2026-05-17'), "
+     "date_trunc('minute', TIMESTAMP '2026-05-17 13:45:59'), "
+     "date_trunc('year', DATE '2026-05-17'), date_trunc('second', DATE '2026-05-17');", False, False),
+    # `INTERVAL -2 DAY` is `interval - 2` aliased `day` to DuckDB too, so both
+    # engines fail it at bind, not at parse.
+    ("dialect-interval-unary-minus", "SELECT INTERVAL -2 DAY;", False, True),
+    ("dialect-interval-no-unit", "SELECT INTERVAL 3;", False, True),
+    ("dialect-interval-bad-plural", "SELECT INTERVAL 2 MILLENNIUMS;", False, True),
 ]
 
 
@@ -1819,8 +2214,21 @@ CSV_PROBES = [
     ("csv-gzip-option", "SELECT * FROM read_csv('{gz}', compression='gzip', header=true, delim=',') ORDER BY id;", True),
     ("csv-gzip-suffix", "SELECT COUNT(*), SUM(total) FROM read_csv('{gz}');", False),
     ("csv-insert-select-casts", "CREATE TABLE st (id VARCHAR, total DOUBLE); INSERT INTO st SELECT id, total FROM read_csv('{gz}', compression='gzip', header=true); SELECT * FROM st ORDER BY id;", True),
+    # dialect-3: the `types` / `dtypes` / `column_types` overrides and the
+    # `columns` schema, all as DuckDB's struct/list literals.
+    ("csv-types-struct", "SELECT * FROM read_csv('{gz}', types={'total': 'VARCHAR', 'active': 'VARCHAR'}) ORDER BY id;", True),
+    ("csv-types-dtypes", "SELECT * FROM read_csv('{gz}', dtypes={'id': 'VARCHAR'}) ORDER BY id;", True),
+    ("csv-column-types-list", "SELECT * FROM read_csv('{gz}', column_types=['VARCHAR', 'VARCHAR']) ORDER BY id;", True),
+    ("csv-columns-struct", "SELECT * FROM read_csv('{f}', columns={'id': 'INTEGER', 'region': 'VARCHAR', 'total': 'DOUBLE', 'active': 'BOOLEAN', 'day': 'DATE', 'note': 'VARCHAR'}) ORDER BY id;", True),
     # QuackLab's ETL: stage the gzip CSV in a temp table, then load the real one.
     ("csv-temp-stage-etl", "CREATE TABLE master (id INTEGER, region VARCHAR, total DECIMAL(10,2)); CREATE TEMP TABLE stage AS SELECT id, region, total FROM read_csv('{gz}'); INSERT INTO master SELECT id, region, total FROM stage; SELECT * FROM master ORDER BY id;", True),
+]
+
+
+CSV_ERROR_PROBES = [
+    ("csv-types-unknown-name", "SELECT * FROM read_csv('{f}', types={'zz': 'DATE'});"),
+    ("csv-columns-list-form", "SELECT * FROM read_csv('{f}', columns=['INTEGER']);"),
+    ("csv-types-bad-type", "SELECT * FROM read_csv('{f}', types={'id': 'WIDGET'});"),
 ]
 
 
@@ -1861,6 +2269,14 @@ def run_csv():
             prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
             ok = rows_equal(prows_n, d[1], ordered)
             check(label, ok, "" if ok else f"\npink={prows_n}\nduck={d[1]}")
+        # Errors both engines must refuse: an unknown column name, and the
+        # list form of `columns`.
+        for label, template in CSV_ERROR_PROBES:
+            sql = template.replace("{f}", path).replace("{gz}", gz_path)
+            got = pink_query("", sql)
+            d = duck_query("", sql)
+            check(label, got[0] == "error" and d[0] == "error",
+                  f"pink={got[0]} duck={d[0]}")
     finally:
         shutil.rmtree(directory, ignore_errors=True)
 
@@ -2010,6 +2426,74 @@ def run_remote():
         "note: remote Arrow is value-pinned in extensions/arrow/tests/remote.rs "
         "(DuckDB has no Arrow file reader)"
     )
+
+
+# ---- dialect-3 (2026-11): what QuackLab's charts and ETL still trip on ----
+#
+# Each case builds what it needs. Cases that must fail on both engines compare
+# only the class (error vs rows), like every other `expect_error` probe.
+DIALECT3_QUERIES = [
+    # ILIKE / NOT ILIKE, with and without ESCAPE.
+    ("d3-ilike-basic", "SELECT 'JFK' ILIKE 'jfk%', 'jfk' ILIKE 'JFK%', 'abc' ILIKE 'a_c', 'abc' ILIKE 'a%c', NULL ILIKE 'a', '' ILIKE '%';", False, False),
+    ("d3-ilike-not", "SELECT 'JFK' NOT ILIKE 'jfk%', 'jfk' NOT ILIKE 'JFK%', 'abc' NOT ILIKE 'a_c';", False, False),
+    ("d3-ilike-escape", "SELECT 'a%b' ILIKE 'a\\%b' ESCAPE '\\', 'axb' ILIKE 'a\\%b' ESCAPE '\\', 'JFK' NOT ILIKE 'x%' ESCAPE '\\', 'a_b' ILIKE 'a!_b' ESCAPE '!', 'a_b' ILIKE 'a!_b';", False, False),
+    ("d3-ilike-empty-escape", "SELECT 'a_b' ILIKE 'a\\_b' ESCAPE '', 'a_b' ILIKE 'a_b' ESCAPE '';", False, False),
+    ("d3-ilike-unicode", "SELECT 'É' ILIKE 'é', 'Straße' ILIKE 'STRASSE', 'İ' ILIKE 'i', 'ǅ' ILIKE 'ǆ';", False, False),
+    ("d3-ilike-widget", "SELECT COUNT(*) FROM emp WHERE CAST(name AS VARCHAR) ILIKE 'a%' ESCAPE '\\';", False, False),
+    ("d3-ilike-bad-escape", "SELECT 'a' ILIKE 'a' ESCAPE 'ab';", False, True),
+    # GROUP BY: a name binds to the FROM column first; an alias only stands in
+    # for a bare top-level key, never inside an expression.
+    ("d3-groupby-column-shadows-alias", "SELECT b + 1 AS a FROM (SELECT 1 AS a, 2 AS b) t GROUP BY a;", False, True),
+    ("d3-groupby-alias-fallback", "SELECT x + 1 AS z, COUNT(*) FROM (SELECT 1 AS x UNION ALL SELECT 1) t GROUP BY z ORDER BY z;", False, False),
+    ("d3-groupby-alias-in-expression", "SELECT b AS x FROM (SELECT 1 AS b) t GROUP BY x + 0;", False, True),
+    ("d3-groupby-alias-expr-key", "SELECT a + 1 AS a, COUNT(*) FROM (SELECT 1 AS a UNION ALL SELECT 2) t GROUP BY a + 1 ORDER BY a;", False, False),
+    ("d3-groupby-having-alias", "CREATE TABLE gb2 (b INTEGER); INSERT INTO gb2 VALUES (1), (2); SELECT b + 1 AS z FROM gb2 GROUP BY z HAVING z > 2 ORDER BY z;", True, False),
+    # ORDER BY: a bare name prefers the output alias; inside an expression the
+    # FROM column wins.
+    ("d3-orderby-alias-wins", "SELECT -id AS id FROM emp ORDER BY id;", True, False),
+    ("d3-orderby-expr-uses-column", "SELECT -id AS id FROM emp ORDER BY id + 0;", True, False),
+    ("d3-orderby-shadow-in-expr", "SELECT b AS a FROM (SELECT 1 AS a, 2 AS b) t ORDER BY a + 0;", True, False),
+    # The exact QuackLab widget shapes: a grouped date_trunc with the same
+    # alias as the source column, ordered by the expression.
+    ("d3-widget-revenue-month", "CREATE TABLE rm (DAY_ID DATE, AMT DECIMAL(10,2)); INSERT INTO rm VALUES (DATE '2024-01-05', 1.25), (DATE '2024-01-20', 2.50), (DATE '2024-02-01', 3.00); SELECT date_trunc('month', DAY_ID) AS DAY_ID, SUM(AMT) AS AMT FROM rm WHERE DAY_ID >= DATE '2024-01-01' - INTERVAL 1 DAY GROUP BY date_trunc('month', DAY_ID) ORDER BY date_trunc('month', DAY_ID);", True, False),
+    ("d3-widget-vendor-week", "CREATE TABLE wd (VENDOR_NAME VARCHAR, DAY_ID DATE, AMT INTEGER); INSERT INTO wd VALUES ('a', DATE '2024-01-03', 1), ('a', DATE '2024-01-10', 2), ('b', DATE '2024-01-04', 3); SELECT VENDOR_NAME, date_trunc('week', DAY_ID) AS DAY_ID, SUM(AMT) FROM wd GROUP BY VENDOR_NAME, date_trunc('week', DAY_ID) ORDER BY date_trunc('week', DAY_ID) ASC;", False, False),
+    ("d3-widget-od-distance-filtered", "SELECT CASE WHEN CAST(name AS VARCHAR) ILIKE 'JFK%' ESCAPE '\\' THEN 'JFK' ELSE 'other' END AS zone, COUNT(*) FROM emp GROUP BY zone ORDER BY zone;", True, False),
+    # INSERT ... BY NAME: matched by name, the rest default or NULL.
+    ("d3-insert-by-name", "CREATE TABLE bn (a INTEGER, b INTEGER DEFAULT 7, c VARCHAR); INSERT INTO bn BY NAME SELECT 5 AS b, 'x' AS c; INSERT INTO bn (a, c) VALUES (1, 'y'); INSERT INTO bn BY NAME (SELECT 2 AS a); SELECT * FROM bn ORDER BY a;", True, False),
+    ("d3-insert-by-name-case", "CREATE TABLE bn2 (a INTEGER, c VARCHAR); INSERT INTO bn2 BY NAME SELECT 1 AS A, 'x' AS C; SELECT * FROM bn2;", True, False),
+    ("d3-insert-by-name-unknown", "CREATE TABLE bn3 (a INTEGER); INSERT INTO bn3 BY NAME SELECT 1 AS zz;", False, True),
+    ("d3-insert-by-name-duplicate", "CREATE TABLE bn4 (a INTEGER); INSERT INTO bn4 BY NAME SELECT 1 AS a, 2 AS a;", False, True),
+    ("d3-insert-by-name-values", "CREATE TABLE bn5 (a INTEGER); INSERT INTO bn5 BY NAME VALUES (1);", False, True),
+    # MERGE SET * / INSERT * (positional over every target column) and
+    # INSERT BY NAME (by name).
+    ("d3-merge-update-set-star", "CREATE TABLE mt (a INTEGER, b INTEGER, c INTEGER); INSERT INTO mt VALUES (1, 2, 3); CREATE TABLE ms (a INTEGER, b INTEGER, c INTEGER); INSERT INTO ms VALUES (9, 8, 7); MERGE INTO mt USING ms ON mt.a = ms.a WHEN MATCHED THEN UPDATE SET *; SELECT * FROM mt;", True, False),
+    ("d3-merge-update-set-star-count", "CREATE TABLE mt (a INTEGER, b INTEGER, c INTEGER); INSERT INTO mt VALUES (1, 2, 3); CREATE TABLE ms (k INTEGER, a INTEGER, b INTEGER, c INTEGER); INSERT INTO ms VALUES (1, 9, 8, 7); MERGE INTO mt USING ms ON mt.a = ms.k WHEN MATCHED THEN UPDATE SET *;", False, True),
+    ("d3-merge-insert-star", "CREATE TABLE mt2 (a INTEGER, b INTEGER); CREATE TABLE ms2 (a INTEGER, b INTEGER); INSERT INTO ms2 VALUES (4, 5); MERGE INTO mt2 USING ms2 ON mt2.a = ms2.a WHEN NOT MATCHED THEN INSERT *; SELECT * FROM mt2;", True, False),
+    ("d3-merge-insert-by-name", "CREATE TABLE mt3 (a INTEGER, b INTEGER DEFAULT 7, c VARCHAR); CREATE TABLE ms3 (a INTEGER, c VARCHAR); INSERT INTO ms3 VALUES (1, 'x'); MERGE INTO mt3 USING ms3 ON mt3.a = ms3.a WHEN NOT MATCHED THEN INSERT BY NAME; SELECT * FROM mt3;", True, False),
+    ("d3-merge-insert-star-count", "CREATE TABLE mt4 (a INTEGER, b INTEGER); CREATE TABLE ms4 (a INTEGER); INSERT INTO ms4 VALUES (1); MERGE INTO mt4 USING ms4 ON mt4.a = ms4.a WHEN NOT MATCHED THEN INSERT *;", False, True),
+    ("d3-merge-update-set-star-count", "CREATE TABLE mt5 (a INTEGER, b INTEGER, c INTEGER); CREATE TABLE ms5 (a INTEGER, c INTEGER); INSERT INTO ms5 VALUES (1, 2); MERGE INTO mt5 USING ms5 ON mt5.a = ms5.a WHEN MATCHED THEN UPDATE SET *;", False, True),
+    ("d3-merge-unnamed-using", "CREATE TABLE mt6 (a INTEGER, b INTEGER); CREATE TABLE ms6 (a INTEGER); INSERT INTO ms6 VALUES (1); MERGE INTO mt6 USING (SELECT a FROM ms6) ON mt6.a = unnamed_subquery.a WHEN NOT MATCHED THEN INSERT VALUES (unnamed_subquery.a, 9); SELECT * FROM mt6;", True, False),
+    ("d3-merge-unnamed-using-ambiguous", "CREATE TABLE mt6 (a INTEGER, b INTEGER); CREATE TABLE ms6 (a INTEGER); INSERT INTO ms6 VALUES (1); MERGE INTO mt6 USING (SELECT a FROM ms6) ON mt6.a = a WHEN NOT MATCHED THEN INSERT VALUES (a, 9);", False, True),
+    # Derived tables without an alias: DuckDB names them `unnamed_subquery`,
+    # `unnamed_subquery2`, ...
+    ("d3-derived-unnamed", "SELECT * FROM (SELECT 1 AS a);", False, False),
+    ("d3-derived-unnamed-name", "SELECT unnamed_subquery.a FROM (SELECT 1 AS a);", False, False),
+    ("d3-derived-unnamed-join", "SELECT * FROM (SELECT 1 AS a) JOIN (SELECT 1 AS b) ON a = b;", False, False),
+    ("d3-derived-unnamed-second", "SELECT unnamed_subquery2.b FROM (SELECT 1 AS a), (SELECT 1 AS b);", False, False),
+    ("d3-derived-unnamed-first-ref", "SELECT unnamed_subquery1.a FROM (SELECT 1 AS a);", False, True),
+    ("d3-derived-unnamed-in", "SELECT id FROM emp WHERE did IN (SELECT did FROM (SELECT did FROM dept)) ORDER BY id;", True, False),
+    ("d3-derived-unnamed-exists", "SELECT id FROM emp WHERE EXISTS (SELECT 1 FROM (SELECT did FROM dept) WHERE did = emp.did) ORDER BY id;", True, False),
+    ("d3-derived-unnamed-cte", "WITH c AS (SELECT 1 AS a) SELECT * FROM (SELECT a FROM c);", False, False),
+    ("d3-derived-unnamed-insert", "CREATE TABLE di (a INTEGER, b INTEGER); INSERT INTO di SELECT * FROM (SELECT 1, 2); SELECT * FROM di;", True, False),
+    ("d3-derived-unnamed-values", "CREATE TABLE dv (a INTEGER, b INTEGER); INSERT INTO dv SELECT * FROM (VALUES (1, 2)); SELECT * FROM dv;", True, False),
+    ("d3-derived-values-select", "SELECT * FROM (VALUES (3, 4));", True, False),
+    ("d3-derived-unnamed-ctas", "CREATE TABLE dc AS SELECT * FROM (SELECT 1 AS a); SELECT * FROM dc;", True, False),
+    ("d3-derived-unnamed-quacklab", "CREATE SCHEMA s; CREATE TABLE s.t (a INTEGER, b INTEGER); INSERT INTO s.t SELECT * FROM (SELECT 1, 2); SELECT * FROM s.t;", True, False),
+    ("d3-derived-unnamed-setop", "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT 2) t ORDER BY a;", True, False),
+    ("d3-derived-unnamed-nested", "SELECT * FROM (SELECT * FROM (SELECT 1 AS a));", False, False),
+    ("d3-derived-unnamed-function", "SELECT * FROM range(2);", True, False),
+    ("d3-derived-unnamed-group", "SELECT a, COUNT(*) FROM (SELECT x AS a FROM jx) GROUP BY a ORDER BY a;", True, False),
+]
 
 
 # ---- wave 135a: the pipeline's aggregate-rooted mart shape ----

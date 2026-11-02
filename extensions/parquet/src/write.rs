@@ -366,6 +366,16 @@ fn physical_type(dtype: DataType, column: &str) -> Result<PhysicalType, WriteErr
         DataType::Double => PhysicalType::DOUBLE,
         DataType::Varchar => PhysicalType::BYTE_ARRAY,
         DataType::Uuid => PhysicalType::FIXED_LEN_BYTE_ARRAY,
+        // HUGEINT arrives in step 7 of `docs/slt-3-hugeint-plan.md` as
+        // FIXED_LEN_BYTE_ARRAY(16) plus the `duckdb.int128` marker; until
+        // then a column of it cannot be written rather than silently
+        // becoming DOUBLE.
+        DataType::Hugeint | DataType::Uhugeint => {
+            return Err(WriteError::UnsupportedType {
+                column: column.to_string(),
+                message: format!("{} is not yet supported in Parquet", dtype.name()),
+            });
+        }
         DataType::Decimal { precision, .. } => {
             if precision <= 9 {
                 PhysicalType::INT32
@@ -464,6 +474,10 @@ fn build_schema(
             builder = builder.with_id(Some(ids.0));
         }
         match dtype {
+            // `physical_type` refuses them before this match.
+            DataType::Hugeint | DataType::Uhugeint => {
+                unreachable!("physical_type refuses 128-bit integer columns")
+            }
             DataType::Boolean | DataType::Integer | DataType::Bigint | DataType::Double => {}
             DataType::Varchar => {
                 builder = builder
@@ -523,6 +537,12 @@ fn write_column(
     name: &str,
 ) -> Result<(), WriteError> {
     match dtype {
+        DataType::Hugeint | DataType::Uhugeint => {
+            return Err(WriteError::UnsupportedType {
+                column: name.to_string(),
+                message: format!("{} is not yet supported in Parquet", dtype.name()),
+            });
+        }
         DataType::Boolean => write_typed(
             column.typed::<BoolType>(),
             rows,

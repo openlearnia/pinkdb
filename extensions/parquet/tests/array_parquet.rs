@@ -113,6 +113,7 @@ fn read_file(path: &Path) -> (Vec<(String, DataType)>, Vec<Vec<Value>>) {
         args: vec![TableFunctionArg {
             name: None,
             value: Value::Varchar(path.display().to_string()),
+            literal: None,
         }],
     };
     let schema = source.bind(&call).unwrap().expect("read_parquet binds");

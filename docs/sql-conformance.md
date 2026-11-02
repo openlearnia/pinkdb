@@ -14,6 +14,7 @@ Row 95 is big, so it is split:
 | **95a** | the query forms: `QUALIFY`, `TRY_CAST`, subscripts, `IS [NOT] DISTINCT FROM`, `VALUES`/`TABLE`, `FETCH FIRST`, `LIKE … ESCAPE`, `SIMILAR TO`, `DISTINCT ON`, aggregate `FILTER`, named `WINDOW`, `GROUPING SETS`/`ROLLUP`/`CUBE` + `GROUPING()`, `WITH RECURSIVE`, set operations with `ALL` | **done** (this page) |
 | **95b** | the DML forms: `INSERT … ON CONFLICT` (and `INSERT OR REPLACE` / `INSERT OR IGNORE`), `UPDATE … FROM`, `DELETE … USING`, `RETURNING`, `MERGE`, data-modifying CTEs, primary/unique key enforcement | **done** (this page) |
 | **95c** | the rest: `LATERAL`, ordered-set aggregates (`WITHIN GROUP`), `TABLESAMPLE`, `FOR UPDATE`/`SHARE`, `AT TIME ZONE`, row constructors, list literals/`LIST`, `FILTER` on a window aggregate, windows built on another window, VARIANT slicing, the JSON mutation functions, `SET VARIABLE`/`$name` | **done** (this page) |
+| **slt-2** | the corpus-driven batch: `PRAGMA` statements, DuckDB's settings catalogue, `ATTACH` a plain database, `count()`, `GROUP BY ALL`/`ORDER BY ALL`, `CHAR(n)`, keyword-named columns, `default_null_order`/`default_order` | **done** (this page) |
 
 Legend: **✅ supported** (same answer as DuckDB 2.0.0 on the shared corpus) ·
 **≈ divergent** (accepted, different from DuckDB, in the stated way) ·
@@ -86,6 +87,130 @@ A conflict target that is not backed by a key is refused like DuckDB:
 | slicing a `VARIANT` (`v[1:2]`) | ✗ | `slicing a VARIANT is not supported: ARRAY_SLICE needs a LIST and pinkdb has no LIST type (use variant_extract with a path)` — DuckDB refuses a VARIANT slice too (`ARRAY_SLICE can only operate on LISTs and VARCHARs`). |
 | subscripting another type (`a[1]` on `INT`) | ✗ | `subscripting a INTEGER is not supported: only ARRAY, VARCHAR and VARIANT have subscripts` |
 
+## slt-2 — the corpus-driven batch
+
+DuckDB's own sqllogictest corpus (`bench/sqllogictest/`) found these: most
+failing files stop at their first unsupported statement, and these were the
+cheapest wide ones. Every behaviour was checked live against
+`~/.local/bin/duckdb -no-agent` (v2.0.0-alpha46057), and the same probes run
+in `bench/duckdiff.py`.
+
+Measured on the corpus: **444 files pass** (from 344), **100 files newly
+pass, 0 regressions**; 83.6% of non-skipped records pass. Of the newly passing
+files, 60 were blocked by a `PRAGMA`, 38 by a `SET`/`RESET`, 26 by the null
+order, 3 by `ATTACH ':memory:'`, 4 by `GROUP BY ALL`/`ORDER BY ALL`, 3 by
+`CHAR(n)` and 2 by `count()` (a file can count for several).
+`docs/sqllogictest-baseline.md` has the full run.
+
+### PRAGMA
+
+| form | behaviour |
+|---|---|
+| `PRAGMA show_tables` | the current database's tables, as `SHOW TABLES` |
+| `PRAGMA table_info('t')`, `PRAGMA table_info(t)`, `SELECT * FROM pragma_table_info('t')` | DuckDB's rows: `cid` (0-based), `name`, `type`, `notnull`, `dflt_value`, `pk` |
+| `PRAGMA database_list` | `seq`, `name`, `file` (`NULL` for an in-memory database) |
+| `PRAGMA version` | `library_version`, `source_id`, `codename` — pinkdb's version, an empty source id, `pinkdb` |
+| `PRAGMA platform` | one row, `<os>_<arch>` |
+| `PRAGMA <setting> = <value>` | the same as `SET <setting> = <value>`, including `PRAGMA threads=4` and a `MAP {…}` value |
+| `PRAGMA <statement pragma>` | DuckDB's `Success` (BOOLEAN) result with no rows, for the no-op list below |
+| anything else | DuckDB's `Catalog Error: Pragma Function with name <x> does not exist!` |
+
+Statement pragmas accepted as no-ops (the verification and tuning knobs the
+corpus switches on and off): `asof_loop_join_threshold`,
+`checkpoint_on_shutdown`, `debug_asof_iejoin`, `debug_checkpoint_abort`,
+`debug_force_external`, `debug_force_no_cross_product`,
+`debug_print_bind_context`, `debug_print_optimized_plan`,
+`debug_print_plans`, `debug_set_forced_table_scan_info`,
+`debug_skip_checkpoint_on_commit`, `debug_verify_serializer`,
+`debug_verify_vector`, `debug_window_mode`,
+`disable_checkpoint_on_shutdown`, `disable_logging`, `disable_object_cache`,
+`disable_optimizer`, `disable_print_progress_bar`, `disable_profiling`,
+`disable_progress_bar`, `disable_verification`,
+`disable_verify_parallelism`, `enable_checkpoint_on_shutdown`,
+`enable_logging`, `enable_object_cache`, `enable_optimizer`,
+`enable_print_progress_bar`, `enable_profiling`, `enable_progress_bar`,
+`enable_verification`, `force_checkpoint`, `force_compression`,
+`verify_external`, `verify_parallelism`, `verify_serializer`.
+
+A bare `PRAGMA <setting>` (no `= value`) is the Catalog Error above, as in
+DuckDB.
+
+### Settings
+
+`SET`/`SET SESSION`/`SET GLOBAL`/`SET LOCAL`, `RESET`, `RESET ALL` and
+`current_setting('…')`.
+
+Implemented: `threads` (the machine's core count by default; a statement runs
+on one thread, so the value is reported and unused), `default_null_order`,
+`default_order`, `memory_limit` (stored, not enforced — pinkdb has no
+configured cap).
+
+Accepted and stored with no engine effect: every other name
+`duckdb_settings()` returns (the display and tuning knobs, `timezone`,
+`calendar`, `wal_autocheckpoint`, `tracked_metrics`, `disabled_optimizers`,
+`profiling_*` and the rest), plus DuckDB's deprecated spellings
+(`profile_output`, `profiling_mode`) and the knobs it registers only in debug
+and extension builds (`debug_*`, `force_variant_shredding`,
+`enable_caching_operators`, … — the corpus files that set them are written for
+those builds). Three more names are pinkdb's own switches, not DuckDB's:
+`join_filter_pushdown`, `hnsw_exact` and `hnsw_ef_search`. A name outside the
+list keeps DuckDB's `Catalog Error: unrecognized configuration parameter
+"…"`, and so does
+`current_setting` of one. Settings are separate from `SET VARIABLE` variables
+(`$x`, `getvariable`), which are unchanged.
+
+Every scope spelling is accepted and means the session: `SET LOCAL`/`SESSION`
+of a global-only setting (`threads`, `memory_limit`) is an error in DuckDB
+(`cannot be set locally`), and a session value there is accepted here.
+
+`default_null_order` accepts `NULLS_FIRST`, `NULLS_LAST`,
+`NULLS_FIRST_ON_ASC_LAST_ON_DESC`, `NULLS_LAST_ON_ASC_FIRST_ON_DESC` and
+DuckDB's `SQLite`/`MySQL`/`Postgres` spellings, and reports the normalised
+form; `default_order` takes `ASC`/`ASCENDING`/`DESC`/`DESCENDING`. Both apply
+to every `ORDER BY` (an item's own `ASC`/`DESC` and `NULLS FIRST`/`NULLS LAST`
+win), to a window `ORDER BY`, and to ordered aggregates where pinkdb has
+them.
+
+### Dialect items
+
+| item | behaviour |
+|---|---|
+| `count()` | `count(*)`, in `OVER` too |
+| `GROUP BY ALL` | one grouping set of every non-aggregate select item, in select order; mixes with plain keys and grouping sets like DuckDB |
+| `ORDER BY ALL` | every visible column, in order; `DESC`/`NULLS FIRST` on the item apply to all |
+| `CHAR(n)`, `CHARACTER(n)`, `BPCHAR`, `VARCHAR(n)` | `VARCHAR` — the length is ignored, as DuckDB ignores it |
+| type names as column names (`date`, `timestamp`, `range`, `text`, …) | accepted: `date`, `timestamp` and `range` became nameable without making the grammar rules that need them ambiguous |
+| `read_csv_auto(…)` | an alias of `read_csv` (with the `parquetlake`/`httpfs` features) |
+
+### ATTACH ':memory:' (a plain database)
+
+`ATTACH [DATABASE] ':memory:' AS name`, `DETACH [IF EXISTS] name`, `USE name`,
+`SHOW DATABASES`.
+
+- `:memory:` is an in-memory database of the store, gone at `DETACH` (the rows
+  are the store's own, checkpointed with it, like DuckDB's memory database is
+  not in any file).
+- A **file path is refused**: `ATTACH 'x.db' AS x` (with or without
+  `DATABASE`, `READ_ONLY` or `TYPE`) answers
+  `ATTACH 'x.db' is not a lake: pinkdb attaches ":memory:" or a lake (a lake:
+  or ducklake: catalog, or TYPE LAKE); attaching a plain database file is not
+  supported`. A second durable database behind one name has no owner: two
+  processes could attach the same file and one `DETACH` would silently
+  overwrite the other, and a durable session store would checkpoint the
+  attached rows into its own file as well. Use a lake for a separate durable
+  database, `EXPORT`/`COPY` for a file.
+- A path that *is* in DuckDB's format is still refused by its header, so the
+  reason is the format and not the missing feature: `ATTACH: "…" is a DuckDB
+  database file; pinkdb cannot read DuckDB files (EXPORT the data from DuckDB
+  as CSV or Parquet and read that instead)`.
+- `ATTACH ':memory:' (READ_ONLY)` is DuckDB's error: `Cannot launch in-memory
+  database in read-only mode!`.
+- Divergences: `USE`/`DETACH` of the current database is not special-cased.
+  Two corpus files that used a plain database file
+  (`attach/attach_issue16122.test`,
+  `parallelism/interquery/concurrent_checkpoint_insert.test`) are expected
+  failures for that reason.
+
 ## Divergences worth knowing
 
 These are accepted by both engines with different answers, or accepted by one
@@ -97,6 +222,8 @@ not planned to change.
 | `'{"a":1}'::VARIANT` | the **object** (VARCHAR→VARIANT parses JSON, which gives the type a literal form the parser/WAL/prepared statements carry) | the **string**; `json(...)::VARIANT` is needed for an object |
 | `1.e2`, `5.` (a point with no digits after it) | parse error, `a number with an exponent needs digits after the dot (write 1.0e2)` | `5.` is `DECIMAL(1,0)`, `1.e2` is DOUBLE |
 | an unaliased decimal literal written `1_000.5` or `00.5` | the column is named from the folded value (`1000.5`, `0.5`); the written *scale* survives, so `1.50` stays `1.50` | the source text (`1_000.5`, `00.5`) |
+| `SET LOCAL`/`SET SESSION` of a global-only setting (`threads`, `memory_limit`) | accepted, session-wide | `Catalog Error: option "threads" cannot be set locally` |
+| `ATTACH 'x.db' AS x` | Catalog Error naming `:memory:` and lakes as the supported forms | attaches `x.db` as its own durable database |
 | `[1.5, 2.5]` (an ARRAY of decimal literals) | `DOUBLE[2]`: the fixed-size `ARRAY` has no DECIMAL element kind, so a decimal element types as DOUBLE (wave 126a) | `DECIMAL(2,1)[2]`; a column of that ARRAY must be `DOUBLE[]` in pinkdb |
 | `v.js.a` (database-qualified three-part column vs a VARIANT chain) | `database "v" not found` — wave 94 keeps `db.table.column` authoritative; write `js.a['b']` for nested VARIANT access | a VARIANT path |
 | `SIMILAR TO 'a{1,2,3}'` | literal text (matches nothing) | invalid-regular-expression error |
@@ -162,6 +289,16 @@ not planned to change.
   CTE's target needs the write privilege;
 * `crates/pinkdb/src/serve.rs` — the read-only allowlist refuses every new
   statement kind and a `WITH` whose body writes.
+* `crates/pinkdb/src/sql/peg_parser.rs` — `PRAGMA`/`SET`/`RESET` forms,
+  `GROUP BY ALL`/`ORDER BY ALL`, `CHAR(n)`/`CHARACTER(n)`/`BPCHAR` and
+  keyword-named columns parse to the expected statements;
+* `crates/pinkdb/src/db.rs` — `duckdb_settings_round_trip`,
+  `pragma_rows_are_duckdb_shaped`, `count_star_without_an_argument`,
+  `group_by_all_and_order_by_all`, `null_and_direction_defaults_reach_every_order`,
+  and the ATTACH round trips (memory, file write-back and reopen, `READ_ONLY`
+  refusal, a DuckDB-format file refused);
+* `bench/duckdiff.py` — the settings, pragma and ATTACH batteries re-measure
+  each of the above against DuckDB.
 
 ## Performance
 

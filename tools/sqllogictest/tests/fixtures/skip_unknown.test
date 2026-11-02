@@ -1,0 +1,4 @@
+test-env NOT_A_DIRECTIVE example
+
+statement ok
+SELECT 1

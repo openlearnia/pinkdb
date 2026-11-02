@@ -102,7 +102,7 @@ fn format_parquet_then_save_and_open_round_trips() {
     assert!(out.contains("Opened lake version 2"), "{out}");
     assert!(out.contains("│ 1       │ x       │"), "{out}");
     assert!(out.contains("│ 2       │ NULL    │"), "{out}");
-    assert!(out.contains("│ 1        │"), "{out}");
+    assert!(out.contains("│ 1            │"), "{out}");
 
     // The lake pins the provider and stores real `.parquet` files. The pin
     // itself lives in the catalog the runtime keeps (the JSON catalog was
@@ -145,7 +145,7 @@ fn attach_answers_from_the_parquet_lake_statistics() {
     ));
     assert!(out.contains("decodes: 0 files"), "statistics-only: {out}");
     assert!(
-        out.contains("│ 3        │ 2        │ 1       │ 3       │ x       │ z       │"),
+        out.contains("│ 3            │ 2        │ 1       │ 3       │ x       │ z       │"),
         "{out}"
     );
 
@@ -179,7 +179,7 @@ fn per_table_format_choice_and_rewrite_conversion() {
     assert!(out.contains("Opened lake version 2"), "{out}");
     assert!(out.contains("│ 1       │"), "{out}");
     assert!(out.contains("│ 2       │"), "{out}");
-    assert!(out.contains("│ 1        │"), "{out}");
+    assert!(out.contains("│ 1            │"), "{out}");
 
     // Only `t` switched: `u` keeps the build default (`.pink` in this
     // parquetlake build), and each table's directory carries files with its
@@ -221,7 +221,10 @@ fn per_table_format_choice_and_rewrite_conversion() {
          .quit\n",
         lake = lake.display()
     ));
-    assert!(out.contains("│ 2        │ 1       │ 2       │"), "{out}");
+    assert!(
+        out.contains("│ 2            │ 1       │ 2       │"),
+        "{out}"
+    );
 
     cleanup(&dir);
 }

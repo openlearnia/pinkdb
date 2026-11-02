@@ -205,7 +205,7 @@ fn lean_attach_answers_from_statistics_without_decoding() {
     assert!(!out.contains("Error"), "{out}");
     // The stats answers.
     assert!(
-        out.contains("│ 3        │ 3        │ 2        │ 2        │"),
+        out.contains("│ 3            │ 3        │ 2        │ 2        │"),
         "{out}"
     );
     // The fast paths decoded nothing; each fallback decoded only the columns

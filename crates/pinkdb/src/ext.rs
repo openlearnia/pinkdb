@@ -102,6 +102,8 @@ pub(crate) fn ext_type_of(dtype: DataType) -> Option<ExtType> {
         // 128-bit kind, and the VARCHAR channel would need an allocation per
         // value. A function that takes or returns one is refused at bind.
         DataType::Uuid => None,
+        // Same for the 128-bit integers (step 6 of the HUGEINT plan).
+        DataType::Hugeint | DataType::Uhugeint => None,
         // VARIANT is an additive ABI v1 type (tag 10, the pinkdb C ABI's
         // number). Its payload rides the VARCHAR text channel as bytes in the
         // engine's VARIANT encoding — the extension sees no field names, only
@@ -618,6 +620,9 @@ pub(crate) fn push_ext_arg<'a>(
         // Unreachable: `ext_type_of` rejects UUID in the binder's exact-type
         // check before any callback can run.
         VectorData::Uuid(_) => unreachable!("extensions v1 do not accept UUID arguments"),
+        VectorData::Int128(_) | VectorData::UInt128(_) => {
+            unreachable!("extensions v1 do not accept 128-bit integer arguments")
+        }
         // The engine's array vector already holds its elements contiguously,
         // so the ABI view is a slice of it — no copy, no per-element boxing.
         VectorData::Array {

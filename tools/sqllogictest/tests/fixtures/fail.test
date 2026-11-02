@@ -1,0 +1,7 @@
+statement ok
+CREATE TABLE t(i INTEGER)
+
+query I
+SELECT 42
+----
+41

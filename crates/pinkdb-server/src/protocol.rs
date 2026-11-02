@@ -641,7 +641,7 @@ impl Response {
                 put_u32(&mut buf, count_u32(names.len(), "ResultSet columns")?);
                 for (name, dtype) in names.iter().zip(types) {
                     put_str(&mut buf, name)?;
-                    put_u8(&mut buf, dtype_byte(*dtype));
+                    put_u8(&mut buf, dtype_byte(*dtype)?);
                     // v6: DECIMAL's parameters ride after the tag.
                     if let DataType::Decimal { precision, scale } = dtype {
                         put_u8(&mut buf, *precision);
@@ -1024,12 +1024,20 @@ fn put_value(buf: &mut Vec<u8>, value: &Value) -> Result<(), ProtocolError> {
             put_u8(buf, value_tag::UUID);
             buf.extend_from_slice(&bits.to_le_bytes());
         }
+        // The wire format has no 128-bit value tag yet (step 6 of the
+        // HUGEINT plan); refusing keeps an older peer from mis-reading it.
+        Value::Hugeint(_) | Value::Uhugeint(_) => {
+            return Err(ProtocolError::Server(format!(
+                "{} is not yet supported in the wire protocol",
+                value.data_type().expect("non-null").name()
+            )));
+        }
     }
     Ok(())
 }
 
-fn dtype_byte(dtype: DataType) -> u8 {
-    match dtype {
+fn dtype_byte(dtype: DataType) -> Result<u8, ProtocolError> {
+    Ok(match dtype {
         DataType::Boolean => dtype_tag::BOOLEAN,
         DataType::Integer => dtype_tag::INTEGER,
         DataType::Bigint => dtype_tag::BIGINT,
@@ -1042,7 +1050,15 @@ fn dtype_byte(dtype: DataType) -> u8 {
         DataType::Variant => dtype_tag::VARIANT,
         DataType::Array { .. } => dtype_tag::ARRAY,
         DataType::Uuid => dtype_tag::UUID,
-    }
+        // Likewise no data-type tag yet; a client that does not know it would
+        // truncate or mis-size the column.
+        DataType::Hugeint | DataType::Uhugeint => {
+            return Err(ProtocolError::Server(format!(
+                "{} is not yet supported in the wire protocol",
+                dtype.name()
+            )));
+        }
+    })
 }
 
 /// Cursor over one frame body. Every read is checked against the remaining
@@ -1247,6 +1263,19 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hugeint_results_name_the_wire_boundary() {
+        let response = Response::ResultSet {
+            names: vec!["h".to_string()],
+            types: vec![DataType::Hugeint],
+        };
+        let err = encode_response(&response).expect_err("the wire has no 128-bit tag");
+        assert_eq!(
+            err.to_string(),
+            "HUGEINT is not yet supported in the wire protocol"
+        );
+    }
 
     #[test]
     fn login_debug_redacts_the_password() {

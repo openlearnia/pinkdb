@@ -946,6 +946,8 @@ enum CmpTail {
         negated: bool,
         right: Expr,
         escape: Option<Expr>,
+        /// `ILIKE`: the same pattern syntax, compared case-insensitively.
+        ci: bool,
     },
     SimilarTo {
         negated: bool,
@@ -1156,6 +1158,26 @@ fn apply_cmp(left: Expr, tail: CmpTail) -> Expr {
             negated,
             right,
             escape,
+            ci: true,
+        } => negate_if(
+            negated,
+            Expr::Function {
+                qual: Box::new(Qualifier::none()),
+                name: "ilike_escape".to_string(),
+                args: vec![
+                    left,
+                    right,
+                    escape.unwrap_or(Expr::Literal(Value::Varchar(String::new()))),
+                ],
+                distinct: false,
+                filter: None,
+            },
+        ),
+        CmpTail::Like {
+            negated,
+            right,
+            escape,
+            ci: false,
         } => match escape {
             None => Expr::Binary {
                 op: if negated {
@@ -1342,6 +1364,63 @@ fn parse_int(text: &str) -> Option<i64> {
     text.replace('_', "").parse().ok()
 }
 
+/// `INTERVAL '<duration>'` and `INTERVAL '<count>' <unit>`: the quoted form
+/// keeps DuckDB's duration grammar, and with a unit word the string is the
+/// count DuckDB casts to DOUBLE (`INTERVAL '5' MINUTE`).
+fn interval_literal_value(text: &str, unit: Option<crate::types::IntervalUnit>) -> Option<Expr> {
+    let iv = match unit {
+        Some(unit) => {
+            let count: f64 = text.trim().parse().ok()?;
+            crate::types::interval_from_count(unit, count)
+        }
+        None => crate::types::parse_interval(text),
+    }?;
+    Some(Expr::Literal(Value::Interval {
+        months: iv.months,
+        days: iv.days,
+        micros: iv.micros,
+    }))
+}
+
+/// `INTERVAL <count> <unit>`: a literal count folds here to an interval value
+/// (so `REFRESH` and `generate_series` still see a literal); a row-dependent
+/// count becomes the `interval_count` call the binder types.
+fn interval_count_expr(count: Expr, unit: crate::types::IntervalUnit) -> Expr {
+    if let Expr::Literal(v) = &count {
+        let folded = literal_as_double(v).and_then(|n| crate::types::interval_from_count(unit, n));
+        if let Some(iv) = folded {
+            return Expr::Literal(Value::Interval {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            });
+        }
+    }
+    Expr::Function {
+        qual: Box::new(Qualifier::none()),
+        name: "interval_count".to_string(),
+        args: vec![
+            count,
+            Expr::Literal(Value::Varchar(unit.name().to_string())),
+        ],
+        distinct: false,
+        filter: None,
+    }
+}
+
+/// A numeric literal (or a numeric string) as the DOUBLE DuckDB casts an
+/// interval count to.
+fn literal_as_double(v: &Value) -> Option<f64> {
+    match v {
+        Value::Integer(n) => Some(f64::from(*n)),
+        Value::Bigint(n) => Some(*n as f64),
+        Value::Double(d) => Some(*d),
+        Value::Decimal { value, scale, .. } => Some(*value as f64 / 10f64.powi(i32::from(*scale))),
+        Value::Varchar(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 /// A numeric literal typed like DuckDB's `NumberToValue`: a point literal
 /// with no exponent is `DECIMAL(written width, written scale)`, where the
 /// width counts every written digit including leading zeros (`0.06` is
@@ -1377,14 +1456,19 @@ fn number_value(text: &str) -> std::result::Result<Value, &'static str> {
 }
 
 /// Integer literal → `Value` with DuckDB's magnitude rule (INTEGER when it
-/// fits i32, else BIGINT); out-of-i64-range text is a parse error, exactly like
-/// the lexer's `Token::Integer` overflow error.
+/// fits i32, BIGINT when it fits i64, else HUGEINT); out-of-i128-range text is
+/// a parse error, exactly like the lexer's `Token::Integer` overflow error.
 fn int_value(text: &str) -> std::result::Result<Value, &'static str> {
-    let n = parse_int(text).ok_or("integer literal out of range")?;
-    if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
-        Ok(Value::Integer(n as i32))
-    } else {
+    let n: i128 = text
+        .replace('_', "")
+        .parse()
+        .map_err(|_| "integer literal out of range")?;
+    if let Ok(n) = i32::try_from(n) {
+        Ok(Value::Integer(n))
+    } else if let Ok(n) = i64::try_from(n) {
         Ok(Value::Bigint(n))
+    } else {
+        Ok(Value::Hugeint(n))
     }
 }
 
@@ -1426,9 +1510,52 @@ fn table_qualifier(qual: Qualifier, is_temp: bool) -> std::result::Result<Qualif
     }
 }
 
+/// Fold a primary's postfix operators left to right.
+fn apply_postfix(e: Expr, rest: Vec<PostfixOp>) -> Expr {
+    rest.into_iter().fold(e, |expr, op| match op {
+        PostfixOp::Cast(dtype) => Expr::Cast {
+            expr: Box::new(expr),
+            dtype,
+        },
+        PostfixOp::Index(i) => Expr::Subscript {
+            base: Box::new(expr),
+            index: Box::new(i),
+        },
+        PostfixOp::Slice(from, to) => Expr::Slice {
+            base: Box::new(expr),
+            from: from.map(Box::new),
+            to: to.map(Box::new),
+        },
+        // `(expr).a` is a field lookup by name: the same node a
+        // `v['a']` subscript builds, so the binder sees one
+        // shape for both spellings.
+        PostfixOp::Field(field) => Expr::Subscript {
+            base: Box::new(expr),
+            index: Box::new(Expr::Literal(Value::Varchar(field))),
+        },
+        // `AT TIME ZONE` is the two-argument `timezone(zone, ts)`
+        // scalar, DuckDB's desugaring (its column titles show
+        // `timezone('UTC', …)` too).
+        PostfixOp::AtTimeZone(zone) => Expr::Function {
+            qual: Box::new(Qualifier::none()),
+            name: "timezone".to_string(),
+            args: vec![zone, expr],
+            distinct: false,
+            filter: None,
+        },
+    })
+}
+
+/// The value of `-<digits>`: the sign is part of the literal, so i128::MIN's
+/// magnitude (which does not fit i128 on its own) parses.
+fn neg_int_literal(text: &str, rest: Vec<PostfixOp>) -> std::result::Result<Expr, &'static str> {
+    let value = int_value(&format!("-{text}"))?;
+    Ok(apply_postfix(Expr::Literal(value), rest))
+}
+
 peg::parser! {
     grammar peg_sql() for str {
-        use super::{apply_cmp, desugar_case, int_value, table_qualifier, CmpTail};
+        use super::{apply_cmp, apply_postfix, desugar_case, int_value, neg_int_literal, table_qualifier, CmpTail};
 
         // Source text between two positions. `DEFAULT` keeps the expression
         // as written for introspection and persistence; the bound expression
@@ -1454,6 +1581,8 @@ peg::parser! {
         rule rparen() = ")" ws()
         rule lbracket() = "[" ws()
         rule rbracket() = "]" ws()
+        rule lbrace() = "{" ws()
+        rule rbrace() = "}" ws()
         rule star() = "*" ws()
         rule plus() = "+" ws()
         // `-` never starts a token when it opens a `--` line comment.
@@ -1505,6 +1634,7 @@ peg::parser! {
             / s:ident_raw() ws() {?
                   match Keyword::lookup(s) {
                       None => Ok(s.to_string()),
+                      Some(k) if !k.is_reserved() => Ok(s.to_string()),
                       Some(_) => Err("identifier"),
                   }
               }
@@ -1626,8 +1756,9 @@ peg::parser! {
             / describe_stmt()
             / explain_stmt()
             / merge_stmt()
+            / pragma_stmt()
             / reset_stmt()
-            / set_variable_stmt()
+            / set_stmt()
             / select_statement()
 
         rule select_statement() -> Statement = s:query() { Statement::Select(s) }
@@ -1646,9 +1777,6 @@ peg::parser! {
             = word("pivot") source:from_source() suffix:source_suffix() word("on") on:concat_expr()
               values:pivot_in()? using:pivot_using()? group:pivot_group_by()? tail:query_tail() {?
                   let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
-                  if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
-                      return Err("derived table needs an alias");
-                  }
                   let from = FromClause {
                       source, alias, col_aliases, at, sample: None, lateral, joins: Vec::new(),
                   };
@@ -2446,14 +2574,15 @@ peg::parser! {
               }
 
         rule insert() -> Statement
-            = kw(Keyword::Insert) kw(Keyword::Into) t:table_ref() columns:col_name_list()? source:insert_source()
+            = kw(Keyword::Insert) kw(Keyword::Into) t:table_ref() by_name:insert_by_name()
+              columns:col_name_list()? source:insert_source()
               oc:on_conflict()? ret:returning_clause() {?
                   if columns.is_some() && matches!(source, InsertSource::DefaultValues) {
                       return Err("You can not provide both a column list and DEFAULT VALUES, \
                                  please remove one of the two");
                   }
                   Ok(Statement::Insert {
-                      qual: t.0, table: t.1, columns, source, on_conflict: oc, returning: ret,
+                      qual: t.0, table: t.1, by_name, columns, source, on_conflict: oc, returning: ret,
                   })
               }
             / kw(Keyword::Insert) word("or") mode:insert_or() kw(Keyword::Into) t:table_ref()
@@ -2463,7 +2592,7 @@ peg::parser! {
                                  please remove one of the two");
                   }
                   Ok(Statement::Insert {
-                      qual: t.0, table: t.1, columns, source,
+                      qual: t.0, table: t.1, by_name: false, columns, source,
                       on_conflict: Some(OnConflict { columns: None, action: mode }),
                       returning: ret,
                   })
@@ -2471,6 +2600,12 @@ peg::parser! {
             / word("replace") kw(Keyword::Into) {?
                   Err("REPLACE INTO is not supported (DuckDB has no REPLACE INTO): spell it INSERT OR REPLACE")
               }
+
+        /// `INSERT INTO t BY NAME SELECT …`: match the query's columns to the
+        /// target's by name. Only the `SELECT` source takes it.
+        rule insert_by_name() -> bool
+            = word("by") word("name") { true }
+            / { false }
 
         /// `OR REPLACE` / `OR IGNORE` after `INSERT` (wave 95b).
         rule insert_or() -> OnConflictAction
@@ -2510,6 +2645,9 @@ peg::parser! {
             = word("default") word("values") { InsertSource::DefaultValues }
             / kw(Keyword::Values) rows:insert_rows() { InsertSource::Values(rows) }
             / q:select() { InsertSource::Select(Box::new(q)) }
+            // `INSERT INTO t BY NAME (SELECT …)`: DuckDB takes the parenthesized
+            // form too.
+            / lparen() q:select() rparen() { InsertSource::Select(Box::new(q)) }
 
         rule insert_rows() -> Vec<Vec<Expr>>
             = first:insert_row() rest:(comma() r:insert_row() { r })* {
@@ -2635,33 +2773,86 @@ peg::parser! {
         rule merge_condition() -> Expr = kw(Keyword::And) e:expr() { e }
 
         rule merge_action() -> MergeAction
-            = kw(Keyword::Update) kw(Keyword::Set) first:set_item()
+            = kw(Keyword::Update) kw(Keyword::Set) star() { MergeAction::UpdateAll }
+            / kw(Keyword::Update) kw(Keyword::Set) first:set_item()
               rest:(comma() s:set_item() { s })* {
                   let mut sets = vec![first];
                   sets.extend(rest);
                   MergeAction::Update { sets }
               }
             / kw(Keyword::Delete) { MergeAction::Delete }
+            / kw(Keyword::Insert) star() { MergeAction::InsertAll }
+            / kw(Keyword::Insert) word("by") word("name") { MergeAction::InsertByName }
             / kw(Keyword::Insert) columns:col_name_list()? kw(Keyword::Values) values:insert_row() {
                   MergeAction::Insert { columns, values }
               }
 
-        /// `SET VARIABLE name = expr`, and `SET name = expr` — the engine
-        /// switches (`join_filter_pushdown`) read like DuckDB's settings.
-        /// `SET`, `VARIABLE` and the name are words, so both stay usable as
-        /// identifiers elsewhere.
-        rule set_variable_stmt() -> Statement
-            = kw(Keyword::Set) word("variable")? name:ident() eq() value:expr() {
+        /// `SET VARIABLE name = expr`, and `SET [LOCAL|SESSION|GLOBAL] name
+        /// (=|TO) expr` — the engine's settings (wave slt-2; see
+        /// [`crate::settings`]). The scope keyword is accepted and dropped:
+        /// pinkdb has one setting scope per session. `SET`, `VARIABLE` and
+        /// the name are words, so both stay usable as identifiers elsewhere.
+        rule set_stmt() -> Statement
+            = kw(Keyword::Set) word("variable") name:ident() eq() value:expr() {
                   Statement::SetVariable { name, value }
               }
-
-        /// `RESET <setting>`: the reset form of a process-wide setting
-        /// (`RESET memory_limit`). Parsed as `SET <name> = NULL`, which the
-        /// executor reads as "back to the default".
-        rule reset_stmt() -> Statement
-            = word("reset") name:ident() {
-                  Statement::SetVariable { name, value: Expr::Literal(Value::Null) }
+            / kw(Keyword::Set) (word("local") / word("session") / word("global"))?
+              name:ident() (eq() / word("to")) value:setting_value() {
+                  Statement::SetSetting { name, value }
               }
+
+        /// `RESET <setting>` / `RESET ALL`: back to the setting's default.
+        rule reset_stmt() -> Statement
+            = word("reset") kw_all() { Statement::ResetSetting { name: None } }
+            / word("reset") name:ident() { Statement::ResetSetting { name: Some(name) } }
+
+        /// `PRAGMA <name>`, `PRAGMA <name>(<args>)` and `PRAGMA <name> =
+        /// <value>` (wave slt-2). DuckDB spells a setting assignment as a
+        /// pragma too, so the `=` form becomes a [`Statement::SetSetting`];
+        /// which names are answered, accepted as no-ops or refused is the
+        /// binder's explicit lists.
+        rule pragma_stmt() -> Statement
+            = word("pragma") name:ident() args:pragma_args()? value:pragma_value()? {?
+                  match (args, value) {
+                      (Some(_), Some(_)) => Err("PRAGMA arguments or a value, not both"),
+                      (Some(args), None) => Ok(Statement::Pragma { name, args }),
+                      (None, Some(value)) => Ok(Statement::SetSetting { name, value }),
+                      (None, None) => Ok(Statement::Pragma { name, args: Vec::new() }),
+                  }
+              }
+
+        rule pragma_args() -> Vec<Expr>
+            = lparen() l:pragma_arg_list()? rparen() { l.unwrap_or_default() }
+
+        rule pragma_arg_list() -> Vec<Expr>
+            = first:setting_value() rest:(comma() e:setting_value() { e })* {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+
+        rule pragma_value() -> Expr = eq() v:setting_value() { v }
+
+        /// The right side of a setting: a `MAP {…}` literal or any
+        /// expression. DuckDB's MAP literal is kept as text — no setting
+        /// pinkdb acts on takes a map, and the corpus' renderer settings are
+        /// `MAP {'k': MAP {'k': v}}` only, so a `}` inside a quoted key would
+        /// need a real map value.
+        rule setting_value() -> Expr
+            = m:map_literal() { m }
+            / e:expr() { e }
+
+        /// `MAP {k: v, …}` → `MAP {{k: v, …}}` as a VARCHAR value.
+        rule map_literal() -> Expr
+            = word("map") lbrace() body:map_body() rbrace() {
+                  Expr::Literal(Value::Varchar(format!("MAP {{{body}}}")))
+              }
+
+        rule map_body() -> String = parts:map_body_part()* { parts.concat() }
+
+        rule map_body_part() -> String
+            = lbrace() inner:map_body() rbrace() { format!("{{{inner}}}") }
+            / s:$([^'}' | '{']+) { s.to_string() }
 
         /// `COPY <table> TO '<path>' [(FORMAT <name>)]` (wave 71).
         ///
@@ -2987,9 +3178,7 @@ peg::parser! {
         rule from_list() -> FromClause
             = source:from_source() suffix:source_suffix() sample:sample_clause() joins:(j:from_entry() { j })* {?
                   let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
-                  if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
-                      Err("derived table needs an alias")
-                  } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
+                  if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
                       Ok(FromClause { source, alias, col_aliases, at, sample, lateral, joins })
@@ -3003,9 +3192,7 @@ peg::parser! {
         rule from_entry() -> JoinClause
             = comma() source:from_source() suffix:source_suffix() sample:sample_clause() {?
                   let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
-                  if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
-                      Err("derived table needs an alias")
-                  } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
+                  if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
                       Ok(JoinClause { kind: JoinKind::Cross, source, alias, col_aliases, at, sample, lateral, on: None })
@@ -3105,12 +3292,34 @@ peg::parser! {
         /// argument (DuckDB's `read_csv(f, header = true)`), never a
         /// comparison.
         rule table_function_arg() -> crate::sql::ast::TableFunctionCallArg
-            = name:ident() (named_arg_arrow() / "=" !"=" ws()) e:expr() {
-                  crate::sql::ast::TableFunctionCallArg { name: Some(name), expr: e }
+            = name:ident() (named_arg_arrow() / "=" !"=" ws()) f:struct_literal() {
+                  crate::sql::ast::TableFunctionCallArg {
+                      name: Some(name), expr: Expr::Literal(Value::Null), fields: Some(f),
+                  }
+              }
+            / name:ident() (named_arg_arrow() / "=" !"=" ws()) e:expr() {
+                  crate::sql::ast::TableFunctionCallArg { name: Some(name), expr: e, fields: None }
               }
             / e:expr() {
-                  crate::sql::ast::TableFunctionCallArg { name: None, expr: e }
+                  crate::sql::ast::TableFunctionCallArg { name: None, expr: e, fields: None }
               }
+
+        /// `{ 'k': v, … }`: DuckDB's STRUCT literal, which the CSV reader
+        /// takes for `types`/`columns`. Only a table-function argument
+        /// accepts the form — pinkdb has no STRUCT value type to hold it.
+        rule struct_literal() -> Vec<(String, Expr)>
+            = lbrace() first:struct_field() rest:(comma() f:struct_field() { f })* rbrace() {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+
+        rule struct_field() -> (String, Expr)
+            = k:struct_key() ":" ws() v:expr() { (k, v) }
+
+        rule struct_key() -> String
+            = s:string_lit() { s }
+            / i:ident() { i }
 
         /// `:=` (DuckDB's named-argument form) or `=>` (accepted too).
         rule named_arg_arrow()
@@ -3166,9 +3375,7 @@ peg::parser! {
         rule join_clause() -> JoinClause
             = kw(Keyword::Cross) kw(Keyword::Join) source:from_source() suffix:source_suffix() sample:sample_clause() {?
                   let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
-                  if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
-                      Err("derived table needs an alias")
-                  } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
+                  if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
                       Ok(JoinClause { kind: JoinKind::Cross, source, alias, col_aliases, at, sample, lateral, on: None })
@@ -3176,9 +3383,7 @@ peg::parser! {
               }
             / kind:join_kind() source:from_source() suffix:source_suffix() sample:sample_clause() kw(Keyword::On) on:expr() {?
                   let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
-                  if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
-                      Err("derived table needs an alias")
-                  } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
+                  if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
                       Ok(JoinClause { kind, source, alias, col_aliases, at, sample, lateral, on: Some(on) })
@@ -3219,7 +3424,8 @@ peg::parser! {
               }
 
         rule group_item() -> GroupItem
-            = word("rollup") lparen() l:expr_list() rparen() { GroupItem::Set(GroupSet::Rollup(l)) }
+            = kw_all() { GroupItem::Set(GroupSet::All) }
+            / word("rollup") lparen() l:expr_list() rparen() { GroupItem::Set(GroupSet::Rollup(l)) }
             / word("cube") lparen() l:expr_list() rparen() { GroupItem::Set(GroupSet::Cube(l)) }
             / word("grouping") word("sets") lparen() s:grouping_sets() rparen() { GroupItem::Set(GroupSet::Sets(s)) }
             / e:expr() { GroupItem::Plain(e) }
@@ -3275,15 +3481,28 @@ peg::parser! {
                   out
               }
 
+        /// One order key: `ORDER BY ALL [ASC|DESC] [NULLS FIRST|LAST]`, or
+        /// an expression with the same optional suffixes. `ALL` must be tried
+        /// first — it is a plain identifier to the expression grammar.
         rule order_item() -> OrderItem
-            = e:expr() desc:order_direction() nulls:nulls_order() {
-                  OrderItem { expr: e, desc, nulls_first: nulls }
+            = kw_all() desc:order_direction() nulls:nulls_order() {
+                  OrderItem {
+                      all: true,
+                      expr: Expr::Literal(Value::Null),
+                      desc,
+                      nulls_first: nulls,
+                  }
+              }
+            / e:expr() desc:order_direction() nulls:nulls_order() {
+                  OrderItem { all: false, expr: e, desc, nulls_first: nulls }
               }
 
-        rule order_direction() -> bool
-            = kw(Keyword::Desc) { true }
-            / kw(Keyword::Asc) { false }
-            / { false }
+        /// `DESC` / `ASC`, or `None` when the session's `default_order`
+        /// decides.
+        rule order_direction() -> Option<bool>
+            = kw(Keyword::Desc) { Some(true) }
+            / kw(Keyword::Asc) { Some(false) }
+            / { None }
 
         /// `NULLS FIRST` / `NULLS LAST` (a non-reserved two-word suffix).
         rule nulls_order() -> Option<bool>
@@ -3348,7 +3567,10 @@ peg::parser! {
               }
             / neg:not_flag() kw(Keyword::In) lparen() t:in_tail(neg) { t }
             / neg:not_flag() kw(Keyword::Like) right:concat_expr() escape:escape_clause()? {
-                  CmpTail::Like { negated: neg, right, escape }
+                  CmpTail::Like { negated: neg, right, escape, ci: false }
+              }
+            / neg:not_flag() word("ilike") right:concat_expr() escape:escape_clause()? {
+                  CmpTail::Like { negated: neg, right, escape, ci: true }
               }
             / neg:not_flag() word("similar") word("to") right:concat_expr() {
                   CmpTail::SimilarTo { negated: neg, right }
@@ -3358,7 +3580,7 @@ peg::parser! {
               }
             / op:cmp_op() right:concat_expr() { CmpTail::Binary { op, right } }
 
-        /// `ESCAPE '<one char>'` after a `LIKE` pattern.
+        /// `ESCAPE '<one char>'` after a `LIKE`/`ILIKE` pattern.
         rule escape_clause() -> Expr = word("escape") e:concat_expr() { e }
 
         rule in_tail(negated: bool) -> CmpTail
@@ -3396,7 +3618,11 @@ peg::parser! {
               }
 
         rule unary() -> Expr
-            = minus() e:unary() { Expr::Unary { op: UnaryOp::Negate, expr: Box::new(e) } }
+            // The minus is part of an integer literal, so the magnitude of
+            // i128::MIN (which does not fit i128 on its own) parses; postfix
+            // casts still bind to the literal (`-5::HUGEINT`).
+            = minus() n:int_text() ws() rest:(op:postfix_op() { op })* {? neg_int_literal(n, rest) }
+            / minus() e:unary() { Expr::Unary { op: UnaryOp::Negate, expr: Box::new(e) } }
             / plus() e:unary() { Expr::Unary { op: UnaryOp::Plus, expr: Box::new(e) } }
             / cast_postfix()
 
@@ -3405,34 +3631,7 @@ peg::parser! {
         /// sit under `unary`, so `-x::INT` is `-(x::INT)`, `a || b::VARCHAR`
         /// casts only `b`, and `v['a'][1]` subscripts the field first).
         rule cast_postfix() -> Expr
-            = e:primary() rest:(op:postfix_op() { op })* {
-                  rest.into_iter().fold(e, |expr, op| match op {
-                      PostfixOp::Cast(dtype) => Expr::Cast { expr: Box::new(expr), dtype },
-                      PostfixOp::Index(i) => Expr::Subscript { base: Box::new(expr), index: Box::new(i) },
-                      PostfixOp::Slice(from, to) => Expr::Slice {
-                          base: Box::new(expr),
-                          from: from.map(Box::new),
-                          to: to.map(Box::new),
-                      },
-                      // `(expr).a` is a field lookup by name: the same node a
-                      // `v['a']` subscript builds, so the binder sees one
-                      // shape for both spellings.
-                      PostfixOp::Field(field) => Expr::Subscript {
-                          base: Box::new(expr),
-                          index: Box::new(Expr::Literal(Value::Varchar(field))),
-                      },
-                      // `AT TIME ZONE` is the two-argument `timezone(zone, ts)`
-                      // scalar, DuckDB's desugaring (its column titles show
-                      // `timezone('UTC', …)` too).
-                      PostfixOp::AtTimeZone(zone) => Expr::Function {
-                          qual: Box::new(Qualifier::none()),
-                          name: "timezone".to_string(),
-                          args: vec![zone, expr],
-                          distinct: false,
-                          filter: None,
-                      },
-                  })
-              }
+            = e:primary() rest:(op:postfix_op() { op })* { apply_postfix(e, rest) }
 
         rule postfix_op() -> PostfixOp
             = dcolon() ty:type_name() { PostfixOp::Cast(ty) }
@@ -3592,14 +3791,29 @@ peg::parser! {
                   crate::types::parse_interval(&s).ok_or("valid INTERVAL literal")
               }
 
-        /// `INTERVAL '...'` — matched as a bare word (like `extract`) so
-        /// `interval` stays usable as a column/table name and a type name.
+        /// `INTERVAL '<duration>'` or DuckDB's unquoted `INTERVAL <count>
+        /// <unit>` (`INTERVAL 6 DAY`, `INTERVAL (2+1) HOUR`,
+        /// `INTERVAL '5' MINUTE`) — matched as a bare word (like `extract`)
+        /// so `interval` stays usable as a column/table name and a type name.
         rule interval_literal() -> Expr
-            = iv:interval_value() { Expr::Literal(Value::Interval {
-                  months: iv.months,
-                  days: iv.days,
-                  micros: iv.micros,
-              }) }
+            = interval_name() body:interval_body() { body }
+
+        rule interval_body() -> Expr
+            = s:string_lit() u:interval_unit_word()? {?
+                  interval_literal_value(&s, u).ok_or("valid INTERVAL literal")
+              }
+            / c:interval_count_expr() u:interval_unit_word() { interval_count_expr(c, u) }
+
+        /// The count of `INTERVAL <count> <unit>`: a number literal or a
+        /// parenthesized expression (`(x)`, `(2+1)`, ...).
+        rule interval_count_expr() -> Expr
+            = v:number() { Expr::Literal(v) }
+            / lparen() e:expr() rparen() { e }
+
+        rule interval_unit_word() -> crate::types::IntervalUnit
+            = ws() w:ident_raw() ws() {?
+                  crate::types::IntervalUnit::from_word(w).ok_or("an interval unit")
+              }
 
         rule interval_name()
             = s:ident_raw() ws() {? if s.eq_ignore_ascii_case("interval") { Ok(()) } else { Err("INTERVAL") } }
@@ -3853,12 +4067,33 @@ peg::parser! {
 
         /// The inside of `OVER (...)` and of a `WINDOW w AS (...)` definition.
         rule window_spec() -> OverClause
-            = base:ident()? partition:partition_clause()? order:order_by_clause()? frame:frame_clause()? {
+            = base:window_base()? partition:partition_clause()? order:order_by_clause()? frame:frame_clause()? {
                   OverClause {
                       base,
                       partition: partition.unwrap_or_default(),
                       order: order.unwrap_or_default(),
                       frame,
+                  }
+              }
+
+        /// The base window's name. Not a frame keyword: those spellings are
+        /// valid identifiers now (`RANGE` is not reserved), but in a window
+        /// specification `OVER (RANGE BETWEEN …)` names no base window.
+        rule window_base() -> String
+            = quoted_ident()
+            / s:ident_raw() ws() {?
+                  match Keyword::lookup(s) {
+                      Some(
+                          Keyword::Range
+                          | Keyword::Rows
+                          | Keyword::Row
+                          | Keyword::Unbounded
+                          | Keyword::Current
+                          | Keyword::Preceding
+                          | Keyword::Following,
+                      ) => Err("window name"),
+                      Some(k) if k.is_reserved() => Err("identifier"),
+                      _ => Ok(s.to_string()),
                   }
               }
 
@@ -4838,7 +5073,6 @@ mod tests {
         "SELECT * FROM right;",
         "SELECT 1 AS left;",
         "SELECT 1 AS right;",
-        "SELECT * FROM (SELECT * FROM emp);",
         "INSERT INTO wt VALUES ",
         "SELECT/HAVING expression must be an aggregate or appear in GROUP BY",
         "UPDATE needs at least one SET assignment",
@@ -4885,8 +5119,8 @@ mod tests {
         "SELECT t.5;",
         "SELECT 5.e2;",
         "SELECT 1.e2;",
-        "SELECT 99999999999999999999;",
-        "SELECT -9223372036854775808;",
+        "SELECT 170141183460469231731687303715884105728;",
+        "SELECT -170141183460469231731687303715884105729;",
         "SELECT `x`;",
         "SELECT 1)",
         "SELECT (1;",
@@ -4916,7 +5150,6 @@ mod tests {
         "SELECT a FROM t GROUP BY;",
         "SELECT a FROM t ORDER BY;",
         "SELECT a FROM t HAVING;",
-        "SELECT * FROM (SELECT 1);",
         "SELECT * FROM (1);",
         "WITH a AS SELECT 1 SELECT * FROM a;",
         "SELECT 1 UNION SELECT;",
@@ -5163,21 +5396,44 @@ mod tests {
         assert_eq!(lit("SELECT 1E-2;"), Value::Double(0.01));
         assert_eq!(lit("SELECT 0.5E-3;"), Value::Double(0.0005));
         assert_eq!(lit("SELECT 3e2;"), Value::Double(300.0));
-        // i32-fitting integers stay INTEGER, larger ones BIGINT.
+        // i32-fitting integers stay INTEGER, larger ones BIGINT, and past
+        // i64 the cascade ends at HUGEINT (a literal that does not fit i128
+        // is still a parse error: DuckDB would widen it to BIGNUM).
         assert_eq!(lit("SELECT 2147483647;"), Value::Integer(i32::MAX));
         assert_eq!(lit("SELECT 2147483648;"), Value::Bigint(2147483648));
         assert_eq!(lit("SELECT 9223372036854775807;"), Value::Bigint(i64::MAX));
+        assert_eq!(
+            lit("SELECT 9223372036854775808;"),
+            Value::Hugeint(9223372036854775808)
+        );
+        assert_eq!(
+            lit("SELECT 99999999999999999999;"),
+            Value::Hugeint(99999999999999999999)
+        );
+        // The minus folds into the literal, so i64::MIN stays BIGINT and the
+        // signed 128-bit extremes parse.
+        assert_eq!(lit("SELECT -9223372036854775808;"), Value::Bigint(i64::MIN));
+        assert_eq!(
+            lit("SELECT -170141183460469231731687303715884105728;"),
+            Value::Hugeint(i128::MIN)
+        );
+        assert_eq!(
+            lit("SELECT 170141183460469231731687303715884105727;"),
+            Value::Hugeint(i128::MAX)
+        );
+        // A cast after a folded literal still applies to the literal
+        // (the binder keeps `Cast(Literal(...))`; `tests/hugeint.rs` checks
+        // the value it produces).
+        assert!(parse("SELECT -5::HUGEINT;").is_ok());
         // `1.` is not a float (the dot stays a token), a bare exponent marker
-        // is not a number, and out-of-i64-range text is a parse error — so
-        // i64::MIN cannot be spelled as a literal.
+        // is not a number, and text past i128 is a parse error.
         for sql in [
             "SELECT 1.;",
             "SELECT 1.e2;",
             "SELECT 5.;",
             "SELECT 1e+;",
-            "SELECT 9223372036854775808;",
-            "SELECT 99999999999999999999;",
-            "SELECT -9223372036854775808;",
+            "SELECT 170141183460469231731687303715884105728;",
+            "SELECT -170141183460469231731687303715884105729;",
         ] {
             assert!(matches!(parse(sql), Err(PinkDbError::Parse(_))), "{sql}");
         }
@@ -5718,7 +5974,7 @@ mod tests {
                 };
                 assert_eq!(over.partition.len(), 1);
                 assert_eq!(over.order.len(), 1);
-                assert!(over.order[0].desc);
+                assert_eq!(over.order[0].desc, Some(true));
                 assert!(over.frame.is_none());
             }
             _ => panic!(),
@@ -6853,5 +7109,444 @@ mod tests {
                 "{bad} must be a clean parse/parameter error"
             );
         }
+    }
+
+    #[test]
+    fn interval_count_forms_and_units() {
+        // The quoted duration grammar is unchanged.
+        assert_eq!(
+            lit("SELECT INTERVAL '6 days';"),
+            Value::Interval {
+                months: 0,
+                days: 6,
+                micros: 0
+            }
+        );
+        assert_eq!(
+            lit("SELECT INTERVAL '1.5 days';"),
+            Value::Interval {
+                months: 0,
+                days: 1,
+                micros: 43_200_000_000
+            }
+        );
+        // Unquoted counts fold when constant; the count truncates toward
+        // zero, except for milliseconds and seconds (DuckDB 2.0).
+        let days = |days| Value::Interval {
+            months: 0,
+            days,
+            micros: 0,
+        };
+        assert_eq!(lit("SELECT INTERVAL 3 DAY;"), days(3));
+        assert_eq!(lit("SELECT INTERVAL 1 DAYS;"), days(1));
+        assert_eq!(lit("SELECT interval 1.5 day;"), days(1));
+        assert_eq!(lit("SELECT INTERVAL (1.5) DAY;"), days(1));
+        assert_eq!(
+            lit("SELECT INTERVAL '5' MINUTE;"),
+            Value::Interval {
+                months: 0,
+                days: 0,
+                micros: 300_000_000
+            }
+        );
+        assert_eq!(
+            lit("SELECT INTERVAL 1.2345675 SECOND;"),
+            Value::Interval {
+                months: 0,
+                days: 0,
+                micros: 1_234_568
+            }
+        );
+        for (word, months, days, micros) in [
+            ("MICROSECOND", 0, 0, 3),
+            ("MILLISECOND", 0, 0, 3_000),
+            ("SECOND", 0, 0, 3_000_000),
+            ("MINUTE", 0, 0, 180_000_000),
+            ("HOUR", 0, 0, 10_800_000_000),
+            ("DAY", 0, 3, 0),
+            ("WEEK", 0, 21, 0),
+            ("MONTH", 3, 0, 0),
+            ("QUARTER", 9, 0, 0),
+            ("YEAR", 36, 0, 0),
+            ("DECADE", 360, 0, 0),
+            ("CENTURY", 3_600, 0, 0),
+            ("MILLENNIUM", 36_000, 0, 0),
+        ] {
+            let want = Value::Interval {
+                months,
+                days,
+                micros,
+            };
+            assert_eq!(lit(&format!("SELECT INTERVAL 3 {word};")), want, "{word}");
+        }
+        for (plural, singular) in [
+            ("MICROSECONDS", "MICROSECOND"),
+            ("MILLISECONDS", "MILLISECOND"),
+            ("SECONDS", "SECOND"),
+            ("MINUTES", "MINUTE"),
+            ("HOURS", "HOUR"),
+            ("DAYS", "DAY"),
+            ("WEEKS", "WEEK"),
+            ("MONTHS", "MONTH"),
+            ("QUARTERS", "QUARTER"),
+            ("YEARS", "YEAR"),
+            ("DECADES", "DECADE"),
+            ("CENTURIES", "CENTURY"),
+            ("MILLENNIA", "MILLENNIUM"),
+        ] {
+            assert_eq!(
+                lit(&format!("SELECT INTERVAL 2 {plural};")),
+                lit(&format!("SELECT INTERVAL 2 {singular};")),
+                "{plural}"
+            );
+        }
+        // A row-dependent count stays a call for the binder to type.
+        let (count, unit) = interval_call("SELECT INTERVAL (x) DAY;");
+        assert!(matches!(count, Expr::Column { .. }));
+        assert_eq!(unit, "day");
+        let (count, unit) = interval_call("SELECT INTERVAL (2 + x) WEEK;");
+        assert!(matches!(count, Expr::Binary { .. }));
+        assert_eq!(unit, "week");
+        // `interval` and unit words stay usable as column names.
+        let Statement::Select(sel) = parse_one("SELECT interval, day FROM t;") else {
+            panic!()
+        };
+        assert!(matches!(
+            &sel.projections[0],
+            Projection::Expr { expr: Expr::Column { name, .. }, .. } if name == "interval"
+        ));
+        assert!(matches!(
+            &sel.projections[1],
+            Projection::Expr { expr: Expr::Column { name, .. }, .. } if name == "day"
+        ));
+        // DuckDB reads `INTERVAL -2 DAY` as `interval` minus 2 aliased `day`
+        // (a binder error when no such column exists), not the interval form.
+        let Statement::Select(sel) = parse_one("SELECT INTERVAL -2 DAY;") else {
+            panic!()
+        };
+        assert!(matches!(
+            &sel.projections[0],
+            Projection::Expr {
+                expr: Expr::Binary { .. },
+                ..
+            }
+        ));
+        // A unit word is mandatory, and the duration grammar does not take
+        // one after it.
+        for bad in [
+            "SELECT INTERVAL 3;",
+            "SELECT INTERVAL '1 day' HOUR;",
+            "SELECT INTERVAL 3 FORTNIGHT;",
+            "SELECT INTERVAL 2 MILLENNIUMS;",
+            "SELECT INTERVAL 2 CENTURYS;",
+        ] {
+            assert!(parse(bad).is_err(), "{bad} must not parse");
+        }
+    }
+
+    /// The desugared `interval_count(count, '<unit>')` call of an unquoted
+    /// interval with a non-constant count.
+    fn interval_call(sql: &str) -> (Expr, String) {
+        let Expr::Function { name, args, .. } = projection_expr(parse_one(sql)) else {
+            panic!("not a call: {sql}");
+        };
+        assert_eq!(name, "interval_count");
+        let Expr::Literal(Value::Varchar(unit)) = &args[1] else {
+            panic!("unit is not a string literal: {sql}");
+        };
+        (args[0].clone(), unit.clone())
+    }
+
+    /// The body of a `NOT x` unary, else the expression itself.
+    fn without_not(e: Expr) -> Expr {
+        match e {
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr,
+            } => *expr,
+            other => other,
+        }
+    }
+
+    /// `ILIKE` folds case, so it desugars to the `ilike_escape` scalar;
+    /// `LIKE … ESCAPE` keeps `like_escape` and a plain `LIKE` stays `~~`.
+    #[test]
+    fn ilike_and_like_escape_desugar() {
+        let ci = |sql: &str| without_not(projection_expr(parse_one(sql)));
+        let Expr::Function { name, args, .. } = ci("SELECT a ILIKE 'x%' AS b FROM t") else {
+            panic!("ILIKE is not a call");
+        };
+        assert_eq!(name, "ilike_escape");
+        assert_eq!(args.len(), 3, "no ESCAPE means an empty escape string");
+        assert_eq!(args[2], Expr::Literal(Value::Varchar(String::new())));
+        let Expr::Function { name, args, .. } =
+            ci(r#"SELECT a NOT ILIKE 'x\%' ESCAPE '\' AS b FROM t"#)
+        else {
+            panic!("NOT ILIKE ESCAPE is not a call");
+        };
+        assert_eq!(name, "ilike_escape");
+        assert_eq!(args[2], Expr::Literal(Value::Varchar("\\".to_string())));
+        let Expr::Function { name, .. } = without_not(projection_expr(parse_one(
+            r#"SELECT a LIKE 'x\%' ESCAPE '\' AS b"#,
+        ))) else {
+            panic!("LIKE ESCAPE is not a call");
+        };
+        assert_eq!(name, "like_escape");
+        assert!(matches!(
+            projection_expr(parse_one("SELECT a NOT LIKE 'x%' AS b")),
+            Expr::Binary {
+                op: BinaryOp::NotLike,
+                ..
+            }
+        ));
+        // `ILIKE` is a bare word, not a reserved one: a column may be named it.
+        assert!(matches!(
+            projection_expr(parse_one("SELECT ilike FROM t")),
+            Expr::Column { name, .. } if name == "ilike"
+        ));
+    }
+
+    #[test]
+    fn insert_by_name_parses() {
+        let Statement::Insert { by_name, .. } = parse_one("INSERT INTO t BY NAME SELECT 5 AS b")
+        else {
+            panic!("not an INSERT");
+        };
+        assert!(by_name, "BY NAME must reach the AST");
+        let Statement::Insert { by_name, .. } = parse_one("INSERT INTO t SELECT 1") else {
+            panic!("not an INSERT");
+        };
+        assert!(!by_name);
+        // `BY NAME` precedes a column list, as DuckDB's grammar has it.
+        parse_one("INSERT INTO t BY NAME (SELECT 5 AS b)");
+    }
+
+    #[test]
+    fn merge_set_star_and_insert_star_parse() {
+        let Statement::Merge { clauses, .. } = parse_one(
+            "MERGE INTO t USING s ON t.a = s.a \
+             WHEN MATCHED THEN UPDATE SET * \
+             WHEN NOT MATCHED THEN INSERT *",
+        ) else {
+            panic!("not a MERGE");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert!(matches!(clauses[0].action, MergeAction::UpdateAll));
+        assert!(matches!(clauses[1].action, MergeAction::InsertAll));
+        let Statement::Merge { clauses, .. } =
+            parse_one("MERGE INTO t USING s ON t.a = s.a WHEN NOT MATCHED THEN INSERT BY NAME")
+        else {
+            panic!("not a MERGE");
+        };
+        assert!(matches!(clauses[0].action, MergeAction::InsertByName));
+    }
+
+    /// The `{key: value, …}` literal is a table-function argument shape only;
+    /// anywhere else it stays a syntax error.
+    #[test]
+    fn table_function_struct_literal_arguments() {
+        let Statement::Select(sel) = parse_one(
+            "SELECT * FROM read_csv('f.csv', types = {'DAY_ID': 'DATE', AMT: 'DECIMAL(10,2)'})",
+        ) else {
+            panic!("not a SELECT");
+        };
+        let Some(FromClause {
+            source: FromSource::Function { args, .. },
+            ..
+        }) = sel.from
+        else {
+            panic!("not a table function");
+        };
+        assert_eq!(args[1].name.as_deref(), Some("types"));
+        let fields = args[1].fields.as_ref().expect("struct fields");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0, "DAY_ID");
+        assert_eq!(
+            fields[0].1,
+            Expr::Literal(Value::Varchar("DATE".to_string()))
+        );
+        assert_eq!(fields[1].0, "AMT");
+        assert_eq!(
+            fields[1].1,
+            Expr::Literal(Value::Varchar("DECIMAL(10,2)".to_string()))
+        );
+        // A plain argument carries no fields, and the list form stays an array.
+        assert!(args[0].fields.is_none());
+        let Statement::Select(sel) = parse_one("SELECT * FROM read_csv('f.csv', types = ['DATE'])")
+        else {
+            panic!("not a SELECT");
+        };
+        let Some(FromClause {
+            source: FromSource::Function { args, .. },
+            ..
+        }) = sel.from
+        else {
+            panic!("not a table function");
+        };
+        assert!(args[1].fields.is_none());
+        assert!(matches!(args[1].expr, Expr::ArrayLiteral(_)));
+        for bad in ["SELECT {a: 1};", "SELECT * FROM t WHERE {a: 1};"] {
+            assert!(parse(bad).is_err(), "{bad} must not parse");
+        }
+    }
+
+    /// DuckDB names an alias-less derived table `unnamed_subquery`; the parser
+    /// takes one wherever a FROM item goes.
+    #[test]
+    fn derived_tables_need_no_alias() {
+        let Statement::Select(sel) = parse_one("SELECT * FROM (SELECT 1 AS a)") else {
+            panic!("not a SELECT");
+        };
+        let Some(from) = sel.from else {
+            panic!("no FROM");
+        };
+        assert!(from.alias.is_none());
+        assert!(matches!(from.source, FromSource::Derived(_)));
+        for sql in [
+            "SELECT * FROM (SELECT 1 AS a) JOIN (SELECT 1 AS b) ON a = b;",
+            "SELECT (SELECT 1) IN (SELECT * FROM (SELECT 1));",
+            "INSERT INTO t SELECT * FROM (SELECT 1, 2);",
+            "CREATE TABLE t2 AS SELECT * FROM (SELECT 1);",
+            "MERGE INTO t USING (SELECT 1 AS a) ON t.a = a WHEN MATCHED THEN DELETE;",
+            "SELECT * FROM (SELECT 1 AS a), (SELECT 2 AS b);",
+        ] {
+            parse_one(sql);
+        }
+    }
+    /// `PRAGMA` in DuckDB's three forms, and the settings spellings next to
+    /// it: a bare pragma is a pragma, `= value` is a setting assignment, and
+    /// the paren form carries the pragma's arguments.
+    #[test]
+    fn pragma_and_setting_forms_parse() {
+        match parse_one("PRAGMA disable_checkpoint_on_shutdown;") {
+            Statement::Pragma { name, args } => {
+                assert_eq!(name, "disable_checkpoint_on_shutdown");
+                assert!(args.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_one("PRAGMA table_info('s.t');") {
+            Statement::Pragma { name, args } => {
+                assert_eq!(name, "table_info");
+                assert_eq!(args, vec![Expr::Literal(Value::Varchar("s.t".to_string()))]);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A bare identifier argument names the table, as in DuckDB.
+        match parse_one("PRAGMA table_info(t);") {
+            Statement::Pragma { args, .. } => {
+                assert!(matches!(&args[0], Expr::Column { name, .. } if name == "t"));
+            }
+            other => panic!("{other:?}"),
+        }
+        for sql in [
+            "PRAGMA threads = 4;",
+            "PRAGMA threads=4;",
+            "SET threads = 4;",
+            "SET SESSION threads = 4;",
+            "SET GLOBAL threads TO 4;",
+            "SET LOCAL threads = 4;",
+            "PRAGMA force_compression = 'zstd';",
+            "PRAGMA explain_output = PHYSICAL_ONLY;",
+        ] {
+            assert!(
+                matches!(parse_one(sql), Statement::SetSetting { .. }),
+                "{sql}"
+            );
+        }
+        // An unquoted value is the identifier it looks like; the binder turns
+        // it into text for the settings that want text.
+        match parse_one("PRAGMA explain_output = PHYSICAL_ONLY;") {
+            Statement::SetSetting { name, value } => {
+                assert_eq!(name, "explain_output");
+                assert!(matches!(value, Expr::Column { name, .. } if name == "PHYSICAL_ONLY"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // DuckDB's `MAP {…}` setting value is kept as text: no setting pinkdb
+        // acts on takes a map.
+        match parse_one("SET profiling_renderer_settings = MAP {'a': MAP {'b': 0}};") {
+            Statement::SetSetting { value, .. } => {
+                assert_eq!(
+                    value,
+                    Expr::Literal(Value::Varchar("MAP {'a': MAP {'b': 0}}".to_string()))
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // `SET VARIABLE` keeps its own statement.
+        assert!(matches!(
+            parse_one("SET VARIABLE x = 1;"),
+            Statement::SetVariable { .. }
+        ));
+        assert!(matches!(
+            parse_one("RESET threads;"),
+            Statement::ResetSetting { name: Some(_) }
+        ));
+        assert!(matches!(
+            parse_one("RESET ALL;"),
+            Statement::ResetSetting { name: None }
+        ));
+        // Arguments and a value in one pragma is a parse error.
+        assert!(matches!(
+            parse("PRAGMA table_info('t') = 1;"),
+            Err(PinkDbError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn group_and_order_by_all_parse() {
+        let Statement::Select(sel) = parse_one("SELECT a, sum(b) FROM t GROUP BY ALL;") else {
+            panic!()
+        };
+        assert!(matches!(sel.group_sets.as_slice(), [GroupSet::All]));
+        assert!(sel.group_by.is_empty());
+        let Statement::Select(sel) = parse_one("SELECT a FROM t GROUP BY a, ALL;") else {
+            panic!()
+        };
+        assert_eq!(sel.group_by.len(), 1);
+        assert!(matches!(sel.group_sets.as_slice(), [GroupSet::All]));
+        let Statement::Select(sel) = parse_one("SELECT a, b FROM t ORDER BY ALL DESC;") else {
+            panic!()
+        };
+        assert!(sel.order_by[0].all);
+        assert_eq!(sel.order_by[0].desc, Some(true));
+        let Statement::Select(sel) = parse_one("SELECT a FROM t ORDER BY ALL;") else {
+            panic!()
+        };
+        assert!(sel.order_by[0].all);
+        assert_eq!(sel.order_by[0].desc, None);
+    }
+
+    /// DuckDB's `CHAR(n)` family is VARCHAR, its type names are column names,
+    /// `count()` is `count(*)`, and a table function's name may name a column.
+    #[test]
+    fn duckdb_type_and_name_spellings_parse() {
+        let Statement::CreateTable { items, .. } =
+            parse_one("CREATE TABLE t (a CHAR(1), b CHARACTER(5), c BPCHAR, d VARCHAR(10));")
+        else {
+            panic!()
+        };
+        for item in &items {
+            let TableItem::Column(column) = item else {
+                panic!("{item:?}")
+            };
+            assert_eq!(column.dtype, crate::types::DataType::Varchar, "{column:?}");
+        }
+        assert!(matches!(
+            parse_one("CREATE TABLE t (date DATE, timestamp TIMESTAMP, range INTEGER);"),
+            Statement::CreateTable { .. }
+        ));
+        assert!(matches!(
+            parse_one("CREATE TABLE t AS SELECT range % 10 AS g FROM range(100);"),
+            Statement::CreateTableAs { .. }
+        ));
+        let Statement::Select(sel) = parse_one("SELECT count() FROM t;") else {
+            panic!()
+        };
+        assert!(matches!(
+            &sel.projections[0],
+            Projection::Expr { expr: Expr::Function { args, .. }, .. } if args.is_empty()
+        ));
     }
 }

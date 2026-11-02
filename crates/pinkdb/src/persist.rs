@@ -574,8 +574,8 @@ pub struct SavedTableStats {
 /// [`crate::stats::Zone`] the local tables keep and the scans prune with.
 type ChunkColumnStats = crate::stats::Zone;
 
-fn dtype_tag(t: DataType) -> u8 {
-    match t {
+fn dtype_tag(t: DataType) -> Result<u8> {
+    Ok(match t {
         DataType::Boolean => 0,
         DataType::Integer => 1,
         DataType::Bigint => 2,
@@ -596,7 +596,16 @@ fn dtype_tag(t: DataType) -> u8 {
         DataType::Array { .. } => 10,
         // UUID is a fixed 16-byte payload, so the tag carries no parameters.
         DataType::Uuid => 11,
-    }
+        // The 128-bit integers have no layout in this format yet (step 5 of
+        // `docs/slt-3-hugeint-plan.md`). Refusing here keeps every writer
+        // from emitting a tag a reader would reject as corrupt.
+        DataType::Hugeint | DataType::Uhugeint => {
+            return Err(PinkDbError::Execution(format!(
+                "{} is not yet supported in .pink storage",
+                t.name()
+            )));
+        }
+    })
 }
 
 fn dtype_from_tag(b: u8) -> Result<DataType> {
@@ -2299,6 +2308,11 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
                 consider_best(&mut best, ENC_FSST, fsst);
             }
         }
+        // Guarded by `write_table`'s refusal: a table with a 128-bit column
+        // never reaches the encoder (step 5 gives it a layout).
+        DataType::Hugeint | DataType::Uhugeint => {
+            unreachable!("128-bit integer chunks have no .pink layout yet")
+        }
     }
     best.expect("at least plain encoding")
 }
@@ -3285,6 +3299,10 @@ fn write_stat_value(w: &mut Writer, v: Option<&Value>) {
     match v {
         None => w.u8(SV_NONE),
         Some(Value::Array(_)) => w.u8(SV_NONE),
+        // Guarded by `write_table`'s refusal, and no reader can produce a
+        // 128-bit value from a saved zone map: keep the file self-consistent
+        // rather than inventing a tag before step 5.
+        Some(Value::Hugeint(_) | Value::Uhugeint(_)) => w.u8(SV_NONE),
         Some(Value::Boolean(b)) => {
             w.u8(SV_BOOL);
             w.u8(*b as u8);
@@ -3868,7 +3886,7 @@ impl PinkDb {
                     fw.u32(tdir.schema.len() as u32);
                     for (col, dtype) in &tdir.schema {
                         fw.str(col);
-                        fw.u8(dtype_tag(*dtype));
+                        fw.u8(dtype_tag(*dtype)?);
                         if let DataType::Decimal { precision, scale } = dtype {
                             fw.u8(*precision);
                             fw.u8(*scale);
@@ -3919,7 +3937,7 @@ impl PinkDb {
                     write_materialized_view_defs(&mut fw, &sdir.materialized_views);
                 }
                 if with_procedures {
-                    write_procedure_defs(&mut fw, &sdir.procedures);
+                    write_procedure_defs(&mut fw, &sdir.procedures)?;
                 }
                 if with_triggers {
                     write_trigger_defs(&mut fw, &sdir.triggers);
@@ -4427,6 +4445,17 @@ fn write_table<S: Sink>(
 ) -> Result<(TableDir, TableCarry)> {
     let schema = t.schema();
     let n_chunks = t.num_chunks();
+    // The .pink format has no 128-bit integer layout yet (step 5 of
+    // `docs/slt-3-hugeint-plan.md`). Refuse before encoding any page, so a
+    // table with such a column cannot reach the writer at all.
+    for (col, dtype) in &schema {
+        if matches!(dtype, DataType::Hugeint | DataType::Uhugeint) {
+            return Err(PinkDbError::Execution(format!(
+                "{} is not yet supported in .pink storage (column \"{col}\")",
+                dtype.name()
+            )));
+        }
+    }
     // The per-column statistics of the whole table (the lake's stats
     // block), accumulated as each row group is encoded.
     let mut accs: Vec<ChunkColumnStats> =
@@ -5246,6 +5275,8 @@ fn null_vector(dtype: DataType, rows: usize) -> Vector {
             scale,
         },
         DataType::Uuid => VectorData::Uuid(vec![0; rows]),
+        DataType::Hugeint => VectorData::Int128(vec![0; rows]),
+        DataType::Uhugeint => VectorData::UInt128(vec![0; rows]),
         DataType::Interval => VectorData::Interval(vec![
             crate::types::Interval {
                 months: 0,
@@ -6111,7 +6142,7 @@ fn read_materialized_view_defs(r: &mut Reader) -> Result<Vec<crate::storage::Mat
 /// not stored**: only the text, which the loader re-parses (a body is
 /// validated at `CREATE`, and a stored body that no longer parses is a
 /// corrupt file). JavaScript bodies are opaque text and load in every build.
-fn write_procedure_defs(w: &mut Writer, defs: &[crate::procedure::ProcedureDef]) {
+fn write_procedure_defs(w: &mut Writer, defs: &[crate::procedure::ProcedureDef]) -> Result<()> {
     w.u32(defs.len() as u32);
     for def in defs {
         w.str(&def.name);
@@ -6119,7 +6150,7 @@ fn write_procedure_defs(w: &mut Writer, defs: &[crate::procedure::ProcedureDef])
         w.u32(def.params.len() as u32);
         for (name, dtype) in &def.params {
             w.str(name);
-            w.u8(dtype_tag(*dtype));
+            w.u8(dtype_tag(*dtype)?);
             // DECIMAL rides its precision/scale, exactly like the schema.
             if let DataType::Decimal { precision, scale } = dtype {
                 w.u8(*precision);
@@ -6132,6 +6163,7 @@ fn write_procedure_defs(w: &mut Writer, defs: &[crate::procedure::ProcedureDef])
         }
         w.str(&def.source);
     }
+    Ok(())
 }
 
 /// Encode one database's trigger section: the count, then per trigger (in
@@ -6668,6 +6700,10 @@ fn plain_payload(v: &Vector) -> Vec<u8> {
         DataType::Varchar => enc_strs_plain(&varchar_payload(v)),
         DataType::Variant => variant_payload(v),
         DataType::Array { .. } => array_payload(v, 1),
+        // `write_table` refuses 128-bit columns before any page is encoded.
+        DataType::Hugeint | DataType::Uhugeint => {
+            unreachable!("128-bit integers have no PLAIN layout")
+        }
         DataType::Uuid => {
             let VectorData::Uuid(values) = v.data() else {
                 unreachable!()
@@ -8176,6 +8212,10 @@ mod tests {
                 3 => 0x8000_0000_0000_4000_8000_0000_0000_0000,
                 _ => (i as u128) << 64 | i as u128,
             }),
+            // Not in the corpus dtype list: no .pink layout exists yet.
+            DataType::Hugeint | DataType::Uhugeint => {
+                unreachable!("128-bit integers have no .pink round trip")
+            }
             DataType::Interval => Value::Interval {
                 months: match i % 5 {
                     0 => 0,
@@ -9272,6 +9312,10 @@ mod tests {
                     DataType::Date => Value::Date(r as i32),
                     DataType::Timestamp => Value::Timestamp(r as i64),
                     DataType::Uuid => Value::Uuid(u128::from(r) << 64 | u128::from(r >> 1)),
+                    // `write_table` refuses these before any page is encoded.
+                    DataType::Hugeint | DataType::Uhugeint => {
+                        unreachable!("128-bit integers have no .pink layout")
+                    }
                     DataType::Decimal { scale, .. } => Value::decimal(r as i128, scale),
                     DataType::Interval => Value::Interval {
                         months: (r % 1000) as i32,

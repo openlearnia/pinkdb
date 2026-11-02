@@ -96,6 +96,10 @@ pub struct TableFunctionArg {
     /// positional argument.
     pub name: Option<String>,
     pub value: Value,
+    /// A `{key: value, …}` or `[value, …]` literal given in place of a value
+    /// (`read_csv(…, types={'a': 'DATE'})`), rendered as its text: the engine
+    /// has no STRUCT and no text-list value, so the source parses this back.
+    pub literal: Option<String>,
 }
 
 impl TableFunctionArg {
@@ -108,6 +112,12 @@ impl TableFunctionArg {
 
 impl fmt::Display for TableFunctionArg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(literal) = &self.literal {
+            return match &self.name {
+                Some(name) => write!(f, "{name} := {literal}"),
+                None => write!(f, "{literal}"),
+            };
+        }
         match &self.name {
             Some(name) => write!(f, "{name} := {}", display_value(&self.value)),
             None => write!(f, "{}", display_value(&self.value)),

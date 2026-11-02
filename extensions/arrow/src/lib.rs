@@ -394,6 +394,7 @@ mod tests {
                     args: vec![pinkdb::TableFunctionArg {
                         name: None,
                         value: pinkdb::Value::Varchar("x.arrow".to_string()),
+                        literal: None,
                     }],
                 })
                 .unwrap_err()
@@ -425,6 +426,7 @@ mod tests {
                 args: vec![pinkdb::TableFunctionArg {
                     name: None,
                     value: pinkdb::Value::Integer(1),
+                    literal: None,
                 }],
             })
             .unwrap_err()
