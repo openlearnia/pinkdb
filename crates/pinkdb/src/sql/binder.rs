@@ -3744,7 +3744,7 @@ impl<'a> Binder<'a> {
         if name.eq_ignore_ascii_case("current_setting") {
             let [Expr::Literal(Value::Varchar(setting))] = args else {
                 return Err(PinkDbError::Type(
-                    "current_setting takes one constant name".to_string(),
+                    "current_setting() takes one constant setting name".to_string(),
                 ));
             };
             let canonical = crate::settings::resolve(setting)?;

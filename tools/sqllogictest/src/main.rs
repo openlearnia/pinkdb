@@ -153,20 +153,28 @@ fn run_command(args: &[String]) -> ExitCode {
     }
 
     let started = Instant::now();
+    // pinkdb's memory limit is process-wide (wave 136a), while DuckDB's is per
+    // database: a file that sets it would squeeze every file running beside
+    // it. Those files run one at a time after the parallel phase, each
+    // followed by a reset of the limit.
+    let (serial, parallel): (Vec<usize>, Vec<usize>) =
+        (0..files.len()).partition(|&i| sets_process_limit(&files[i].1));
     let next = AtomicUsize::new(0);
     let (sender, receiver) = mpsc::channel();
-    let results = std::thread::scope(|scope| {
-        for _ in 0..args.jobs.min(files.len()) {
+    let mut results = std::thread::scope(|scope| {
+        for _ in 0..args.jobs.min(parallel.len()) {
             let sender = sender.clone();
             let files = &files;
+            let parallel = &parallel;
             let config = &config;
             let next = &next;
             scope.spawn(move || {
                 loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some((rel, path)) = files.get(index) else {
+                    let slot = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&index) = parallel.get(slot) else {
                         break;
                     };
+                    let (rel, path) = &files[index];
                     let result = run_file(config, path, rel);
                     if sender.send((index, result)).is_err() {
                         break;
@@ -181,6 +189,11 @@ fn run_command(args: &[String]) -> ExitCode {
         }
         results
     });
+    for index in serial {
+        let (rel, path) = &files[index];
+        results.push((index, run_file(&config, path, rel)));
+        pinkdb::memory::reset_limit();
+    }
     let wall_ms = started.elapsed().as_millis() as u64;
     let mut results: Vec<_> = results.into_iter().collect();
     results.sort_by_key(|(index, _)| *index);
@@ -349,4 +362,13 @@ fn print_help() {
          --slow includes .test_slow files. --minimal writes status and skip reason only\n\
          (the baseline form). --list prints the selected files instead of running them."
     );
+}
+
+/// Whether a test file sets pinkdb's process-wide memory limit
+/// (`memory_limit` or its alias `max_memory`).
+fn sets_process_limit(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|text| {
+        let text = text.to_ascii_lowercase();
+        text.contains("memory_limit") || text.contains("max_memory")
+    })
 }
