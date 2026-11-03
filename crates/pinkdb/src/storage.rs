@@ -145,7 +145,11 @@ impl StoreSource {
             SourceData::File { file, .. } => {
                 pread_exact(file, offset, buf)?;
                 #[cfg(test)]
-                SOURCE_READ_BYTES.with(|bytes| bytes.set(bytes.get() + buf.len() as u64));
+                {
+                    SOURCE_READ_BYTES
+                        .fetch_add(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    SOURCE_READ_BYTES_LOCAL.with(|bytes| bytes.set(bytes.get() + buf.len() as u64));
+                }
             }
         }
         Ok(())
@@ -190,13 +194,24 @@ impl std::fmt::Debug for StoreSource {
 // What a `File` source has read on this thread. A test hook: an open must
 // leave the data region alone until a statement reads a chunk.
 #[cfg(test)]
-thread_local! {
-    static SOURCE_READ_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
+static SOURCE_READ_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 pub(crate) fn source_read_bytes() -> u64 {
-    SOURCE_READ_BYTES.with(|bytes| bytes.get())
+    SOURCE_READ_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// The reads made by the calling thread, for an exact assertion (an open runs
+// on the test's thread; other tests' stores read the same files in parallel,
+// which moves the process-wide counter).
+#[cfg(test)]
+thread_local! {
+    static SOURCE_READ_BYTES_LOCAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn source_read_bytes_local() -> u64 {
+    SOURCE_READ_BYTES_LOCAL.with(|bytes| bytes.get())
 }
 
 /// Fill `buf` from `offset` with a positioned read, so concurrent workers do
@@ -544,6 +559,11 @@ impl EncodedChunk {
         self.chunk.decode_page(self.page, dtype)
     }
 
+    /// Check the enclosing chunk's checksum and page index, decoding nothing.
+    fn verify(&self) -> Result<()> {
+        self.chunk.verify()
+    }
+
     /// The pool bytes a decode of this page needs, before the vector exists:
     /// the decoded width per row, over the page's encoded length.
     fn decoded_bound(&self, dtype: DataType) -> Result<usize> {
@@ -683,7 +703,17 @@ impl ChunkHandle {
             Some(encoded) => encoded,
             None => return Err(missing_payload()),
         };
-        let mut charge = crate::memory::reserve(encoded.decoded_bound(dtype)?)?;
+        // A write's decode is the truth until saved: it charges the operator
+        // pool and fails when there is truly no room. A scan's decode is a
+        // cache entry, charged to `decoded_cache_limit`; when that budget is
+        // full even after evicting, the chunk is decoded for this caller alone
+        // — a query never fails because the cache is full.
+        let bound = encoded.decoded_bound(dtype)?;
+        let mut charge = if dirty {
+            Some(crate::memory::reserve(bound)?)
+        } else {
+            crate::memory::reserve_decoded(bound)
+        };
         let mut state = handle.lock();
         // Another thread may have decoded the chunk while this one reserved.
         if let Some(payload) = state.payload.as_ref() {
@@ -692,12 +722,28 @@ impl ChunkHandle {
             return Ok(vector);
         }
         let encoded = state.encoded.clone().ok_or_else(missing_payload)?;
+        let mut cached = charge.is_some();
         let decoded = Arc::new(encoded.decode(dtype)?);
-        // The bound over-estimates; the charge follows the chunk's real size.
-        charge.resize(decoded.memory_size())?;
+        if cached {
+            // The bound over-estimates; the charge follows the chunk's real
+            // size. A cache entry that cannot grow to it is simply not cached.
+            match charge
+                .as_mut()
+                .expect("cached")
+                .resize(decoded.memory_size())
+            {
+                Ok(()) => {}
+                Err(_) if !dirty => cached = false,
+                Err(e) => return Err(e),
+            }
+        }
+        if !cached {
+            drop(state);
+            return Ok(decoded);
+        }
         state.payload = Some(ChunkPayload {
             vector: Arc::clone(&decoded),
-            charge: Arc::new(charge),
+            charge: Arc::new(charge.expect("cached")),
         });
         state.dirty |= dirty;
         // Registered under the handle's lock: an eviction that raced past here
@@ -1070,6 +1116,22 @@ impl Column {
         match self.chunks.get(i) {
             Some(handle) => ChunkHandle::get(handle, self.dtype, false),
             None => Err(self.out_of_range(i)),
+        }
+    }
+
+    /// Chunk `i` decoded for one caller alone: a streaming scan drops it when
+    /// the morsel's operators finish, so it is neither cached nor charged to
+    /// the decoded cache (wave 136c-2). A chunk that is already decoded is
+    /// shared instead of decoded again — someone already paid for it.
+    #[allow(dead_code)] // the §10 A/B's uncached variant; see `execute`
+    pub(crate) fn chunk_uncached(&self, i: usize) -> Result<Arc<Vector>> {
+        let handle = self.chunks.get(i).ok_or_else(|| self.out_of_range(i))?;
+        if let Some(vector) = handle.decoded(false) {
+            return Ok(vector);
+        }
+        match handle.stored() {
+            Some(encoded) => Ok(Arc::new(encoded.decode(self.dtype)?)),
+            None => Err(missing_payload()),
         }
     }
 
@@ -2841,15 +2903,53 @@ impl DataTable {
     /// whole read the query never asked for (wave 136b step 2). Placeholders
     /// stay checked: `DataChunk::expect_column` rejects one the projection does
     /// reach.
-    /// Materialize every chunk. The lake hands whole tables to its readers, so
-    /// its provider path decodes here; queries decode only what they read.
-    pub fn decode_all(&self) -> Result<()> {
+    /// Check every column chunk's checksum and page index, decoding nothing:
+    /// the lake hands whole tables to its readers, and a reader decodes each
+    /// chunk through the cache as it reads it (wave 136c-2).
+    pub fn verify_all(&self) -> Result<()> {
         for col in &self.columns {
-            for i in 0..col.num_chunks() {
-                col.chunk(i)?;
+            for handle in &col.chunks {
+                if let Some(chunk) = handle.stored() {
+                    chunk.verify()?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Read chunk `idx` outside the decoded cache: a streaming scan's chunks
+    /// live only as long as the morsel that read them.
+    pub(crate) fn scan_chunk_uncached(&self, idx: usize) -> Result<Option<DataChunk>> {
+        if idx >= self.num_chunks() {
+            return Ok(None);
+        }
+        let mut cols = Vec::with_capacity(self.columns.len());
+        for c in &self.columns {
+            cols.push(c.chunk_uncached(idx)?);
+        }
+        Ok(DataChunk::from_arcs(cols))
+    }
+
+    /// [`Self::scan_chunk_projected`], decoded outside the cache.
+    pub(crate) fn scan_chunk_projected_uncached(
+        &self,
+        idx: usize,
+        present: &[bool],
+    ) -> Result<Option<DataChunk>> {
+        if idx >= self.num_chunks() {
+            return Ok(None);
+        }
+        let mut cols = Vec::with_capacity(self.columns.len());
+        for (ci, c) in self.columns.iter().enumerate() {
+            if present.get(ci).copied().unwrap_or(false) {
+                cols.push(c.chunk_uncached(idx)?);
+            } else {
+                cols.push(Arc::new(Vector::new_empty(c.dtype)));
+            }
+        }
+        let mut chunk = DataChunk::projected(cols, self.chunk_rows(idx));
+        chunk.ordinal = idx;
+        Ok(Some(chunk))
     }
 
     pub fn scan_chunk_projected(&self, idx: usize, present: &[bool]) -> Result<Option<DataChunk>> {

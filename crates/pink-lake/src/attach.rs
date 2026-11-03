@@ -1467,11 +1467,16 @@ fn decode_via_provider(
     // The lake's readers materialize whole tables (this path is the one that
     // runs for formats without a projected reader), and `from_columns` folds
     // statistics over the rows it is handed. The engine `.pink` reader keeps
-    // its data encoded, so decode it here.
-    file_table.decode_all().map_err(|e| LakeError::Engine {
-        context: format!("decoding data file \"{}\"", file.rel()),
-        source: e,
-    })?;
+    // its data encoded, so decode it here — through the decoded cache, which
+    // charges the budget instead of the operator pool (wave 136c-2).
+    for column in &file_table.columns {
+        for i in 0..column.num_chunks() {
+            column.chunk(i).map_err(|e| LakeError::Engine {
+                context: format!("decoding data file \"{}\"", file.rel()),
+                source: e,
+            })?;
+        }
+    }
     if !file_db.eq_ignore_ascii_case(&entry.db)
         || !file_table.name.eq_ignore_ascii_case(&entry.table)
     {

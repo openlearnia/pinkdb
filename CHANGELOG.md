@@ -9,6 +9,27 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-11-03
+### Wave 136 (step c-2) — the decoded cache lives inside `memory_limit` ✅
+
+Decoded chunks are a cache, not a pin: they use whatever room `memory_limit`
+leaves free, and a query that needs the memory takes it from them.
+
+- **One budget**: clean decoded chunks and operator state share
+  `memory_limit`, the way DuckDB's buffer pool lives inside `max_memory`. An
+  operator reservation that does not fit evicts clean chunks in one batch
+  before it fails; dirty chunks are never evicted. `SET decoded_cache_limit`
+  caps the cache below that (a size, `0` for no cache, `-1`/`RESET` for the
+  free room).
+- **Speed**: warm TPC-H SF1 against step c-1, interleaved: geomean 1.001 at
+  the default limit, 0.999 at `memory_limit = '256MB'`.
+- **Memory**: TPC-H Q1 peaks at 656 MB at the default limit and 300 MB at
+  `memory_limit = '256MB'` (973 MB at step b-4). A small limit costs speed:
+  TPC-H SF1 takes 2.3× as long at 256 MB, because every scan decodes again; the
+  decoder port that narrows that gap is the next step.
+- The QuackLab chart server (16 clients × 10 rounds) is unchanged at 476–525
+  MB peak, 17 MB live after the load: its peak is per-statement working memory
+  the allocator keeps, a separate item.
+
 ### Wave 136 (step c-1) — a lazily opened store reads only its footer ✅
 
 An open no longer reads the data region: chunk bytes come from the file when a

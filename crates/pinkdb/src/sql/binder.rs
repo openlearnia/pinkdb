@@ -3748,8 +3748,11 @@ impl<'a> Binder<'a> {
                 ));
             };
             let canonical = crate::settings::resolve(setting)?;
-            // The process-wide limit lives in the memory pool (wave 136a).
-            if crate::memory::is_limit_setting(canonical) {
+            // The process-wide limit lives in the memory pool (wave 136a), and
+            // the decoded cache's budget beside it (wave 136c-2).
+            if crate::memory::is_limit_setting(canonical)
+                || crate::memory::is_cache_limit_setting(canonical)
+            {
                 return self.bind_current_setting(args);
             }
             // A store setting (`wal_sync_method` on a durable store) reads back
@@ -4112,6 +4115,17 @@ impl<'a> Binder<'a> {
                 ));
             }
         };
+        if crate::memory::is_cache_limit_setting(&name) {
+            let mut deps = self.dynamic_functions_used.borrow_mut();
+            let dep = "$decoded_cache_limit".to_string();
+            if !deps.contains(&dep) {
+                deps.push(dep);
+            }
+            drop(deps);
+            return Ok(BoundExpr::Literal(Value::Varchar(
+                crate::memory::human_bytes(crate::memory::cache_limit()),
+            )));
+        }
         if !matches!(name.as_str(), "memory_limit" | "max_memory") {
             return Err(PinkDbError::Catalog(format!(
                 "unrecognized configuration parameter \"{name}\""
