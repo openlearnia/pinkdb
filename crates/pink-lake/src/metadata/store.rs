@@ -5510,10 +5510,10 @@ fn ensure_inlined_table(
     types: &BTreeMap<String, DataType>,
 ) -> Result<()> {
     if !table_exists(conn, table_name)? {
-        // DuckDB stores an inlined column as BIGINT for the integer widths
-        // (including BOOLEAN, as 0/1) and VARCHAR for everything else — the
-        // declared type, not the value, decides. Create the table with the
-        // whole schema, not just the columns this row happened to write.
+        // DuckDB stores an inlined column in its backend type for the
+        // column's declared type (BIGINT/VARCHAR on SQLite, one Postgres type
+        // per logtype). Create the table with the whole schema, not just the
+        // columns this row happened to write.
         let mut columns: Vec<String> = Vec::new();
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         if let Some(schema) = &target.columns {
@@ -5534,16 +5534,15 @@ fn ensure_inlined_table(
             quote_ident(table_name)
         );
         for column in &columns {
+            let declared = declared_column_type(conn, table_id, column)?;
             sql.push_str(", ");
             sql.push_str(&quote_ident(column));
             sql.push(' ');
-            sql.push_str(
-                if column_is_integer_physical(conn, table_id, column, types)? {
-                    "BIGINT"
-                } else {
-                    "VARCHAR"
-                },
-            );
+            sql.push_str(&inlined_column_type(
+                conn.dialect(),
+                declared.as_deref(),
+                types.get(&column.to_ascii_lowercase()).copied(),
+            ));
         }
         sql.push(')');
         conn.execute_batch(&sql)
@@ -5615,31 +5614,91 @@ fn ensure_inlined_table(
     Ok(())
 }
 
-/// DuckDB's physical inlined type: BIGINT for the integer logtypes it casts
-/// to an integer, VARCHAR otherwise (including HUGEINT, UBIGINT, FLOAT,
-/// DECIMAL, DATE, TIMESTAMP and INTERVAL).
-fn column_is_integer_physical(
+/// The declared type of one column, newest schema first — the column's own
+/// row, so a column that left the current schema still has one.
+fn declared_column_type(
     conn: &dyn SqlConnection,
     table_id: i64,
     column: &str,
-    types: &BTreeMap<String, DataType>,
-) -> Result<bool> {
-    let column_type: Option<String> = conn
-        .query_row(
-            "SELECT column_type FROM ducklake_column
-             WHERE table_id = ?1 AND lower(column_name) = lower(?2)
-             ORDER BY begin_snapshot DESC LIMIT 1",
-            params![table_id, column],
-            |row| row.get(0),
-        )
-        .map_err(|e| sql_error("reading an inlined column's type", e))?;
-    if let Some(column_type) = column_type {
-        return Ok(is_integer_ducklake_type(&column_type));
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT column_type FROM ducklake_column
+         WHERE table_id = ?1 AND lower(column_name) = lower(?2)
+         ORDER BY begin_snapshot DESC LIMIT 1",
+        params![table_id, column],
+        |row| row.get(0),
+    )
+    .map_err(|e| sql_error("reading an inlined column's type", e))
+}
+
+/// DuckLake v2.0.0's backend type for one inlined column. The declared type
+/// decides, not the value.
+///
+/// SQLite stores the integer logtypes as BIGINT and everything else as VARCHAR
+/// (DuckLake's `sqlite_metadata_manager.cpp`, `GetColumnTypeInternal`).
+/// Postgres stores a type per logtype, text for the ones it has no native
+/// type for, and bytes for VARCHAR/VARIANT
+/// (`postgres_metadata_manager.cpp`, `TypeIsNativelySupported` and
+/// `GetColumnTypeInternal`).
+fn inlined_column_type(
+    dialect: Dialect,
+    declared: Option<&str>,
+    dtype: Option<DataType>,
+) -> String {
+    let declared = declared.map(|t| t.trim().to_ascii_lowercase());
+    let declared = declared.as_deref();
+    if dialect != Dialect::Postgres {
+        let integer = match declared {
+            Some(declared) => is_integer_ducklake_type(declared),
+            None => matches!(
+                dtype,
+                Some(DataType::Boolean | DataType::Integer | DataType::Bigint)
+            ),
+        };
+        return if integer { "BIGINT" } else { "VARCHAR" }.to_string();
     }
-    Ok(matches!(
-        types.get(&column.to_ascii_lowercase()),
-        Some(DataType::Boolean | DataType::Integer | DataType::Bigint)
-    ))
+    let postgres = match declared {
+        Some("boolean") => "BOOLEAN",
+        Some("int8" | "int16") => "SMALLINT",
+        Some("uint8" | "uint16" | "int32") => "INTEGER",
+        Some("int64" | "uint32") => "BIGINT",
+        Some("float32") => "REAL",
+        Some("float64" | "double") => "DOUBLE PRECISION",
+        // No native mapping (and VARIANT's storage type is BYTEA).
+        Some("varchar" | "blob" | "variant") => "BYTEA",
+        Some("int128" | "uint128" | "uint64" | "date") => "VARCHAR",
+        Some(t) if t.starts_with("timestamp") => "VARCHAR",
+        Some("interval") => "INTERVAL",
+        Some("uuid") => "UUID",
+        Some(t) if t.starts_with("decimal(") => return t.to_ascii_uppercase(),
+        // A LIST writes as VARCHAR text; so does every nested type.
+        Some("list") => "VARCHAR",
+        Some(t) if t.starts_with("struct") || t.starts_with("map") || t.contains('[') => "VARCHAR",
+        _ => return postgres_inlined_type(dtype),
+    };
+    postgres.to_string()
+}
+
+/// The Postgres inlined type of a column whose DuckLake type text is not
+/// known (a historical column with no `ducklake_column` row).
+fn postgres_inlined_type(dtype: Option<DataType>) -> String {
+    match dtype {
+        Some(DataType::Boolean) => "BOOLEAN",
+        Some(DataType::Integer) => "INTEGER",
+        Some(DataType::Bigint) => "BIGINT",
+        Some(DataType::Double) => "DOUBLE PRECISION",
+        Some(DataType::Varchar | DataType::Variant) => "BYTEA",
+        Some(DataType::Date | DataType::Timestamp) => "VARCHAR",
+        Some(DataType::Hugeint | DataType::Uhugeint) => "VARCHAR",
+        Some(DataType::Interval) => "INTERVAL",
+        Some(DataType::Uuid) => "UUID",
+        Some(DataType::Array { .. }) => "VARCHAR",
+        Some(DataType::Decimal { precision, scale }) => {
+            return format!("DECIMAL({precision},{scale})");
+        }
+        None => "VARCHAR",
+    }
+    .to_string()
 }
 
 fn is_integer_ducklake_type(column_type: &str) -> bool {
@@ -5721,7 +5780,11 @@ fn insert_inlined_row(
                         .and_then(|c| DataType::from_sql(&c.dtype))
                 })
             });
-        values.push(canonical_sql_value(dtype, inlined.values.get(index))?);
+        values.push(canonical_sql_value(
+            conn.dialect(),
+            dtype,
+            inlined.values.get(index),
+        )?);
     }
     conn.execute(&sql, &values)
         .map_err(|e| sql_error("inserting an inlined row", e))?;
@@ -5729,6 +5792,7 @@ fn insert_inlined_row(
 }
 
 fn canonical_sql_value(
+    dialect: Dialect,
     dtype: Option<DataType>,
     canonical: Option<&Option<String>>,
 ) -> Result<SqlValue> {
@@ -5741,12 +5805,28 @@ fn canonical_sql_value(
         // part of the table's current schema, so no reader decodes it.
         return Ok(SqlValue::Text(canonical.to_string()));
     };
+    let ducklake_text =
+        || canonical_to_ducklake(dtype, canonical).unwrap_or_else(|| canonical.to_string());
     Ok(match dtype {
         DataType::Boolean => SqlValue::Integer(i64::from(matches!(canonical, "true" | "1"))),
         DataType::Integer => {
             SqlValue::Integer(canonical.parse::<i32>().map(i64::from).unwrap_or_default())
         }
         DataType::Bigint => SqlValue::Integer(canonical.parse::<i64>().unwrap_or_default()),
+        // A Postgres DOUBLE column takes the bits themselves: the canonical
+        // encoding is hex text for DuckDB's VARCHAR storage, not a float
+        // literal the server would parse.
+        DataType::Double if dialect == Dialect::Postgres => {
+            match u64::from_str_radix(canonical, 16) {
+                Ok(bits) => SqlValue::Real(f64::from_bits(bits)),
+                Err(_) => SqlValue::Text(ducklake_text()),
+            }
+        }
+        // DuckLake stores VARCHAR as BYTEA in a Postgres catalog (Postgres text
+        // cannot hold a NUL); VARIANT's Postgres storage type is BYTEA too.
+        DataType::Varchar | DataType::Variant if dialect == Dialect::Postgres => {
+            SqlValue::Blob(ducklake_text().into_bytes())
+        }
         DataType::Double
         | DataType::Date
         | DataType::Timestamp
@@ -5757,10 +5837,7 @@ fn canonical_sql_value(
         | DataType::Array { .. }
         | DataType::Uuid
         | DataType::Hugeint
-        | DataType::Uhugeint => match canonical_to_ducklake(dtype, canonical) {
-            Some(text) => SqlValue::Text(text),
-            None => SqlValue::Text(canonical.to_string()),
-        },
+        | DataType::Uhugeint => SqlValue::Text(ducklake_text()),
     })
 }
 
@@ -6103,6 +6180,10 @@ fn ducklake_type(dtype: &str) -> String {
         "INTEGER" => "int32".to_string(),
         "BIGINT" => "int64".to_string(),
         "DOUBLE" => "float64".to_string(),
+        // DuckLake names the 128-bit integers after their width; DuckDB's
+        // catalog reader has no `hugeint` spelling.
+        "HUGEINT" => "int128".to_string(),
+        "UHUGEINT" => "uint128".to_string(),
         "VARCHAR" => "varchar".to_string(),
         "DATE" => "date".to_string(),
         "TIMESTAMP" => "timestamp".to_string(),
@@ -6158,6 +6239,8 @@ fn pink_dtype(ducklake: &str) -> pinkdb::DataType {
         "interval" => pinkdb::DataType::Interval,
         "variant" => pinkdb::DataType::Variant,
         "uuid" => pinkdb::DataType::Uuid,
+        "int128" => pinkdb::DataType::Hugeint,
+        "uint128" => pinkdb::DataType::Uhugeint,
         _ => pinkdb::DataType::Varchar,
     }
 }
@@ -6344,9 +6427,12 @@ fn sql_to_canonical(dtype: Option<&pinkdb::DataType>, value: &SqlValue) -> Optio
     };
     match value {
         SqlValue::Null => None,
-        // DuckLake writes VARCHAR inlined values as BYTEA in a Postgres
-        // catalog, where SQLite stores them as TEXT.
-        SqlValue::Blob(bytes) if matches!(dtype, pinkdb::DataType::Varchar) => {
+        // DuckLake writes VARCHAR (and VARIANT, whose storage type is BYTEA)
+        // inlined values as BYTEA in a Postgres catalog, where SQLite stores
+        // them as TEXT.
+        SqlValue::Blob(bytes)
+            if matches!(dtype, pinkdb::DataType::Varchar | pinkdb::DataType::Variant) =>
+        {
             String::from_utf8(bytes.clone()).ok()
         }
         SqlValue::Blob(_) => None,
@@ -6631,14 +6717,17 @@ mod tests {
     #[test]
     fn ducklake_versions_outside_the_range_are_refused() {
         let label = Path::new("cat.sqlite");
-        for version in ["1.1-dev1", "1.1", "1.2", "1.3"] {
+        for version in ["1.1", "1.2", "1.3"] {
             check_ducklake_version(label, Some(version)).unwrap();
         }
-        let message = check_ducklake_version(label, Some("1.4"))
-            .unwrap_err()
-            .to_string();
-        assert!(message.contains("1.4"), "{message}");
-        assert!(message.contains("1.1-dev1 through 1.3"), "{message}");
+        // The 2.0 alphas' `1.1-dev1` is refused, as DuckDB v2.0.0 refuses it.
+        for version in ["1.4", "1.1-dev1"] {
+            let message = check_ducklake_version(label, Some(version))
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(version), "{message}");
+            assert!(message.contains("1.1 through 1.3"), "{message}");
+        }
     }
 
     #[test]

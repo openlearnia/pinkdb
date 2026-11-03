@@ -22,6 +22,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pink_lake::{Commit, Lake};
 use pink_lake_parquet::{FORMAT_ID, register};
+#[cfg(feature = "catalog-postgres")]
+use pinkdb::Vector;
 use pinkdb::{ArrayElem, DataTable, DataType, PinkDb, QueryResult, Value};
 
 // Wave 132b: QuackLab's attach sequence. The mock S3 is std-only and is
@@ -503,6 +505,212 @@ fn a_pinkdb_postgres_catalog_lake_attaches_in_duckdb() {
         "DuckDB attach/count/filter over a pinkdb Parquet lake with a Postgres catalog"
     );
 
+    cleanup(&dir);
+}
+
+/// Every scalar type pinkdb stores inline, cast to text: the form both
+/// engines print, so an inlined row one wrote can be compared with the row the
+/// other reads.
+#[cfg(feature = "catalog-postgres")]
+const TWELVE_TYPE_CASTS: &str = "CAST(b AS VARCHAR) AS b, CAST(i AS VARCHAR) AS i, \
+     CAST(g AS VARCHAR) AS g, CAST(h AS VARCHAR) AS h, CAST(uh AS VARCHAR) AS uh, \
+     CAST(d AS VARCHAR) AS d, CAST(n AS VARCHAR) AS n, CAST(v AS VARCHAR) AS v, \
+     CAST(dt AS VARCHAR) AS dt, CAST(ts AS VARCHAR) AS ts, CAST(iv AS VARCHAR) AS iv, \
+     CAST(u AS VARCHAR) AS u";
+
+#[cfg(feature = "catalog-postgres")]
+const TWELVE_TYPE_COLUMNS: [&str; 12] = [
+    "b", "i", "g", "h", "uh", "d", "n", "v", "dt", "ts", "iv", "u",
+];
+
+/// One row of every type pinkdb stores inline, matching
+/// `pink-lake/tests/fixtures/ducklake-v2.0.0`. The row arrives as a typed chunk
+/// because `DataTable::append_row` cannot store the 128-bit columns.
+#[cfg(feature = "catalog-postgres")]
+fn twelve_type_table() -> Arc<DataTable> {
+    fn vector(dtype: DataType, value: Value) -> Vector {
+        let mut v = Vector::new_empty(dtype);
+        v.push_valid(value).unwrap();
+        v
+    }
+    let schema = vec![
+        ("b".to_string(), DataType::Boolean),
+        ("i".to_string(), DataType::Integer),
+        ("g".to_string(), DataType::Bigint),
+        ("h".to_string(), DataType::Hugeint),
+        ("uh".to_string(), DataType::Uhugeint),
+        ("d".to_string(), DataType::Double),
+        ("n".to_string(), pinkdb::types::decimal_type(10, 2).unwrap()),
+        ("v".to_string(), DataType::Varchar),
+        ("dt".to_string(), DataType::Date),
+        ("ts".to_string(), DataType::Timestamp),
+        ("iv".to_string(), DataType::Interval),
+        ("u".to_string(), DataType::Uuid),
+    ];
+    let mut table = DataTable::new("t".to_string(), schema.clone()).unwrap();
+    table
+        .append_chunk(
+            schema
+                .into_iter()
+                .map(|(_, dtype)| match dtype {
+                    DataType::Boolean => vector(dtype, Value::Boolean(true)),
+                    DataType::Integer => vector(dtype, Value::Integer(7)),
+                    DataType::Bigint => vector(dtype, Value::Bigint(7)),
+                    DataType::Hugeint => vector(dtype, Value::Hugeint(7)),
+                    DataType::Uhugeint => vector(dtype, Value::Uhugeint(7)),
+                    DataType::Double => vector(dtype, Value::Double(2.5)),
+                    DataType::Decimal { .. } => vector(
+                        dtype,
+                        Value::Decimal {
+                            value: 225,
+                            precision: 10,
+                            scale: 2,
+                        },
+                    ),
+                    DataType::Varchar => vector(dtype, Value::Varchar("x".to_string())),
+                    DataType::Date => vector(dtype, Value::Date(0)),
+                    DataType::Timestamp => vector(dtype, Value::Timestamp(0)),
+                    DataType::Interval => vector(
+                        dtype,
+                        Value::Interval {
+                            months: 1,
+                            days: 0,
+                            micros: 0,
+                        },
+                    ),
+                    DataType::Uuid => vector(dtype, Value::Uuid(7)),
+                    other => panic!("unexpected column type {other:?}"),
+                })
+                .collect(),
+        )
+        .unwrap();
+    Arc::new(table)
+}
+
+#[cfg(feature = "catalog-postgres")]
+fn twelve_type_rows(db: &mut PinkDb, table: &str) -> Vec<Vec<String>> {
+    let rows = pinkdb_sql_rows(db, &format!("SELECT {TWELVE_TYPE_CASTS} FROM {table}"));
+    assert_eq!(rows.len(), 1, "{table} should hold exactly one row");
+    rows
+}
+
+/// Three doubles a text encoding cannot carry: NaN and both infinities.
+#[cfg(feature = "catalog-postgres")]
+fn double_table() -> Arc<DataTable> {
+    let dtype = DataType::Double;
+    let mut table = DataTable::new("f".to_string(), vec![("d".to_string(), dtype)]).unwrap();
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut v = Vector::new_empty(dtype);
+        v.push_valid(Value::Double(value)).unwrap();
+        table.append_chunk(vec![v]).unwrap();
+    }
+    Arc::new(table)
+}
+
+#[cfg(feature = "catalog-postgres")]
+fn double_rows(db: &mut PinkDb) -> Vec<Value> {
+    match db.execute("SELECT d FROM f").unwrap().pop().unwrap() {
+        QueryResult::Selected { rows, .. } => {
+            rows.into_iter().map(|mut row| row.remove(0)).collect()
+        }
+        other => panic!("expected rows from SELECT d FROM f, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "catalog-postgres")]
+fn duckdb_rows(binary: &Path, attach: &str, data: &Path, table: &str) -> Vec<Vec<String>> {
+    let script = format!(
+        "LOAD ducklake;\n\
+         ATTACH '{attach}' AS l (DATA_PATH '{}', OVERRIDE_DATA_PATH true);\n\
+         SELECT {TWELVE_TYPE_CASTS} FROM l.{table};\n",
+        data.display()
+    );
+    duckdb_json_rows(binary, &script, &TWELVE_TYPE_COLUMNS)
+}
+
+/// DuckLake's Postgres inlined tables use a Postgres type per column (VARCHAR
+/// is BYTEA, dates and 128-bit integers are text), so a row written by either
+/// engine has to come back equal through the other's read path.
+#[cfg(feature = "catalog-postgres")]
+#[test]
+fn postgres_catalog_inlined_types_round_trip_with_duckdb() {
+    let _postgres = postgres_guard();
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    let Some(server) = TestPostgres::start() else {
+        return;
+    };
+    register().unwrap();
+    let dir = scratch("postgres-inlined-types");
+    let data = dir.join("data");
+    let catalog = format!("postgres:{}", server.conninfo());
+    let attach = format!("ducklake:postgres:{}", server.conninfo());
+
+    // pinkdb's own row, inlined because it is the table's only one.
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    let mut commit = Commit::new();
+    commit.append("main.t", twelve_type_table());
+    commit.append("main.f", double_table());
+    lake.commit(&commit).unwrap();
+    assert_eq!(
+        twelve_type_rows(&mut lake.load(None).unwrap(), "t"),
+        duckdb_rows(&binary, &attach, &data, "t"),
+        "DuckDB's read of pinkdb's inlined row"
+    );
+    // A DOUBLE inlined in Postgres is a float8 column, not DuckDB's text form:
+    // the bits, including NaN and the infinities, have to survive.
+    let mut loaded = lake.load(None).unwrap();
+    let mut bits: Vec<u64> = double_rows(&mut loaded)
+        .into_iter()
+        .map(|value| match value {
+            Value::Double(x) => x.to_bits(),
+            other => panic!("expected a double, got {other:?}"),
+        })
+        .collect();
+    bits.sort_unstable();
+    let mut expected = [
+        f64::NAN.to_bits(),
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+    ];
+    expected.sort_unstable();
+    assert_eq!(
+        bits, expected,
+        "NaN and the infinities through a Postgres catalog"
+    );
+    drop(loaded);
+    drop(lake);
+
+    // DuckDB's own row, with values that need each of its Postgres storage
+    // types, inlined by DuckLake as well.
+    let write = format!(
+        "LOAD ducklake;\n\
+         ATTACH '{attach}' AS l (DATA_PATH '{}', OVERRIDE_DATA_PATH true);\n\
+         CREATE TABLE l.w (b BOOLEAN, i INTEGER, g BIGINT, h HUGEINT, uh UHUGEINT, \
+         d DOUBLE, n DECIMAL(10,2), v VARCHAR, dt DATE, ts TIMESTAMP, iv INTERVAL, u UUID);\n\
+         INSERT INTO l.w VALUES (false, -1, -2, 1234567890123456789012345, \
+         340282366920938463463374607431768211455, 0.125, -0.75, 'lake', \
+         DATE '1970-01-02', TIMESTAMP '1970-01-01 00:00:01', INTERVAL '2 days 03:04:05', \
+         UUID '11111111-2222-3333-4444-555555555555');\n",
+        data.display()
+    );
+    match run_duckdb(&binary, &write) {
+        Ok(_) => {}
+        Err(message) if message.contains("extension") || message.contains("Extension") => {
+            println!("skip Postgres interop test: {message}");
+            cleanup(&dir);
+            return;
+        }
+        Err(message) => panic!("{message}"),
+    }
+    let reopened = Lake::open_with_catalog(&catalog, Some(data.to_str().unwrap())).unwrap();
+    assert_eq!(
+        twelve_type_rows(&mut reopened.load(None).unwrap(), "w"),
+        duckdb_rows(&binary, &attach, &data, "w"),
+        "pinkdb's read of DuckDB's inlined row"
+    );
+    drop(reopened);
     cleanup(&dir);
 }
 
