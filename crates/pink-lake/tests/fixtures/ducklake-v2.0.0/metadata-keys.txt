@@ -1,0 +1,4 @@
+version
+created_by
+data_path
+encrypted

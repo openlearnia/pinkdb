@@ -29,6 +29,7 @@ progress log</a>.</p>
 <h3>Fixes ✅</h3>
 <ul>
 <li>A reopened store starts in its default database; <code>USE</code> is per-connection, as in DuckDB.</li>
+<li>Lakes DuckDB v2.0.0 can open: pinkdb writes DuckLake catalog version <code>1.1</code> (the 2.0 alphas' <code>1.1-dev1</code> is refused, as DuckDB refuses it), restores <code>ducklake_schema.parent_schema_id</code>, names 128-bit columns <code>int128</code>/<code>uint128</code>, and types inlined rows in a Postgres catalog as DuckDB does. A test compares every catalog table with a snapshot of DuckDB v2.0.0's.</li>
 </ul>
 <h2>2026-11-02</h2>
 <h3>Wave 133 — lake scans stream, prune to pages, and stay within the memory limit ✅</h3>

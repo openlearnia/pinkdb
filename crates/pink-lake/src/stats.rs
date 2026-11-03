@@ -485,6 +485,8 @@ pub(crate) fn encode_value(dtype: DataType, v: &Value) -> Option<String> {
         (DataType::Boolean, Value::Boolean(b)) => b.to_string(),
         (DataType::Integer, Value::Integer(i)) => i.to_string(),
         (DataType::Bigint, Value::Bigint(i)) => i.to_string(),
+        (DataType::Hugeint, Value::Hugeint(i)) => i.to_string(),
+        (DataType::Uhugeint, Value::Uhugeint(i)) => i.to_string(),
         (DataType::Date, Value::Date(d)) => d.to_string(),
         (DataType::Timestamp, Value::Timestamp(t)) => t.to_string(),
         // Bit-exact: JSON has no NaN/±INF and `-0.0` must stay distinguishable.

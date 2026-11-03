@@ -11,17 +11,17 @@
 //! (`ducklake_inlined_data_<table_id>_<schema_version>`), and that name is
 //! derived from two integers the store allocated, never from user input.
 
-/// The DuckLake metadata format this build writes. Stock DuckDB 2.x reports
-/// `1.1-dev1` for its own catalogs, so writing the same string lets DuckDB
-/// attach a pinkdb-written lake without a version override.
-pub(crate) const DUCKLAKE_VERSION: &str = "1.1-dev1";
+/// The DuckLake metadata format this build writes. DuckDB v2.0.0 writes
+/// `1.1` for its own catalogs and refuses any other string for that format
+/// (the 2.0 alphas' `1.1-dev1` included), so pinkdb writes exactly `1.1`.
+pub(crate) const DUCKLAKE_VERSION: &str = "1.1";
 
 /// The DuckLake versions this build reads. They share the v1.1 table shape;
 /// later versions only add tables pinkdb does not use.
-pub(crate) const SUPPORTED_DUCKLAKE_VERSIONS: &[&str] = &["1.1-dev1", "1.1", "1.2", "1.3"];
+pub(crate) const SUPPORTED_DUCKLAKE_VERSIONS: &[&str] = &["1.1", "1.2", "1.3"];
 
 /// The supported range, for the refusal message.
-pub(crate) const SUPPORTED_DUCKLAKE_RANGE: &str = "1.1-dev1 through 1.3";
+pub(crate) const SUPPORTED_DUCKLAKE_RANGE: &str = "1.1 through 1.3";
 
 /// A SQL dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +150,10 @@ enum DuckLakeType {
     Timestamp,
 }
 
-/// The DuckLake v1.1 tables, exactly as DuckLake creates them. A column whose
+/// The DuckLake v1.1 tables, exactly as DuckDB v2.0.0's ducklake extension
+/// creates them (`ducklake_schema.parent_schema_id` is new since the 2.0
+/// alphas' `1.1-dev1`; DuckDB writes NULL for a top-level schema, as pinkdb
+/// does by omitting it). A column whose
 /// type a backend spells differently carries the token [`DuckLakeType`] names
 /// (`BOOL`, `UUID`, `TIMESTAMP`); [`Dialect::ducklake_ddl`] resolves it. Kept as
 /// a constant list so the parity test can compare it with a catalog DuckDB
@@ -159,7 +162,7 @@ pub(crate) const DUCKLAKE_TABLES: &[&str] = &[
     r#"ducklake_metadata("key" VARCHAR NOT NULL, "value" VARCHAR NOT NULL, "scope" VARCHAR, scope_id BIGINT)"#,
     "ducklake_snapshot(snapshot_id BIGINT PRIMARY KEY, snapshot_time TIMESTAMP, schema_version BIGINT, next_catalog_id BIGINT, next_file_id BIGINT)",
     "ducklake_snapshot_changes(snapshot_id BIGINT PRIMARY KEY, changes_made VARCHAR, author VARCHAR, commit_message VARCHAR, commit_extra_info VARCHAR)",
-    "ducklake_schema(schema_id BIGINT PRIMARY KEY, schema_uuid UUID, begin_snapshot BIGINT, end_snapshot BIGINT, schema_name VARCHAR, path VARCHAR, path_is_relative BOOL)",
+    "ducklake_schema(schema_id BIGINT PRIMARY KEY, schema_uuid UUID, begin_snapshot BIGINT, end_snapshot BIGINT, schema_name VARCHAR, path VARCHAR, path_is_relative BOOL, parent_schema_id BIGINT)",
     "ducklake_table(table_id BIGINT, table_uuid UUID, begin_snapshot BIGINT, end_snapshot BIGINT, schema_id BIGINT, table_name VARCHAR, path VARCHAR, path_is_relative BOOL)",
     "ducklake_view(view_id BIGINT, view_uuid UUID, begin_snapshot BIGINT, end_snapshot BIGINT, schema_id BIGINT, view_name VARCHAR, dialect VARCHAR, \"sql\" VARCHAR, column_aliases VARCHAR)",
     "ducklake_tag(object_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, \"key\" VARCHAR, \"value\" VARCHAR)",

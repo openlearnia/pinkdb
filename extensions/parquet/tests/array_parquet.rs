@@ -16,9 +16,17 @@ use pinkdb::{
 };
 use pinkdb_parquet::write::write_table;
 
-/// The DuckDB reference binary (see the standing rules); the interop tests
-/// skip when it is absent.
-const DUCKDB: &str = "/tmp/duckdb-2.0.0/duckdb";
+/// The DuckDB reference binary, found like the other interop tests do:
+/// `DUCKDB_BIN`, else `~/.local/bin/duckdb`. The interop tests skip when it is
+/// absent (and the gate fails a run that skipped them).
+fn duckdb_path() -> std::path::PathBuf {
+    std::env::var_os("DUCKDB_BIN")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                .join(".local/bin/duckdb")
+        })
+}
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -216,10 +224,14 @@ fn float_arrays_round_trip_and_duckdb_reads_them() {
 /// `Some(rows)` when the DuckDB reference binary exists: each row is the
 /// tab-separated cells of the statement's result.
 fn duck(query: &str) -> Option<Vec<Vec<String>>> {
-    if !Path::new(DUCKDB).exists() {
+    if !duckdb_path().exists() {
+        println!(
+            "skip DuckDB interop check: {} is absent (set DUCKDB_BIN)",
+            duckdb_path().display()
+        );
         return None;
     }
-    let mut child = Command::new(DUCKDB)
+    let mut child = Command::new(duckdb_path())
         .args(["-no-agent", "-noheader", "-list", "-separator", "\t"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
