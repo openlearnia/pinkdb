@@ -607,6 +607,14 @@ struct Compiled<'a> {
 /// sampled at all, so nothing else pays for the check.
 const DENSE_BYTES_PER_ROW: usize = 64;
 
+/// The dense lane is off (2026-11-03). Its per-chunk `Partial` builds a full
+/// group (owned key values, accumulators) for every input row and then merges
+/// it, which made `od_pairs_rollup` 5–15× slower than the per-chunk path it
+/// replaced (170–850 ms against 34 ms, interleaved A/B). Bounding wide-key
+/// GROUP BY state comes back with a radix-partitioned aggregate table
+/// (ROADMAP row 124, step 136c-0b), which replaces this lane.
+const DENSE_LANE: bool = false;
+
 /// Inputs smaller than this are never sampled: their partial state is bounded
 /// by the input itself, and the serial sample would cost more than it saves.
 /// `od_pairs_rollup` (245,570 rows) stays above it.
@@ -637,6 +645,9 @@ fn sample<S: Sink + Sync>(
 where
     S::Partial: Send,
 {
+    if !DENSE_LANE {
+        return Ok(None);
+    }
     let strings = keys.iter().any(|key| key.dtype() == DataType::Varchar)
         || aggs.iter().any(|agg| {
             agg.distinct
