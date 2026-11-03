@@ -57,8 +57,8 @@
   },
   "insert_200_ms": 7.508833019528538,
   "binary_bytes": {
-    "darwin": 14803568,
-    "linux": 19208952
+    "darwin": 19488624,
+    "linux": 23522768
   },
   "regressions": []
 }
