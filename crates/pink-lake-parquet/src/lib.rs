@@ -104,6 +104,10 @@ impl pink_lake::format::FileMorsels for ParquetMorsels {
         self.plan.rows(index)
     }
 
+    fn dropped(&self, index: usize) -> u64 {
+        self.plan.dropped(index)
+    }
+
     fn decode(
         &self,
         index: usize,

@@ -9,6 +9,14 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-11-03</h2>
+<h3>Wave 133d — lake text columns decode once, filters skip rows early ✅</h3>
+<p>Lake queries on text columns get faster again: TPC-H at scale factor 1 from a Parquet lake is 0.89× the time of the previous build (geometric mean; Q19 2× faster), and 1.71× DuckDB v2.0.0's time reading the same Parquet files (was 2.40×). Store tables are unchanged.</p>
+<ul>
+<li><strong>Dictionary columns</strong>: a low-cardinality text column (status codes, shipping modes, flags) is decoded once per row group and gathered by id, instead of value by value.</li>
+<li><strong>Filters on those columns</strong> are evaluated once per distinct value, and rows that fail are dropped before the query's other columns are built.</li>
+<li><strong><code>IN (…)</code> lists</strong> now prune files, row groups and store-table chunks, like <code>=</code> and ranges already did.</li>
+<li><strong>Data files stay open</strong> during a scan instead of being reopened for every read.</li>
+</ul>
 <h3>Wave 133c — lake queries 4× faster ✅</h3>
 <p>TPC-H at scale factor 1 from a Parquet lake runs 4.2× faster than before (geometric mean; every query faster, the slowest ones 14–27×), now 2–7× DuckDB v2.0.0's time on its own storage, down from 3–77×. Store tables are unchanged.</p>
 <ul>

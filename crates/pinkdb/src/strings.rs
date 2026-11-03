@@ -267,7 +267,7 @@ impl StrVec {
     /// Cells over one shared buffer: `ranges` are `(offset, len)` of UTF-8
     /// strings inside `buffer` (a decoded column chunk's bytes). The bytes
     /// are not copied; short strings are inlined.
-    pub(crate) fn over_buffer(
+    pub fn over_buffer(
         buffer: Arc<[u8]>,
         ranges: impl ExactSizeIterator<Item = (usize, usize)>,
     ) -> StrVec {

@@ -31,6 +31,7 @@
 //! counters ([`TableScanOutput`]) report what actually happened.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use parquet::bloom_filter::Sbbf;
 use parquet::column::page::PageReader;
@@ -58,6 +59,7 @@ use pinkdb::{
 };
 use rayon::prelude::*;
 
+use crate::dictionary::Dictionary;
 use crate::ranged::RemoteReadStats;
 use crate::resolve::{FileResolved, OutKind, Resolved, convert_value, file_constant_value};
 use crate::schema_map::FileColumn;
@@ -319,6 +321,12 @@ fn scan_reader<R: ChunkReader + 'static>(
     sink: &mut dyn FnMut(DataChunk) -> Result<()>,
 ) -> Result<()> {
     let decoded = decoded_columns(file, plan);
+    let filtering = drops_rows(plan.resolved, plan);
+    let filter_only = filter_only_columns(file, plan, filtering);
+    let filters: &[PrunePredicate] = match filtering {
+        true => plan.filters,
+        false => &[],
+    };
     let mut offset = 0usize;
     for (rg_index, rg) in file.meta.row_groups.iter().enumerate() {
         if !row_group_survives(plan.resolved, file, rg_index, plan.filters) {
@@ -333,9 +341,20 @@ fn scan_reader<R: ChunkReader + 'static>(
             assemble_row_group(file, plan, lens, &decoded, Vec::new(), sink)?;
             continue;
         }
-        let pieces = decode_row_group(reader, rg_index, &decoded, lens, &file.meta.path)?;
+        let (pieces, kept) = decode_row_group(
+            reader,
+            rg_index,
+            &decoded,
+            &filter_only,
+            filters,
+            lens,
+            &file.meta.path,
+        )?;
         out.columns_decoded += decoded.len() as u64;
-        assemble_row_group(file, plan, lens, &decoded, pieces, sink)?;
+        match kept {
+            Some(kept) => assemble_row_group(file, plan, kept, &decoded, pieces, sink)?,
+            None => assemble_row_group(file, plan, lens, &decoded, pieces, sink)?,
+        }
     }
     Ok(())
 }
@@ -416,6 +435,19 @@ fn scan_local_parallel(
     // A reader parses the footer once; one per worker covers the pool.
     let pool: std::sync::Mutex<Vec<SerializedFileReader<std::fs::File>>> =
         std::sync::Mutex::new(Vec::new());
+    let take_reader = || -> Result<SerializedFileReader<std::fs::File>> {
+        match pool.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+            Some(reader) => Ok(reader),
+            None => open(),
+        }
+    };
+    let give_reader = |reader| pool.lock().unwrap_or_else(|e| e.into_inner()).push(reader);
+    let filtering = drops_rows(plan.resolved, plan);
+    let filter_only = filter_only_columns(file, plan, filtering);
+    let filters: &[PrunePredicate] = match filtering {
+        true => plan.filters,
+        false => &[],
+    };
     let mut at = 0usize;
     while at < surviving.len() {
         // A window bounds the decoded bytes in flight: enough row groups to
@@ -425,6 +457,42 @@ fn scan_local_parallel(
             end += 1;
         }
         let window = &surviving[at..end];
+        if filtering {
+            // A row selection spans the projected columns, so with pushed
+            // filters the row group is the unit of work.
+            let results: Vec<Result<RowGroupDecode>> = window
+                .par_iter()
+                .map(|&(rg_index, rows, start)| {
+                    let reader = take_reader()?;
+                    let lens = chunk_lens(rows, start);
+                    let result = decode_row_group(
+                        &reader,
+                        rg_index,
+                        &decoded,
+                        &filter_only,
+                        filters,
+                        lens,
+                        &file.meta.path,
+                    );
+                    // A failed decode hands its reader back for the tasks after it.
+                    give_reader(reader);
+                    result
+                })
+                .collect();
+            for (&(_, rows, start), result) in window.iter().zip(results) {
+                let (pieces, kept) = result?;
+                out.columns_decoded += decoded.len() as u64;
+                match kept {
+                    Some(kept) => assemble_row_group(file, plan, kept, &decoded, pieces, sink)?,
+                    None => {
+                        let lens = chunk_lens(rows, start);
+                        assemble_row_group(file, plan, lens, &decoded, pieces, sink)?;
+                    }
+                }
+            }
+            at = end;
+            continue;
+        }
         let tasks: Vec<(usize, usize, ChunkLens)> = window
             .iter()
             .flat_map(|&(rg_index, rows, start)| {
@@ -435,13 +503,7 @@ fn scan_local_parallel(
         let results: Vec<Result<Vec<Vector>>> = tasks
             .par_iter()
             .map(|(rg_index, slot, lens)| {
-                let reader = {
-                    let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
-                    match pool.pop() {
-                        Some(reader) => reader,
-                        None => open()?,
-                    }
-                };
+                let reader = take_reader()?;
                 let pieces = decode_in_row_group(
                     &reader,
                     *rg_index,
@@ -450,7 +512,7 @@ fn scan_local_parallel(
                     &file.meta.path,
                 );
                 // A failed decode hands its reader back for the tasks after it.
-                pool.lock().unwrap_or_else(|e| e.into_inner()).push(reader);
+                give_reader(reader);
                 pieces
             })
             .collect();
@@ -488,39 +550,179 @@ fn decode_in_row_group<R: ChunkReader + 'static>(
     decode_column(&*row_group_reader, column, lens)
 }
 
-/// Decode the projected columns of one row group into chunk-sized vectors.
+/// Decode the projected columns of one row group into chunk-sized vectors,
+/// with the pushed `filters` applied to the rows.
+#[allow(clippy::too_many_arguments)]
+/// The decoded pieces of one row group: the columns, and the rows each chunk
+/// kept when a pushed predicate dropped some (`None` when nothing dropped).
+type RowGroupDecode = (Vec<Vec<Vector>>, Option<Vec<usize>>);
+
 fn decode_row_group<R: ChunkReader + 'static>(
     reader: &SerializedFileReader<R>,
     rg_index: usize,
     decoded: &[(usize, usize, &FileColumn)],
+    filter_only: &[(usize, usize, &FileColumn)],
+    filters: &[PrunePredicate],
     lens: ChunkLens,
     path: &str,
-) -> Result<Vec<Vec<Vector>>> {
+) -> Result<RowGroupDecode> {
     let row_group_reader = reader.get_row_group(rg_index).map_err(|e| {
         PinkDbError::Execution(format!(
             "cannot read row group {rg_index} of \"{path}\": {e}"
         ))
     })?;
-    decode_row_group_reader(&*row_group_reader, decoded, lens, path)
+    decode_row_group_reader(
+        &*row_group_reader,
+        decoded,
+        filter_only,
+        filters,
+        lens,
+        path,
+    )
+}
+
+/// Whether the scan may drop the rows its pushed predicates reject.
+///
+/// A projection that asks for a row number numbers the rows it receives, so a
+/// dropped row would renumber every row after it: the predicates then only
+/// prune row groups and pages, as before. The engine re-applies the `WHERE`
+/// above the scan, so dropping a row it would reject changes no result.
+fn drops_rows(resolved: &Resolved, plan: &DecodePlan<'_>) -> bool {
+    !plan.filters.is_empty()
+        && !(0..plan.needed.len())
+            .any(|out| plan.needed[out] && resolved.kind.get(out) == Some(&OutKind::RowNumber))
+}
+
+/// The columns a pushed predicate names that the projection does not decode:
+/// the row selection needs their dictionary, but no engine vector is emitted
+/// for them.
+fn filter_only_columns<'a>(
+    file: &'a FileResolved,
+    plan: &DecodePlan<'_>,
+    filtering: bool,
+) -> Vec<(usize, usize, &'a FileColumn)> {
+    if !filtering {
+        return Vec::new();
+    }
+    let resolved = plan.resolved;
+    (0..resolved.schema.len())
+        .filter(|out| !plan.needed[*out] && resolved.kind[*out] == OutKind::FileColumn)
+        .filter(|out| {
+            plan.filters
+                .iter()
+                .any(|filter| filter.column == *out && filter.path.is_none())
+        })
+        .filter_map(|out| {
+            let at = file.out_to_file.get(out).copied().flatten()?;
+            Some((out, at, &file.meta.columns[at]))
+        })
+        .collect()
+}
+
+/// Both selections' rows, chunk by chunk; each keeps rows in order, so a
+/// merge walk is an intersection.
+fn intersect(a: &[Vec<u32>], b: &[Vec<u32>]) -> Vec<Vec<u32>> {
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| {
+            let mut rows = Vec::with_capacity(a.len().min(b.len()));
+            let (mut i, mut j) = (0, 0);
+            while i < a.len() && j < b.len() {
+                match a[i].cmp(&b[j]) {
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                    std::cmp::Ordering::Equal => {
+                        rows.push(a[i]);
+                        i += 1;
+                        j += 1;
+                    }
+                }
+            }
+            rows
+        })
+        .collect()
 }
 
 /// Decode one row group from any `RowGroupReader` (the serial reader or the
 /// page-filtered wrapper).
+///
+/// A predicate on a dictionary-encoded column is evaluated once per dictionary
+/// entry (see [`Dictionary::kept_rows`]); the row selection it yields drops the
+/// rejected rows of every projected column before they are materialized, and
+/// several predicates intersect. A column whose decode has no dictionary is
+/// decoded in full and filtered after, which keeps the decode path unchanged.
+#[allow(clippy::too_many_arguments)]
 fn decode_row_group_reader(
     row_group_reader: &dyn RowGroupReader,
     decoded: &[(usize, usize, &FileColumn)],
+    filter_only: &[(usize, usize, &FileColumn)],
+    filters: &[PrunePredicate],
     lens: ChunkLens,
     path: &str,
-) -> Result<Vec<Vec<Vector>>> {
-    // One column at a time: each needed file column decodes into the pieces
-    // `lens` describes (a vector never exceeds CHUNK_SIZE rows).
-    let mut pieces: Vec<Vec<Vector>> = Vec::with_capacity(decoded.len());
-    for (_, _, column) in decoded {
-        pieces.push(decode_column(row_group_reader, column, lens).map_err(|e| {
+) -> Result<RowGroupDecode> {
+    // The dictionaries the predicates need, read here and reused for the
+    // projection (a column that is both projected and filtered reads once).
+    let mut dictionaries: Vec<(usize, Dictionary)> = Vec::new();
+    let mut selection: Option<Vec<Vec<u32>>> = None;
+    for (out, at, column) in decoded.iter().chain(filter_only) {
+        if dictionaries.iter().any(|(read, _)| read == at) {
+            continue;
+        }
+        let predicates: Vec<&PrunePredicate> = filters
+            .iter()
+            .filter(|filter| filter.column == *out && filter.path.is_none())
+            .collect();
+        if predicates.is_empty() {
+            continue;
+        }
+        let dictionary = Dictionary::read(row_group_reader, column, lens).map_err(|e| {
             PinkDbError::Execution(format!("column \"{}\" of \"{path}\": {e}", column.name))
-        })?);
+        })?;
+        let Some(dictionary) = dictionary else {
+            continue;
+        };
+        match dictionary.kept_rows(&predicates) {
+            Some(kept) => {
+                selection = Some(match selection {
+                    Some(selection) => intersect(&selection, &kept),
+                    None => kept,
+                });
+            }
+            None => continue,
+        }
+        dictionaries.push((*at, dictionary));
     }
-    Ok(pieces)
+    // The kept rows per chunk, when a predicate dropped any: sized by the
+    // rows actually decoded from a validated row group, never by a footer
+    // count. `None` keeps `lens`, which is iterated rather than collected.
+    let kept_lens: Option<Vec<usize>> = selection
+        .as_ref()
+        .map(|selection| selection.iter().map(Vec::len).collect());
+    // One column at a time: each needed file column decodes into the pieces
+    // `kept_lens` describes (a vector never exceeds CHUNK_SIZE rows).
+    let mut pieces: Vec<Vec<Vector>> = Vec::with_capacity(decoded.len());
+    for (_, at, column) in decoded {
+        let chunks = match dictionaries.iter().find(|(read, _)| read == at) {
+            Some((_, dictionary)) => dictionary.gather(selection.as_deref()).map_err(|e| {
+                PinkDbError::Execution(format!("column \"{}\" of \"{path}\": {e}", column.name))
+            })?,
+            None => {
+                let mut chunks = decode_column(row_group_reader, column, lens).map_err(|e| {
+                    PinkDbError::Execution(format!("column \"{}\" of \"{path}\": {e}", column.name))
+                })?;
+                if let Some(selection) = &selection {
+                    for (chunk, rows) in chunks.iter_mut().zip(selection) {
+                        if rows.len() < chunk.len() {
+                            *chunk = chunk.take(rows);
+                        }
+                    }
+                }
+                chunks
+            }
+        };
+        pieces.push(chunks);
+    }
+    Ok((pieces, kept_lens))
 }
 
 /// Assemble one row group's decoded pieces into full-width engine chunks
@@ -529,7 +731,7 @@ fn decode_row_group_reader(
 fn assemble_row_group(
     file: &FileResolved,
     plan: &DecodePlan<'_>,
-    lens: ChunkLens,
+    lens: impl IntoIterator<Item = usize>,
     decoded: &[(usize, usize, &FileColumn)],
     mut pieces: Vec<Vec<Vector>>,
     sink: &mut dyn FnMut(DataChunk) -> Result<()>,
@@ -538,7 +740,11 @@ fn assemble_row_group(
     let placeholders = &plan.placeholders;
     let width = resolved.schema.len();
     let mut start = 0usize;
-    for (chunk_index, n) in lens.enumerate() {
+    for (chunk_index, n) in lens.into_iter().enumerate() {
+        if n == 0 {
+            // A pushed predicate rejected every row of this chunk.
+            continue;
+        }
         let mut cols: Vec<Arc<Vector>> = Vec::with_capacity(width);
         for (out_index, placeholder) in placeholders.iter().enumerate() {
             if let Some(placeholder) = placeholder {
@@ -638,6 +844,12 @@ fn scan_remote_parallel(
     if decoded.is_empty() {
         return scan_metadata_only(file, plan, out, sink);
     }
+    let filtering = drops_rows(plan.resolved, plan);
+    let filter_only = filter_only_columns(file, plan, filtering);
+    let filters: &[PrunePredicate] = match filtering {
+        true => plan.filters,
+        false => &[],
+    };
 
     // The surviving row groups and the coalesced byte ranges each needs.
     let mut surviving: Vec<(usize, usize, usize, Vec<ByteSpan>)> = Vec::new();
@@ -708,12 +920,21 @@ fn scan_remote_parallel(
             .iter()
             .map(|(rg_index, rows, start, _)| (*rg_index, chunk_lens(*rows, *start)))
             .collect();
-        let results: Vec<Result<Vec<Vec<Vector>>>> = if indexes.len() > 1 {
+        let results: Vec<Result<RowGroupDecode>> = if indexes.len() > 1 {
+            let filter_only = &filter_only;
             std::thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(indexes.len());
                 for (rg_index, lens) in &indexes {
                     handles.push(scope.spawn(move || {
-                        decode_row_group(reader, *rg_index, decoded, *lens, &file.meta.path)
+                        decode_row_group(
+                            reader,
+                            *rg_index,
+                            decoded,
+                            filter_only,
+                            filters,
+                            *lens,
+                            &file.meta.path,
+                        )
                     }));
                 }
                 handles
@@ -725,15 +946,27 @@ fn scan_remote_parallel(
             indexes
                 .iter()
                 .map(|(rg_index, lens)| {
-                    decode_row_group(reader, *rg_index, decoded, *lens, &file.meta.path)
+                    decode_row_group(
+                        reader,
+                        *rg_index,
+                        decoded,
+                        &filter_only,
+                        filters,
+                        *lens,
+                        &file.meta.path,
+                    )
                 })
                 .collect()
         };
 
-        for ((_, lens), result) in indexes.iter().zip(results) {
-            let pieces = result?;
+        for (&(rg_index, lens), result) in indexes.iter().zip(results) {
+            let (pieces, kept) = result?;
             out.columns_decoded += decoded.len() as u64;
-            assemble_row_group(file, plan, *lens, decoded, pieces, sink)?;
+            let _ = rg_index;
+            match kept {
+                Some(kept) => assemble_row_group(file, plan, kept, decoded, pieces, sink)?,
+                None => assemble_row_group(file, plan, lens, decoded, pieces, sink)?,
+            }
         }
 
         let starts: Vec<u64> = spans.iter().map(|span| span.start).collect();
@@ -790,6 +1023,16 @@ fn constant_keeps(constant: &Value, filter: &PrunePredicate, column: DataType) -
     match filter.op {
         PruneOp::IsNull => constant.is_null(),
         PruneOp::IsNotNull => !constant.is_null(),
+        PruneOp::In => {
+            if constant.is_null() {
+                return false;
+            }
+            filter.values.iter().any(|value| {
+                !value.is_null()
+                    && comparable(column, value)
+                    && pinkdb::plan::compare_values(constant, value).is_eq()
+            })
+        }
         _ => {
             let Some(literal) = filter.value.as_ref().filter(|_| {
                 // A NULL literal never satisfies a comparison.
@@ -814,7 +1057,7 @@ fn constant_keeps(constant: &Value, filter: &PrunePredicate, column: DataType) -
                 PruneOp::LtEq => ord != std::cmp::Ordering::Greater,
                 PruneOp::Gt => ord == std::cmp::Ordering::Greater,
                 PruneOp::GtEq => ord != std::cmp::Ordering::Less,
-                PruneOp::IsNull | PruneOp::IsNotNull => unreachable!(),
+                PruneOp::IsNull | PruneOp::IsNotNull | PruneOp::In => unreachable!("handled above"),
             }
         }
     }
@@ -900,6 +1143,8 @@ fn path_keeps(stats: &crate::file_meta::ColStats, filter: &PrunePredicate, rows:
     match filter.op {
         PruneOp::IsNull => stats.null_count != Some(0),
         PruneOp::IsNotNull => stats.null_count != Some(rows),
+        // An `IN` list is only pushed on a column's own value, not a path.
+        PruneOp::In => true,
         PruneOp::NotEq => {
             // `<>` is safe only when every value of the path equals the
             // literal; without both bounds, keep the row group.
@@ -944,10 +1189,32 @@ fn path_keeps(stats: &crate::file_meta::ColStats, filter: &PrunePredicate, rows:
                     .max
                     .as_ref()
                     .is_none_or(|max| compare(max, literal).is_none_or(|o| !o.is_lt())),
-                PruneOp::IsNull | PruneOp::IsNotNull | PruneOp::NotEq => unreachable!(),
+                PruneOp::IsNull | PruneOp::IsNotNull | PruneOp::NotEq | PruneOp::In => {
+                    unreachable!("handled above")
+                }
             }
         }
     }
+}
+
+/// Whether any non-NULL `IN` list value lies inside `[min, max]`: a row can
+/// only match an `IN` by equalling one of them. An order the comparator
+/// cannot decide (`None`, a NaN against VARIANT bounds) proves nothing and
+/// keeps the chunk.
+fn in_bounds(
+    values: &[Value],
+    min: &Value,
+    max: &Value,
+    compare: impl Fn(&Value, &Value) -> Option<std::cmp::Ordering>,
+) -> bool {
+    for value in values.iter().filter(|value| !value.is_null()) {
+        match (compare(min, value), compare(value, max)) {
+            (Some(low), Some(high)) if !low.is_gt() && !high.is_gt() => return true,
+            (Some(_), Some(_)) => {}
+            _ => return true,
+        }
+    }
+    false
 }
 
 /// `compare` applied to an optional bound (an absent bound excludes nothing).
@@ -970,6 +1237,25 @@ fn stats_keeps(
     match filter.op {
         PruneOp::IsNull => stats.null_count != Some(0),
         PruneOp::IsNotNull => stats.null_count != Some(rows),
+        PruneOp::In => {
+            // A row matches only by equalling a non-NULL list value; NaN is
+            // never inside Parquet's bounds, and a NaN list value equals
+            // only a NaN row the bounds do not cover.
+            for value in filter.values.iter().filter(|value| !value.is_null()) {
+                if !comparable(column.ty, value) {
+                    return true;
+                }
+                if matches!(value, Value::Double(x) if x.is_nan()) {
+                    return true;
+                }
+            }
+            let (Some(min), Some(max)) = (stats.min.as_ref(), stats.max.as_ref()) else {
+                return true;
+            };
+            in_bounds(&filter.values, min, max, |a, b| {
+                Some(pinkdb::plan::compare_values(a, b))
+            })
+        }
         _ => {
             // `<>` needs both bounds and must be sure *all* values equal the
             // literal; floats are excluded (the bounds do not cover NaN, and
@@ -1038,7 +1324,9 @@ fn stats_keeps(
                     .max
                     .as_ref()
                     .is_none_or(|max| !pinkdb::plan::compare_values(max, literal).is_lt()),
-                PruneOp::IsNull | PruneOp::IsNotNull | PruneOp::NotEq => unreachable!(),
+                PruneOp::IsNull | PruneOp::IsNotNull | PruneOp::NotEq | PruneOp::In => {
+                    unreachable!("handled above")
+                }
             }
         }
     }
@@ -1056,6 +1344,9 @@ fn decode_column(
     }
     if let DataType::Array { .. } = column.ty {
         return read_array_column(row_group, column, lens);
+    }
+    if let Some(dictionary) = Dictionary::read(row_group, column, lens)? {
+        return dictionary.gather(None);
     }
     let leaf = column.leaf;
     let (precision, scale) = match column.ty {
@@ -1984,6 +2275,430 @@ mod tests {
         assert_both_modes_agree(&path);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A one-column VARCHAR file: `distinct` seeded values, a NULL every 13th
+    /// row and an empty string every 17th.
+    fn write_dictionary(
+        path: &Path,
+        rows: usize,
+        distinct: usize,
+        props: WriterProperties,
+    ) -> Vec<Value> {
+        let field = Arc::new(
+            SchemaType::primitive_type_builder("s", parquet::basic::Type::BYTE_ARRAY)
+                .with_repetition(Repetition::OPTIONAL)
+                .build()
+                .unwrap(),
+        );
+        let schema = Arc::new(
+            SchemaType::group_type_builder("pinkdb_schema")
+                .with_fields(vec![field])
+                .build()
+                .unwrap(),
+        );
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, schema, Arc::new(props)).unwrap();
+        let mut expected = Vec::with_capacity(rows);
+        let mut values = Vec::new();
+        let mut levels = Vec::with_capacity(rows);
+        for row in 0..rows {
+            if row % 13 == 0 {
+                levels.push(0);
+                expected.push(Value::Null);
+            } else {
+                levels.push(1);
+                let text = if row % 17 == 0 {
+                    String::new()
+                } else {
+                    format!("{:0>4}", (row * 7919) % distinct)
+                };
+                values.push(ByteArray::from(text.as_bytes()));
+                expected.push(Value::Varchar(text));
+            }
+        }
+        let mut group = writer.next_row_group().unwrap();
+        let mut column = group.next_column().unwrap().unwrap();
+        column
+            .typed::<ByteArrayType>()
+            .write_batch(&values, Some(&levels), None)
+            .unwrap();
+        column.close().unwrap();
+        group.close().unwrap();
+        writer.close().unwrap();
+        expected
+    }
+
+    /// The encodings of a column's pages, dictionary page included.
+    fn page_encodings(path: &Path, column: usize) -> Vec<parquet::basic::Encoding> {
+        use parquet::column::page::Page;
+        let reader = SerializedFileReader::new(std::fs::File::open(path).unwrap()).unwrap();
+        let group = reader.get_row_group(0).unwrap();
+        let mut pages = group.get_column_page_reader(column).unwrap();
+        let mut encodings = Vec::new();
+        while let Some(page) = pages.get_next_page().unwrap() {
+            encodings.push(match page {
+                Page::DictionaryPage { encoding, .. } => encoding,
+                Page::DataPage { encoding, .. } => encoding,
+                Page::DataPageV2 { encoding, .. } => encoding,
+            });
+        }
+        encodings
+    }
+
+    fn resolve_one(path: &Path) -> Resolved {
+        crate::resolve::resolve(&path.display().to_string(), &Options::default()).expect("resolve")
+    }
+
+    /// Every row a scan with `filters` emits, in the order it emits them.
+    fn read_filtered(
+        resolved: &Resolved,
+        projection: Option<&[usize]>,
+        filters: &[PrunePredicate],
+        serial: bool,
+    ) -> Vec<Vec<Value>> {
+        let output = if serial {
+            scan_serial(resolved, projection, filters).expect("serial scan")
+        } else {
+            scan(resolved, projection, filters)
+                .expect("parallel scan")
+                .0
+        };
+        let mut rows = Vec::new();
+        for chunk in &output.chunks {
+            for r in 0..chunk.num_rows {
+                // Columns the projection does not read are zero-length
+                // placeholders.
+                rows.push(
+                    (0..chunk.columns.len())
+                        .filter(|&c| !chunk.columns[c].is_empty())
+                        .map(|c| chunk.columns[c].get(r))
+                        .collect(),
+                );
+            }
+        }
+        rows
+    }
+
+    /// Whether `row` passes `filter`, i.e. the predicate is TRUE for it. A
+    /// NULL cell or NULL literal is never TRUE, and `IN` matches no row for an
+    /// empty list or a NULL list element.
+    fn holds(row: &[Value], filter: &PrunePredicate) -> bool {
+        let cell = &row[filter.column];
+        match filter.op {
+            PruneOp::IsNull => cell.is_null(),
+            PruneOp::IsNotNull => !cell.is_null(),
+            PruneOp::In => {
+                !cell.is_null()
+                    && filter
+                        .values
+                        .iter()
+                        .any(|value| !value.is_null() && value == cell)
+            }
+            op => {
+                let literal = filter.value.as_ref().expect("comparison literal");
+                if cell.is_null() || literal.is_null() {
+                    return false;
+                }
+                let order = pinkdb::plan::compare_values(cell, literal);
+                match op {
+                    PruneOp::Eq => order.is_eq(),
+                    PruneOp::NotEq => !order.is_eq(),
+                    PruneOp::Lt => order.is_lt(),
+                    PruneOp::LtEq => !order.is_gt(),
+                    PruneOp::Gt => order.is_gt(),
+                    PruneOp::GtEq => !order.is_lt(),
+                    PruneOp::IsNull | PruneOp::IsNotNull | PruneOp::In => {
+                        unreachable!("handled above")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Several data pages in one chunk, a dictionary page, NULLs and empty
+    /// strings: every row comes back unchanged in both decode modes.
+    #[test]
+    fn dictionary_pages_round_trip_in_both_modes() {
+        let dir = scratch("dict_pages");
+        let path = dir.join("dict.parquet");
+        let props = WriterProperties::builder()
+            .set_data_page_size_limit(1024)
+            .build();
+        let expected = write_dictionary(&path, 5000, 500, props);
+        let encodings = page_encodings(&path, 0);
+        assert!(
+            encodings
+                .iter()
+                .any(|e| matches!(e, parquet::basic::Encoding::PLAIN_DICTIONARY)
+                    || matches!(e, parquet::basic::Encoding::RLE_DICTIONARY)),
+            "the fixture has no dictionary-encoded data page: {encodings:?}"
+        );
+        assert!(encodings.len() > 2, "one page only: {encodings:?}");
+        let resolved = resolve_one(&path);
+        for serial in [false, true] {
+            let (rows, lens) = read(&resolved, serial);
+            assert!(lens.len() > 1, "one chunk only: {lens:?}");
+            assert_eq!(rows.len(), expected.len());
+            for (r, (got, want)) in rows.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    got.as_slice(),
+                    std::slice::from_ref(want),
+                    "row {r} (serial: {serial})"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pushed filter keeps exactly the rows the same predicate marks TRUE:
+    /// every comparison, both NULL tests and several `IN` lists, on a column
+    /// whose chunk takes both the dictionary path and the PLAIN fallback.
+    #[test]
+    fn dictionary_filters_keep_exactly_the_matching_rows() {
+        let dir = scratch("dict_filters");
+        for (tag, props, exact) in [
+            (
+                "dictionary",
+                WriterProperties::builder()
+                    .set_data_page_size_limit(1024)
+                    .build(),
+                true,
+            ),
+            (
+                "dictionary_and_plain",
+                WriterProperties::builder()
+                    .set_data_page_size_limit(1024)
+                    .set_dictionary_page_size_limit(4096)
+                    .build(),
+                false,
+            ),
+        ] {
+            let path = dir.join(format!("{tag}.parquet"));
+            let expected = write_dictionary(&path, 4000, 4000, props);
+            let resolved = resolve_one(&path);
+            let filters = [
+                PrunePredicate::compare(0, PruneOp::Eq, Value::Varchar("0042".into())),
+                PrunePredicate::compare(0, PruneOp::NotEq, Value::Varchar("0042".into())),
+                PrunePredicate::compare(0, PruneOp::Lt, Value::Varchar("0500".into())),
+                PrunePredicate::compare(0, PruneOp::LtEq, Value::Varchar("0500".into())),
+                PrunePredicate::compare(0, PruneOp::Gt, Value::Varchar("3500".into())),
+                PrunePredicate::compare(0, PruneOp::GtEq, Value::Varchar("3500".into())),
+                PrunePredicate::null_test(0, false),
+                PrunePredicate::null_test(0, true),
+                PrunePredicate::in_list(
+                    0,
+                    ["0042", "0007", "1234", "", "3999"]
+                        .iter()
+                        .map(|s| Value::Varchar((*s).into()))
+                        .collect(),
+                ),
+                PrunePredicate::in_list(0, vec![Value::Varchar("0042".into()), Value::Null]),
+                PrunePredicate::in_list(
+                    0,
+                    vec![Value::Varchar("0042".into()), Value::Varchar("0042".into())],
+                ),
+                PrunePredicate::in_list(0, Vec::new()),
+            ];
+            for filter in &filters {
+                let want: Vec<Vec<Value>> = expected
+                    .iter()
+                    .filter(|cell| holds(std::slice::from_ref(*cell), filter))
+                    .map(|cell| vec![cell.clone()])
+                    .collect();
+                for serial in [false, true] {
+                    let got = read_filtered(&resolved, None, std::slice::from_ref(filter), serial);
+                    if exact {
+                        assert_eq!(got, want, "{tag}: {filter:?} (serial: {serial})");
+                    } else {
+                        // A chunk that spills to PLAIN pages has no dictionary
+                        // to select from, so the scan returns a superset; the
+                        // engine's `WHERE` above the scan drops the rest.
+                        let kept: Vec<Vec<Value>> = got
+                            .iter()
+                            .filter(|row| holds(row, filter))
+                            .cloned()
+                            .collect();
+                        assert_eq!(kept, want, "{tag}: {filter:?} (serial: {serial})");
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A filter on a column the projection does not read still drops rows, and
+    /// the projected column stays aligned with them; a predicate on a column
+    /// that has no dictionary keeps the same contract.
+    #[test]
+    fn dictionary_filter_on_an_unprojected_column_keeps_rows_aligned() {
+        let dir = scratch("dict_filter_only");
+        let path = dir.join("filter_only.parquet");
+        write_groups(&path, &[4000]);
+        let resolved = resolve_one(&path);
+        let (all, _) = read(&resolved, false);
+        let filters = [
+            PrunePredicate::in_list(
+                1,
+                vec![Value::Varchar("bb".into()), Value::Varchar("ccc".into())],
+            ),
+            PrunePredicate::compare(1, PruneOp::Eq, Value::Varchar("bb".into())),
+            PrunePredicate::compare(1, PruneOp::Gt, Value::Varchar("a".into())),
+            PrunePredicate::null_test(1, false),
+            PrunePredicate::in_list(0, vec![Value::Integer(7), Value::Integer(11)]),
+            PrunePredicate::compare(0, PruneOp::LtEq, Value::Integer(3)),
+        ];
+        for filter in &filters {
+            let want: Vec<Vec<Value>> = all
+                .iter()
+                .filter(|row| holds(row, filter))
+                .map(|row| row[..2].to_vec())
+                .collect();
+            assert!(
+                !want.is_empty() && want.len() < all.len(),
+                "{filter:?} keeps everything or nothing"
+            );
+            for projection in [&[0usize][..], &[1][..], &[0, 1][..]] {
+                for serial in [false, true] {
+                    let got = read_filtered(
+                        &resolved,
+                        Some(projection),
+                        std::slice::from_ref(filter),
+                        serial,
+                    );
+                    let want: Vec<Vec<Value>> = want
+                        .iter()
+                        .map(|row| projection.iter().map(|&c| row[c].clone()).collect())
+                        .collect();
+                    if filter.column == 1 {
+                        // A dictionary-encoded predicate column selects rows
+                        // even when the projection does not read it.
+                        assert_eq!(
+                            got, want,
+                            "{filter:?} projected {projection:?} (serial: {serial})"
+                        );
+                    } else {
+                        // An INTEGER column decodes through the typed path and
+                        // has no dictionary to select from: the scan returns
+                        // every row and the engine's `WHERE` drops the
+                        // rejected ones.
+                        let everything: Vec<Vec<Value>> = all
+                            .iter()
+                            .map(|row| projection.iter().map(|&c| row[c].clone()).collect())
+                            .collect();
+                        assert_eq!(
+                            got, everything,
+                            "{filter:?} projected {projection:?} (serial: {serial})"
+                        );
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dictionary that spills to PLAIN pages mid-chunk still reads back
+    /// exactly, in both modes.
+    #[test]
+    fn a_plain_fallback_page_still_round_trips() {
+        let dir = scratch("dict_fallback");
+        let path = dir.join("fallback.parquet");
+        let props = WriterProperties::builder()
+            .set_data_page_size_limit(1024)
+            .set_dictionary_page_size_limit(4096)
+            .build();
+        let expected = write_dictionary(&path, 4000, 4000, props);
+        let encodings = page_encodings(&path, 0);
+        assert!(
+            encodings
+                .iter()
+                .any(|e| matches!(e, parquet::basic::Encoding::PLAIN)),
+            "the dictionary never spilled to PLAIN pages: {encodings:?}"
+        );
+        let resolved = resolve_one(&path);
+        for serial in [false, true] {
+            let (rows, _) = read(&resolved, serial);
+            assert_eq!(rows.len(), expected.len());
+            for (r, (got, want)) in rows.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    got.as_slice(),
+                    std::slice::from_ref(want),
+                    "row {r} (serial: {serial})"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Invalid UTF-8 in a dictionary entry fails with the text a value-by-value
+    /// decode produces today.
+    #[test]
+    fn invalid_utf8_in_a_dictionary_entry_keeps_todays_error() {
+        let dir = scratch("dict_utf8");
+        let path = dir.join("utf8.parquet");
+        let field = Arc::new(
+            SchemaType::primitive_type_builder("s", parquet::basic::Type::BYTE_ARRAY)
+                .with_repetition(Repetition::OPTIONAL)
+                .build()
+                .unwrap(),
+        );
+        let schema = Arc::new(
+            SchemaType::group_type_builder("pinkdb_schema")
+                .with_fields(vec![field])
+                .build()
+                .unwrap(),
+        );
+        let mut writer = SerializedFileWriter::new(
+            std::fs::File::create(&path).unwrap(),
+            schema,
+            Arc::new(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        let mut group = writer.next_row_group().unwrap();
+        let mut column = group.next_column().unwrap().unwrap();
+        let values = [ByteArray::from(&[0xffu8, 0xfe][..])];
+        let levels = [1i16];
+        column
+            .typed::<ByteArrayType>()
+            .write_batch(&values, Some(&levels), None)
+            .unwrap();
+        column.close().unwrap();
+        group.close().unwrap();
+        writer.close().unwrap();
+        assert!(
+            page_encodings(&path, 0).iter().any(|e| matches!(
+                e,
+                parquet::basic::Encoding::PLAIN_DICTIONARY
+            ) || matches!(
+                e,
+                parquet::basic::Encoding::RLE_DICTIONARY
+            )),
+            "the fixture is not dictionary-encoded"
+        );
+        let resolved = resolve_one(&path);
+        for serial in [false, true] {
+            let err = if serial {
+                scan_serial(&resolved, None, &[]).unwrap_err()
+            } else {
+                match scan(&resolved, None, &[]) {
+                    Ok(_) => panic!("valid UTF-8 came out of an invalid dictionary entry"),
+                    Err(err) => err,
+                }
+            };
+            // The serial reader wraps a column's error with the file path;
+            // the parallel reader reports the column alone — today's texts.
+            let want = if serial {
+                format!(
+                    "column \"s\" of \"{}\": column \"s\": the bytes are not valid UTF-8",
+                    path.display()
+                )
+            } else {
+                "column \"s\": the bytes are not valid UTF-8".to_string()
+            };
+            assert_eq!(err.to_string(), want, "serial: {serial}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Gap merged across page spans: a page is tens of kilobytes, so a
@@ -2013,6 +2728,8 @@ pub struct RowGroupMorsels {
     props: ReaderPropertiesPtr,
     transport: Arc<crate::ranged::TransportCounters>,
     groups: Vec<GroupPlan>,
+    /// The rows each morsel's pushed predicates rejected, per morsel.
+    dropped: Vec<AtomicU64>,
     counters: MorselCounters,
 }
 
@@ -2060,6 +2777,14 @@ impl RowGroupMorsels {
         self.groups.get(index).map_or(0, |group| group.rows as u64)
     }
 
+    /// The rows morsel `index` dropped because a pushed predicate rejected
+    /// them (they are not in [`rows`](Self::rows)' output).
+    pub fn dropped(&self, index: usize) -> u64 {
+        self.dropped
+            .get(index)
+            .map_or(0, |dropped| dropped.load(AtomicOrdering::Relaxed))
+    }
+
     /// What the plan pruned, and what it will read.
     pub fn counters(&self) -> MorselCounters {
         self.counters
@@ -2086,11 +2811,17 @@ impl RowGroupMorsels {
         let file = &self.resolved.files[0];
         let plan = self.decode_plan();
         let decoded = decoded_columns(file, &plan);
+        let filtering = drops_rows(&self.resolved, &plan);
+        let filter_only = filter_only_columns(file, &plan, filtering);
+        let filters: &[PrunePredicate] = match filtering {
+            true => &self.filters,
+            false => &[],
+        };
         let lens = chunk_lens(group.rows, group.offset);
         if decoded.is_empty() {
             return assemble_row_group(file, &plan, lens, &decoded, Vec::new(), sink);
         }
-        let pieces = match (&self.reader, &self.remote) {
+        let (pieces, kept) = match (&self.reader, &self.remote) {
             (FileSource::Remote(chunk), Some(spec)) => {
                 self.fetch(chunk, spec, group)?;
                 let rg_meta = self.metadata.row_group(group.index);
@@ -2116,14 +2847,34 @@ impl RowGroupMorsels {
                             props: Arc::clone(&self.props),
                             locations: selection.locations.clone(),
                         };
-                        decode_row_group_reader(&filtered, &decoded, lens, &self.path)?
+                        decode_row_group_reader(
+                            &filtered,
+                            &decoded,
+                            &filter_only,
+                            filters,
+                            lens,
+                            &self.path,
+                        )?
                     }
-                    None => decode_row_group_reader(&row_group, &decoded, lens, &self.path)?,
+                    None => decode_row_group_reader(
+                        &row_group,
+                        &decoded,
+                        &filter_only,
+                        filters,
+                        lens,
+                        &self.path,
+                    )?,
                 }
             }
-            (FileSource::Local(reader), _) => {
-                decode_row_group(reader, group.index, &decoded, lens, &self.path)?
-            }
+            (FileSource::Local(reader), _) => decode_row_group(
+                reader,
+                group.index,
+                &decoded,
+                &filter_only,
+                filters,
+                lens,
+                &self.path,
+            )?,
             (FileSource::Remote(_), None) => {
                 return Err(PinkDbError::Execution(format!(
                     "the parquet morsel plan for \"{}\" lost its range source",
@@ -2131,7 +2882,15 @@ impl RowGroupMorsels {
                 )));
             }
         };
-        assemble_row_group(file, &plan, lens, &decoded, pieces, sink)
+        let dropped = match &kept {
+            Some(kept) => group.rows - kept.iter().sum::<usize>(),
+            None => 0,
+        };
+        self.dropped[index].fetch_add(dropped as u64, AtomicOrdering::Relaxed);
+        match kept {
+            Some(kept) => assemble_row_group(file, &plan, kept, &decoded, pieces, sink),
+            None => assemble_row_group(file, &plan, lens, &decoded, pieces, sink),
+        }
     }
 
     fn decode_plan(&self) -> DecodePlan<'_> {
@@ -2309,6 +3068,7 @@ pub fn plan_row_groups(
             kept_offset = kept_offset.saturating_add(kept_rows);
         }
     }
+    let dropped = groups.iter().map(|_| AtomicU64::new(0)).collect();
     Ok(RowGroupMorsels {
         path,
         resolved,
@@ -2321,6 +3081,7 @@ pub fn plan_row_groups(
         props,
         transport,
         groups,
+        dropped,
         counters,
     })
 }

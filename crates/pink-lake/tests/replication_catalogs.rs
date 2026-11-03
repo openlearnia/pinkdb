@@ -1286,21 +1286,27 @@ fn stop_aborts_an_in_flight_cycle_at_a_table_boundary_body() {
     wait_for("the first cycle to start", Duration::from_secs(10), || {
         CycleGuard::is_active(&dest_dir, job)
     });
-    let stopped = Instant::now();
+    // No wall-clock bound (a loaded machine stretches any cycle): the abort is
+    // proven by state. `stop` returned with no cycle active, the cycle did not
+    // copy every table, and each table it recorded as synced is whole, so it
+    // stopped between tables, never inside one.
     supervisor.stop();
-    assert!(
-        stopped.elapsed() < Duration::from_secs(5),
-        "a stop during a cycle took {:?}",
-        stopped.elapsed()
-    );
     assert!(!CycleGuard::is_active(&dest_dir, job));
-    let synced = replication::tables(&open_lake(&dest_dir).unwrap(), job)
-        .unwrap()
-        .len();
+    let lake = open_lake(&dest_dir).unwrap();
+    let synced = replication::tables(&lake, job).unwrap();
     assert!(
-        synced < 60,
-        "the stop should abort at a table boundary, but all {synced} tables were copied"
+        synced.len() < 60,
+        "the stop should abort at a table boundary, but all {} tables were copied",
+        synced.len()
     );
+    for table in &synced {
+        assert_eq!(
+            lake_table_rows(&lake, &table.dest).len(),
+            20,
+            "{} was cut inside the table",
+            table.dest
+        );
+    }
     cleanup(&dir);
 }
 

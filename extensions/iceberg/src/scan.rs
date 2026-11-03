@@ -554,6 +554,21 @@ fn bounds_may_match(
     ty: &IceType,
     predicate: &PrunePredicate,
 ) -> bool {
+    if predicate.op == PruneOp::In {
+        // No single literal: any list value inside the bounds can match, and
+        // an undecodable bound or literal proves nothing. A NULL element
+        // matches no row.
+        let lower = lower.and_then(|bytes| decode_bound(bytes, ty));
+        let upper = upper.and_then(|bytes| decode_bound(bytes, ty));
+        return predicate
+            .values
+            .iter()
+            .filter(|value| !value.is_null())
+            .any(|value| match predicate_bound(value, ty) {
+                Some(value) => inside(&value, lower.as_ref(), upper.as_ref()),
+                None => true,
+            });
+    }
     let Some(value) = predicate.value.as_ref() else {
         return true;
     };
@@ -565,17 +580,7 @@ fn bounds_may_match(
     // A missing or undecodable bound proves nothing; a bound that cannot be
     // compared with the literal does either.
     match predicate.op {
-        PruneOp::Eq => {
-            let below = lower
-                .as_ref()
-                .and_then(|lower| cmp(&value, lower))
-                .is_some_and(|order| order.is_lt());
-            let above = upper
-                .as_ref()
-                .and_then(|upper| cmp(&value, upper))
-                .is_some_and(|order| order.is_gt());
-            !(below || above)
-        }
+        PruneOp::Eq => inside(&value, lower.as_ref(), upper.as_ref()),
         PruneOp::Lt => !matches!(
             lower.as_ref().and_then(|lower| cmp(lower, &value)),
             Some(std::cmp::Ordering::Less)
@@ -592,8 +597,20 @@ fn bounds_may_match(
             upper.as_ref().and_then(|upper| cmp(upper, &value)),
             Some(std::cmp::Ordering::Less)
         ),
-        PruneOp::NotEq | PruneOp::IsNull | PruneOp::IsNotNull => true,
+        // `IN` is decided above, before a single literal is decoded.
+        PruneOp::NotEq | PruneOp::IsNull | PruneOp::IsNotNull | PruneOp::In => true,
     }
+}
+
+/// Whether `value` lies inside the bounds; a missing bound never excludes it.
+fn inside(value: &Bound, lower: Option<&Bound>, upper: Option<&Bound>) -> bool {
+    let below = lower
+        .and_then(|lower| cmp(value, lower))
+        .is_some_and(|order| order.is_lt());
+    let above = upper
+        .and_then(|upper| cmp(value, upper))
+        .is_some_and(|order| order.is_gt());
+    !(below || above)
 }
 
 /// Decode Iceberg's single-value encoding of a bound.
@@ -669,6 +686,7 @@ mod tests {
             op: PruneOp::Eq,
             value: Some(Value::Bigint(5)),
             path: None,
+            values: Vec::new(),
         };
         assert!(!bounds_may_match(
             Some(&lower),
@@ -681,6 +699,7 @@ mod tests {
             op: PruneOp::Eq,
             value: Some(Value::Bigint(2)),
             path: None,
+            values: Vec::new(),
         };
         assert!(bounds_may_match(
             Some(&lower),

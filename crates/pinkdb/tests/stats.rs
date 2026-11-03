@@ -440,6 +440,32 @@ fn zone_map_pruning_keeps_every_row_it_should() {
         );
         assert_ne!(all[0][0], Value::Bigint(0));
     }
+    // An `IN` list prunes chunks by the same zone maps; the same predicate
+    // inside a projection is evaluated per row and is never pushed, so it is
+    // the ground truth for what the chunk skipping must keep.
+    for list in [
+        "k IN (0, 4998, 9000)",
+        "k IN (3, NULL)",
+        "s IN ('s1', 's4990', '')",
+        "k NOT IN (1, 2)",
+        // Lists that match nothing: every value outside every chunk's
+        // bounds, only a NULL, and a string no row holds.
+        "k IN (-5, 100000)",
+        "k IN (NULL)",
+        "s IN ('zzz')",
+    ] {
+        let pushed = rows(
+            &mut db,
+            &format!("SELECT count(*), count(k) FROM t WHERE {list};"),
+        );
+        let unhinted = rows(
+            &mut db,
+            &format!(
+                "SELECT count(*), count(k) FROM t WHERE (CASE WHEN {list} THEN 1 ELSE 0 END) = 1;"
+            ),
+        );
+        assert_eq!(pushed, unhinted, "{list}");
+    }
 }
 
 /// Random joins of every shape, run with the dynamic filters on and off: the

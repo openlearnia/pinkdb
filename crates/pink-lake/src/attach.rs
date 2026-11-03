@@ -676,7 +676,9 @@ impl ScanPlan {
                     rows += push_physical(&self.entry, &planned.file, plan, chunk, sink)?;
                     Ok(())
                 })?;
-                let expected = morsels.rows(*morsel as usize);
+                // `rows` is what the plan would decode without a pushed
+                // predicate; the decode emits the subset the predicate keeps.
+                let expected = morsels.rows(*morsel as usize) - morsels.dropped(*morsel as usize);
                 if rows != expected {
                     return Err(PinkDbError::Execution(format!(
                         "corrupt: {}: table \"{}\": data file \"{}\" streamed {rows} rows, \
@@ -1281,6 +1283,7 @@ fn file_plan(
                 op: filter.op,
                 value: filter.value.clone(),
                 path: filter.path.clone(),
+                values: filter.values.clone(),
             })
         })
         .collect();
@@ -2891,6 +2894,7 @@ mod tests {
             op: pinkdb::attached::PruneOp::GtEq,
             value: Some(Value::Integer(12_000)),
             path: None,
+            values: Vec::new(),
         }];
         let mut pruned = Vec::new();
         let io = drain_scan(&attachment, &table, None, &predicates, &mut |chunk| {
@@ -2904,6 +2908,61 @@ mod tests {
             pruned,
             (12_000..16_000).map(Value::Integer).collect::<Vec<Value>>()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Wave 133d: a pushed `IN` list prunes lake files (and store chunks)
+    /// only when no list value can match; every answer equals the same
+    /// predicate evaluated row by row in a projection, which the scan does
+    /// not push.
+    #[test]
+    fn in_lists_prune_lakes_without_dropping_matching_rows() {
+        let dir = scratch("in_pushdown");
+        let lake_dir = dir.join("lake");
+        let mut base = PinkDb::new();
+        base.execute("CREATE TABLE t (i INTEGER, v VARCHAR, n BIGINT);")
+            .unwrap();
+        {
+            let t = base.table_mut("t").unwrap();
+            for r in 0..3000i32 {
+                let v = if r % 11 == 0 {
+                    Value::Null
+                } else {
+                    Value::Varchar(format!("{:02}", r % 40))
+                };
+                t.append_row(vec![Value::Integer(r), v, Value::Bigint(r as i64 * 3)])
+                    .unwrap();
+            }
+        }
+        crate::save_store(&base, &lake_dir).unwrap();
+        let lake = Lake::open(&lake_dir).unwrap();
+        let (attachment, _) = build(&lake, None).unwrap();
+        let mut lake_db = PinkDb::new();
+        lake_db
+            .attach_lake(Arc::clone(&attachment) as Arc<dyn AttachedLake>)
+            .unwrap();
+        let mut plain = base;
+        let lists = [
+            "v IN ('03', '07', '39')",
+            "v IN ('03', NULL, '07')",
+            "v IN ('00')",
+            "v IN ('03', '07') AND i > 1000",
+            "i IN (1, 2, 3, 2999)",
+            "i IN (1, 2.5, 3)",
+            "n IN (0, 3, -3, 8997)",
+        ];
+        for list in lists {
+            let sql = |cond: &str| format!("SELECT i, v FROM t WHERE {cond} ORDER BY i;");
+            let got = query(&mut lake_db, &sql(list));
+            // The same predicate marked in a projection is evaluated per row
+            // with no pushed predicate at all: the ground truth.
+            let marked = query(
+                &mut lake_db,
+                &sql(&format!("(CASE WHEN {list} THEN 1 ELSE 0 END) = 1")),
+            );
+            assert_eq!(got, marked, "lake: {list}");
+            assert_eq!(got, query(&mut plain, &sql(list)), "store: {list}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

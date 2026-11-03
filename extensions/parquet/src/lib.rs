@@ -132,6 +132,7 @@
 //!   the transport (no custom CA), and no ranged `HEAD` cache across
 //!   statements (bind and scan each read the footer again, cheaply).
 
+mod dictionary;
 mod file_meta;
 mod glob;
 mod hive;
