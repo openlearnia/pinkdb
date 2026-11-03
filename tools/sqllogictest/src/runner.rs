@@ -29,10 +29,16 @@ use crate::report::{FileResult, FileStatus, FirstFailure, Records};
 /// The `STANDARD_VECTOR_SIZE` the corpus' `require vector_size` checks against.
 const STANDARD_VECTOR_SIZE: usize = 2048;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub statement_timeout: Duration,
+    /// The inter-node deadline: a file that reaches it reports its own
+    /// timeout, with the records it had.
     pub file_timeout: Duration,
+    /// The outer cutoff that decides a file is still running: `run_file`'s
+    /// worker gets this long before the caller gives up on it. A child process
+    /// is bounded by its parent's kill instead and sets this far out.
+    pub hard_timeout: Duration,
     /// One directory below this is created per test file.
     pub temp_root: PathBuf,
     /// The duckdb checkout root; `data/...` paths, `{DATA_DIR}` and
@@ -62,8 +68,13 @@ pub fn run_file(cfg: &Config, path: &Path, rel: &str) -> FileResult {
     let worker_cfg = cfg.clone();
     let worker_path = path.to_path_buf();
     let worker_rel = rel.to_string();
+    // A deep plan (DuckDB's corpus has a CUBE of 12 columns: 4096 grouping
+    // sets) can recurse far past the 2 MiB default; a stack overflow aborts
+    // the whole runner, which `catch_unwind` cannot contain. Reserve what a
+    // DuckDB main thread would have and more: only touched pages are used.
     let handle = match std::thread::Builder::new()
         .name(format!("slt-{rel}"))
+        .stack_size(256 << 20)
         .spawn(move || {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 run_file_inner(&worker_cfg, &worker_path, &worker_rel, worker_progress)
@@ -99,8 +110,7 @@ pub fn run_file(cfg: &Config, path: &Path, rel: &str) -> FileResult {
         }
     };
 
-    let hard_timeout = cfg.file_timeout + Duration::from_secs(2);
-    match receiver.recv_timeout(hard_timeout) {
+    match receiver.recv_timeout(cfg.hard_timeout) {
         Ok(result) => {
             let _ = handle.join();
             result
@@ -117,7 +127,7 @@ pub fn run_file(cfg: &Config, path: &Path, rel: &str) -> FileResult {
                 records: progress.records,
                 first_failure: progress.first_failure.clone(),
                 notes: vec!["file worker did not stop within the deadline".to_string()],
-                duration_ms: hard_timeout.as_millis() as u64,
+                duration_ms: cfg.hard_timeout.as_millis() as u64,
             }
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => FileResult {
@@ -526,9 +536,7 @@ impl<'a> Runner<'a> {
 
     fn run_statement(&mut self, statement: &Statement) -> Result<(), Stop> {
         let sql = self.replace_keywords(&statement.sql, true);
-        if self.cfg.test_hook && sql.contains("pinkdb_slt_crash") {
-            panic!("pinkdb-slt crash test hook");
-        }
+        self.test_hook(&sql);
         let budget = self.statement_budget()?;
         let expected_raw = statement.expected_error.clone();
         let expected = self.replace_keywords(&expected_raw, false);
@@ -608,9 +616,7 @@ impl<'a> Runner<'a> {
             .iter()
             .map(|line| self.replace_keywords(line, false))
             .collect();
-        if self.cfg.test_hook && sql.contains("pinkdb_slt_crash") {
-            panic!("pinkdb-slt crash test hook");
-        }
+        self.test_hook(&sql);
         let budget = self.statement_budget()?;
         let result = {
             let connection = self.connection(query.connection.as_deref());
@@ -890,6 +896,39 @@ impl<'a> Runner<'a> {
         progress.first_failure = self.first.clone();
     }
 
+    /// The fixture hooks. `crash` is a plain panic, which `run_file` catches;
+    /// the other three are the failures a single process cannot contain, so
+    /// only the isolated runner (`isolate::run_file_isolated`) records them.
+    fn test_hook(&self, sql: &str) {
+        if !self.cfg.test_hook {
+            return;
+        }
+        if sql.contains("pinkdb_slt_crash") {
+            panic!("pinkdb-slt crash test hook");
+        }
+        if sql.contains("pinkdb_slt_stack_overflow") {
+            // Escaping the stack is the point of the hook.
+            #[allow(unconditional_recursion)]
+            fn recurse(depth: usize) -> usize {
+                // A 4 KiB frame whose array is read after the call: the
+                // recursion cannot be turned into a tail call, so the worker
+                // stack really runs out.
+                let pad = [0u8; 4096];
+                std::hint::black_box(&pad);
+                recurse(depth + 1) + pad[0] as usize + depth
+            }
+            let _ = recurse(0);
+        }
+        if sql.contains("pinkdb_slt_abort") {
+            std::process::abort();
+        }
+        if sql.contains("pinkdb_slt_hang") {
+            // Long past every deadline the runner can check: only the parent's
+            // kill of the child ends this.
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
+
     fn crash(&mut self, line: usize, sql: &str, payload: Box<dyn std::any::Any + Send>) -> Stop {
         let message = panic_message(payload);
         self.records.fail += 1;
@@ -1158,6 +1197,7 @@ mod tests {
         Config {
             statement_timeout: Duration::from_secs(10),
             file_timeout: Duration::from_secs(30),
+            hard_timeout: Duration::from_secs(32),
             temp_root: root,
             duckdb_root: std::env::temp_dir(),
             run_id: "unit-run".to_string(),

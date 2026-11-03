@@ -1,0 +1,4 @@
+# Not a query, a hook: the worker thread runs out of stack, which no panic
+# handler can catch. Only a child process contains it — as this file's crash.
+statement ok
+SELECT pinkdb_slt_stack_overflow()

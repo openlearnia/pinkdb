@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use pinkdb_sqllogictest::report::{FileStatus, Report, check, summary};
+use pinkdb_sqllogictest::isolate::{self, run_file_isolated};
+use pinkdb_sqllogictest::report::{FileResult, FileStatus, Report, check, summary};
 use pinkdb_sqllogictest::runner::{Config, run_file};
 
 fn main() -> ExitCode {
@@ -22,6 +23,9 @@ fn main() -> ExitCode {
     std::panic::set_hook(Box::new(|_| {}));
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        // The hidden child mode of `run_file_isolated`, before anything else
+        // can claim the argument.
+        Some(isolate::CHILD_FLAG) => isolate::run_child(),
         Some("summary") => summary_command(&args[1..]),
         Some("check") => check_command(&args[1..]),
         Some("--help" | "-h" | "help") => {
@@ -43,6 +47,8 @@ struct RunArgs {
     statement_timeout: Duration,
     file_timeout: Duration,
     list: bool,
+    /// Run files in this process (debugging) instead of one child each.
+    in_process: bool,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
@@ -59,6 +65,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         statement_timeout: Duration::from_secs(10),
         file_timeout: Duration::from_secs(60),
         list: false,
+        in_process: false,
     };
     let mut index = 0;
     while index < args.len() {
@@ -89,6 +96,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--minimal" => parsed.minimal = true,
             "--slow" => parsed.slow = true,
             "--list" => parsed.list = true,
+            "--in-process" => parsed.in_process = true,
             other => return Err(format!("unknown argument {other}")),
         }
         index += 1;
@@ -142,6 +150,9 @@ fn run_command(args: &[String]) -> ExitCode {
     let config = Config {
         statement_timeout: args.statement_timeout,
         file_timeout: args.file_timeout,
+        // The in-process worker gets this long before it is abandoned; a child
+        // process is bounded by the parent's kill of the whole process.
+        hard_timeout: args.file_timeout + Duration::from_secs(2),
         temp_root: temp_root.clone(),
         duckdb_root,
         run_id: format!("{}-{}", std::process::id(), temp_root.display()),
@@ -161,6 +172,7 @@ fn run_command(args: &[String]) -> ExitCode {
         (0..files.len()).partition(|&i| sets_process_limit(&files[i].1));
     let next = AtomicUsize::new(0);
     let (sender, receiver) = mpsc::channel();
+    let in_process = args.in_process;
     let mut results = std::thread::scope(|scope| {
         for _ in 0..args.jobs.min(parallel.len()) {
             let sender = sender.clone();
@@ -175,7 +187,7 @@ fn run_command(args: &[String]) -> ExitCode {
                         break;
                     };
                     let (rel, path) = &files[index];
-                    let result = run_file(config, path, rel);
+                    let result = run_one(config, path, rel, in_process);
                     if sender.send((index, result)).is_err() {
                         break;
                     }
@@ -191,7 +203,7 @@ fn run_command(args: &[String]) -> ExitCode {
     });
     for index in serial {
         let (rel, path) = &files[index];
-        results.push((index, run_file(&config, path, rel)));
+        results.push((index, run_one(&config, path, rel, in_process)));
         pinkdb::memory::reset_limit();
     }
     let wall_ms = started.elapsed().as_millis() as u64;
@@ -239,6 +251,16 @@ fn run_command(args: &[String]) -> ExitCode {
         count(FileStatus::Timeout),
     );
     ExitCode::SUCCESS
+}
+
+/// One file: in a child process by default, so a stack overflow or an abort
+/// costs that file alone, or here with `--in-process`.
+fn run_one(config: &Config, path: &Path, rel: &str, in_process: bool) -> FileResult {
+    if in_process {
+        run_file(config, path, rel)
+    } else {
+        run_file_isolated(config, path, rel)
+    }
 }
 
 fn collect_files(args: &RunArgs) -> Result<Vec<(String, PathBuf)>, String> {
@@ -356,11 +378,14 @@ fn print_help() {
         "pinkdb-slt: run DuckDB sqllogictest files against pinkdb\n\n\
          usage:\n  \
          pinkdb-slt --corpus <dir> [--filter <glob>] [--jobs N] [--out <file.json>] [--slow]\n           \
-         [--minimal] [--baseline-out <file.json>] [--statement-timeout <ms>] [--file-timeout <ms>]\n  \
+         [--minimal] [--baseline-out <file.json>] [--statement-timeout <ms>] [--file-timeout <ms>]\n           \
+         [--in-process]\n  \
          pinkdb-slt summary <file.json>\n  \
          pinkdb-slt check <file.json> --baseline <baseline.json>\n\n\
          --slow includes .test_slow files. --minimal writes status and skip reason only\n\
-         (the baseline form). --list prints the selected files instead of running them."
+         (the baseline form). --list prints the selected files instead of running them.\n\
+         --in-process runs every file in this process: a crash fixture takes the\n\
+         whole run down with it, which is why the default gives each file a child."
     );
 }
 
