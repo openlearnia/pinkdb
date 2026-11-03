@@ -496,6 +496,11 @@ fn to_js<'js>(ctx: &Ctx<'js>, v: &JsValue) -> rquickjs::Result<Value<'js>> {
             }
         }
         JsValue::Int(i) => BigInt::from_i64(ctx.clone(), *i)?.into_value(),
+        // Past `i64` there is no direct constructor: `BigInt(text)` is exact.
+        JsValue::BigInt(i) => {
+            let ctor: Function = ctx.globals().get("BigInt")?;
+            ctor.call((i.to_string(),))?
+        }
         JsValue::Double(x) => Value::new_float(ctx.clone(), *x),
         JsValue::Str(s) => rquickjs::String::from_str(ctx.clone(), s)?.into_value(),
     })
@@ -528,8 +533,13 @@ pub(crate) fn from_js(v: &Value<'_>, what: &str) -> Result<JsValue, JsError> {
             .get::<Coerced<String>>()
             .map_err(|e| JsError::Value(format!("{what}: {e}")))?
             .0;
-        return text.parse::<i64>().map(JsValue::Int).map_err(|_| {
-            JsError::Value(format!("{what}: BigInt {text} is outside the BIGINT range"))
+        if let Ok(i) = text.parse::<i64>() {
+            return Ok(JsValue::Int(i));
+        }
+        return text.parse::<i128>().map(JsValue::BigInt).map_err(|_| {
+            JsError::Value(format!(
+                "{what}: BigInt {text} is outside the HUGEINT range"
+            ))
         });
     }
     Err(JsError::Value(format!(

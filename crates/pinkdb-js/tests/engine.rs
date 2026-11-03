@@ -74,9 +74,14 @@ fn number_conversions_are_exact() {
         run("return 9223372036854775807n;"),
         Ok(JsValue::Int(i64::MAX))
     );
-    assert!(matches!(
+    // Past `i64` a BigInt is a HUGEINT; past `i128` it has no SQL integer.
+    assert_eq!(
         run("return 9223372036854775808n;"),
-        Err(JsError::Value(m)) if m.contains("BIGINT range")
+        Ok(JsValue::BigInt(9_223_372_036_854_775_808))
+    );
+    assert!(matches!(
+        run("return 2n ** 127n;"),
+        Err(JsError::Value(m)) if m.contains("HUGEINT range")
     ));
     assert_eq!(
         run("return -9223372036854775808n;"),

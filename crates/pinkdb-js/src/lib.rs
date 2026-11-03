@@ -243,6 +243,9 @@ pub enum JsValue {
     Bool(bool),
     /// An integral number that fits `i64`.
     Int(i64),
+    /// An integer outside `i64` (a HUGEINT); a JavaScript `BigInt` on the
+    /// script side.
+    BigInt(i128),
     Double(f64),
     Str(String),
 }
@@ -253,6 +256,7 @@ impl fmt::Display for JsValue {
             JsValue::Null => write!(f, "null"),
             JsValue::Bool(b) => write!(f, "{b}"),
             JsValue::Int(i) => write!(f, "{i}"),
+            JsValue::BigInt(i) => write!(f, "{i}n"),
             JsValue::Double(x) => write!(f, "{x:?}"),
             JsValue::Str(s) => write!(f, "'{s}'"),
         }
