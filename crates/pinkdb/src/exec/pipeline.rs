@@ -607,6 +607,11 @@ struct Compiled<'a> {
 /// sampled at all, so nothing else pays for the check.
 const DENSE_BYTES_PER_ROW: usize = 64;
 
+/// Inputs smaller than this are never sampled: their partial state is bounded
+/// by the input itself, and the serial sample would cost more than it saves.
+/// `od_pairs_rollup` (245,570 rows) stays above it.
+const DENSE_MIN_ROWS: usize = 131_072;
+
 /// What the source's first morsel said: the chunks it decoded to, the flat
 /// sink's partials for them, and whether the aggregate's state grows with the
 /// rows. `pulled` marks a source that has given the morsel up — a lake scan
@@ -641,6 +646,18 @@ where
                     .is_some_and(|arg| arg.dtype() == DataType::Varchar)
         });
     if !strings {
+        return Ok(None);
+    }
+    // The sample folds a whole morsel on one thread before the parallel run
+    // starts. On a small input that serial prefix is a large share of the
+    // work (a 60k-row DISTINCT under a correlated NOT IN paid ~1 ms in the CI
+    // guard), and the per-row state it guards against is bounded anyway: at
+    // DENSE_BYTES_PER_ROW × DENSE_MIN_ROWS it cannot pass ~40 MB.
+    let known_rows = match &compiled.source {
+        Source::Chunks(source) => Some(source.chunks.iter().map(DataChunk::num_rows).sum()),
+        Source::Streamed(source) => source.rows(),
+    };
+    if known_rows.is_some_and(|rows| rows < DENSE_MIN_ROWS) {
         return Ok(None);
     }
     let (chunks, pulled) = match &compiled.source {
