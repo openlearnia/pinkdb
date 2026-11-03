@@ -218,3 +218,54 @@ fn both_halves_implement_the_engine_traits() {
     assert_eq!(read.name(), "arrow");
     assert_eq!(write.name(), "arrow");
 }
+
+#[test]
+fn hugeint_columns_export_as_decimal128() {
+    let dir = scratch_dir("hugeint");
+    let file = dir.join("h.arrow");
+    let mut db = PinkDb::new();
+    pinkdb_arrow::register(&mut db);
+    db.execute("CREATE TABLE t (h HUGEINT, u UHUGEINT);")
+        .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES \
+         (170141183460469231731687303715884105727, \
+          340282366920938463463374607431768211455), \
+         (-170141183460469231731687303715884105728, 0), (NULL, NULL);",
+    )
+    .unwrap();
+    db.execute(&format!("COPY t TO '{}' (FORMAT arrow);", file.display()))
+        .unwrap();
+
+    // DuckDB's ArrowConverter writes both widths as Decimal128(38,0); a
+    // UHUGEINT above i128::MAX keeps its bits, so it reads back negative.
+    let rows = query(
+        &mut db,
+        &format!(
+            "SELECT typeof(h), typeof(u) FROM read_arrow('{}') LIMIT 1;",
+            file.display()
+        ),
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Varchar("DECIMAL(38,0)".into()),
+            Value::Varchar("DECIMAL(38,0)".into()),
+        ]]
+    );
+    let rows = query(
+        &mut db,
+        &format!(
+            "SELECT h, u FROM read_arrow('{}') ORDER BY h NULLS LAST;",
+            file.display()
+        ),
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::decimal(i128::MIN, 0), Value::decimal(0, 0)],
+            vec![Value::decimal(i128::MAX, 0), Value::decimal(-1, 0)],
+            vec![Value::Null, Value::Null],
+        ]
+    );
+}

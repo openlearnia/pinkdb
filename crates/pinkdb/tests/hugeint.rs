@@ -1,13 +1,14 @@
-//! HUGEINT (signed 128-bit integer): steps 1–3 of
-//! `docs/slt-3-hugeint-plan.md` — the type model, literals and casts,
-//! arithmetic and comparison. Every expected value and every error text here
-//! was read from DuckDB 2.0.0-alpha46057 (the reference CLI) on the same
-//! expression, so a divergence is a bug in this engine, not in the test.
+//! HUGEINT and UHUGEINT (128-bit integers): steps 1–3 of
+//! `docs/slt-3-hugeint-plan.md` for the signed width, step 8 for the unsigned
+//! one. Every expected value and every error text here was read from the
+//! DuckDB v2.0.0 release (the reference CLI) on the same expression, so a
+//! divergence is a bug in this engine, not in the test.
 
 use pinkdb::{PinkDb, QueryResult, Value};
 
 const MAX: &str = "170141183460469231731687303715884105727";
 const MIN: &str = "-170141183460469231731687303715884105728";
+const UMAX: &str = "340282366920938463463374607431768211455";
 
 fn rows(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
     match db.execute(sql).unwrap().pop().unwrap() {
@@ -94,6 +95,19 @@ fn declared_hugeint_columns_hold_every_value() {
     assert_eq!(
         text(&mut db, "SELECT typeof(a) FROM h LIMIT 1;"),
         ["HUGEINT"]
+    );
+}
+
+#[test]
+fn double_to_hugeint_rounds_to_even() {
+    let mut db = PinkDb::new();
+    assert_eq!(
+        text(
+            &mut db,
+            "SELECT 2.5::DOUBLE::HUGEINT, 3.5::DOUBLE::HUGEINT, \
+             (-2.5)::DOUBLE::HUGEINT, 0.5::DOUBLE::HUGEINT;"
+        ),
+        ["2", "4", "-2", "0"]
     );
 }
 
@@ -514,32 +528,344 @@ fn hugeint_keys_group_with_the_narrower_integers() {
 #[test]
 fn hugeint_and_uhugeint_round_trip_through_pink_storage() {
     let mut db = PinkDb::new();
-    // UHUGEINT values arrive in step 8 (no literal or cast produces one yet),
-    // so this column only proves the tag, footer and NULL round trip; the
-    // 16-byte u128 payload is covered by persist's corpus, which writes
-    // u128::MAX directly.
     db.execute(&format!(
         "CREATE TABLE s (h HUGEINT, u UHUGEINT);
          INSERT INTO s VALUES
-           ({MAX}, NULL),
-           ({MIN}, NULL),
-           (NULL, NULL),
-           (0, NULL);"
+           ({MAX}, 0),
+           ({MIN}, 1),
+           (NULL, 170141183460469231731687303715884105728),
+           (0, {UMAX}),
+           (1, NULL);"
     ))
     .unwrap();
-    let before = rows(&mut db, "SELECT h, u FROM s ORDER BY h;");
+    let before = rows(&mut db, "SELECT h, u FROM s ORDER BY h NULLS LAST;");
     let bytes = db.to_pink_bytes().unwrap();
     let mut back = PinkDb::from_pink_bytes(&bytes).unwrap();
-    assert_eq!(rows(&mut back, "SELECT h, u FROM s ORDER BY h;"), before);
+    assert_eq!(
+        rows(&mut back, "SELECT h, u FROM s ORDER BY h NULLS LAST;"),
+        before
+    );
     // The 128-bit bounds reach the zone map, so the pruned scan still answers
     // the extremes exactly.
     assert_eq!(
-        row(&mut back, "SELECT min(h), max(h), min(u), count(u) FROM s;"),
+        row(
+            &mut back,
+            "SELECT min(h), max(h), min(u), max(u), count(u) FROM s;"
+        ),
         vec![
             Value::Hugeint(i128::MIN),
             Value::Hugeint(i128::MAX),
-            Value::Null,
-            Value::Bigint(0),
+            Value::Uhugeint(0),
+            Value::Uhugeint(u128::MAX),
+            Value::Bigint(4),
+        ]
+    );
+    assert_eq!(
+        row(
+            &mut back,
+            &format!("SELECT count(*) FROM s WHERE u = {UMAX};")
+        ),
+        vec![Value::Bigint(1)]
+    );
+}
+
+// ---------- step 8: UHUGEINT values ----------
+
+#[test]
+fn uhugeint_literals_take_the_unsigned_type_that_fits() {
+    let mut db = PinkDb::new();
+    assert_eq!(
+        text(
+            &mut db,
+            "SELECT typeof(170141183460469231731687303715884105728), \
+             typeof(340282366920938463463374607431768211455), \
+             typeof(170141183460469231731687303715884105727);"
+        ),
+        ["UHUGEINT", "UHUGEINT", "HUGEINT"]
+    );
+    assert_eq!(text(&mut db, &format!("SELECT {UMAX};")), [UMAX]);
+    assert_eq!(
+        row(&mut db, &format!("SELECT {UMAX};")),
+        vec![Value::Uhugeint(u128::MAX)]
+    );
+    assert_eq!(
+        text(&mut db, "SELECT 170141183460469231731687303715884105728;"),
+        ["170141183460469231731687303715884105728"]
+    );
+    // One past u128 stays a parse error (DuckDB says BIGNUM; plan §9).
+    assert!(
+        err(&mut db, "SELECT 340282366920938463463374607431768211456;")
+            .contains("integer literal out of range")
+    );
+}
+
+#[test]
+fn text_to_uhugeint_matches_duckdb() {
+    let mut db = PinkDb::new();
+    assert_eq!(
+        text(
+            &mut db,
+            "SELECT '7'::UHUGEINT, '0'::UHUGEINT, '-0'::UHUGEINT, '-00'::UHUGEINT, \
+             '+12'::UHUGEINT, '1_000'::UHUGEINT, '1.5'::UHUGEINT, '2.5'::UHUGEINT, \
+             '.5'::UHUGEINT, '15e-1'::UHUGEINT, '1e3'::UHUGEINT;"
+        ),
+        ["7", "0", "0", "0", "12", "1000", "2", "3", "1", "2", "1000"]
+    );
+    assert_eq!(
+        text(
+            &mut db,
+            &format!(
+                "SELECT ' {UMAX} '::UHUGEINT, '0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'::UHUGEINT, '0b101'::UHUGEINT;"
+            )
+        ),
+        [UMAX, UMAX, "5"]
+    );
+    assert_eq!(
+        err(&mut db, "SELECT '-1'::UHUGEINT;"),
+        "Conversion Error: Could not convert string '-1' to UINT128"
+    );
+    assert_eq!(
+        err(&mut db, "SELECT '-0.4'::UHUGEINT;"),
+        "Conversion Error: Could not convert string '-0.4' to UINT128"
+    );
+    assert_eq!(
+        err(&mut db, "SELECT 'abc'::UHUGEINT;"),
+        "Conversion Error: Could not convert string 'abc' to UINT128"
+    );
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT '340282366920938463463374607431768211456'::UHUGEINT;"
+        ),
+        "Conversion Error: Could not convert string \
+         '340282366920938463463374607431768211456' to UINT128"
+    );
+    assert_eq!(
+        err(&mut db, "SELECT '1e39'::UHUGEINT;"),
+        "Conversion Error: Could not convert string '1e39' to UINT128"
+    );
+    assert_eq!(
+        err(&mut db, "SELECT '-0x7f'::UHUGEINT;"),
+        "Conversion Error: Could not convert string '-0x7f' to UINT128"
+    );
+}
+
+#[test]
+fn double_to_uhugeint_rounds_to_even() {
+    let mut db = PinkDb::new();
+    assert_eq!(
+        text(
+            &mut db,
+            "SELECT CAST(0.5 AS DOUBLE)::UHUGEINT, CAST(1.5 AS DOUBLE)::UHUGEINT, \
+             CAST(2.5 AS DOUBLE)::UHUGEINT, CAST(3.5 AS DOUBLE)::UHUGEINT, \
+             CAST(-0.5 AS DOUBLE)::UHUGEINT, CAST(-0.0 AS DOUBLE)::UHUGEINT, \
+             CAST(1.2345e20 AS DOUBLE)::UHUGEINT;"
+        ),
+        ["0", "2", "2", "4", "0", "0", "123450000000000000000"]
+    );
+    assert_eq!(
+        err(&mut db, "SELECT CAST(-2.5 AS DOUBLE)::UHUGEINT;"),
+        "Conversion Error: Type DOUBLE with value -2.5 can't be cast because the value is out of \
+         range for the destination type UINT128"
+    );
+    // 2^128 as a DOUBLE is already past the exclusive upper bound.
+    assert_eq!(
+        err(&mut db, "SELECT 3.402823669209385e38::DOUBLE::UHUGEINT;"),
+        "Conversion Error: Type DOUBLE with value 3.402823669209385e+38 can't be cast because the \
+         value is out of range for the destination type UINT128"
+    );
+}
+
+#[test]
+fn uhugeint_decimal_casts_match_duckdb() {
+    let mut db = PinkDb::new();
+    assert_eq!(
+        text(
+            &mut db,
+            "SELECT (1.5::DECIMAL(10,1))::UHUGEINT, (0.4::DECIMAL(10,1))::UHUGEINT, \
+             ((-0.4)::DECIMAL(10,1))::UHUGEINT, (42::UHUGEINT)::DECIMAL(38,2);"
+        ),
+        ["2", "0", "0", "42.00"]
+    );
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT (0::DECIMAL(10,2) - 1::DECIMAL(10,2))::UHUGEINT;"
+        ),
+        "Conversion Error: Failed to cast decimal value -1 to type UINT128"
+    );
+    assert_eq!(
+        err(&mut db, &format!("SELECT {UMAX}::UHUGEINT::DECIMAL(38,0);")),
+        format!("Conversion Error: Could not cast value {UMAX} to DECIMAL(38,0)")
+    );
+}
+
+#[test]
+fn uhugeint_narrows_to_the_smaller_types_or_refuses() {
+    let mut db = PinkDb::new();
+    assert_eq!(
+        text(
+            &mut db,
+            "SELECT 42::UHUGEINT::INTEGER, 42::UHUGEINT::BIGINT, 42::UHUGEINT::HUGEINT, \
+             42::UHUGEINT::DOUBLE, 1::UHUGEINT::BOOLEAN, 0::UHUGEINT::BOOLEAN;"
+        ),
+        ["42", "42", "42", "42", "true", "false"]
+    );
+    assert_eq!(
+        err(&mut db, &format!("SELECT {UMAX}::UHUGEINT::INTEGER;")),
+        format!(
+            "Conversion Error: Type UINT128 with value {UMAX} can't be cast because the value is \
+             out of range for the destination type INT32"
+        )
+    );
+    assert_eq!(
+        err(&mut db, &format!("SELECT {UMAX}::UHUGEINT::BIGINT;")),
+        format!(
+            "Conversion Error: Type UINT128 with value {UMAX} can't be cast because the value is \
+             out of range for the destination type INT64"
+        )
+    );
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT 170141183460469231731687303715884105728::UHUGEINT::HUGEINT;"
+        ),
+        "Conversion Error: Type UINT128 with value 170141183460469231731687303715884105728 \
+         can't be cast because the value is out of range for the destination type INT128"
+    );
+    assert_eq!(
+        err(&mut db, "SELECT (0::HUGEINT - 1::HUGEINT)::UHUGEINT;"),
+        "Conversion Error: Type INT128 with value -1 can't be cast because the value is out of \
+         range for the destination type UINT128"
+    );
+    assert_eq!(
+        err(&mut db, "SELECT (0::BIGINT - 1::BIGINT)::UHUGEINT;"),
+        "Conversion Error: Type INT64 with value -1 can't be cast because the value is out of \
+         range for the destination type UINT128"
+    );
+}
+
+#[test]
+fn uhugeint_arithmetic_and_overflow_texts_match_duckdb() {
+    let mut db = PinkDb::new();
+    assert_eq!(
+        text(
+            &mut db,
+            "SELECT typeof(5::UHUGEINT + 2::UHUGEINT), 5::UHUGEINT + 2::UHUGEINT, \
+             5::UHUGEINT - 2::UHUGEINT, 5::UHUGEINT * 2::UHUGEINT, \
+             5::UHUGEINT % 2::UHUGEINT, abs(5::UHUGEINT), typeof(abs(5::UHUGEINT));"
+        ),
+        ["UHUGEINT", "7", "3", "10", "1", "5", "UHUGEINT"]
+    );
+    assert_eq!(
+        err(&mut db, &format!("SELECT {UMAX} + 1::UHUGEINT;")),
+        format!("Out of Range Error: Overflow in addition of UINT128 ({UMAX} + 1)!")
+    );
+    assert_eq!(
+        err(&mut db, "SELECT 0::UHUGEINT - 1::UHUGEINT;"),
+        "Out of Range Error: Overflow in subtraction of UINT128 (0 - 1)!"
+    );
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT 100000000000000000000::UHUGEINT * 100000000000000000000::UHUGEINT;"
+        ),
+        "Out of Range Error: Overflow in multiplication of UINT128 \
+         (100000000000000000000 * 100000000000000000000)!"
+    );
+    assert_eq!(
+        err(&mut db, "SELECT 7::UHUGEINT % 0::UHUGEINT;"),
+        "Invalid Input Error: Division by zero in expression (7 % 0). Use TRY(...) to return \
+         NULL for this expression, or SET error_on_division_by_zero=false to return NULL for all \
+         divisions by zero."
+    );
+    assert_eq!(
+        err(&mut db, "SELECT -u FROM (VALUES (1::UHUGEINT)) t(u);"),
+        "Out of Range Error: Overflow in negation of numeric value!"
+    );
+}
+
+#[test]
+fn uhugeint_mixes_promote_like_duckdb() {
+    let mut db = PinkDb::new();
+    assert_eq!(
+        text(
+            &mut db,
+            "SELECT typeof(1::UHUGEINT + 1::BIGINT), 1::UHUGEINT + 1::BIGINT, \
+             typeof(1::UHUGEINT + 1::INTEGER), typeof(1::UHUGEINT + 1::HUGEINT), \
+             typeof(1::UHUGEINT + 1.0), typeof(1::UHUGEINT * 1::DECIMAL(3,1)), \
+             1::UHUGEINT % 2::BIGINT, typeof(1::UHUGEINT % 2::BIGINT), \
+             typeof(5::UHUGEINT % 2::HUGEINT), typeof(5::UHUGEINT % 2::DECIMAL(3,0)), \
+             typeof(5::UHUGEINT % 2::DECIMAL(3,1));"
+        ),
+        [
+            "DOUBLE",
+            "2",
+            "DOUBLE",
+            "DOUBLE",
+            "DECIMAL(38,1)",
+            "DECIMAL(38,1)",
+            "1",
+            "DOUBLE",
+            "DOUBLE",
+            "DECIMAL(38,0)",
+            "DOUBLE"
+        ]
+    );
+    // Every signed mix widens to DOUBLE, so the two 2^127 neighbours compare
+    // equal (DuckDB's MaxLogicalType). BIGINT stays exact.
+    assert_eq!(
+        text(
+            &mut db,
+            "SELECT 340282366920938463463374607431768211455::UHUGEINT = \
+             9223372036854775807::BIGINT, \
+             340282366920938463463374607431768211455::UHUGEINT > \
+             9223372036854775807::BIGINT, \
+             170141183460469231731687303715884105727::HUGEINT = \
+             170141183460469231731687303715884105728::UHUGEINT, \
+             170141183460469231731687303715884105727::HUGEINT < \
+             170141183460469231731687303715884105728::UHUGEINT;"
+        ),
+        ["false", "true", "true", "false"]
+    );
+    assert_eq!(
+        texts(
+            &mut db,
+            &format!(
+                "SELECT u FROM (VALUES (1::UHUGEINT), ({UMAX}::UHUGEINT), (0::UHUGEINT)) t(u) \
+                 ORDER BY u;"
+            )
+        ),
+        ["0", "1", UMAX]
+    );
+}
+
+#[test]
+fn uhugeint_aggregates_typed_like_duckdb() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE a (u UHUGEINT);").unwrap();
+    db.execute("INSERT INTO a VALUES (1::UHUGEINT), (2::UHUGEINT), (3::UHUGEINT), (NULL);")
+        .unwrap();
+    assert_eq!(
+        text(
+            &mut db,
+            "SELECT typeof(sum(u)), sum(u), typeof(avg(u)), avg(u), typeof(min(u)), min(u), \
+             typeof(max(u)), max(u), count(u) FROM a;"
+        ),
+        [
+            "DOUBLE", "6", "DOUBLE", "2", "UHUGEINT", "1", "UHUGEINT", "3", "3"
+        ]
+    );
+    db.execute("CREATE TABLE m (u UHUGEINT);").unwrap();
+    db.execute(&format!(
+        "INSERT INTO m VALUES ({UMAX}::UHUGEINT), ({UMAX}::UHUGEINT);"
+    ))
+    .unwrap();
+    assert_eq!(
+        text(&mut db, "SELECT sum(u), avg(u) FROM m;"),
+        [
+            "680564733841877000000000000000000000000",
+            "340282366920938500000000000000000000000"
         ]
     );
 }

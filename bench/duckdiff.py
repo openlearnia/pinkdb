@@ -929,6 +929,75 @@ def run_parquet_writer():
 
 
 
+PARQUET_UHUGEINT_SETUP = """
+CREATE TABLE pqh (h HUGEINT, u UHUGEINT);
+INSERT INTO pqh VALUES
+ (0, 0), (1, 1),
+ (170141183460469231731687303715884105727,
+  170141183460469231731687303715884105728),
+ (-170141183460469231731687303715884105728,
+  340282366920938463463374607431768211455),
+ (NULL, NULL);
+COPY pqh TO '{path}' (FORMAT parquet);
+"""
+
+# DuckDB v2.0.0 writes both widths as bare DOUBLE and reads DOUBLE back, so
+# every value is compared as the double it became (the max UHUGEINT rounds to
+# 2^128, exactly).
+PARQUET_UHUGEINT_QUERY = (
+    "SELECT typeof(h), typeof(u), count(*), "
+    "count(CASE WHEN h = 0.0e0 THEN 1 END), "
+    "count(CASE WHEN u = 0.0e0 THEN 1 END), "
+    "count(CASE WHEN h = 170141183460469231731687303715884105727::HUGEINT::DOUBLE "
+    "THEN 1 END), "
+    "count(CASE WHEN u = "
+    "340282366920938463463374607431768211455::UHUGEINT::DOUBLE THEN 1 END), "
+    "count(h), count(u) FROM read_parquet('{path}') GROUP BY 1, 2;"
+)
+
+PARQUET_UHUGEINT_EXPECTED = [
+    ["DOUBLE", "DOUBLE", "5", "1", "1", "1", "1", "4", "4"]
+]
+
+
+def run_parquet_hugeint():
+    """Each engine writes HUGEINT/UHUGEINT columns; both read both files."""
+    directory = tempfile.mkdtemp(prefix="duckdiff_pqh_")
+    try:
+        for writer in ("pinkdb", "duckdb"):
+            path = os.path.join(directory, f"{writer}.parquet")
+            setup = PARQUET_UHUGEINT_SETUP.format(path=path)
+            if writer == "pinkdb":
+                tables = pink_tables(setup, "SELECT 1;")
+                failed = [t for t in tables if t[0] == "error"]
+                ok = not failed and os.path.exists(path)
+                detail = failed[0][1] if failed else "no file written"
+            else:
+                wrote = duck_query(setup, "SELECT 1;")
+                ok = wrote[0] != "error" and os.path.exists(path)
+                detail = wrote[1] if wrote[0] == "error" else "no file written"
+            check(f"pq-hugeint-writer-{writer}", ok, detail)
+            if not ok:
+                continue
+            for reader in ("pinkdb", "duckdb"):
+                read = pink_query if reader == "pinkdb" else duck_query
+                got = read("", PARQUET_UHUGEINT_QUERY.format(path=path))
+                if got[0] == "error":
+                    check(f"pq-hugeint-{writer}-reader-{reader}", False, got[1])
+                    continue
+                rows = got[2] if reader == "pinkdb" else got[1]
+                check(
+                    f"pq-hugeint-{writer}-reader-{reader}",
+                    rows_equal(
+                        [[norm_pink(c, "VARCHAR") for c in r] for r in rows],
+                        PARQUET_UHUGEINT_EXPECTED,
+                        True,
+                    ),
+                    f"{rows!r}",
+                )
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
 
 def run_small():
     print("== small battery ==")
@@ -957,9 +1026,12 @@ def run_small():
     run_settings()
     run_hugeint()
     run_hugeint_arithmetic()
+    run_uhugeint()
+    run_uhugeint_arithmetic()
     run_attach()
     run_arrow()
     run_parquet()
+    run_parquet_hugeint()
 
 
 # ---- wave 71: the core arrow extension (`extensions/arrow`) ----
@@ -1781,6 +1853,122 @@ HUGEINT_ARITH_QUERIES = [
 ]
 
 
+# ---- slt-3d: UHUGEINT literals, casts, arithmetic, comparisons ----
+#
+# UHUGEINT is DuckDB's unsigned 128-bit integer. The release promotes every
+# mix with a signed width to DOUBLE (so 2^127-1 = 2^127-1 is true across the
+# boundary), rounds DOUBLE input to even, and spells its overflow UINT128.
+UHUGEINT_SETUP = """
+CREATE TABLE us (x UHUGEINT);
+INSERT INTO us VALUES (0), (1), ('1267650600228229401496703205376'),
+    (340282366920938463463374607431768211455),
+    (170141183460469231731687303715884105728), (NULL);
+"""
+
+UHUGEINT_QUERIES = [
+    # Above i128::MAX a literal is UHUGEINT; i128::MAX itself stays HUGEINT.
+    ("dialect-uhugeint-literal-width",
+     "SELECT typeof(1), typeof(170141183460469231731687303715884105727), "
+     "typeof(170141183460469231731687303715884105728), "
+     "typeof(340282366920938463463374607431768211455), "
+     "170141183460469231731687303715884105728, "
+     "340282366920938463463374607431768211455;", False, False),
+    ("dialect-uhugeint-text",
+     "SELECT '7'::UHUGEINT, '  12  '::UHUGEINT, '+12'::UHUGEINT, "
+     "'1.5'::UHUGEINT, '2.5'::UHUGEINT, '1_000'::UHUGEINT, "
+     "'0x07'::UHUGEINT, '0b101010'::UHUGEINT, '-0'::UHUGEINT;", False, False),
+    ("dialect-uhugeint-text-garbage", "SELECT 'abc'::UHUGEINT;", False, True),
+    ("dialect-uhugeint-text-negative", "SELECT '-1'::UHUGEINT;", False, True),
+    ("dialect-uhugeint-text-range",
+     "SELECT '340282366920938463463374607431768211456'::UHUGEINT;", False, True),
+    # DOUBLE input rounds to even and is bounded by [0, 2^128).
+    ("dialect-uhugeint-double-rounds",
+     "SELECT 1.9::UHUGEINT, 1.5::UHUGEINT, 2.5::UHUGEINT, 0.5::UHUGEINT, "
+     "(-0.0)::UHUGEINT, 1e30::UHUGEINT;", False, False),
+    ("dialect-uhugeint-double-range", "SELECT (-2.5)::UHUGEINT;", False, True),
+    ("dialect-uhugeint-double-bound",
+     "SELECT (3.402823669209385e38)::UHUGEINT;", False, True),
+    ("dialect-uhugeint-decimal",
+     "SELECT 42::UHUGEINT::DECIMAL(38,5), 1.5::DECIMAL(10,1)::UHUGEINT, "
+     "(-0.4)::DECIMAL(10,1)::UHUGEINT, 12.345::DECIMAL(10,3)::UHUGEINT;",
+     False, False),
+    ("dialect-uhugeint-decimal-negative",
+     "SELECT (-1)::DECIMAL(10,2)::UHUGEINT;", False, True),
+    ("dialect-uhugeint-narrows",
+     "SELECT 42::UHUGEINT::INTEGER, 42::UHUGEINT::BIGINT, "
+     "42::UHUGEINT::HUGEINT, 42::UHUGEINT::DOUBLE, "
+     "0::UHUGEINT::BOOLEAN, 1::UHUGEINT::BOOLEAN, 1::UHUGEINT::VARCHAR;",
+     False, False),
+    ("dialect-uhugeint-narrow-range",
+     "SELECT 9223372036854775808::UHUGEINT::BIGINT;", False, True),
+    ("dialect-uhugeint-hugeint-range",
+     "SELECT 170141183460469231731687303715884105728::UHUGEINT::HUGEINT;",
+     False, True),
+    ("dialect-uhugeint-hugeint-negative",
+     "SELECT (-1)::HUGEINT::UHUGEINT;", False, True),
+    ("dialect-uhugeint-typeof-mix",
+     "SELECT typeof(1::UHUGEINT + 1::UHUGEINT), typeof(1::UHUGEINT + 1), "
+     "typeof(1::UHUGEINT + 1::BIGINT), typeof(1::UHUGEINT + 1::HUGEINT), "
+     "typeof(1::UHUGEINT + 1.0e0), "
+     "typeof(1::UHUGEINT + 1.5::DECIMAL(3,1)), "
+     "typeof(1::UHUGEINT % 2::UHUGEINT), typeof(1::UHUGEINT % 2::BIGINT), "
+     "typeof(5.5e0 % 2.5e0);", False, False),
+]
+
+UHUGEINT_ARITH_QUERIES = [
+    ("dialect-uhugeint-arith",
+     "SELECT 42::UHUGEINT + 42::UHUGEINT, 100::UHUGEINT - 42::UHUGEINT, "
+     "100::UHUGEINT * 50::UHUGEINT, 100::UHUGEINT / 4::UHUGEINT, "
+     "90::UHUGEINT % 20::UHUGEINT, 7::UHUGEINT % 3::UHUGEINT, "
+     "340282366920938463463374607431768211455::UHUGEINT % "
+     "170141183460469231731687303715884105728::UHUGEINT;", False, False),
+    ("dialect-uhugeint-add-overflow",
+     "SELECT 340282366920938463463374607431768211455::UHUGEINT + "
+     "1::UHUGEINT;", False, True),
+    ("dialect-uhugeint-sub-overflow",
+     "SELECT 0::UHUGEINT - 1::UHUGEINT;", False, True),
+    ("dialect-uhugeint-mul-overflow",
+     "SELECT 100000000000000000000::UHUGEINT * "
+     "100000000000000000000::UHUGEINT;", False, True),
+    ("dialect-uhugeint-mod-zero",
+     "SELECT 7::UHUGEINT % 0::UHUGEINT;", False, True),
+    ("dialect-uhugeint-neg", "SELECT -1::UHUGEINT;", False, True),
+    ("dialect-uhugeint-abs",
+     "SELECT ABS(0::UHUGEINT), ABS(7::UHUGEINT), "
+     "ABS(340282366920938463463374607431768211455::UHUGEINT);", False, False),
+    ("dialect-uhugeint-cmp",
+     "SELECT 0::UHUGEINT < 1::UHUGEINT, "
+     "170141183460469231731687303715884105728::UHUGEINT > "
+     "170141183460469231731687303715884105727::UHUGEINT, "
+     "340282366920938463463374607431768211455::UHUGEINT = "
+     "340282366920938463463374607431768211455::UHUGEINT, "
+     "0::UHUGEINT = 0::BIGINT, 0::UHUGEINT = (-1)::BIGINT, "
+     "1::UHUGEINT = 1.0e0, 1::UHUGEINT = 1::HUGEINT;", False, False),
+    # DuckDB compares HUGEINT with UHUGEINT as DOUBLE, so 2^127-1 equals
+    # itself across the boundary and 2^127 compares greater.
+    ("dialect-uhugeint-cmp-hugeint-edge",
+     "SELECT 170141183460469231731687303715884105727::HUGEINT = "
+     "170141183460469231731687303715884105727::UHUGEINT, "
+     "170141183460469231731687303715884105727::HUGEINT < "
+     "170141183460469231731687303715884105728::UHUGEINT;", False, False),
+    ("dialect-uhugeint-mix-values",
+     "SELECT 5::UHUGEINT % 2::BIGINT, 5::UHUGEINT % 2::HUGEINT, "
+     "5::UHUGEINT + 2.5e0, 5::UHUGEINT % 2.0e0;", False, False),
+    ("dialect-uhugeint-column", "SELECT x FROM us ORDER BY x;", True, False),
+    ("dialect-uhugeint-filter",
+     "SELECT x FROM us WHERE x > 1 ORDER BY x;", True, False),
+    ("dialect-uhugeint-filter-widths",
+     "SELECT COUNT(*) FROM us WHERE x > 42;", False, False),
+    ("dialect-uhugeint-group",
+     "SELECT x, COUNT(*) FROM us GROUP BY x ORDER BY x;", True, False),
+    ("dialect-uhugeint-aggregates",
+     "SELECT typeof(SUM(x)), typeof(AVG(x)), typeof(MIN(x)), "
+     "typeof(MAX(x)) FROM us;", False, False),
+    ("dialect-uhugeint-aggregate-values",
+     "SELECT SUM(x), AVG(x), MIN(x), MAX(x) FROM us;", False, False),
+]
+
+
 def run_hugeint():
     print("== HUGEINT literals, casts and typeof battery (slt-3) ==")
     for label, sql, ordered, expect_error in HUGEINT_QUERIES:
@@ -1791,6 +1979,18 @@ def run_hugeint_arithmetic():
     print("== HUGEINT arithmetic and comparison battery (slt-3) ==")
     for label, sql, ordered, expect_error in HUGEINT_ARITH_QUERIES:
         run_case(label, sql, ordered, expect_error, HUGEINT_SETUP, HUGEINT_SETUP)
+
+
+def run_uhugeint():
+    print("== UHUGEINT literals, casts and typeof battery (slt-3d) ==")
+    for label, sql, ordered, expect_error in UHUGEINT_QUERIES:
+        run_case(label, sql, ordered, expect_error, UHUGEINT_SETUP, UHUGEINT_SETUP)
+
+
+def run_uhugeint_arithmetic():
+    print("== UHUGEINT arithmetic and comparison battery (slt-3d) ==")
+    for label, sql, ordered, expect_error in UHUGEINT_ARITH_QUERIES:
+        run_case(label, sql, ordered, expect_error, UHUGEINT_SETUP, UHUGEINT_SETUP)
 
 
 # ---- unaliased expression names ----

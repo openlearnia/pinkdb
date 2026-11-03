@@ -776,6 +776,17 @@ impl Vector {
         Ok(())
     }
 
+    /// Typed UHUGEINT append.
+    pub(crate) fn push_u128(&mut self, x: u128) -> Result<()> {
+        self.check_room()?;
+        match &mut self.data {
+            VectorData::UInt128(v) => v.push(x),
+            data => return Err(typed_push_error("a uhugeint", data.dtype())),
+        }
+        self.finish_typed_push();
+        Ok(())
+    }
+
     /// Shared tail of the typed push helpers: bump `len`, mark the new row valid.
     fn finish_typed_push(&mut self) {
         self.len += 1;
