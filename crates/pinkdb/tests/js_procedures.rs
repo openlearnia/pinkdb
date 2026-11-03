@@ -79,6 +79,33 @@ fn store() -> PinkDb {
     db
 }
 
+/// `SUM` over integers is HUGEINT (as in DuckDB): small sums reach a script as
+/// numbers, sums past 2^53 as BigInt, and a BigInt past `i64` returns to SQL
+/// as a HUGEINT.
+#[test]
+fn hugeint_sums_cross_the_bridge_as_numbers_or_bigints() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE big (v BIGINT);").unwrap();
+    db.execute("INSERT INTO big VALUES (4611686018427387904), (4611686018427387904);")
+        .unwrap();
+    db.execute(
+        "CREATE PROCEDURE sums() LANGUAGE JAVASCRIPT AS $$
+           const small = db.value('SELECT sum(v) FROM (VALUES (1), (2)) t(v)');
+           const past53 = db.value('SELECT sum(v) FROM (VALUES (9007199254740993::BIGINT), (0::BIGINT)) t(v)');
+           const past64 = db.value('SELECT sum(v) FROM big');
+           print(typeof small, small, typeof past53, String(past53), typeof past64, String(past64));
+           return past64 + 1n;
+         $$;",
+    )
+    .unwrap();
+    let (output, value) = call(&mut db, "CALL sums();");
+    assert_eq!(
+        output,
+        vec!["number 3 bigint 9007199254740993 bigint 9223372036854775808"]
+    );
+    assert_eq!(value, Some(Value::Hugeint(9_223_372_036_854_775_809)));
+}
+
 #[test]
 fn a_procedure_writes_reads_prints_and_returns() {
     let mut db = store();
