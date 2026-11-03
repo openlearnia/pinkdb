@@ -1,7 +1,7 @@
 // pinkdb extension C++17 SDK — pinkdb_ext.hpp
 //
 // A header-only, standard-library-only wrapper over the pinkdb extension ABI
-// v1 (minor 2). `include/pinkdb_extension.h` next to this file is the complete
+// v1 (minor 6). `include/pinkdb_extension.h` next to this file is the complete
 // contract and the single source of truth; this header adds C++ ergonomics on
 // top of it and never reinterprets the ABI by itself.
 //
@@ -92,6 +92,8 @@ constexpr int32_t kVarchar = PINKDB_EXT_TYPE_VARCHAR;
 constexpr int32_t kDate = PINKDB_EXT_TYPE_DATE;
 constexpr int32_t kTimestamp = PINKDB_EXT_TYPE_TIMESTAMP;
 constexpr int32_t kInterval = PINKDB_EXT_TYPE_INTERVAL;
+constexpr int32_t kHugeint = PINKDB_EXT_TYPE_HUGEINT;
+constexpr int32_t kUhugeint = PINKDB_EXT_TYPE_UHUGEINT;
 constexpr int32_t kVariant = PINKDB_EXT_TYPE_VARIANT;
 
 // Codes `guard` returns when it contains an exception. They are ordinary
@@ -187,6 +189,17 @@ public:
 
     int32_t date() const noexcept { return static_cast<int32_t>(value_->int64); } ///< days since 1970-01-01
     int64_t timestamp() const noexcept { return value_->int64; }                  ///< µs since 1970-01-01 UTC
+
+    /// 128-bit integers: low 64 bits in `int64`, high 64 in the `double_` bits.
+    __int128 hugeint() const noexcept {
+        const unsigned __int128 bits = (static_cast<unsigned __int128>(detail::bits_of(value_->double_)) << 64) |
+                                       static_cast<uint64_t>(value_->int64);
+        return static_cast<__int128>(bits);
+    }
+    unsigned __int128 uhugeint() const noexcept {
+        return (static_cast<unsigned __int128>(detail::bits_of(value_->double_)) << 64) |
+               static_cast<uint64_t>(value_->int64);
+    }
 
     Interval interval() const noexcept {
         const uint64_t bits = detail::bits_of(value_->double_);
@@ -350,6 +363,17 @@ public:
     void set_timestamp(int64_t micros) noexcept {
         tag(kTimestamp);
         out_->int64 = micros;
+    }
+    void set_hugeint(__int128 value) noexcept {
+        tag(kHugeint);
+        const unsigned __int128 bits = static_cast<unsigned __int128>(value);
+        out_->int64 = static_cast<int64_t>(static_cast<uint64_t>(bits));
+        out_->double_ = detail::double_of(static_cast<uint64_t>(bits >> 64));
+    }
+    void set_uhugeint(unsigned __int128 value) noexcept {
+        tag(kUhugeint);
+        out_->int64 = static_cast<int64_t>(static_cast<uint64_t>(value));
+        out_->double_ = detail::double_of(static_cast<uint64_t>(value >> 64));
     }
     void set_interval(const Interval &interval) noexcept {
         tag(kInterval);

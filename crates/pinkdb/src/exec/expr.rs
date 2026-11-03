@@ -351,7 +351,7 @@ fn eval_dynamic_scalar(
                 )));
             };
             let encoded = variant_args.get(i).and_then(|bytes| bytes.as_deref());
-            crate::ext::push_ext_arg(&mut ext_args, v, row, arg_type, encoded)?;
+            crate::ext::push_ext_arg(&mut ext_args, name, i + 1, v, row, arg_type, encoded)?;
         }
         let value = function
             .call(&ext_args)

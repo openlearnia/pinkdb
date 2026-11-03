@@ -78,6 +78,12 @@ statements=(
     "SELECT CASE WHEN ext_now_micros() IS NOT NULL AND ext_now_micros() IS NOT NULL THEN 'volatile ok' ELSE 'volatile FAIL' END;"
     "SELECT ext_clamp(CAST(1 AS BIGINT), CAST(10 AS BIGINT), CAST(0 AS BIGINT));"
 
+    # SUM(INTEGER) is a HUGEINT; the fixture's BIGINT-declared function must
+    # still bind (the checked narrowing regression this smoke pins).
+    "CREATE TABLE sum_t (i INTEGER);"
+    "INSERT INTO sum_t VALUES (1), (2), (3);"
+    "SELECT CASE WHEN cf_sum_bigint(SUM(i)) = 6 THEN 'sum ok' ELSE 'sum FAIL' END FROM sum_t;"
+
     # Volatile: allowed in a read-only query, refused in a statement the
     # engine WAL-logs (replay would compute a different value).
     "CREATE TABLE volatile_t (x BIGINT);"
@@ -131,6 +137,7 @@ check_marker "ext_deg2rad applied"     "degrees ok"
 check_marker "NULL inputs -> NULL"     "null ok"
 check_marker "ext_repeat + ownership"  "repeat ok"
 check_marker "ext_title applied"       "title ok"
+check_marker "SUM(INTEGER) binds to BIGINT" "sum ok"
 check_marker "volatile allowed in SELECT" "volatile ok"
 check "ext_clamp/deg2rad display row"  "│ 5       │ 3.141592653589793 │"
 check "VARCHAR display row"            "│ ababab   │ Hello World │"

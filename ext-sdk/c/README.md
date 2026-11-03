@@ -231,7 +231,13 @@ SELECT my_ext_greet(1);              -- Error: ... argument 1 must be VARCHAR, g
 
 Tips: test NULL inputs explicitly (`... IS NULL`), exercise the VARCHAR result
 through a built-in (`upper(...)`, `length(...)`) to prove the bytes survive,
-and trigger your error codes on purpose. `./smoke.sh` is the full worked
+and trigger your error codes on purpose. Arguments are strictly typed, with
+one documented exception: a HUGEINT/UHUGEINT argument (tags 13/14, 16
+little-endian bytes split over `int64` and `double_`) binds to a declared
+BIGINT parameter through a **checked** narrowing — an out-of-range value is an
+error naming the function and the parameter, never a wrap. That keeps
+`my_ext(SUM(int_col))` working; an exact HUGEINT parameter receives the value
+unchanged. `./smoke.sh` is the full worked
 example: it builds the examples and runs a deterministic session covering
 numeric results, NULLs, a VARCHAR result, the volatile flag and an error path.
 

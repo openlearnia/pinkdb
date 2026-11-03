@@ -502,9 +502,15 @@ Tips: test NULL inputs explicitly (`... IS NULL`), exercise the VARCHAR result
 through a built-in (`upper(...)`, `length(...)`) to prove the bytes survive,
 check a multibyte round trip, and trigger your error codes on purpose. A
 non-NULL argument needs an explicit `CAST` to the declared type — `INTEGER`
-literals do not widen into `BIGINT` parameters. `./smoke.sh` is the full worked
+literals do not widen into `BIGINT` parameters. The documented exception is a
+HUGEINT/UHUGEINT argument bound to a BIGINT parameter: the host checks that it
+fits (an out-of-range value is an error naming the function and the parameter,
+never a wrap), which keeps `my_ext(SUM(int_col))` working; an exact HUGEINT
+parameter receives the value unchanged. Go has no native 128-bit integer:
+`pinkdb.Hugeint(lo, hi)` / `pinkdb.Uhugeint(lo, hi)` and the matching
+`HugeintBits`/`UhugeintBits` accessors carry the two halves. `./smoke.sh` is the full worked
 example: it builds the release CLI and the example, runs a deterministic
-session in a self-cleaning temp directory, and greps 15 checks — VARCHAR
+session in a self-cleaning temp directory, and greps 17 checks — VARCHAR
 results, NULLs, a multibyte round trip, composition with built-ins, a 5,000-row
 parallel query, and both error paths.
 

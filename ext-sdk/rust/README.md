@@ -189,6 +189,8 @@ author prefers:
 | `DATE` | `Date` (days since 1970-01-01) | `Date` |
 | `TIMESTAMP` | `Timestamp` (microseconds since 1970-01-01 UTC) | `Timestamp` |
 | `INTERVAL` | `Interval` (`months`/`days`/`micros`) | `Interval` |
+| `HUGEINT` | `i128` | `i128` |
+| `UHUGEINT` | `u128` | `u128` |
 
 `Option<T>` around any of them makes NULL a normal value; `Result<T, String>`
 around a return type makes errors returnable. All combinations are accepted:
@@ -197,16 +199,21 @@ registered argument/return types are *derived from the Rust types you write* —
 there is no separate metadata table to keep in sync.
 
 ABI v1 is strictly typed: the engine inserts **no implicit casts** for
-extension arguments, with three documented exceptions — a **numeric**
-argument (INTEGER, BIGINT, DECIMAL) widens into a `DOUBLE` parameter, the
-implicit cast DuckDB applies to its math functions (`exp(1)`, `sqrt(4)`); an
-INTEGER widens into a `BIGINT` parameter (`ext_rs_repeat('ab', 3)` works);
-and a **DATE** widens into a `TIMESTAMP` parameter (`dayofweek(DATE
-'2024-01-07')`), midnight of that day, as DuckDB casts it.
-`ext_rs_repeat('ab', 1.5)` is an error (`argument 2 must be BIGINT, got
-DOUBLE (use CAST)`): a narrowing cast is never implicit. A VARCHAR stays
-strict even for a `DOUBLE` parameter (`exp('1')` is an error; DuckDB parses
-the string — a documented divergence).
+extension arguments, with these documented exceptions — a **numeric**
+argument (INTEGER, BIGINT, HUGEINT, UHUGEINT, DECIMAL) widens into a
+`DOUBLE` parameter, the implicit cast DuckDB applies to its math functions
+(`exp(1)`, `sqrt(4)`); an INTEGER widens into a `BIGINT` parameter
+(`ext_rs_repeat('ab', 3)` works); a **DATE** widens into a `TIMESTAMP`
+parameter (`dayofweek(DATE '2024-01-07')`), midnight of that day, as DuckDB
+casts it; and a **HUGEINT/UHUGEINT** argument narrows into a `BIGINT`
+parameter only when the value fits, which is what keeps
+`ext_rs_clamp(SUM(int_col), ...)` working after SUM became 128-bit. An
+out-of-range value is an error naming the function and the parameter, never
+a wrap; an exact 128-bit parameter (`i128`/`u128`) receives the value
+unchanged. `ext_rs_repeat('ab', 1.5)` is an error (`argument 2 must be
+BIGINT, got DOUBLE (use CAST)`): a narrowing cast outside that rule is never
+implicit. A VARCHAR stays strict even for a `DOUBLE` parameter (`exp('1')`
+is an error; DuckDB parses the string — a documented divergence).
 
 ### NULL handling is explicit
 

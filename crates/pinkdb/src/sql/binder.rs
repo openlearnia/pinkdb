@@ -4480,22 +4480,25 @@ impl<'a> Binder<'a> {
             // callback `is_null` with the registered type tag.
             //
             // Everything else must equal the registered argument type — ABI
-            // v1 inserts no implicit casts — with four documented widening
-            // rules: a **DOUBLE parameter accepts any numeric argument**
-            // (INTEGER, BIGINT, DECIMAL) and the engine inserts the CAST to
-            // DOUBLE that DuckDB applies implicitly, so `exp(1)`, `log(100)`
-            // and an integer or DECIMAL column all work like DuckDB; a
-            // **BIGINT parameter accepts an INTEGER** (lossless, DuckDB's
-            // implicit cast: `split_part(s, ',', 1)`); a **TIMESTAMP
-            // parameter accepts a DATE** (midnight, DuckDB's implicit cast:
-            // `dayofweek(DATE '2024-01-07')`); and a **VARCHAR parameter
-            // accepts a VARIANT**, whose text form is its JSON value, so the
-            // `json_*` functions read VARIANT directly as DuckDB's do. Every
-            // other declared type stays exact and keeps the CAST hint
-            // (`json_array(1)` and `ext_repeat('x', 1.5)` keep their
-            // documented errors): a string is not a number, and parsing one
-            // is not this ABI's job.
-            bound.push(coerce_host_arg(&func_name, i + 1, want, b)?);
+            // v1 inserts no implicit casts — with five documented rules: a
+            // **DOUBLE parameter accepts any numeric argument**
+            // (INTEGER, BIGINT, HUGEINT, UHUGEINT, DECIMAL) and the engine
+            // inserts the CAST to DOUBLE that DuckDB applies implicitly, so
+            // `exp(1)`, `log(100)` and an integer or DECIMAL column all work
+            // like DuckDB; a **BIGINT parameter accepts an INTEGER**
+            // (lossless, DuckDB's implicit cast: `split_part(s, ',', 1)`);
+            // a **BIGINT parameter also accepts a HUGEINT or UHUGEINT** and
+            // the executor checks the narrowing at run time (an
+            // out-of-range value is an error naming the function and
+            // parameter, never a wrap); a **TIMESTAMP parameter accepts a
+            // DATE** (midnight, DuckDB's implicit cast: `dayofweek(DATE
+            // '2024-01-07')`); and a **VARCHAR parameter accepts a VARIANT**,
+            // whose text form is its JSON value, so the `json_*` functions
+            // read VARIANT directly as DuckDB's do. Every other declared
+            // type stays exact and keeps the CAST hint (`json_array(1)` and
+            // `ext_repeat('x', 1.5)` keep their documented errors): a string
+            // is not a number, and parsing one is not this ABI's job.
+            bound.push(coerce_extension_arg(&func_name, i + 1, want, b)?);
         }
         Ok(BoundExpr::DynamicScalar {
             name: func_name.to_ascii_lowercase().into_boxed_str(),
@@ -4637,6 +4640,26 @@ fn assign_host_args(
         }
     }
     Ok(slots)
+}
+
+/// Check one extension argument against its declared type. This is
+/// [`coerce_host_arg`] plus the ABI's one checked narrowing: a HUGEINT or
+/// UHUGEINT expression binds to a BIGINT parameter unchanged, and
+/// `push_ext_arg` performs the range check when the row is evaluated (so a
+/// value outside the BIGINT range is a clear per-call error, not a CAST
+/// type error, and never a wrap).
+fn coerce_extension_arg(
+    what: &str,
+    position: usize,
+    want: crate::ext::ExtType,
+    bound: BoundExpr,
+) -> Result<BoundExpr> {
+    if want == crate::ext::ExtType::Bigint
+        && matches!(bound.dtype(), DataType::Hugeint | DataType::Uhugeint)
+    {
+        return Ok(bound);
+    }
+    coerce_host_arg(what, position, want, bound)
 }
 
 /// Check one host-function argument against its declared type: ABI v1's rules

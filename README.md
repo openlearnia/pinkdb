@@ -522,7 +522,11 @@ elements), and the bindings hand over a Node `Float64Array`, a Python
 `list[float]` and a Go `[]float64`. Extension ABI **minor 5** adds
 `ExtType::ArrayDouble` — a borrowed pointer-plus-length view of the engine's
 element buffer with no per-element boxing — which the `vss` and `embeddings`
-extensions use.
+extensions use. **Minor 6** adds `ExtType::Hugeint`/`Uhugeint` (tags 13/14,
+16 little-endian bytes split over the existing scalars); a HUGEINT argument
+still binds to a declared BIGINT parameter through a checked narrowing, so
+`my_ext(SUM(int_col))` keeps working, and an old host refuses the new tags at
+registration.
 
 Parquet uses DuckDB 2.0's three-level `LIST` group in both directions (DuckDB
 reads our files, we read its `FLOAT[3]`/`INTEGER[3]` files), with the length in

@@ -52,14 +52,18 @@ echo "==> ./ext-sdk/rust/check-native-exports.sh"
 echo "==> cargo build --release -p pinkdb-cli"
 (cd "$repo" && cargo build --release -p pinkdb-cli)
 
-echo "==> make -C ext-sdk/rust (example)"
+echo "==> make -C ext-sdk/rust (example + conformance fixture)"
 make -C "$here" -s all
+make -C "$here" -s conformance
 
 lib="$repo/target/release/librust_string_ext.$so_ext"
-if [ ! -f "$lib" ]; then
-    echo "FAIL: expected example library is missing: $lib" >&2
-    exit 1
-fi
+conf="$repo/target/release/libconformance_ext.$so_ext"
+for f in "$lib" "$conf"; do
+    if [ ! -f "$f" ]; then
+        echo "FAIL: expected SDK library is missing: $f" >&2
+        exit 1
+    fi
+done
 
 # One scratch session directory; cleaned up whatever happens. (TMPDIR on
 # macOS carries a trailing slash — strip it so the mktemp template is tidy.)
@@ -75,6 +79,7 @@ trap cleanup EXIT
 # explicit CAST to BIGINT.
 statements=(
     "LOAD EXTENSION '$lib';"
+    "LOAD EXTENSION '$conf';"
 
     # Display queries: what the report shows. Values are grepped below.
     "SELECT ext_rs_repeat('ab', CAST(3 AS BIGINT)) AS repeated, ext_rs_len('héllo') AS bytes, length('héllo') AS chars;"
@@ -100,6 +105,12 @@ statements=(
     "SELECT CASE WHEN ext_rs_tick() >= 0 THEN 'tick ok' ELSE 'tick FAIL' END;"
     # ...and is refused in a statement the engine WAL-logs, before it runs.
     "INSERT INTO t VALUES (ext_rs_tick());"
+
+    # SUM(INTEGER) is a HUGEINT; the fixture's BIGINT-declared function must
+    # still bind (the checked narrowing regression this smoke pins).
+    "CREATE TABLE sum_t (i INTEGER);"
+    "INSERT INTO sum_t VALUES (1), (2), (3);"
+    "SELECT CASE WHEN cf_sum_bigint(SUM(i)) = 6 THEN 'sum ok' ELSE 'sum FAIL' END FROM sum_t;"
 
     # Error paths: the repeat cap and a NULL into a plain (non-Option)
     # parameter are both code 1; ABI v1 is strictly typed.
@@ -148,6 +159,7 @@ check_marker() { # check_marker <description> <marker>: one result ROW is exactl
 }
 
 check "rust_string_ext loaded"        "Extension rust_string_ext loaded."
+check "conformance_ext loaded"        "Extension conformance_ext loaded."
 check "repeat/len display row"        "│ ababab   │ 6      │ 5       │"
 check "clamp/next_day display row"    "│ 5       │ 2024-02-29 │"
 check_marker "repeat applied"         "repeat ok"
@@ -156,6 +168,7 @@ check_marker "NULLs through Option"   "null ok"
 check_marker "clamp applied"          "clamp ok"
 check_marker "DATE round trip"        "day ok"
 check_marker "built-in composition"   "compose ok"
+check_marker "SUM(INTEGER) binds to BIGINT" "sum ok"
 check_marker "deterministic INSERT"   "insert ok"
 check_marker "volatile read allowed"  "tick ok"
 check "volatile INSERT refused"       "ext_rs_tick() is volatile (nondeterministic) and cannot be called in a statement the engine WAL-logs"

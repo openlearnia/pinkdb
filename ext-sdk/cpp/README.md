@@ -215,7 +215,13 @@ SELECT my_greet(1);                  -- Error: ... argument 1 must be VARCHAR, g
 
 Tips: test NULL inputs explicitly (`... IS NULL`), exercise a VARCHAR result
 through a built-in (`upper(...)`, `length(...)`) to prove the bytes survive,
-and trigger your error codes on purpose. `./smoke.sh` is the full worked
+and trigger your error codes on purpose. Arguments are strictly typed, with
+one documented exception: a HUGEINT/UHUGEINT argument binds to a declared
+BIGINT parameter through a **checked** narrowing — an out-of-range value is an
+error naming the function and the parameter, never a wrap. That keeps
+`my_ext(SUM(int_col))` working; an exact HUGEINT parameter receives the value
+unchanged (`Value::hugeint()`/`uhugeint()`, `Writer::set_hugeint`/
+`set_uhugeint`). `./smoke.sh` is the full worked
 example: it builds both libraries and runs one session covering numeric
 results, NULLs, multibyte and empty VARCHAR results, the volatile path in a
 read-only statement and its refusal in a WAL-logged `INSERT`, both error paths,

@@ -22,21 +22,22 @@ use std::fmt;
 #[cfg(not(target_arch = "wasm32"))]
 pub const PINKDB_EXT_ABI_VERSION: u32 = 1;
 
-/// ABI **minor** version implemented by this loader (major 1, minor 5).
+/// ABI **minor** version implemented by this loader (major 1, minor 6).
 ///
 /// Minor 2 adds [`PinkdbHostApi::execute_statement`] and the optional
 /// `pinkdb_ext_serve` export; minor 3 adds [`ExtType::Variant`]
 /// ([`PINKDB_EXT_TYPE_VARIANT`]); minor 4 adds the optional
 /// `pinkdb_ext_command` export and [`PinkdbHostApi::execute_internal`];
 /// minor 5 adds the fixed-size array types [`ExtType::ArrayDouble`] and
-/// [`ExtType::ArrayFloat`] (wave 107a). All are additive, so minor 1 and
-/// minor 0 extensions are unchanged. The wire exposes the minor only
-/// indirectly (`struct_size`, symbol presence), which is why the major check
-/// stayed an equality check — and why a new *type tag* needs no
-/// `struct_size` landmark: a host only ever sends the types an extension
-/// declared, and an older host rejects an unknown tag at registration.
+/// [`ExtType::ArrayFloat`] (wave 107a); minor 6 adds [`ExtType::Hugeint`] and
+/// [`ExtType::Uhugeint`]. All are additive, so minor 1 and minor 0 extensions
+/// are unchanged. The wire exposes the minor only indirectly (`struct_size`,
+/// symbol presence, type tags), which is why the major check stayed an
+/// equality check — and why a new *type tag* needs no `struct_size` landmark:
+/// a host only ever sends the types an extension declared, and an older host
+/// rejects an unknown tag at registration.
 #[cfg(not(target_arch = "wasm32"))]
-pub const PINKDB_EXT_ABI_MINOR: u32 = 5;
+pub const PINKDB_EXT_ABI_MINOR: u32 = 6;
 
 /// Maximum argument count accepted by [`crate::PinkdbHostApi::register_scalar`]
 /// and by [`crate::LinkedFunction::new`]. Kept identical for both loading
@@ -120,6 +121,17 @@ pub const PINKDB_EXT_TYPE_ARRAY_DOUBLE: i32 = 11;
 /// so a distance kernel can read a `FLOAT[N]` argument with no conversion.
 pub const PINKDB_EXT_TYPE_ARRAY_FLOAT: i32 = 12;
 
+/// Signed 128-bit integer (`HUGEINT`), carried by value as 16 little-endian
+/// bytes: the low 64 bits in `int64`, the high 64 bits in the bits of
+/// `double` ([`pack_wide`] / [`unpack_wide`]). The tag number matches
+/// `pinkdb.h`'s `PINKDB_TYPE_HUGEINT`.
+pub const PINKDB_EXT_TYPE_HUGEINT: i32 = 13;
+
+/// Unsigned 128-bit integer (`UHUGEINT`), carried exactly like
+/// [`PINKDB_EXT_TYPE_HUGEINT`]. The tag number matches `pinkdb.h`'s
+/// `PINKDB_TYPE_UHUGEINT`.
+pub const PINKDB_EXT_TYPE_UHUGEINT: i32 = 14;
+
 /// Pack an array length into the ARRAY_DOUBLE tag: `(len << 8) | 11`.
 pub const fn pack_array_len(len: u32) -> i32 {
     PINKDB_EXT_TYPE_ARRAY_DOUBLE | ((len as i32) << 8)
@@ -133,6 +145,23 @@ pub const fn unpack_array_len(tag: i32) -> u32 {
 /// Pack an array length into the ARRAY_FLOAT tag: `(len << 8) | 12`.
 pub const fn pack_array_float_len(len: u32) -> i32 {
     PINKDB_EXT_TYPE_ARRAY_FLOAT | ((len as i32) << 8)
+}
+
+/// Pack a 128-bit integer into the by-value ABI payload: the low 64 bits go
+/// in `int64`, the high 64 bits in the bits of `double`. Both tags use both
+/// scalar fields; `double` carries no numeric meaning for an integer — use
+/// [`unpack_wide`], never the float itself.
+pub const fn pack_wide(value: i128) -> (i64, f64) {
+    let bits = value as u128;
+    (bits as u64 as i64, f64::from_bits((bits >> 64) as u64))
+}
+
+/// Unpack the payload written by [`pack_wide`] back into a signed 128-bit
+/// integer. The bit pattern is preserved, so a negative value sign-extends.
+pub const fn unpack_wide(int64: i64, double: f64) -> i128 {
+    let low = int64 as u64 as u128;
+    let high = double.to_bits() as u128;
+    ((high << 64) | low) as i128
 }
 
 /// Pack an interval's three fields into the by-value ABI payload: `micros`
@@ -378,6 +407,10 @@ pub enum ExtType {
     Varchar,
     Date,
     Timestamp,
+    /// Signed 128-bit integer, carried by value as [`pack_wide`] describes.
+    Hugeint,
+    /// Unsigned 128-bit integer, carried like [`ExtType::Hugeint`].
+    Uhugeint,
     /// Calendar interval (`months`, `days`, `micros`), carried by value as
     /// [`pack_interval`] describes.
     Interval,
@@ -411,6 +444,8 @@ impl ExtType {
             ExtType::Varchar => PINKDB_EXT_TYPE_VARCHAR,
             ExtType::Date => PINKDB_EXT_TYPE_DATE,
             ExtType::Timestamp => PINKDB_EXT_TYPE_TIMESTAMP,
+            ExtType::Hugeint => PINKDB_EXT_TYPE_HUGEINT,
+            ExtType::Uhugeint => PINKDB_EXT_TYPE_UHUGEINT,
             ExtType::Interval => PINKDB_EXT_TYPE_INTERVAL,
             ExtType::Variant => PINKDB_EXT_TYPE_VARIANT,
             ExtType::ArrayDouble { len } => pack_array_len(len),
@@ -428,6 +463,8 @@ impl ExtType {
             PINKDB_EXT_TYPE_VARCHAR => Some(ExtType::Varchar),
             PINKDB_EXT_TYPE_DATE => Some(ExtType::Date),
             PINKDB_EXT_TYPE_TIMESTAMP => Some(ExtType::Timestamp),
+            PINKDB_EXT_TYPE_HUGEINT => Some(ExtType::Hugeint),
+            PINKDB_EXT_TYPE_UHUGEINT => Some(ExtType::Uhugeint),
             PINKDB_EXT_TYPE_INTERVAL => Some(ExtType::Interval),
             PINKDB_EXT_TYPE_VARIANT => Some(ExtType::Variant),
             tag if tag & 0xff == PINKDB_EXT_TYPE_ARRAY_DOUBLE => Some(ExtType::ArrayDouble {
@@ -450,6 +487,8 @@ impl ExtType {
             ExtType::Varchar => "VARCHAR".to_string(),
             ExtType::Date => "DATE".to_string(),
             ExtType::Timestamp => "TIMESTAMP".to_string(),
+            ExtType::Hugeint => "HUGEINT".to_string(),
+            ExtType::Uhugeint => "UHUGEINT".to_string(),
             ExtType::Interval => "INTERVAL".to_string(),
             ExtType::Variant => "VARIANT".to_string(),
             ExtType::ArrayDouble { len } => format!("DOUBLE[{len}]"),
@@ -476,6 +515,10 @@ pub enum ExtArg<'a> {
     Varchar(&'a [u8]),
     Date(i32),
     Timestamp(i64),
+    /// Signed 128-bit integer, carried by value as [`pack_wide`] describes.
+    Hugeint(i128),
+    /// Unsigned 128-bit integer, carried like [`ExtArg::Hugeint`].
+    Uhugeint(u128),
     /// A calendar interval, by value.
     Interval {
         months: i32,
@@ -504,6 +547,8 @@ impl ExtArg<'_> {
             ExtArg::Varchar(_) => ExtType::Varchar,
             ExtArg::Date(_) => ExtType::Date,
             ExtArg::Timestamp(_) => ExtType::Timestamp,
+            ExtArg::Hugeint(_) => ExtType::Hugeint,
+            ExtArg::Uhugeint(_) => ExtType::Uhugeint,
             ExtArg::Interval { .. } => ExtType::Interval,
             ExtArg::Variant(_) => ExtType::Variant,
             ExtArg::ArrayDouble(values) => ExtType::ArrayDouble {
@@ -560,6 +605,28 @@ impl ExtArg<'_> {
             ),
             ExtArg::Date(d) => (PINKDB_EXT_TYPE_DATE, 0, d as i64, 0.0, std::ptr::null(), 0),
             ExtArg::Timestamp(us) => (PINKDB_EXT_TYPE_TIMESTAMP, 0, us, 0.0, std::ptr::null(), 0),
+            ExtArg::Hugeint(v) => {
+                let (int64, double) = pack_wide(v);
+                (
+                    PINKDB_EXT_TYPE_HUGEINT,
+                    0,
+                    int64,
+                    double,
+                    std::ptr::null(),
+                    0,
+                )
+            }
+            ExtArg::Uhugeint(v) => {
+                let (int64, double) = pack_wide(v as i128);
+                (
+                    PINKDB_EXT_TYPE_UHUGEINT,
+                    0,
+                    int64,
+                    double,
+                    std::ptr::null(),
+                    0,
+                )
+            }
             ExtArg::Interval {
                 months,
                 days,
@@ -617,6 +684,10 @@ pub enum ExtValue {
     Varchar(Vec<u8>),
     Date(i32),
     Timestamp(i64),
+    /// Signed 128-bit integer, carried by value as [`pack_wide`] describes.
+    Hugeint(i128),
+    /// Unsigned 128-bit integer, carried like [`ExtValue::Hugeint`].
+    Uhugeint(u128),
     /// A calendar interval, by value.
     Interval {
         months: i32,
@@ -644,6 +715,8 @@ impl ExtValue {
             ExtValue::Varchar(_) => ExtType::Varchar,
             ExtValue::Date(_) => ExtType::Date,
             ExtValue::Timestamp(_) => ExtType::Timestamp,
+            ExtValue::Hugeint(_) => ExtType::Hugeint,
+            ExtValue::Uhugeint(_) => ExtType::Uhugeint,
             ExtValue::Interval { .. } => ExtType::Interval,
             ExtValue::Variant(_) => ExtType::Variant,
             ExtValue::ArrayDouble(values) => ExtType::ArrayDouble {
@@ -672,6 +745,8 @@ mod tests {
             ExtType::Timestamp,
             ExtType::Interval,
             ExtType::Variant,
+            ExtType::Hugeint,
+            ExtType::Uhugeint,
         ];
         let mut tags: Vec<i32> = all.iter().map(|t| t.tag()).collect();
         tags.sort_unstable();
@@ -710,6 +785,31 @@ mod tests {
         assert_eq!(abi.is_null, 0);
         assert_eq!(abi.text_len, 3);
         assert!(!abi.text_ptr.is_null());
+    }
+
+    /// The 128-bit payload is the 16 little-endian bytes of the integer split
+    /// over both scalars; every bit survives, including both signs and UHUGEINT's
+    /// upper half.
+    #[test]
+    fn wide_payload_round_trips() {
+        for value in [i128::MIN, -1, 0, 1, i128::MAX] {
+            let (int64, double) = pack_wide(value);
+            assert_eq!(unpack_wide(int64, double), value);
+
+            let abi = ExtArg::Hugeint(value).to_abi();
+            assert_eq!(abi.type_tag, PINKDB_EXT_TYPE_HUGEINT);
+            assert_eq!(abi.is_null, 0);
+            assert_eq!(unpack_wide(abi.int64, abi.double), value);
+            assert!(abi.text_ptr.is_null());
+        }
+        for value in [0, 1, u64::MAX as u128, u128::MAX] {
+            let (int64, double) = pack_wide(value as i128);
+            assert_eq!(unpack_wide(int64, double) as u128, value);
+        }
+        assert_eq!(
+            ExtArg::Null(ExtType::Hugeint).to_abi().type_tag,
+            PINKDB_EXT_TYPE_HUGEINT
+        );
     }
 
     /// The interval payload survives the by-value round trip in every field,

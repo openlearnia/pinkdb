@@ -40,6 +40,9 @@ lowercase):
 | `cf_bool` | BOOLEAN | the argument; NULL in → NULL out |
 | `cf_int` | INTEGER | the argument; NULL in → NULL out |
 | `cf_bigint` | BIGINT | the argument; NULL in → NULL out |
+| `cf_hugeint` | HUGEINT | the argument's 128 bits; NULL in → NULL out |
+| `cf_uhugeint` | UHUGEINT | the argument's 128 bits; NULL in → NULL out |
+| `cf_sum_bigint` | BIGINT | the argument; used by the smoke tests on `SUM(int_col)`; NULL in → NULL out |
 | `cf_double` | DOUBLE | the argument bit-for-bit (NaN and ±inf included); NULL in → NULL out |
 | `cf_date` | DATE | the argument (days since 1970-01-01); NULL in → NULL out |
 | `cf_timestamp` | TIMESTAMP | the argument (microseconds since the epoch); NULL in → NULL out |
@@ -136,7 +139,7 @@ single-test run writes its observations to a file). Three hosts are published:
 | host | `abi_version` | `struct_size` | expected |
 |---|---|---|---|
 | legacy | 1 | `PINKDB_EXT_API_V1_SIZE` (32) | non-zero code, and no function registered as deterministic that the fixture declares volatile |
-| full | 1 | `PINKDB_EXT_API_MINOR2_SIZE` (48) | `0`, exactly the 15 registrations, `cf_volatile` the only volatile one |
+| full | 1 | `PINKDB_EXT_API_MINOR2_SIZE` (48) | `0`, exactly the 19 registrations, `cf_volatile` the only volatile one |
 | future | 999 | `PINKDB_EXT_API_V1_SIZE` | non-zero code, nothing registered |
 
 The loader's own header is never the host in these runs: the child calls the
@@ -145,7 +148,7 @@ builds, which is what makes the three cases possible at all. Measured refusal co
 asserted, since each SDK picks its own): legacy host C 3, C++ 1 (13
 registrations accepted before `cf_volatile`, which is what the "nothing
 volatile registered as deterministic" assertion pins), Go 10, Rust 4; unknown
-ABI C/C++/Go 1, Rust 3. A full host returns 0 with all 15 registrations for all
+ABI C/C++/Go 1, Rust 3. A full host returns 0 with all 19 registrations for all
 four.
 
 ## What the fixture deliberately does not cover

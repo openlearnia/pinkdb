@@ -39,14 +39,17 @@ esac
 echo "==> cargo build --release -p pinkdb-cli"
 (cd "$repo" && cargo build --release -p pinkdb-cli)
 
-echo "==> make -C ext-sdk/go (example)"
+echo "==> make -C ext-sdk/go (example + conformance fixture)"
 make -C "$here" -s all
 
 lib="$here/build/string_ext.$so_ext"
-if [ ! -f "$lib" ]; then
-    echo "FAIL: expected example library is missing: $lib" >&2
-    exit 1
-fi
+conf="$here/build/conformance_ext.$so_ext"
+for f in "$lib" "$conf"; do
+    if [ ! -f "$f" ]; then
+        echo "FAIL: expected SDK library is missing: $f" >&2
+        exit 1
+    fi
+done
 
 # One scratch session directory; cleaned up whatever happens. (TMPDIR on
 # macOS carries a trailing slash — strip it so the mktemp template is tidy.)
@@ -66,6 +69,7 @@ rows="$(awk 'BEGIN { for (i = 1; i <= 5000; i++) printf "%s(%d)", (i == 1 ? "" :
 # arguments need an explicit CAST (ABI v1 is strictly typed).
 statements=(
     "LOAD EXTENSION '$lib';"
+    "LOAD EXTENSION '$conf';"
     "CREATE TABLE t (i BIGINT);"
     "INSERT INTO t VALUES $rows;"
 
@@ -87,6 +91,12 @@ statements=(
     "SELECT CASE WHEN SUM(ext_go_len(CAST(i AS VARCHAR))) = 18893 THEN 'bytes ok' ELSE 'bytes FAIL' END AS marker FROM t;"
     "SELECT CASE WHEN COUNT(*) = 4001 THEN 'digits ok' ELSE 'digits FAIL' END AS marker FROM t WHERE ext_go_len(CAST(i AS VARCHAR)) = 4;"
     "SELECT CASE WHEN COUNT(*) = 5000 THEN 'repeat rows ok' ELSE 'repeat rows FAIL' END AS marker FROM (SELECT ext_go_repeat(CAST(i AS VARCHAR), 2) AS r FROM t WHERE ext_go_len(CAST(i AS VARCHAR)) > 0) AS d;"
+
+    # SUM(INTEGER) is a HUGEINT; the fixture's BIGINT-declared function must
+    # still bind (the checked narrowing regression this smoke pins).
+    "CREATE TABLE sum_t (i INTEGER);"
+    "INSERT INTO sum_t VALUES (1), (2), (3);"
+    "SELECT CASE WHEN cf_sum_bigint(SUM(i)) = 6 THEN 'sum ok' ELSE 'sum FAIL' END FROM sum_t;"
 
     # Error paths: the repeat cap is error code 2; ABI v1 is strictly typed.
     "SELECT ext_go_repeat('ab', 1000000);"
@@ -133,6 +143,7 @@ check_marker() { # check_marker <description> <marker>: one result ROW is exactl
 }
 
 check "string_ext loaded"             "Extension string_ext loaded."
+check "conformance_ext loaded"        "Extension conformance_ext loaded."
 check "ext_go_repeat/ext_go_len row"  "│ ababab   │ 6      │ 5       │"
 check "multibyte + built-in upper"    "│ héllohéllo │ ABAB    │"
 check "5,000-row display row"         "│ 5000    │"
@@ -141,6 +152,7 @@ check_marker "NULL inputs -> NULL"    "null ok"
 check_marker "ext_go_repeat applied"  "repeat ok"
 check_marker "ext_go_len applied"     "len ok"
 check_marker "built-in composition"   "compose ok"
+check_marker "SUM(INTEGER) binds to BIGINT" "sum ok"
 check_marker "5,000 rows filtered"    "rows ok"
 check_marker "5,000 rows byte sum"    "bytes ok"
 check_marker "4-digit row count"      "digits ok"

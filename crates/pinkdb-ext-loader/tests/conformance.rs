@@ -33,7 +33,7 @@ use pinkdb_ext_loader::{
 };
 
 /// The functions the contract requires, in registration order.
-const REQUIRED: [&str; 16] = [
+const REQUIRED: [&str; 19] = [
     "cf_echo",
     "cf_bool",
     "cf_int",
@@ -50,6 +50,9 @@ const REQUIRED: [&str; 16] = [
     "cf_unwind",
     "cf_volatile",
     "cf_thread",
+    "cf_hugeint",
+    "cf_uhugeint",
+    "cf_sum_bigint",
 ];
 
 fn load_fixture(fixture: &Fixture) -> LoadedExtension {
@@ -309,6 +312,39 @@ fn values_round_trip_in_every_tag() {
             ExtValue::Null,
             "{sdk}"
         );
+
+        // HUGEINT/UHUGEINT: 16 little-endian bytes split over both scalars.
+        for value in [i128::MIN, -1, 0, 1, i128::MAX] {
+            assert_eq!(
+                call(&ext, "cf_hugeint", &[ExtArg::Hugeint(value)]),
+                ExtValue::Hugeint(value),
+                "{sdk} cf_hugeint({value})"
+            );
+        }
+        for value in [0, 1, u64::MAX as u128, u128::MAX] {
+            assert_eq!(
+                call(&ext, "cf_uhugeint", &[ExtArg::Uhugeint(value)]),
+                ExtValue::Uhugeint(value),
+                "{sdk} cf_uhugeint({value})"
+            );
+        }
+        assert_eq!(
+            call(&ext, "cf_hugeint", &[ExtArg::Null(ExtType::Hugeint)]),
+            ExtValue::Null,
+            "{sdk}"
+        );
+        assert_eq!(
+            call(&ext, "cf_uhugeint", &[ExtArg::Null(ExtType::Uhugeint)]),
+            ExtValue::Null,
+            "{sdk}"
+        );
+        for value in [0, -1, i64::MIN, i64::MAX] {
+            assert_eq!(
+                call(&ext, "cf_sum_bigint", &[ExtArg::Bigint(value)]),
+                ExtValue::Bigint(value),
+                "{sdk} cf_sum_bigint({value})"
+            );
+        }
 
         // VARIANT: the payload is opaque bytes on the text channel, so a
         // fixture that is not the engine cannot interpret it — it must come
@@ -594,6 +630,53 @@ extern "C" fn stub_register(
     record(name, false)
 }
 
+/// An old host that does not know tags 13/14: it refuses a registration that
+/// names one, exactly as a pre-minor-6 host must refuse the new extension.
+fn has_wide_tag(n_args: u32, arg_types: *const i32, ret_type: i32) -> bool {
+    if ret_type == 13 || ret_type == 14 {
+        return true;
+    }
+    if arg_types.is_null() {
+        return false;
+    }
+    // SAFETY: the ABI promises `n_args` readable tags for the call.
+    (0..n_args as usize).any(|i| {
+        let tag = unsafe { *arg_types.add(i) };
+        tag == 13 || tag == 14
+    })
+}
+
+extern "C" fn old_tag_register(
+    _ctx: *mut c_void,
+    name: *const c_char,
+    n_args: u32,
+    arg_types: *const i32,
+    ret_type: i32,
+    _callback: Option<PinkdbExtScalarFn>,
+    _user_data: *mut c_void,
+) -> i32 {
+    if has_wide_tag(n_args, arg_types, ret_type) {
+        return 1;
+    }
+    record(name, false)
+}
+
+extern "C" fn old_tag_register_flags(
+    _ctx: *mut c_void,
+    name: *const c_char,
+    n_args: u32,
+    arg_types: *const i32,
+    ret_type: i32,
+    flags: u32,
+    _callback: Option<PinkdbExtScalarFn>,
+    _user_data: *mut c_void,
+) -> i32 {
+    if has_wide_tag(n_args, arg_types, ret_type) {
+        return 1;
+    }
+    record(name, flags & 0x1 != 0)
+}
+
 extern "C" fn stub_register_flags(
     _ctx: *mut c_void,
     name: *const c_char,
@@ -730,6 +813,12 @@ fn child_host(mode: &str) -> Box<PinkdbHostApi> {
             boxed
         }
         "full" => Box::new(full_host(1)),
+        "old_tags" => {
+            let mut host = full_host(1);
+            host.register_scalar = old_tag_register;
+            host.register_scalar_flags = old_tag_register_flags;
+            Box::new(host)
+        }
         "minor2" => {
             // A host that stops at the minor-2 surface: `execute_internal` is
             // not part of what it publishes, so a v1 extension (which never
@@ -861,6 +950,22 @@ fn struct_size_and_abi_version_are_negotiated() {
                 .collect::<Vec<_>>(),
             ["cf_volatile"],
             "{} volatile registrations",
+            fixture.sdk
+        );
+
+        // A host that predates tags 13/14 refuses the new registration; the
+        // remainder of the extension loads, but the wide functions do not.
+        let (code, registered) = init_in_child(fixture, "old_tags");
+        assert_ne!(
+            code, 0,
+            "{} registered a 128-bit function on a host without the tag",
+            fixture.sdk
+        );
+        assert!(
+            !registered
+                .iter()
+                .any(|a| a.name.starts_with("cf_hugeint") || a.name.starts_with("cf_uhugeint")),
+            "{} registered a 128-bit function on an old host: {registered:?}",
             fixture.sdk
         );
 
