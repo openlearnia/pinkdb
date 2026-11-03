@@ -623,3 +623,115 @@ fn lake_identity_is_written_to_the_footer() {
     assert_eq!(read_identity(&path).unwrap(), None);
     cleanup(&dir);
 }
+
+#[test]
+fn hugeint_and_uhugeint_columns_write_as_double() {
+    use parquet::basic::{ConvertedType, Type as PhysicalType};
+
+    let dir = scratch("hugeint");
+    let expected = vec![
+        vec![Value::Hugeint(i128::MAX), Value::Uhugeint(u128::MAX)],
+        vec![Value::Hugeint(i128::MIN), Value::Uhugeint(0)],
+        vec![Value::Hugeint(0), Value::Uhugeint(1)],
+        vec![Value::Null, Value::Null],
+    ];
+    let src = table(
+        "t",
+        vec![
+            ("h".to_string(), DataType::Hugeint),
+            ("u".to_string(), DataType::Uhugeint),
+        ],
+        expected,
+    );
+    // DuckDB v2.0.0 writes both widths as a bare DOUBLE and reads DOUBLE
+    // back, so the reader's schema is what the round trip pins.
+    let bytes = write_table(&src).unwrap();
+    let path = dir.join("data.parquet");
+    std::fs::write(&path, &bytes).unwrap();
+    let (schema, rows) = read_rows(
+        &path,
+        vec![
+            ("h".to_string(), DataType::Double),
+            ("u".to_string(), DataType::Double),
+        ],
+    );
+    assert_eq!(schema.len(), 2);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Double(i128::MAX as f64),
+                Value::Double(u128::MAX as f64)
+            ],
+            vec![Value::Double(i128::MIN as f64), Value::Double(0.0)],
+            vec![Value::Double(0.0), Value::Double(1.0)],
+            vec![Value::Null, Value::Null],
+        ]
+    );
+
+    let reader =
+        SerializedFileReader::new(std::fs::File::open(dir.join("data.parquet")).unwrap()).unwrap();
+    let descr = reader.metadata().file_metadata().schema_descr();
+    for column in 0..2 {
+        let column = descr.column(column);
+        assert_eq!(column.physical_type(), PhysicalType::DOUBLE);
+        assert_eq!(column.converted_type(), ConvertedType::NONE);
+        assert!(column.logical_type_ref().is_none());
+    }
+    cleanup(&dir);
+}
+
+#[test]
+fn copy_of_hugeint_columns_reads_back_as_double() {
+    let dir = scratch("hugeint-copy");
+    let mut db = PinkDb::new();
+    pinkdb_parquet::register(&mut db);
+    db.execute("CREATE TABLE t (h HUGEINT, u UHUGEINT);")
+        .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES \
+         (170141183460469231731687303715884105727, \
+          340282366920938463463374607431768211455), \
+         (-170141183460469231731687303715884105728, 0), (NULL, NULL);",
+    )
+    .unwrap();
+    let file = dir.join("h.parquet");
+    db.execute(&format!("COPY t TO '{}' (FORMAT parquet);", file.display()))
+        .unwrap();
+    let rows = match db
+        .execute(&format!(
+            "SELECT typeof(h), typeof(u), h, u FROM read_parquet('{}') ORDER BY h NULLS LAST;",
+            file.display()
+        ))
+        .unwrap()
+        .pop()
+        .unwrap()
+    {
+        pinkdb::QueryResult::Selected { rows, .. } => rows,
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Varchar("DOUBLE".into()),
+                Value::Varchar("DOUBLE".into()),
+                Value::Double(i128::MIN as f64),
+                Value::Double(0.0),
+            ],
+            vec![
+                Value::Varchar("DOUBLE".into()),
+                Value::Varchar("DOUBLE".into()),
+                Value::Double(i128::MAX as f64),
+                Value::Double(u128::MAX as f64),
+            ],
+            vec![
+                Value::Varchar("DOUBLE".into()),
+                Value::Varchar("DOUBLE".into()),
+                Value::Null,
+                Value::Null,
+            ],
+        ]
+    );
+    cleanup(&dir);
+}

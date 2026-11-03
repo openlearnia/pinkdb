@@ -2357,6 +2357,7 @@ impl DataTable {
                 | Value::Integer(_)
                 | Value::Bigint(_)
                 | Value::Hugeint(_)
+                | Value::Uhugeint(_)
                 | Value::Double(_)
                 | Value::Decimal { .. }),
                 t @ (DataType::Boolean
@@ -2365,7 +2366,8 @@ impl DataTable {
                 | DataType::Double
                 | DataType::Date
                 | DataType::Timestamp
-                | DataType::Hugeint),
+                | DataType::Hugeint
+                | DataType::Uhugeint),
             ) if matches!(v, Value::Varchar(_))
                 || !matches!(t, DataType::Boolean | DataType::Date | DataType::Timestamp) =>
             {
@@ -2378,6 +2380,8 @@ impl DataTable {
                 v @ (Value::Boolean(_)
                 | Value::Integer(_)
                 | Value::Bigint(_)
+                | Value::Hugeint(_)
+                | Value::Uhugeint(_)
                 | Value::Double(_)
                 | Value::Decimal { .. }
                 | Value::Date(_)

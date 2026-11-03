@@ -1435,8 +1435,9 @@ pub fn from_value(v: &Value) -> Result<Variant> {
         Value::Decimal {
             value: x, scale, ..
         } => Variant::Decimal(*x, *scale),
-        // The decimal kind holds a HUGEINT exactly; UHUGEINT values above
-        // `i128::MAX` have no VARIANT kind until step 8.
+        // The decimal kind holds a HUGEINT exactly; a UHUGEINT above
+        // `i128::MAX` has no VARIANT kind, so it is refused rather than
+        // wrapped.
         Value::Hugeint(x) => Variant::Decimal(*x, 0),
         Value::Uhugeint(x) => Variant::Decimal(
             i128::try_from(*x).map_err(|_| {

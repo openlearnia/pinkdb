@@ -855,7 +855,7 @@ pub(crate) fn decimal_operand_width(t: DataType) -> Option<(u8, u8)> {
         DataType::Decimal { precision, scale } => Some((precision, scale)),
         DataType::Integer => Some((10, 0)),
         DataType::Bigint => Some((19, 0)),
-        DataType::Hugeint => Some((DECIMAL_MAX_PRECISION, 0)),
+        DataType::Hugeint | DataType::Uhugeint => Some((DECIMAL_MAX_PRECISION, 0)),
         _ => None,
     }
 }
@@ -892,6 +892,10 @@ pub(crate) fn common_numeric(a: DataType, b: DataType) -> Result<DataType> {
             let wb = decimal_operand_width(b).expect("numeric without a decimal width");
             decimal_common(wa, wb)
         }
+        // UHUGEINT with HUGEINT (or any narrower signed integer) is DOUBLE
+        // in DuckDB, unlike the two same-type operands below.
+        (DataType::Uhugeint, DataType::Uhugeint) => DataType::Uhugeint,
+        (DataType::Uhugeint, _) | (_, DataType::Uhugeint) => DataType::Double,
         (DataType::Hugeint, _) | (_, DataType::Hugeint) => DataType::Hugeint,
         // HUGEINT wins over every narrower integer, and loses to DOUBLE and
         // DECIMAL (the arms above).
@@ -954,16 +958,18 @@ fn arithmetic_dtype(op: BinaryOp, l: DataType, r: DataType) -> Result<DataType> 
                 )));
             }
             if l == DataType::Double || r == DataType::Double {
-                return Err(PinkDbError::Type(
-                    "`%` needs integer operands in v1".to_string(),
-                ));
+                return Ok(DataType::Double);
             }
             if matches!(l, DataType::Decimal { .. }) || matches!(r, DataType::Decimal { .. }) {
                 let wa = decimal_operand_width(l).expect("numeric without a decimal width");
                 let wb = decimal_operand_width(r).expect("numeric without a decimal width");
                 // DuckDB: the wider of the two integer parts + the wider scale.
+                // A result that does not fit 38 digits is DOUBLE, not clamped.
                 let scale = wa.1.max(wb.1);
                 let int_digits = (wa.0 - wa.1).max(wb.0 - wb.1) as i32;
+                if int_digits + scale as i32 > DECIMAL_MAX_PRECISION as i32 {
+                    return Ok(DataType::Double);
+                }
                 return Ok(DataType::Decimal {
                     precision: clamp_precision(int_digits + scale as i32, scale),
                     scale,
@@ -1146,6 +1152,12 @@ fn check_cast(from: DataType, to: DataType) -> Result<()> {
         return Err(PinkDbError::Type(format!(
             "cannot CAST {from} AS {to}: the array size is part of the type",
         )));
+    }
+    // UUID is 128 bits; DuckDB reads it as UHUGEINT and back unchanged.
+    if (from == DataType::Uuid && to == DataType::Uhugeint)
+        || (from == DataType::Uhugeint && to == DataType::Uuid)
+    {
+        return Ok(());
     }
     // Date ↔ timestamp (midnight / truncate).
     if (from == DataType::Date && to == DataType::Timestamp)
@@ -1472,6 +1484,36 @@ fn cast_decimal_literal_to_column(l: BoundExpr, r: BoundExpr) -> (BoundExpr, Bou
     (l, r)
 }
 
+/// An integer literal beside a UHUGEINT operand takes its type when it fits;
+/// DuckDB folds literal constants into the other side before combining types,
+/// so `u + 1` is UHUGEINT while `u + 1::INTEGER` (a cast, not a literal) is
+/// the DOUBLE a signed mix gives.
+fn cast_integer_literal_to_uhugeint(l: BoundExpr, r: BoundExpr) -> (BoundExpr, BoundExpr) {
+    fn as_uhugeint(e: &BoundExpr) -> Option<BoundExpr> {
+        let BoundExpr::Literal(v) = e else {
+            return None;
+        };
+        let x = match v {
+            Value::Integer(i) => u128::try_from(*i).ok()?,
+            Value::Bigint(i) => u128::try_from(*i).ok()?,
+            Value::Uhugeint(x) => *x,
+            _ => return None,
+        };
+        Some(BoundExpr::Literal(Value::Uhugeint(x)))
+    }
+    if l.dtype() == DataType::Uhugeint
+        && let Some(lit) = as_uhugeint(&r)
+    {
+        return (l, lit);
+    }
+    if r.dtype() == DataType::Uhugeint
+        && let Some(lit) = as_uhugeint(&l)
+    {
+        return (lit, r);
+    }
+    (l, r)
+}
+
 /// A string literal compared with a UUID or a 128-bit integer is that value's
 /// text: DuckDB gives literals the other operand's type implicitly, and every
 /// other pair still has to agree.
@@ -1480,7 +1522,8 @@ fn cast_uuid_literal(l: BoundExpr, r: BoundExpr) -> (BoundExpr, BoundExpr) {
         expr: Box::new(e),
         dtype: t,
     };
-    let text_cmp = |t: DataType| matches!(t, DataType::Uuid | DataType::Hugeint);
+    let text_cmp =
+        |t: DataType| matches!(t, DataType::Uuid | DataType::Hugeint | DataType::Uhugeint);
     if text_cmp(l.dtype()) && matches!(r, BoundExpr::Literal(Value::Varchar(_))) {
         let t = l.dtype();
         return (l, cast(r, t));
@@ -2619,6 +2662,7 @@ impl<'a> Binder<'a> {
                     return self.bind_is_distinct(*op, left, right, aggs, allow_agg);
                 }
                 let (l, r) = self.bind_binary_operands(*op, left, right, aggs, allow_agg)?;
+                let (l, r) = cast_integer_literal_to_uhugeint(l, r);
                 let (l, r) = cast_uuid_literal(l, r);
                 let dtype = match op {
                     BinaryOp::And | BinaryOp::Or => {
@@ -4934,23 +4978,16 @@ fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
                 ));
             }
             // The accumulator is 128-bit for every integer input and AVG's
-            // result is DOUBLE (DuckDB); UHUGEINT is step 8 of the plan.
-            if matches!(t, DataType::Uhugeint) {
-                return Err(PinkDbError::Type(format!(
-                    "AVG over {} is not yet supported (step 8 of the HUGEINT plan)",
-                    t.name()
-                )));
-            }
+            // result is DOUBLE (DuckDB); a UHUGEINT column arrives widened to
+            // DOUBLE, exactly as in the release.
             Ok(DataType::Double)
         }
         AggFunc::Sum => match arg.expect("sum has an arg") {
-            // SUM over any integer is HUGEINT (DuckDB); the accumulator is
-            // exact in i128, so no intermediate total can overflow it.
+            // SUM over any signed integer is HUGEINT (DuckDB); the
+            // accumulator is exact in i128, so no intermediate total can
+            // overflow it. UHUGEINT sums through DOUBLE, as in the release.
             DataType::Integer | DataType::Bigint | DataType::Hugeint => Ok(DataType::Hugeint),
-            DataType::Uhugeint => Err(PinkDbError::Type(format!(
-                "SUM over {} is not yet supported (step 8 of the HUGEINT plan)",
-                arg.expect("sum has an arg").name()
-            ))),
+            DataType::Uhugeint => Ok(DataType::Double),
             DataType::Double => Ok(DataType::Double),
             // SUM(DECIMAL(p,s)) → DECIMAL(38,s) with a runtime overflow check
             // (DuckDB).
@@ -10508,6 +10545,7 @@ fn can_assign(from: DataType, to: DataType) -> bool {
                 | DataType::Integer
                 | DataType::Bigint
                 | DataType::Hugeint
+                | DataType::Uhugeint
                 | DataType::Double
                 | DataType::Decimal { .. }
                 | DataType::Date
@@ -10522,6 +10560,7 @@ fn can_assign(from: DataType, to: DataType) -> bool {
             DataType::Integer
                 | DataType::Bigint
                 | DataType::Hugeint
+                | DataType::Uhugeint
                 | DataType::Double
                 | DataType::Decimal { .. }
         )

@@ -12,6 +12,7 @@
 //! | `DATE` | `Date32` (days since epoch) |
 //! | `TIMESTAMP` | `Timestamp(Microsecond, no time zone)` |
 //! | `DECIMAL(p,s)` | `Decimal128(p,s)` |
+//! | `HUGEINT` / `UHUGEINT` | `Decimal128(38,0)` (DuckDB's ArrowConverter; UHUGEINT keeps its raw 128 bits) |
 //! | `INTERVAL` | `Interval(MonthDayNano)` (µs → ns, exact) |
 //!
 //! `ARRAY` is refused in both directions (wave 107a): Arrow's `FixedSizeList`
@@ -148,15 +149,9 @@ pub fn arrow_type(dtype: DataType) -> Result<ArrowType> {
         DataType::Timestamp => ArrowType::Timestamp(TimeUnit::Microsecond, None),
         DataType::Decimal { precision, scale } => ArrowType::Decimal128(precision, scale as i8),
         DataType::Interval => ArrowType::Interval(IntervalUnit::MonthDayNano),
-        // Arrow can carry a 128-bit integer as Decimal128(38,0), but that
-        // loses the integer type, so the writer refuses instead (step 7 of
-        // the HUGEINT plan).
-        DataType::Hugeint | DataType::Uhugeint => {
-            return Err(PinkDbError::Type(format!(
-                "{} is not yet supported in Arrow",
-                dtype.name()
-            )));
-        }
+        // DuckDB's ArrowConverter writes both 128-bit integers as
+        // Decimal128(38,0) unless lossless conversion is asked for.
+        DataType::Hugeint | DataType::Uhugeint => ArrowType::Decimal128(38, 0),
         DataType::Variant => {
             return Err(PinkDbError::Type(
                 "arrow has no VARIANT type pinkdb can write exactly; the arrow extension \

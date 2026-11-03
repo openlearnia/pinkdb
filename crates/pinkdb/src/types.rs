@@ -174,10 +174,9 @@ pub enum DataType {
     /// 16-byte universally unique identifier, ordered and grouped by its
     /// unsigned 128-bit value (DuckDB's rules).
     Uuid,
-    /// Signed 128-bit integer (DuckDB's `HUGEINT`). Storage, wire and ABI
-    /// support arrives in steps 5–7 of `docs/slt-3-hugeint-plan.md`.
+    /// Signed 128-bit integer (DuckDB's `HUGEINT`).
     Hugeint,
-    /// Unsigned 128-bit integer (DuckDB's `UHUGEINT`); step 8.
+    /// Unsigned 128-bit integer (DuckDB's `UHUGEINT`).
     Uhugeint,
 }
 
@@ -1424,6 +1423,40 @@ pub fn parse_i128_str(s: &str) -> Option<i128> {
     parse_i128_text(&split_int_text(s)?)
 }
 
+/// Parse a VARCHAR cell into a UHUGEINT with DuckDB's UINT128 cast rules.
+/// The unsigned text parser accepts a sign only when every character after
+/// it is a zero (`'-0'` is 0, `'-1'` and `'-0.4'` are conversion errors), and
+/// rounds a fraction or exponent half away from zero. All 39-digit values
+/// fit, so the check is `u128` overflow rather than a digit cap.
+pub fn parse_u128_str(s: &str) -> Option<u128> {
+    // DuckDB checks the raw sign before any digit handling, so this also
+    // rejects `-0.0`, `-0e5` and `-0x0`.
+    if let Some(rest) = s.trim().strip_prefix('-') {
+        return rest.bytes().all(|b| b == b'0').then_some(0);
+    }
+    if let Some((_, radix, digits)) = bit_pattern(s) {
+        return u128::from_str_radix(&digits, radix).ok();
+    }
+    let t = split_int_text(s)?;
+    let point = t.int_part.len() as i64 + i64::from(t.exponent);
+    let digits: Vec<u8> = t.int_part.bytes().chain(t.frac_part.bytes()).collect();
+    if point < 0 {
+        return Some(0);
+    }
+    let integer = &digits[..(point as usize).min(digits.len())];
+    let mut value: u128 = 0;
+    for &b in integer {
+        value = value.checked_mul(10)?.checked_add(u128::from(b - b'0'))?;
+    }
+    for _ in integer.len()..point as usize {
+        value = value.checked_mul(10)?;
+    }
+    if digits.get(point as usize).is_some_and(|b| *b >= b'5') {
+        value = value.checked_add(1)?;
+    }
+    Some(value)
+}
+
 // ---------- interval ----------
 // DuckDB's interval_t: months + days + microseconds, displayed with each
 // field's own sign. Comparisons normalize months to 30-day months and days
@@ -2369,6 +2402,61 @@ mod tests {
         assert_eq!(parse_i128_str("0x80000000000000000000000000000000"), None);
         assert_eq!(parse_i128_str("-0x7f"), None);
         assert_eq!(parse_i128_str("0b101"), Some(5));
+    }
+
+    #[test]
+    fn uhugeint_text_cast_matches_duckdb() {
+        assert_eq!(
+            parse_u128_str("340282366920938463463374607431768211455"),
+            Some(u128::MAX)
+        );
+        assert_eq!(
+            parse_u128_str("340282366920938463463374607431768211456"),
+            None
+        );
+        assert_eq!(
+            parse_u128_str("170141183460469231731687303715884105728"),
+            Some(1 << 127)
+        );
+        // A sign is accepted only in front of zeros.
+        assert_eq!(parse_u128_str("-0"), Some(0));
+        assert_eq!(parse_u128_str("-000"), Some(0));
+        assert_eq!(parse_u128_str("-1"), None);
+        assert_eq!(parse_u128_str("-0.4"), None);
+        assert_eq!(parse_u128_str("-0.0"), None);
+        assert_eq!(parse_u128_str("-0e5"), None);
+        assert_eq!(parse_u128_str("+12"), Some(12));
+        assert_eq!(parse_u128_str(" 12 "), Some(12));
+        assert_eq!(parse_u128_str("1_000"), Some(1000));
+        assert_eq!(parse_u128_str("abc"), None);
+        // Fractions and exponents round on the first dropped digit.
+        assert_eq!(parse_u128_str("1.5"), Some(2));
+        assert_eq!(parse_u128_str("2.5"), Some(3));
+        assert_eq!(parse_u128_str("0.5"), Some(1));
+        assert_eq!(parse_u128_str("0.4"), Some(0));
+        assert_eq!(parse_u128_str("15e-1"), Some(2));
+        assert_eq!(parse_u128_str("1e3"), Some(1000));
+        assert_eq!(parse_u128_str("1e-39"), Some(0));
+        assert_eq!(parse_u128_str("1e39"), None);
+        assert_eq!(
+            parse_u128_str("340282366920938463463374607431768211455.4"),
+            Some(u128::MAX)
+        );
+        assert_eq!(
+            parse_u128_str("340282366920938463463374607431768211455.5"),
+            None
+        );
+        let zeros = "0".repeat(300);
+        assert_eq!(parse_u128_str(&format!("1.{zeros}1e5")), Some(100000));
+        assert_eq!(parse_u128_str(&format!("0.{zeros}1e5")), Some(0));
+        // `0x`/`0b` are positive bit patterns; a negative one is refused.
+        assert_eq!(
+            parse_u128_str("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
+            Some(u128::MAX)
+        );
+        assert_eq!(parse_u128_str("0x100000000000000000000000000000000"), None);
+        assert_eq!(parse_u128_str("-0x7f"), None);
+        assert_eq!(parse_u128_str("0b101"), Some(5));
     }
 
     #[test]

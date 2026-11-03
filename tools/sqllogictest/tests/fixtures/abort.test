@@ -1,0 +1,3 @@
+# The same containment, for a plain abort: no unwinding, no result.
+statement ok
+SELECT pinkdb_slt_abort()
