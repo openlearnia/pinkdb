@@ -544,10 +544,11 @@ fn numeric_text(raw: &[u8]) -> String {
     if raw.len() < 8 {
         return String::new();
     }
-    let digits: Vec<u16> = raw[8..]
-        .chunks_exact(2)
+    let (pairs, _) = raw[8..].as_chunks::<2>();
+    let digits: Vec<u16> = pairs
+        .iter()
         .take(i16_at(raw, 0).max(0) as usize)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .map(|pair| u16::from_be_bytes(*pair))
         .collect();
     let weight = i16_at(raw, 2);
     let dscale = i16_at(raw, 6).max(0) as usize;
