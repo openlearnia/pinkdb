@@ -1034,11 +1034,16 @@ class Suite:
         baseline = json.loads(baseline_path.read_text()) if baseline_path.exists() else None
         regressions = []
         if baseline and not self.args.update_baseline:
+            # The fastest warm run is compared, not the median: these queries
+            # take 1-3 ms, and on shared runners a median moved 3 -> 8 ms for
+            # the same plan (corr_not_in, 2026-11-03). A real regression slows
+            # every run, so it still shows in the fastest one.
             for key, _ in queries:
                 base = baseline.get(key, {}).get("median_ms")
-                got = out[key]["median_ms"]
+                warm = out[key]["runs_ms"][1:]
+                got = min(warm) if warm else None
                 if base and got and got > max(2 * base, base + 5):
-                    regressions.append(f"{key}: {got:.1f}ms vs baseline {base:.1f}ms")
+                    regressions.append(f"{key}: fastest {got:.1f}ms vs baseline {base:.1f}ms")
             # Binary sizes differ by platform (Mach-O vs ELF, linkers), so the
             # baseline keeps one per sys.platform; a platform without one is
             # not checked (record it with --update-baseline on that platform).
