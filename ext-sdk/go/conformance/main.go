@@ -33,7 +33,8 @@ package main
 #define PINKDB_CF_FUNCTIONS(X)                                                 \
     X(cf_echo) X(cf_bool) X(cf_int) X(cf_bigint) X(cf_double) X(cf_date)       \
     X(cf_timestamp) X(cf_interval) X(cf_variant) X(cf_all) X(cf_empty)       \
-    X(cf_fill) X(cf_fail) X(cf_unwind) X(cf_volatile) X(cf_thread)
+    X(cf_fill) X(cf_fail) X(cf_unwind) X(cf_volatile) X(cf_thread)          \
+    X(cf_hugeint) X(cf_uhugeint) X(cf_sum_bigint)
 
 #define PINKDB_CF_EXTERN(name) \
     extern int32_t name(void *user_data, void *args, size_t n_args, void *out);
@@ -146,6 +147,36 @@ func cfBigint(args []pinkdb.Value, out *pinkdb.Value) int32 {
 	}
 	*out = pinkdb.Bigint(args[0].Bigint())
 	return 0
+}
+
+// cfHugeint and cfUhugeint return both 64-bit halves verbatim; Go has no
+// native 128-bit integer, so the SDK exposes the halves.
+func cfHugeint(args []pinkdb.Value, out *pinkdb.Value) int32 {
+	if len(args) < 1 {
+		return 1
+	}
+	if args[0].IsNull != 0 {
+		return 0
+	}
+	lo, hi := args[0].HugeintBits()
+	*out = pinkdb.Hugeint(lo, hi)
+	return 0
+}
+
+func cfUhugeint(args []pinkdb.Value, out *pinkdb.Value) int32 {
+	if len(args) < 1 {
+		return 1
+	}
+	if args[0].IsNull != 0 {
+		return 0
+	}
+	lo, hi := args[0].UhugeintBits()
+	*out = pinkdb.Uhugeint(lo, hi)
+	return 0
+}
+
+func cfSumBigint(args []pinkdb.Value, out *pinkdb.Value) int32 {
+	return cfBigint(args, out)
 }
 
 // cfDouble returns the argument bit for bit: the payload travels as a double,
@@ -345,6 +376,21 @@ func cf_bigint(userData, args unsafe.Pointer, nArgs C.size_t, out unsafe.Pointer
 	return invoke(cfBigint, args, out, nArgs)
 }
 
+//export cf_hugeint
+func cf_hugeint(userData, args unsafe.Pointer, nArgs C.size_t, out unsafe.Pointer) C.int32_t {
+	return invoke(cfHugeint, args, out, nArgs)
+}
+
+//export cf_uhugeint
+func cf_uhugeint(userData, args unsafe.Pointer, nArgs C.size_t, out unsafe.Pointer) C.int32_t {
+	return invoke(cfUhugeint, args, out, nArgs)
+}
+
+//export cf_sum_bigint
+func cf_sum_bigint(userData, args unsafe.Pointer, nArgs C.size_t, out unsafe.Pointer) C.int32_t {
+	return invoke(cfSumBigint, args, out, nArgs)
+}
+
 //export cf_double
 func cf_double(userData, args unsafe.Pointer, nArgs C.size_t, out unsafe.Pointer) C.int32_t {
 	return invoke(cfDouble, args, out, nArgs)
@@ -474,6 +520,9 @@ var registrations = []registration{
 	{"cf_unwind", nil, pinkdb.TypeBigint, C.cf_unwind_ptr(), false},
 	{"cf_volatile", nil, pinkdb.TypeBigint, C.cf_volatile_ptr(), true},
 	{"cf_thread", nil, pinkdb.TypeBigint, C.cf_thread_ptr(), false},
+	{"cf_hugeint", []int32{pinkdb.TypeHugeint}, pinkdb.TypeHugeint, C.cf_hugeint_ptr(), false},
+	{"cf_uhugeint", []int32{pinkdb.TypeUhugeint}, pinkdb.TypeUhugeint, C.cf_uhugeint_ptr(), false},
+	{"cf_sum_bigint", []int32{pinkdb.TypeBigint}, pinkdb.TypeBigint, C.cf_sum_bigint_ptr(), false},
 }
 
 //export pinkdb_extension_init

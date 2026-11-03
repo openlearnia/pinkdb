@@ -155,3 +155,46 @@ Gates: full gate `t133c` on `7ef8edf` (on main `32c9a9d` + clippy fix): 89 steps
 DuckDB v2.0.0 interop step and the stricter VARIANT/ARRAY step. The one failure was the gate's own
 Postgres sharing port 55433 with the interop tests' servers; the step is split and both halves pass
 (`logs/t133c-pgfix.log`, 49 tests, no skips).
+
+## 133d — dictionary pages, per-entry filters, open files (added 2026-11-03)
+
+Profile basis: `~/Desktop/projects/pinkdb-wt/briefs/w133d-proposal.md`. Against DuckDB v2.0.0 reading the
+**same** Parquet files (the fair baseline, `prof133d/vs_duck_parquet.py`), the 133c lake was 2.40×
+(geomean); dictionary-encoded VARCHAR decoding was 22–45% of busy CPU (a refcounted `ByteArray` and a
+`from_utf8` per value), reopening the data file for every range read 5–7%.
+
+Changes (pi sessions `w133d` and, after the app crash, `w133d-c1`; brief `briefs/w133d.md`):
+- `extensions/parquet/src/dictionary.rs`: a dictionary-encoded VARCHAR column chunk decodes its
+  dictionary page once (UTF-8 checked once per entry), reads data-page ids with its own RLE/bit-pack
+  decoder, and gathers ordinary pinkdb vectors (no dictionary vector in the engine, per the parent's
+  condition). A chunk whose footer page-encoding mask shows PLAIN data pages (a dictionary that outgrew
+  its page: high-cardinality text such as `l_comment`) keeps the old path. Without that check every such
+  chunk was read twice (review caught it: plain string scan 1.44× slower; fixed, 0.98×).
+- Pushed predicates on such a column are evaluated once per dictionary entry; failing rows are dropped
+  from every column before materialization (after DuckDB's `DictionaryDecoder::InitializeDictionary`
+  filter). The lake's row accounting subtracts dropped rows (pi found `+` there, which broke every
+  filtered lake scan in the first draft).
+- Generic `IN` pushdown: `PrunePredicate::in_list`, rebuilt from the parser's `OR` chain; store zone
+  pruning, lake zones, the Parquet and Iceberg scans honour it.
+- `LocalStorage` keeps ≤ 64 data files open and reads with `read_at`.
+
+## Measured (133d)
+
+Release CLIs with the gate's features (`~/Desktop/projects/pinkdb-wt/ab-133d/`), TPC-H SF 1, A = main
+`0493148`, B = 133d. Data rebuilt by A (the `bench-ab` tree had been deleted by a cleanup).
+
+| | result | target |
+|---|---|---|
+| lake A/B, 7 rounds interleaved | **0.888** geomean, no query slower (Q19 0.49, Q12 0.78, Q2 0.79) | — |
+| store A/B, 7 rounds interleaved | **0.996** (max Q11 1.12 at 8 → 9 ms) | ≤ 1.03 ✓ |
+| vs DuckDB on the same Parquet, all 22 | **1.71×** (was 2.40×); worst Q18 2.68, Q12 2.34, Q20 2.30 | ≤ 1.8 ✓ |
+| Q12 vs DuckDB on the same Parquet | **2.34×** (was 6.31×) | ≤ 2.5 ✓ |
+| dictionary-filter probe (`l_shipmode IN (…)`), 9 rounds interleaved with DuckDB | **1.40×** (14 vs 10 ms; main 29 ms) | ≤ 1.3 ✗ (by ~4 ms) |
+
+The probe target was set when DuckDB took 23–29 ms on it; at 10–14 ms the per-query fixed cost
+dominates. The remaining lake gap is the engine paths handed to stream C (ungrouped aggregate through
+`GeneralSink`, serial join build, VARCHAR GROUP BY fold: numeric probe 2.1×, dictionary group 2.6×).
+
+Gates: full gate `t133d` (90/91 steps; the workspace step's 236 "never executed" errors were test
+binaries deleted mid-run by the build lock's cleanup after a concurrent baseline build launched from
+this worktree, rerun alone: 2,878 passed, 0 failed, `logs/t133d-workspace-rerun.log`).

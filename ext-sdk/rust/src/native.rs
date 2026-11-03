@@ -129,6 +129,12 @@ unsafe fn collect_args<'a>(
             }
             Some(ExtType::Date) => ExtArg::Date(value.int64 as i32),
             Some(ExtType::Timestamp) => ExtArg::Timestamp(value.int64),
+            Some(ExtType::Hugeint) => {
+                ExtArg::Hugeint(pinkdb_ext_loader::unpack_wide(value.int64, value.double))
+            }
+            Some(ExtType::Uhugeint) => {
+                ExtArg::Uhugeint(pinkdb_ext_loader::unpack_wide(value.int64, value.double) as u128)
+            }
             Some(ExtType::Interval) => {
                 let (months, days, micros) =
                     pinkdb_ext_loader::unpack_interval(value.int64, value.double);
@@ -234,6 +240,20 @@ fn write_result(value: ExtValue, out: &mut PinkdbExtValue) -> Result<(), String>
         ExtValue::Timestamp(micros) => {
             out.is_null = 0;
             out.int64 = micros;
+            Ok(())
+        }
+        ExtValue::Hugeint(v) => {
+            out.is_null = 0;
+            let (int64, double) = pinkdb_ext_loader::pack_wide(v);
+            out.int64 = int64;
+            out.double = double;
+            Ok(())
+        }
+        ExtValue::Uhugeint(v) => {
+            out.is_null = 0;
+            let (int64, double) = pinkdb_ext_loader::pack_wide(v as i128);
+            out.int64 = int64;
+            out.double = double;
             Ok(())
         }
         ExtValue::Interval {
@@ -729,6 +749,21 @@ mod tests {
         assert_eq!(out.int64, 9);
         write_result(ExtValue::Timestamp(-1), &mut out).unwrap();
         assert_eq!(out.int64, -1);
+        for value in [i128::MIN, -1, 0, i128::MAX] {
+            write_result(ExtValue::Hugeint(value), &mut out).unwrap();
+            assert_eq!(out.is_null, 0);
+            assert_eq!(pinkdb_ext_loader::unpack_wide(out.int64, out.double), value);
+            assert!(out.text_ptr.is_null());
+        }
+        for value in [0, 1, u128::MAX] {
+            write_result(ExtValue::Uhugeint(value), &mut out).unwrap();
+            assert_eq!(out.is_null, 0);
+            assert_eq!(
+                pinkdb_ext_loader::unpack_wide(out.int64, out.double) as u128,
+                value
+            );
+            assert!(out.text_ptr.is_null());
+        }
         write_result(
             ExtValue::Interval {
                 months: 13,
@@ -805,9 +840,31 @@ mod tests {
                     text_len: 0,
                 }
             },
+            {
+                let (int64, double) = pinkdb_ext_loader::pack_wide(i128::MIN);
+                PinkdbExtValue {
+                    type_tag: ExtType::Hugeint.tag(),
+                    is_null: 0,
+                    int64,
+                    double,
+                    text_ptr: std::ptr::null(),
+                    text_len: 0,
+                }
+            },
+            {
+                let (int64, double) = pinkdb_ext_loader::pack_wide(u128::MAX as i128);
+                PinkdbExtValue {
+                    type_tag: ExtType::Uhugeint.tag(),
+                    is_null: 0,
+                    int64,
+                    double,
+                    text_ptr: std::ptr::null(),
+                    text_len: 0,
+                }
+            },
         ];
-        // SAFETY: the array holds five valid structs whose text borrows live
-        // for this scope.
+        // SAFETY: the array holds valid structs whose text borrows live for
+        // this scope.
         let decoded = unsafe { collect_args(values.as_ptr(), values.len()) }.unwrap();
         assert_eq!(decoded[0], ExtArg::Boolean(true));
         assert_eq!(decoded[1], ExtArg::Bigint(-7));
@@ -821,6 +878,8 @@ mod tests {
                 micros: -3
             }
         );
+        assert_eq!(decoded[5], ExtArg::Hugeint(i128::MIN));
+        assert_eq!(decoded[6], ExtArg::Uhugeint(u128::MAX));
         // SAFETY: as above, with a NULL array (the zero-argument case).
         assert!(
             unsafe { collect_args(std::ptr::null(), 0) }

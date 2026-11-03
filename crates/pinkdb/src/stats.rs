@@ -16,7 +16,7 @@
 //! prunable bounds for comparisons (the caller checks [`Zone::nan_count`]) —
 //! and VARIANT/ARRAY have no bounds because their total order spans kinds.
 
-use crate::attached::PruneOp;
+use crate::attached::{PruneOp, PrunePredicate};
 use crate::plan::compare_values;
 use crate::types::{DataType, Interval, Value};
 use crate::vector::{Vector, VectorData};
@@ -463,10 +463,37 @@ impl Zone {
                     PruneOp::LtEq => ge_min,
                     PruneOp::Gt => lt_max,
                     PruneOp::GtEq => le_max,
+                    // `IN` is decided per predicate, by `may_match_predicate`.
+                    PruneOp::In => true,
                     PruneOp::IsNull | PruneOp::IsNotNull => unreachable!("handled above"),
                 }
             }
         }
+    }
+
+    /// [`Self::may_match`] for a whole pushed predicate: `IN` can only match a
+    /// row whose value equals one of the list's non-NULL values, so the chunk
+    /// is skippable when none of them lies inside the bounds. Every other op
+    /// is [`Self::may_match`].
+    pub(crate) fn may_match_predicate(&self, rows: u64, predicate: &PrunePredicate) -> bool {
+        if predicate.op != PruneOp::In {
+            return self.may_match(rows, predicate.op, predicate.value.as_ref());
+        }
+        let all_null = self.null_count == rows;
+        if all_null || self.nan_count > 0 {
+            return !all_null;
+        }
+        let (Some(min), Some(max)) = (&self.min, &self.max) else {
+            return true;
+        };
+        let mut inside = false;
+        for value in predicate.values.iter().filter(|value| !value.is_null()) {
+            if !compare_values(value, min).is_lt() && !compare_values(value, max).is_gt() {
+                inside = true;
+                break;
+            }
+        }
+        inside
     }
 
     /// [`Zone::of_vector`]'s work, kept typed so no `Value` is allocated per

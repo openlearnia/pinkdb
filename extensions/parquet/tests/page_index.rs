@@ -97,6 +97,7 @@ fn selective() -> Vec<PrunePredicate> {
         op: PruneOp::Eq,
         value: Some(Value::Bigint(band_target() as i64)),
         path: None,
+        values: Vec::new(),
     }]
 }
 
@@ -220,6 +221,7 @@ fn a_duckdb_file_prunes_at_row_group_granularity() {
         op: PruneOp::Eq,
         value: Some(Value::Bigint(199_999)),
         path: None,
+        values: Vec::new(),
     }];
     let pruned_source = Arc::new(CountedRange {
         bytes: bytes.clone(),

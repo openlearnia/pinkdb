@@ -107,6 +107,21 @@ pinkdb_extension! {
             value
         },
 
+        fn cf_sum_bigint(value: Option<i64>) -> Option<i64> {
+            tally();
+            value
+        },
+
+        fn cf_hugeint(value: Option<i128>) -> Option<i128> {
+            tally();
+            value
+        },
+
+        fn cf_uhugeint(value: Option<u128>) -> Option<u128> {
+            tally();
+            value
+        },
+
         /// Bit for bit: the payload travels as a double, so NaN payloads and
         /// ±inf are the host's bits, not a re-formatted decimal.
         fn cf_double(value: Option<f64>) -> Option<f64> {

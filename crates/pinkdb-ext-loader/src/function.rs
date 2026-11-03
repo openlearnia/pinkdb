@@ -296,6 +296,10 @@ impl DynamicFunction {
             ExtType::ArrayFloat { len } => ExtValue::ArrayFloat(self.float_result(out, len)?),
             ExtType::Date => ExtValue::Date(out.int64 as i32),
             ExtType::Timestamp => ExtValue::Timestamp(out.int64),
+            ExtType::Hugeint => ExtValue::Hugeint(crate::abi::unpack_wide(out.int64, out.double)),
+            ExtType::Uhugeint => {
+                ExtValue::Uhugeint(crate::abi::unpack_wide(out.int64, out.double) as u128)
+            }
             ExtType::Interval => {
                 let (months, days, micros) = crate::abi::unpack_interval(out.int64, out.double);
                 ExtValue::Interval {

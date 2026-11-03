@@ -2173,6 +2173,16 @@ fn collect_prune_predicates(
             collect_prune_predicates(left, out);
             collect_prune_predicates(right, out);
         }
+        // `col IN (...)` is a disjunction of equalities over one column, which
+        // is the chain the parser desugars it into; rebuild the list so the
+        // scan can prove a file empty when no list value is inside its bounds.
+        BoundExpr::Binary {
+            op: BinaryOp::Or, ..
+        } => {
+            if let Some((column, values)) = in_list_values(expr) {
+                out.push(PrunePredicate::in_list(column, values));
+            }
+        }
         BoundExpr::Binary {
             op, left, right, ..
         } => {
@@ -2232,6 +2242,76 @@ fn collect_prune_predicates(
             }
         }
         _ => {}
+    }
+}
+
+/// The column and values of an `IN` list, rebuilt from the `OR` chain the
+/// parser desugars it into (a `false` seed, then one `col = literal` per list
+/// element); `None` for any other disjunction — a different column per branch,
+/// a non-equality term, or a literal the column's statistics cannot compare.
+fn in_list_values(
+    expr: &crate::sql::binder::BoundExpr,
+) -> Option<(usize, Vec<crate::types::Value>)> {
+    let mut column = None;
+    let mut values = Vec::new();
+    if !in_list_terms(expr, &mut column, &mut values) || values.is_empty() {
+        return None;
+    }
+    Some((column?, values))
+}
+
+/// One branch of an `IN` chain: an equality against the list's column once
+/// every branch is in. The desugarer's `false` seed is the disjunction's
+/// identity; a NULL element matches nothing, like `col = NULL`.
+fn in_list_terms(
+    expr: &crate::sql::binder::BoundExpr,
+    column: &mut Option<usize>,
+    values: &mut Vec<crate::types::Value>,
+) -> bool {
+    use crate::sql::ast::BinaryOp;
+    use crate::sql::binder::BoundExpr;
+    match expr {
+        BoundExpr::Literal(crate::types::Value::Boolean(false)) => true,
+        BoundExpr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => in_list_terms(left, column, values) && in_list_terms(right, column, values),
+        BoundExpr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } => {
+            let (column_expr, literal) = match (literal_of(left), literal_of(right)) {
+                (None, Some(literal)) => (&**left, literal),
+                (Some(literal), None) => (&**right, literal),
+                _ => return false,
+            };
+            if literal.is_null() {
+                return true;
+            }
+            // Only the column's own value carries list statistics: a VARIANT
+            // path's bounds are not the column's.
+            let Some((found, None)) = prune_target(column_expr) else {
+                return false;
+            };
+            let Some(literal_dtype) = literal.data_type() else {
+                return false;
+            };
+            if !prunable_types(column_expr.dtype(), literal_dtype) {
+                return false;
+            }
+            match column {
+                Some(column) if *column != found => return false,
+                Some(_) => {}
+                None => *column = Some(found),
+            }
+            values.push(literal.clone());
+            true
+        }
+        _ => false,
     }
 }
 
@@ -3661,5 +3741,79 @@ mod scan_filter_tests {
             unreachable!()
         };
         assert!(ScanFilters::of(&plan).for_scan(input).is_empty());
+    }
+
+    /// The parser desugars `col IN (0, 1, 2)` into a left-deep `OR` chain
+    /// seeded with `false`; the analysis rebuilds the list from that chain so
+    /// the scan can prune a file whose bounds hold no list value.
+    #[test]
+    fn scan_filters_push_in_lists_as_one_predicate() {
+        fn desugared(values: &[i32]) -> BoundExpr {
+            let mut expr = BoundExpr::Literal(Value::Boolean(false));
+            for &value in values {
+                expr = cmp(BinaryOp::Or, expr, cmp(BinaryOp::Eq, col(0), lit(value)));
+            }
+            expr
+        }
+        fn pushed(expr: BoundExpr) -> Vec<PrunePredicate> {
+            let plan = filter(scan("t"), expr);
+            let LogicalPlan::Filter { input, .. } = &plan else {
+                unreachable!()
+            };
+            ScanFilters::of(&plan).for_scan(input).to_vec()
+        }
+
+        // The list keeps its order and becomes one predicate.
+        assert_eq!(
+            pushed(desugared(&[1, 2, 3])),
+            vec![PrunePredicate::in_list(
+                0,
+                vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+            )]
+        );
+        // The seed may sit anywhere; a NULL element adds no value (it matches
+        // no row) but does not spoil the list.
+        let null_term = cmp(BinaryOp::Eq, col(0), BoundExpr::Literal(Value::Null));
+        assert_eq!(
+            pushed(cmp(
+                BinaryOp::Or,
+                cmp(BinaryOp::Eq, col(0), lit(7)),
+                cmp(
+                    BinaryOp::Or,
+                    BoundExpr::Literal(Value::Boolean(false)),
+                    null_term,
+                ),
+            )),
+            vec![PrunePredicate::in_list(0, vec![Value::Integer(7)])]
+        );
+        // The seed alone (`WHERE false`) and an all-NULL list push nothing.
+        assert!(pushed(BoundExpr::Literal(Value::Boolean(false))).is_empty());
+        assert!(pushed(desugared(&[])).is_empty());
+        // A disjunction over two columns, or one holding a non-equality term,
+        // is not an `IN` list.
+        assert!(
+            pushed(cmp(
+                BinaryOp::Or,
+                cmp(BinaryOp::Eq, col(0), lit(1)),
+                cmp(BinaryOp::Eq, col(1), lit(2)),
+            ))
+            .is_empty()
+        );
+        assert!(
+            pushed(cmp(
+                BinaryOp::Or,
+                cmp(BinaryOp::Eq, col(0), lit(1)),
+                cmp(BinaryOp::Lt, col(0), lit(2)),
+            ))
+            .is_empty()
+        );
+        // The list conjunct pushes alongside the other conjuncts of an AND.
+        assert_eq!(
+            pushed(and(desugared(&[4, 5]), cmp(BinaryOp::Eq, col(1), lit(9)))),
+            vec![
+                PrunePredicate::in_list(0, vec![Value::Integer(4), Value::Integer(5)]),
+                PrunePredicate::compare(1, PruneOp::Eq, Value::Integer(9)),
+            ]
+        );
     }
 }

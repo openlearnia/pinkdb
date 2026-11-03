@@ -1,5 +1,5 @@
 /*
- * pinkdb loadable-extension ABI v1 (minor 4) — https://github.com/openlearnia/pinkdb
+ * pinkdb loadable-extension ABI v1 (minor 6) — https://github.com/openlearnia/pinkdb
  *
  * An extension is a shared library (`.dylib` / `.so` / `.dll`) loaded at
  * runtime by the `pinkdb-ext-loader` crate (host side: the SQL statement
@@ -77,12 +77,14 @@
  *             and text_len, and never frees a pointer carried under a
  *             non-VARCHAR tag, see ownership below);
  *   int64     BOOLEAN (0/1), INTEGER, BIGINT, DATE (days since 1970-01-01),
- *             TIMESTAMP (microseconds since 1970-01-01 UTC), and INTERVAL
- *             (microseconds — see the INTERVAL note below);
+ *             TIMESTAMP (microseconds since 1970-01-01 UTC), INTERVAL
+ *             (microseconds — see the INTERVAL note below), and the low 64
+ *             bits of HUGEINT/UHUGEINT (see the 128-bit note below);
  *   double_   DOUBLE (the Rust struct field is named `double`; `double_` is
  *             the C spelling — offsets and layout are identical); for
  *             INTERVAL it carries no numeric meaning and is read as a bit
- *             pattern (see below);
+ *             pattern (see below); for HUGEINT/UHUGEINT it carries the high
+ *             64 bits, likewise as a bit pattern;
  *   text_ptr  VARCHAR bytes, or a VARIANT payload (see below); NULL when
  *             absent;
  *   text_len  byte length of text_ptr (embedded NUL bytes are allowed; a
@@ -134,6 +136,18 @@
  * packed tag; the host checks all three agree. Only FLOAT and DOUBLE arrays
  * have an ABI type (INTEGER/BIGINT arrays are refused by the binder).
  *
+ * HUGEINT and UHUGEINT (type tags 13 and 14, the pinkdb C ABI's
+ * PINKDB_TYPE_HUGEINT / PINKDB_TYPE_UHUGEINT numbers) are 128-bit integers.
+ * The by-value struct cannot grow, so the payload is the 16 little-endian
+ * bytes of the integer split over the two existing scalars: the low 64 bits
+ * in `int64`, the high 64 bits in the bit pattern of `double_`
+ * (`uint64_t bits = (uint64_t)value >> 64; memcpy(&double_, &bits, 8)`). Both
+ * tags use both fields; a NULL value ignores the payload. The bit pattern is
+ * exact — never read the float value itself. Argument and result marshalling
+ * is identical. An older host that does not know the tags rejects the
+ * registration with a clear unknown-tag error, so declaring one never loads
+ * on a host that cannot pass it.
+ *
  * ---------------------------------------------------------------------------
  * Scalar callbacks
  * ---------------------------------------------------------------------------
@@ -145,11 +159,14 @@
  *   read-only. Read-only means "do not modify"; the array itself lives on the
  *   host's stack for the duration of the call.
  * - A registered argument type is fixed: no implicit casts are inserted by
- *   the binder, with one documented exception — a numeric argument
- *   (INTEGER, BIGINT, DECIMAL) widens into a `DOUBLE` parameter, which is
- *   DuckDB's implicit cast for the math functions (`exp(1)`, `sqrt(4)`);
- *   everything else needs an explicit `CAST`. A zero-argument function
- *   receives `args == NULL`.
+ *   the binder, with the documented exceptions — a numeric argument
+ *   (INTEGER, BIGINT, HUGEINT, UHUGEINT, DECIMAL) widens into a `DOUBLE`
+ *   parameter, which is DuckDB's implicit cast for the math functions
+ *   (`exp(1)`, `sqrt(4)`); and a HUGEINT or UHUGEINT argument binds to a
+ *   `BIGINT` parameter through a **checked** narrowing: a value outside the
+ *   BIGINT range fails the statement with an error naming the function and
+ *   the parameter, and is never wrapped. Everything else needs an explicit
+ *   `CAST`. A zero-argument function receives `args == NULL`.
  * - `out` points at host-owned, writable storage pre-filled with NULL. Set
  *   `out->type_tag` (and, for VARCHAR results, text_ptr/text_len), then
  *   return 0. If `is_null` stays non-zero the result is NULL.
@@ -306,12 +323,13 @@ extern "C" {
  * execute_statement host field; 3 = the VARIANT value type (tag 10);
  * 4 = pinkdb_ext_command and the execute_internal host field;
  * 5 = the ARRAY value types (tag 11, DOUBLE elements; tag 12, FLOAT
- *     elements).
+ *     elements); 6 = the HUGEINT and UHUGEINT value types (tags 13 and 14).
  * Extensions that do not use them need not care; hosts compare
  * PINKDB_EXT_ABI_VERSION and probe the additions. A new type tag is safe in
  * both directions: a host only ever sends tags the extension declared, and a
- * minor-2 host rejects a VARIANT registration with a clear error. */
-#define PINKDB_EXT_ABI_MINOR 5
+ * minor-2 host rejects a VARIANT registration, and a minor-5 host a HUGEINT or
+ * UHUGEINT registration, with a clear unknown-tag error. */
+#define PINKDB_EXT_ABI_MINOR 6
 
 /* Maximum number of function arguments the host accepts. */
 #define PINKDB_EXT_MAX_ARGS 64
@@ -325,7 +343,8 @@ extern "C" {
  * 10 is VARIANT, 11 is ARRAY of DOUBLE and 12 is ARRAY of FLOAT (see the
  * payload notes at the top of this header; an ARRAY tag carries its length
  * above the kind byte, so use PINKDB_EXT_ARRAY_TAG / PINKDB_EXT_ARRAY_FLOAT_TAG
- * rather than the bare 11 or 12). */
+ * rather than the bare 11 or 12); 13 is HUGEINT and 14 is UHUGEINT (16-byte
+ * values, see the 128-bit note above). */
 enum {
     PINKDB_EXT_TYPE_NULL = 0,
     PINKDB_EXT_TYPE_BOOLEAN = 1,
@@ -338,7 +357,9 @@ enum {
     PINKDB_EXT_TYPE_INTERVAL = 9,
     PINKDB_EXT_TYPE_VARIANT = 10,
     PINKDB_EXT_TYPE_ARRAY_DOUBLE = 11,
-    PINKDB_EXT_TYPE_ARRAY_FLOAT = 12
+    PINKDB_EXT_TYPE_ARRAY_FLOAT = 12,
+    PINKDB_EXT_TYPE_HUGEINT = 13,
+    PINKDB_EXT_TYPE_UHUGEINT = 14
 };
 
 /* The type tag for a fixed-size DOUBLE array: `(len << 8) | 11`. The low byte

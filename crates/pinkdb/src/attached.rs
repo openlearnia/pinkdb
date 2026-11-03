@@ -117,6 +117,8 @@ pub enum PruneOp {
     IsNull,
     /// `col IS NOT NULL`.
     IsNotNull,
+    /// `col IN (values)`; the list is [`PrunePredicate::values`].
+    In,
 }
 
 /// The exact statistics of one **path** of a VARIANT column
@@ -165,6 +167,9 @@ pub struct PrunePredicate {
     /// The VARIANT path the predicate tests (`v['a'] = 5`), or `None` for a
     /// predicate on the column's own value.
     pub path: Option<Arc<str>>,
+    /// The list values of [`PruneOp::In`], in list order (a NULL element
+    /// matches nothing); empty for every other op.
+    pub values: Vec<Value>,
 }
 
 impl PrunePredicate {
@@ -175,6 +180,19 @@ impl PrunePredicate {
             op,
             value: Some(value),
             path: None,
+            values: Vec::new(),
+        }
+    }
+
+    /// A `column IN (values)` predicate. The list carries the literals as
+    /// written; a NULL element can never make the predicate true.
+    pub fn in_list(column: usize, values: Vec<Value>) -> Self {
+        Self {
+            column,
+            op: PruneOp::In,
+            value: None,
+            path: None,
+            values,
         }
     }
 
@@ -185,6 +203,7 @@ impl PrunePredicate {
             op,
             value: Some(value),
             path: Some(path),
+            values: Vec::new(),
         }
     }
 
@@ -199,6 +218,7 @@ impl PrunePredicate {
             },
             value: None,
             path: None,
+            values: Vec::new(),
         }
     }
 
@@ -213,6 +233,7 @@ impl PrunePredicate {
             },
             value: None,
             path: Some(path),
+            values: Vec::new(),
         }
     }
 }

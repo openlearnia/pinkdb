@@ -6,8 +6,9 @@ import (
 )
 
 // Value / argument type tags, in the header's numbering (the pinkdb C ABI's
-// numbering, plus 9 for INTERVAL and 10 for VARIANT). Tag 8 is that ABI's
-// DECIMAL, which extension ABI v1 deliberately does not support.
+// numbering, plus 9 for INTERVAL, 10 for VARIANT, 13 for HUGEINT and 14 for
+// UHUGEINT). Tag 8 is that ABI's DECIMAL, which extension ABI v1 deliberately
+// does not support.
 const (
 	TypeNull      int32 = 0
 	TypeBoolean   int32 = 1
@@ -19,6 +20,8 @@ const (
 	TypeTimestamp int32 = 7
 	TypeInterval  int32 = 9
 	TypeVariant   int32 = 10
+	TypeHugeint   int32 = 13
+	TypeUhugeint  int32 = 14
 )
 
 // Value mirrors the C `pinkdb_ext_value` struct field for field, so a
@@ -32,7 +35,9 @@ const (
 // (microseconds since the epoch); Double for DOUBLE; TextPtr/TextLen for
 // VARCHAR; and for INTERVAL both — micros in Int64, months and days packed
 // into Double's bit pattern. Never compare or format Double directly for an
-// INTERVAL; use [Value.Interval].
+// INTERVAL; use [Value.Interval]. HUGEINT and UHUGEINT use both scalars too:
+// the low 64 bits in Int64 and the high 64 bits in Double's bit pattern; use
+// [Value.HugeintBits] / [Value.UhugeintBits].
 type Value struct {
 	TypeTag int32
 	IsNull  int32
@@ -116,6 +121,18 @@ func Date(days int32) Value { return Value{TypeTag: TypeDate, Int64: int64(days)
 // Timestamp builds a TIMESTAMP value from microseconds since the epoch.
 func Timestamp(micros int64) Value { return Value{TypeTag: TypeTimestamp, Int64: micros} }
 
+// Hugeint builds a HUGEINT value from its low and high 64-bit halves (little
+// endian: hi is the sign-extension half). Go has no 128-bit integer type, so
+// the halves are explicit rather than silently truncated to int64.
+func Hugeint(lo, hi uint64) Value {
+	return Value{TypeTag: TypeHugeint, Int64: int64(lo), Double: math.Float64frombits(hi)}
+}
+
+// Uhugeint builds a UHUGEINT value from its low and high 64-bit halves.
+func Uhugeint(lo, hi uint64) Value {
+	return Value{TypeTag: TypeUhugeint, Int64: int64(lo), Double: math.Float64frombits(hi)}
+}
+
 // Interval builds an INTERVAL value: a calendar interval with DuckDB's three
 // fields. The by-value struct cannot grow a field without breaking ABI v1, so
 // months and days ride in the 64-bit *pattern* of Double —
@@ -151,6 +168,17 @@ func (v Value) Date() int32 { return int32(v.Int64) }
 
 // Timestamp reads a TIMESTAMP value as microseconds since the epoch.
 func (v Value) Timestamp() int64 { return v.Int64 }
+
+// HugeintBits reads a HUGEINT value's low and high 64-bit halves. The bits are
+// exact; do not read Double as a number.
+func (v Value) HugeintBits() (lo, hi uint64) {
+	return uint64(v.Int64), math.Float64bits(v.Double)
+}
+
+// UhugeintBits reads a UHUGEINT value's low and high 64-bit halves.
+func (v Value) UhugeintBits() (lo, hi uint64) {
+	return uint64(v.Int64), math.Float64bits(v.Double)
+}
 
 // Interval reads an INTERVAL value's three fields. The months/days payload is
 // a bit pattern in Double, never a number: reading it as a float would compare

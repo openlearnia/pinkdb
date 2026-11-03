@@ -98,6 +98,15 @@ int32_t cf_bigint(void *, const ext::Args &args, ext::Writer &out) {
     return 0;
 }
 
+int32_t cf_sum_bigint(void *, const ext::Args &args, ext::Writer &out) {
+    enter();
+    if (args[0].is_null()) {
+        return 0;
+    }
+    out.set_bigint(args[0].bigint());
+    return 0;
+}
+
 int32_t cf_double(void *, const ext::Args &args, ext::Writer &out) {
     enter();
     if (args[0].is_null()) {
@@ -124,6 +133,24 @@ int32_t cf_timestamp(void *, const ext::Args &args, ext::Writer &out) {
         return 0;
     }
     out.set_timestamp(args[0].timestamp());
+    return 0;
+}
+
+int32_t cf_hugeint(void *, const ext::Args &args, ext::Writer &out) {
+    enter();
+    if (args[0].is_null()) {
+        return 0;
+    }
+    out.set_hugeint(args[0].hugeint());
+    return 0;
+}
+
+int32_t cf_uhugeint(void *, const ext::Args &args, ext::Writer &out) {
+    enter();
+    if (args[0].is_null()) {
+        return 0;
+    }
+    out.set_uhugeint(args[0].uhugeint());
     return 0;
 }
 
@@ -302,6 +329,15 @@ extern "C" int32_t pinkdb_extension_init(const PinkdbHostApi *api, void *host_ct
         }
         if (reg("cf_bigint", {ext::kBigint}, ext::kBigint, &cf_bigint, false) != 0) {
             return 13;
+        }
+        if (reg("cf_hugeint", {ext::kHugeint}, ext::kHugeint, &cf_hugeint, false) != 0) {
+            return 25;
+        }
+        if (reg("cf_uhugeint", {ext::kUhugeint}, ext::kUhugeint, &cf_uhugeint, false) != 0) {
+            return 26;
+        }
+        if (reg("cf_sum_bigint", {ext::kBigint}, ext::kBigint, &cf_sum_bigint, false) != 0) {
+            return 27;
         }
         if (reg("cf_double", {ext::kDouble}, ext::kDouble, &cf_double, false) != 0) {
             return 14;

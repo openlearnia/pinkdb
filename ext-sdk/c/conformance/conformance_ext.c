@@ -152,6 +152,28 @@ IDENTITY(cf_bigint, PINKDB_EXT_TYPE_BIGINT, int64)
 IDENTITY(cf_double, PINKDB_EXT_TYPE_DOUBLE, double_)
 IDENTITY(cf_date, PINKDB_EXT_TYPE_DATE, int64)
 IDENTITY(cf_timestamp, PINKDB_EXT_TYPE_TIMESTAMP, int64)
+IDENTITY(cf_sum_bigint, PINKDB_EXT_TYPE_BIGINT, int64)
+
+/* 128-bit integers move two payloads: low 64 bits in `int64`, high 64 bits in
+ * the bits of `double_` (see the header). */
+#define WIDE_IDENTITY(name, tag)                                              \
+    static int32_t name(void *user_data, const pinkdb_ext_value *args,        \
+                        size_t n_args, pinkdb_ext_value *out) {                \
+        (void)user_data;                                                      \
+        (void)n_args;                                                         \
+        note_call();                                                          \
+        if (args[0].is_null) {                                                \
+            return 0;                                                         \
+        }                                                                     \
+        out->type_tag = (tag);                                                \
+        out->is_null = 0;                                                     \
+        out->int64 = args[0].int64;                                           \
+        out->double_ = args[0].double_;                                       \
+        return 0;                                                             \
+    }
+
+WIDE_IDENTITY(cf_hugeint, PINKDB_EXT_TYPE_HUGEINT)
+WIDE_IDENTITY(cf_uhugeint, PINKDB_EXT_TYPE_UHUGEINT)
 
 /* INTERVAL moves two payloads: micros in `int64`, months/days in the bits of
  * `double_` (see the header). */
@@ -461,6 +483,8 @@ int32_t pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx) {
     static const int32_t t_bool[1] = {PINKDB_EXT_TYPE_BOOLEAN};
     static const int32_t t_int[1] = {PINKDB_EXT_TYPE_INTEGER};
     static const int32_t t_bigint[1] = {PINKDB_EXT_TYPE_BIGINT};
+    static const int32_t t_hugeint[1] = {PINKDB_EXT_TYPE_HUGEINT};
+    static const int32_t t_uhugeint[1] = {PINKDB_EXT_TYPE_UHUGEINT};
     static const int32_t t_double[1] = {PINKDB_EXT_TYPE_DOUBLE};
     static const int32_t t_varchar[1] = {PINKDB_EXT_TYPE_VARCHAR};
     static const int32_t t_date[1] = {PINKDB_EXT_TYPE_DATE};
@@ -489,6 +513,18 @@ int32_t pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx) {
     if (api->register_scalar(host_ctx, "cf_bigint", 1, t_bigint,
                              PINKDB_EXT_TYPE_BIGINT, cf_bigint, NULL) != 0) {
         return 13;
+    }
+    if (api->register_scalar(host_ctx, "cf_hugeint", 1, t_hugeint,
+                             PINKDB_EXT_TYPE_HUGEINT, cf_hugeint, NULL) != 0) {
+        return 25;
+    }
+    if (api->register_scalar(host_ctx, "cf_uhugeint", 1, t_uhugeint,
+                             PINKDB_EXT_TYPE_UHUGEINT, cf_uhugeint, NULL) != 0) {
+        return 26;
+    }
+    if (api->register_scalar(host_ctx, "cf_sum_bigint", 1, t_bigint,
+                             PINKDB_EXT_TYPE_BIGINT, cf_sum_bigint, NULL) != 0) {
+        return 27;
     }
     if (api->register_scalar(host_ctx, "cf_double", 1, t_double,
                              PINKDB_EXT_TYPE_DOUBLE, cf_double, NULL) != 0) {

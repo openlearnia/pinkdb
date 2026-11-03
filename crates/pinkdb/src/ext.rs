@@ -99,11 +99,14 @@ pub(crate) fn ext_type_of(dtype: DataType) -> Option<ExtType> {
         DataType::Interval => Some(ExtType::Interval),
         DataType::Decimal { .. } => None,
         // UUID has no ABI type: the extension ABI's value model has no
-        // 128-bit kind, and the VARCHAR channel would need an allocation per
+        // UUID kind, and the VARCHAR channel would need an allocation per
         // value. A function that takes or returns one is refused at bind.
         DataType::Uuid => None,
-        // Same for the 128-bit integers (step 6 of the HUGEINT plan).
-        DataType::Hugeint | DataType::Uhugeint => None,
+        // 128-bit integers are additive ABI minor-6 types (tags 13/14, the
+        // pinkdb C ABI's numbers), carried by value over the two scalar
+        // fields so the value struct does not grow.
+        DataType::Hugeint => Some(ExtType::Hugeint),
+        DataType::Uhugeint => Some(ExtType::Uhugeint),
         // VARIANT is an additive ABI v1 type (tag 10, the pinkdb C ABI's
         // number). Its payload rides the VARCHAR text channel as bytes in the
         // engine's VARIANT encoding — the extension sees no field names, only
@@ -137,6 +140,8 @@ pub(crate) fn dtype_of_ext(dtype: ExtType) -> DataType {
         ExtType::Varchar => DataType::Varchar,
         ExtType::Date => DataType::Date,
         ExtType::Timestamp => DataType::Timestamp,
+        ExtType::Hugeint => DataType::Hugeint,
+        ExtType::Uhugeint => DataType::Uhugeint,
         ExtType::Interval => DataType::Interval,
         ExtType::Variant => DataType::Variant,
         ExtType::ArrayDouble { len } => DataType::Array {
@@ -587,6 +592,8 @@ impl LinkedExtHost for PinkDb {
 /// `NULL` literal evaluates to an all-NULL INTEGER vector).
 pub(crate) fn push_ext_arg<'a>(
     out: &mut Vec<ExtArg<'a>>,
+    function: &str,
+    position: usize,
     vector: &'a Vector,
     row: usize,
     declared: ExtType,
@@ -620,9 +627,29 @@ pub(crate) fn push_ext_arg<'a>(
         // Unreachable: `ext_type_of` rejects UUID in the binder's exact-type
         // check before any callback can run.
         VectorData::Uuid(_) => unreachable!("extensions v1 do not accept UUID arguments"),
-        VectorData::Int128(_) | VectorData::UInt128(_) => {
-            unreachable!("extensions v1 do not accept 128-bit integer arguments")
-        }
+        VectorData::Int128(v) => match declared {
+            ExtType::Hugeint => ExtArg::Hugeint(v[row]),
+            // HUGEINT→BIGINT is a checked narrowing: a value outside the
+            // BIGINT range is an error naming the function and parameter,
+            // never a wrap.
+            ExtType::Bigint => ExtArg::Bigint(i64::try_from(v[row]).map_err(|_| {
+                PinkDbError::Execution(format!(
+                    "extension function {function}() argument {position} is out of range for BIGINT: {}",
+                    v[row]
+                ))
+            })?),
+            other => unreachable!("a HUGEINT argument was bound as {other}"),
+        },
+        VectorData::UInt128(v) => match declared {
+            ExtType::Uhugeint => ExtArg::Uhugeint(v[row]),
+            ExtType::Bigint => ExtArg::Bigint(i64::try_from(v[row]).map_err(|_| {
+                PinkDbError::Execution(format!(
+                    "extension function {function}() argument {position} is out of range for BIGINT: {}",
+                    v[row]
+                ))
+            })?),
+            other => unreachable!("a UHUGEINT argument was bound as {other}"),
+        },
         // The engine's array vector already holds its elements contiguously,
         // so the ABI view is a slice of it — no copy, no per-element boxing.
         VectorData::Array {
@@ -756,6 +783,18 @@ pub(crate) fn ext_value_to_value(
                 return Err(mismatch(ExtType::Timestamp));
             }
             Value::Timestamp(us)
+        }
+        ExtValue::Hugeint(v) => {
+            if dtype != DataType::Hugeint {
+                return Err(mismatch(ExtType::Hugeint));
+            }
+            Value::Hugeint(v)
+        }
+        ExtValue::Uhugeint(v) => {
+            if dtype != DataType::Uhugeint {
+                return Err(mismatch(ExtType::Uhugeint));
+            }
+            Value::Uhugeint(v)
         }
         ExtValue::Interval {
             months,

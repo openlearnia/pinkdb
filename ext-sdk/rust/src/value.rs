@@ -29,6 +29,12 @@ impl ExtArgType for i32 {
 impl ExtArgType for i64 {
     const EXT_TYPE: ExtType = ExtType::Bigint;
 }
+impl ExtArgType for i128 {
+    const EXT_TYPE: ExtType = ExtType::Hugeint;
+}
+impl ExtArgType for u128 {
+    const EXT_TYPE: ExtType = ExtType::Uhugeint;
+}
 impl ExtArgType for f64 {
     const EXT_TYPE: ExtType = ExtType::Double;
 }
@@ -174,6 +180,24 @@ impl FromExtArg<'_> for i64 {
         match arg {
             ExtArg::Bigint(i) => Ok(*i),
             other => Err(type_message("BIGINT", "i64", other)),
+        }
+    }
+}
+
+impl FromExtArg<'_> for i128 {
+    fn from_ext_arg(arg: &ExtArg<'_>) -> Result<i128, String> {
+        match arg {
+            ExtArg::Hugeint(v) => Ok(*v),
+            other => Err(type_message("HUGEINT", "i128", other)),
+        }
+    }
+}
+
+impl FromExtArg<'_> for u128 {
+    fn from_ext_arg(arg: &ExtArg<'_>) -> Result<u128, String> {
+        match arg {
+            ExtArg::Uhugeint(v) => Ok(*v),
+            other => Err(type_message("UHUGEINT", "u128", other)),
         }
     }
 }
@@ -333,7 +357,18 @@ macro_rules! required_at {
     };
 }
 
-required_at!(bool, i32, i64, f64, String, &'a str, Date, Timestamp);
+required_at!(
+    bool,
+    i32,
+    i64,
+    i128,
+    u128,
+    f64,
+    String,
+    &'a str,
+    Date,
+    Timestamp
+);
 
 impl<'a, T: FromExtArg<'a>> FromExtArgAt<'a> for Option<T> {
     fn from_ext_arg_at(args: &'a [ExtArg<'a>], index: usize) -> Result<Self, String> {
@@ -402,6 +437,20 @@ impl IntoExtValue for i64 {
     const RET_TYPE: ExtType = ExtType::Bigint;
     fn into_ext_value(self) -> Result<ExtValue, String> {
         Ok(ExtValue::Bigint(self))
+    }
+}
+
+impl IntoExtValue for i128 {
+    const RET_TYPE: ExtType = ExtType::Hugeint;
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        Ok(ExtValue::Hugeint(self))
+    }
+}
+
+impl IntoExtValue for u128 {
+    const RET_TYPE: ExtType = ExtType::Uhugeint;
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        Ok(ExtValue::Uhugeint(self))
     }
 }
 
@@ -567,6 +616,8 @@ mod tests {
         assert_eq!(bool::EXT_TYPE, ExtType::Boolean);
         assert_eq!(i32::EXT_TYPE, ExtType::Integer);
         assert_eq!(i64::EXT_TYPE, ExtType::Bigint);
+        assert_eq!(i128::EXT_TYPE, ExtType::Hugeint);
+        assert_eq!(u128::EXT_TYPE, ExtType::Uhugeint);
         assert_eq!(f64::EXT_TYPE, ExtType::Double);
         assert_eq!(<String as ExtArgType>::EXT_TYPE, ExtType::Varchar);
         assert_eq!(<&str as ExtArgType>::EXT_TYPE, ExtType::Varchar);
@@ -577,6 +628,9 @@ mod tests {
         assert_eq!(Option::<String>::EXT_TYPE, ExtType::Varchar);
 
         assert_eq!(i32::RET_TYPE, ExtType::Integer);
+        assert_eq!(i64::RET_TYPE, ExtType::Bigint);
+        assert_eq!(i128::RET_TYPE, ExtType::Hugeint);
+        assert_eq!(u128::RET_TYPE, ExtType::Uhugeint);
         assert_eq!(<&'static str as IntoExtValue>::RET_TYPE, ExtType::Varchar);
         assert_eq!(<Option<i64> as IntoExtValue>::RET_TYPE, ExtType::Bigint);
         assert_eq!(Interval::RET_TYPE, ExtType::Interval);
@@ -634,6 +688,25 @@ mod tests {
                 .unwrap_err()
                 .contains("Option<Interval>")
         );
+        for value in [i128::MIN, -1, 0, i128::MAX] {
+            let arg = ExtArg::Hugeint(value);
+            assert_eq!(i128::from_ext_arg(&arg).unwrap(), value);
+            assert_eq!(Option::<i128>::from_ext_arg(&arg).unwrap(), Some(value));
+        }
+        for value in [0, 1, u128::MAX] {
+            let arg = ExtArg::Uhugeint(value);
+            assert_eq!(u128::from_ext_arg(&arg).unwrap(), value);
+            assert_eq!(Option::<u128>::from_ext_arg(&arg).unwrap(), Some(value));
+        }
+        assert_eq!(
+            Option::<i128>::from_ext_arg(&ExtArg::Null(ExtType::Hugeint)).unwrap(),
+            None
+        );
+        assert!(
+            i128::from_ext_arg(&ExtArg::Null(ExtType::Hugeint))
+                .unwrap_err()
+                .contains("Option<i128>")
+        );
         // A wrong runtime tag is a clear error, never a reinterpretation.
         let message = i64::from_ext_arg(&ExtArg::Varchar(b"x")).unwrap_err();
         assert_eq!(message, "expected BIGINT, got VARCHAR");
@@ -644,6 +717,14 @@ mod tests {
         assert_eq!(true.into_ext_value().unwrap(), ExtValue::Boolean(true));
         assert_eq!(3i32.into_ext_value().unwrap(), ExtValue::Integer(3));
         assert_eq!(4i64.into_ext_value().unwrap(), ExtValue::Bigint(4));
+        assert_eq!(
+            i128::MIN.into_ext_value().unwrap(),
+            ExtValue::Hugeint(i128::MIN)
+        );
+        assert_eq!(
+            u128::MAX.into_ext_value().unwrap(),
+            ExtValue::Uhugeint(u128::MAX)
+        );
         assert_eq!(1.5f64.into_ext_value().unwrap(), ExtValue::Double(1.5));
         assert_eq!(
             "hi".to_string().into_ext_value().unwrap(),
