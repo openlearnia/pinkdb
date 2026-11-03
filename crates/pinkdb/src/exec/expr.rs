@@ -4999,7 +4999,7 @@ fn duckdb_type_name(t: DataType) -> &'static str {
     }
 }
 
-/// DuckDB's out-of-range text for a cast into or out of a 128-bit integer.
+/// DuckDB's out-of-range text for a cast into or out of an integer type.
 fn wide_out_of_range(v: &Value, target: DataType) -> PinkDbError {
     let from = duckdb_type_name(v.data_type().expect("a typed value"));
     let value = match v {
@@ -5028,7 +5028,13 @@ fn duckdb_double_text(x: f64) -> String {
         .and_then(|(_, e)| e.parse().ok())
         .unwrap_or(0);
     if (-4..16).contains(&exp) {
-        return format!("{x}");
+        // A DOUBLE always shows a fractional mark, as in DuckDB's `100.0`.
+        let plain = format!("{x}");
+        return if plain.contains('.') {
+            plain
+        } else {
+            format!("{plain}.0")
+        };
     }
     match s.split_once('e') {
         Some((mantissa, exp)) if !exp.starts_with(['+', '-']) => format!("{mantissa}e+{exp}"),
@@ -5106,7 +5112,8 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
         }
         (Value::Variant(x), t) => crate::variant::cast(&x, t),
         // Numeric tower (DuckDB rules): narrowing out of range is an error,
-        // and float→int rounds half away from zero (NaN/±Inf error).
+        // and float→int rounds half to even (DuckDB's `nearbyint`; 2.5 → 2,
+        // 3.5 → 4), with NaN/±Inf out of range.
         (Value::Integer(i), DataType::Bigint) => Ok(Value::Bigint(i as i64)),
         (Value::Integer(i), DataType::Double) => Ok(Value::Double(i as f64)),
         (Value::Bigint(i), DataType::Double) => Ok(Value::Double(i as f64)),
@@ -5211,21 +5218,21 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
             .map(Value::Integer)
             .map_err(|_| cast_out_of_range(&Value::Bigint(i), DataType::Integer)),
         (Value::Double(x), DataType::Integer) => {
-            let r = x.round();
+            let r = x.round_ties_even();
             if (i32::MIN as f64..=i32::MAX as f64).contains(&r) {
                 Ok(Value::Integer(r as i32))
             } else {
-                Err(cast_out_of_range(&Value::Double(x), DataType::Integer))
+                Err(wide_out_of_range(&Value::Double(x), DataType::Integer))
             }
         }
         (Value::Double(x), DataType::Bigint) => {
-            let r = x.round();
+            let r = x.round_ties_even();
             // i64::MAX is not representable in f64; 2^63 is the first value
             // out of range.
             if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&r) {
                 Ok(Value::Bigint(r as i64))
             } else {
-                Err(cast_out_of_range(&Value::Double(x), DataType::Bigint))
+                Err(wide_out_of_range(&Value::Double(x), DataType::Bigint))
             }
         }
         (Value::Double(x), DataType::Double) => Ok(Value::Double(x)),

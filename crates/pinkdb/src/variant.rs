@@ -1344,7 +1344,7 @@ pub fn cast(v: &Variant, target: DataType) -> Result<Value> {
                         .map_err(|_| err(&format!("value {v} (out of range)")))?
                 }
                 Variant::Double(x) => {
-                    let r = x.round();
+                    let r = x.round_ties_even();
                     if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&r) {
                         return Err(err(&format!("value {v} (out of range)")));
                     }

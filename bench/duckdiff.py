@@ -1028,6 +1028,7 @@ def run_small():
     run_hugeint_arithmetic()
     run_uhugeint()
     run_uhugeint_arithmetic()
+    run_cast_float_to_int()
     run_attach()
     run_arrow()
     run_parquet()
@@ -1991,6 +1992,87 @@ def run_uhugeint_arithmetic():
     print("== UHUGEINT arithmetic and comparison battery (slt-3d) ==")
     for label, sql, ordered, expect_error in UHUGEINT_ARITH_QUERIES:
         run_case(label, sql, ordered, expect_error, UHUGEINT_SETUP, UHUGEINT_SETUP)
+
+
+# ---- wave 97: DOUBLE -> integer casts round half to even ----
+#
+# DuckDB v2.0.0 uses `nearbyint` for float -> integer casts
+# (`test/sql/cast/float_integer_cast.test`), so 2.5 -> 2 and 3.5 -> 4, while
+# DECIMAL and VARCHAR sources keep rounding half away from zero.
+CAST_FLOAT_TO_INT_SETUP = """
+CREATE TABLE fi (i INTEGER, b BIGINT, h HUGEINT, u UHUGEINT);
+INSERT INTO fi VALUES
+  (2.5::DOUBLE, 3.5::DOUBLE, -2.5::DOUBLE, 2.5::DOUBLE),
+  (-2.5::DOUBLE, -3.5::DOUBLE, 3.5::DOUBLE, 3.5::DOUBLE),
+  (CAST(-0.5 AS DOUBLE), CAST(-0.5 AS DOUBLE), CAST(-0.0 AS DOUBLE),
+   CAST(-0.5 AS DOUBLE));
+"""
+
+CAST_FLOAT_TO_INT_QUERIES = [
+    ("cast-float-to-int-double-integer-ties",
+     "SELECT 2.5::DOUBLE::INTEGER, 3.5::DOUBLE::INTEGER, "
+     "0.5::DOUBLE::INTEGER, 1.5::DOUBLE::INTEGER, 4.5::DOUBLE::INTEGER, "
+     "-0.5::DOUBLE::INTEGER, -1.5::DOUBLE::INTEGER, -2.5::DOUBLE::INTEGER, "
+     "-3.5::DOUBLE::INTEGER, -4.5::DOUBLE::INTEGER, "
+     "CAST(-0.0 AS DOUBLE)::INTEGER;", False, False),
+    ("cast-float-to-int-double-bigint-ties",
+     "SELECT 2.5::DOUBLE::BIGINT, 3.5::DOUBLE::BIGINT, "
+     "-0.5::DOUBLE::BIGINT, -2.5::DOUBLE::BIGINT, -3.5::DOUBLE::BIGINT, "
+     "CAST(-0.0 AS DOUBLE)::BIGINT, "
+     "CAST(-9223372036854775808.0 AS DOUBLE)::BIGINT;", False, False),
+    ("cast-float-to-int-double-hugeint-ties",
+     "SELECT 2.5::DOUBLE::HUGEINT, 3.5::DOUBLE::HUGEINT, "
+     "-0.5::DOUBLE::HUGEINT, -2.5::DOUBLE::HUGEINT, "
+     "-3.5::DOUBLE::HUGEINT, CAST(-0.0 AS DOUBLE)::HUGEINT;", False, False),
+    ("cast-float-to-int-double-uhugeint-ties",
+     "SELECT 2.5::DOUBLE::UHUGEINT, 3.5::DOUBLE::UHUGEINT, "
+     "-0.5::DOUBLE::UHUGEINT, CAST(-0.0 AS DOUBLE)::UHUGEINT;", False, False),
+    ("cast-float-to-int-decimal-ties",
+     "SELECT 2.5::DECIMAL(10,1)::INTEGER, 3.5::DECIMAL(10,1)::INTEGER, "
+     "-2.5::DECIMAL(10,1)::INTEGER, 2.5::DECIMAL(10,1)::BIGINT, "
+     "2.5::DECIMAL(10,1)::HUGEINT, 2.5::DECIMAL(10,1)::UHUGEINT;",
+     False, False),
+    ("cast-float-to-int-varchar-ties",
+     "SELECT '2.5'::INTEGER, '3.5'::INTEGER, '-2.5'::INTEGER, "
+     "'2.5e0'::BIGINT, '2.5'::HUGEINT, '2.5'::UHUGEINT;", False, False),
+    ("cast-float-to-int-integer-range",
+     "SELECT CAST(2147483647.4 AS DOUBLE)::INTEGER, "
+     "CAST(-2147483648.4 AS DOUBLE)::INTEGER;", False, False),
+    ("cast-float-to-int-integer-overflow",
+     "SELECT CAST(2147483647.5 AS DOUBLE)::INTEGER;", False, True),
+    ("cast-float-to-int-integer-overflow-exact",
+     "SELECT CAST(2147483648.0 AS DOUBLE)::INTEGER;", False, True),
+    ("cast-float-to-int-bigint-overflow",
+     "SELECT 9223372036854775807::DOUBLE::BIGINT;", False, True),
+    ("cast-float-to-int-hugeint-overflow",
+     "SELECT (170141183460469231731687303715884105728.0)::DOUBLE::HUGEINT;",
+     False, True),
+    ("cast-float-to-int-uhugeint-negative",
+     "SELECT CAST(-1.0 AS DOUBLE)::UHUGEINT;", False, True),
+    ("cast-float-to-int-uhugeint-overflow",
+     "SELECT CAST(3.402823669209385e38 AS DOUBLE)::UHUGEINT;", False, True),
+    ("cast-float-to-int-nan", "SELECT CAST('NaN' AS DOUBLE)::INTEGER;",
+     False, True),
+    ("cast-float-to-int-infinity",
+     "SELECT CAST('Infinity' AS DOUBLE)::BIGINT;", False, True),
+    ("cast-float-to-int-negative-infinity",
+     "SELECT CAST('-Infinity' AS DOUBLE)::HUGEINT;", False, True),
+    ("cast-float-to-int-try-cast",
+     "SELECT TRY_CAST(2147483647.5::DOUBLE AS INTEGER), "
+     "TRY_CAST(2.5::DOUBLE AS INTEGER), "
+     "TRY_CAST(CAST('NaN' AS DOUBLE) AS BIGINT);", False, False),
+    ("cast-float-to-int-implicit-insert",
+     "SELECT i, b, h, u FROM fi ORDER BY i;", True, False),
+    ("cast-float-to-int-implicit-insert-overflow",
+     "INSERT INTO fi (i) VALUES (2147483647.5::DOUBLE);", False, True),
+]
+
+
+def run_cast_float_to_int():
+    print("== cast-float-to-int battery ==")
+    for label, sql, ordered, expect_error in CAST_FLOAT_TO_INT_QUERIES:
+        run_case(label, sql, ordered, expect_error,
+                 CAST_FLOAT_TO_INT_SETUP, CAST_FLOAT_TO_INT_SETUP)
 
 
 # ---- unaliased expression names ----

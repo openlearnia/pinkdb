@@ -1708,7 +1708,8 @@ peg::parser! {
 
         /// A row count (LIMIT/OFFSET/FETCH and window frame bounds): a decimal
         /// literal rounds to BIGINT like DuckDB's assignment cast, so
-        /// `LIMIT 2.5` keeps three rows.
+        /// `LIMIT 2.5` keeps three rows. A DOUBLE literal (`2.5e0`) rounds
+        /// half to even, like a DOUBLE → BIGINT cast.
         rule row_count() -> usize
             = n:number() {?
                 let count = match n {
@@ -1717,7 +1718,7 @@ peg::parser! {
                     Value::Decimal { value, scale, .. } =>
                         crate::types::rescale_decimal(value, scale, 0)
                             .ok_or("row count")?,
-                    Value::Double(x) if x.is_finite() => x.round() as i128,
+                    Value::Double(x) if x.is_finite() => x.round_ties_even() as i128,
                     _ => return Err("a row count must be an integer"),
                 };
                 usize::try_from(count).map_err(|_| "row count")
@@ -5505,11 +5506,16 @@ mod tests {
             panic!()
         };
         assert_eq!((sel.limit, sel.offset), (Some(3), Some(1)));
-        // An exponent literal is DOUBLE; DuckDB still takes it as a row count.
+        // An exponent literal is DOUBLE; DuckDB still takes it as a row count,
+        // rounding it half to even like a DOUBLE cast.
         let Statement::Select(sel) = parse_one("SELECT 1 LIMIT 1e3;") else {
             panic!()
         };
         assert_eq!(sel.limit, Some(1000));
+        let Statement::Select(sel) = parse_one("SELECT 1 LIMIT 2.5e0 OFFSET 1.5e0;") else {
+            panic!()
+        };
+        assert_eq!((sel.limit, sel.offset), (Some(2), Some(2)));
     }
 
     #[test]

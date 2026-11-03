@@ -94,14 +94,15 @@ impl Db {
         let lock = memory::test_lock();
         let mut db = PinkDb::new();
         db.execute(&format!(
+            // floor: pinkdb's `/` yields a DOUBLE, so the key needs truncation.
             "CREATE TABLE t AS SELECT \
                'zone_' || ((r % 1000)::VARCHAR) AS a, \
-               'do_' || ((((r / 1000)::BIGINT) % 20)::VARCHAR) AS b, \
-               ((r / 1000)::BIGINT) % 20 AS k, \
+               'do_' || (((floor(r / 1000))::BIGINT % 20)::VARCHAR) AS b, \
+               (floor(r / 1000))::BIGINT % 20 AS k, \
                (r % 97)::BIGINT AS n, \
                DATE '2024-01-01' + (r % 1000)::INTEGER AS d, \
                CAST('2024-01-01 00:00:0' || ((r % 10)::VARCHAR) AS TIMESTAMP) AS ts, \
-               (((r % 1000) * 20) + (((r / 1000)::BIGINT) % 20))::BIGINT AS x \
+               (((r % 1000) * 20) + ((floor(r / 1000))::BIGINT % 20))::BIGINT AS x \
              FROM range(0, {rows}) t(r)"
         ))
         .expect("create the input");
