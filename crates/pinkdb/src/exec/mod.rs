@@ -10,6 +10,7 @@ pub mod aggregate;
 pub(crate) mod dml;
 pub mod expr;
 pub(crate) mod group_table;
+pub(crate) mod grouping_sets;
 pub(crate) mod pipeline;
 pub(crate) mod selection;
 pub(crate) mod window;
@@ -4820,7 +4821,12 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 types,
             })
         }
-        LogicalPlan::Aggregate { input, keys, aggs } => {
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            grouping_sets,
+        } => {
             expr::prime(
                 cx,
                 keys.iter().chain(
@@ -4828,6 +4834,16 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                         .flat_map(|a| a.arg.iter().chain(a.filter.iter())),
                 ),
             )?;
+            if let Some(plan) = grouping_sets {
+                let inner = eval(cx, input)?;
+                let chunks = grouping_sets::aggregate(cx, &inner.chunks, keys, aggs, plan)?;
+                let (names, types) = agg_output_schema(keys, aggs);
+                return Ok(Output {
+                    chunks,
+                    names,
+                    types,
+                });
+            }
             // `FILTER (WHERE …)` is not modeled by the statistics, streaming
             // scan and COUNT(*) fast paths below, which read whole columns: a
             // filtered aggregate skips them and reaches the pipeline, whose
@@ -9291,7 +9307,9 @@ fn explain_into(
                 None => format!("NestedLoopJoin {}", join_name(*kind)),
             }
         }
-        LogicalPlan::Aggregate { input, keys, aggs } => {
+        LogicalPlan::Aggregate {
+            input, keys, aggs, ..
+        } => {
             children.push(input);
             let keys_text: Vec<String> = keys.iter().map(expr_text).collect();
             let aggs_text: Vec<String> = aggs
@@ -11752,7 +11770,10 @@ mod tests {
             "SELECT COUNT(*), COUNT(fb.total) FROM fa LEFT JOIN fb ON fa.id = fb.id AND fb.total > 5;",
         ] {
             let plan = bound_plan(&db, sql);
-            let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+            let LogicalPlan::Aggregate {
+                input, keys, aggs, ..
+            } = top_aggregate(&plan)
+            else {
                 unreachable!()
             };
             {
@@ -14984,7 +15005,10 @@ mod tests {
     /// chunk, order and float bits included).
     fn assert_pipeline_matches_materialized(db: &PinkDb, sql: &str) {
         let plan = bound_plan(db, sql);
-        let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+        let LogicalPlan::Aggregate {
+            input, keys, aggs, ..
+        } = top_aggregate(&plan)
+        else {
             unreachable!()
         };
         // The projections bind the write-once read sets the engine analyses
@@ -15587,7 +15611,10 @@ mod tests {
         ];
         for sql in declined {
             let plan = bound_plan(&db, sql);
-            let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+            let LogicalPlan::Aggregate {
+                input, keys, aggs, ..
+            } = top_aggregate(&plan)
+            else {
                 unreachable!()
             };
             {
@@ -15618,7 +15645,10 @@ mod tests {
             "SELECT COUNT(*) FROM fa RIGHT JOIN fb ON fa.id = fb.id;",
         ] {
             let plan = bound_plan(&db, sql);
-            let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+            let LogicalPlan::Aggregate {
+                input, keys, aggs, ..
+            } = top_aggregate(&plan)
+            else {
                 unreachable!()
             };
             {
@@ -15689,7 +15719,10 @@ mod tests {
         ];
         for sql in chained {
             let plan = bound_plan(&db, sql);
-            let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+            let LogicalPlan::Aggregate {
+                input, keys, aggs, ..
+            } = top_aggregate(&plan)
+            else {
                 unreachable!()
             };
             {
@@ -15733,7 +15766,10 @@ mod tests {
                    JOIN (SELECT f.k AS k FROM fact f JOIN dim d ON f.k = d.k) y
                      ON x.k = y.k;";
         let plan = bound_plan(&db, sql);
-        let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+        let LogicalPlan::Aggregate {
+            input, keys, aggs, ..
+        } = top_aggregate(&plan)
+        else {
             unreachable!()
         };
         {
@@ -15779,7 +15815,10 @@ mod tests {
         // Pre-evaluating `100 / q` over the whole right input would divide by
         // zero on the never-matched q=0 row; the pipeline never sees it.
         let plan = bound_plan(&db, sql);
-        let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+        let LogicalPlan::Aggregate {
+            input, keys, aggs, ..
+        } = top_aggregate(&plan)
+        else {
             unreachable!()
         };
         {
@@ -15818,7 +15857,10 @@ mod tests {
             "SELECT SUM(abs(vb.a)) FROM va JOIN vb ON va.k = vb.k;",
         ] {
             let plan = bound_plan(&db, sql);
-            let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+            let LogicalPlan::Aggregate {
+                input, keys, aggs, ..
+            } = top_aggregate(&plan)
+            else {
                 unreachable!()
             };
             {
@@ -16258,7 +16300,10 @@ mod tests {
         // emits exactly one column (the outer Project duplicates it).
         let sql = "SELECT COUNT(*), COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;";
         let plan = bound_plan(&db, sql);
-        let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+        let LogicalPlan::Aggregate {
+            input, keys, aggs, ..
+        } = top_aggregate(&plan)
+        else {
             unreachable!()
         };
         assert_eq!(aggs.len(), 1);
@@ -16663,6 +16708,7 @@ mod tests {
                     input: Box::new(scan.clone()),
                     keys: Vec::new(),
                     aggs: Vec::new(),
+                    grouping_sets: None,
                 }
             ),
             None
@@ -16781,7 +16827,10 @@ mod tests {
         let sql = "SELECT fb.region, COUNT(*), SUM(fa.x) \
                    FROM fa JOIN fb ON fa.id = fb.id GROUP BY fb.region;";
         let plan = bound_plan(&db, sql);
-        let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+        let LogicalPlan::Aggregate {
+            input, keys, aggs, ..
+        } = top_aggregate(&plan)
+        else {
             unreachable!()
         };
         let LogicalPlan::Join {

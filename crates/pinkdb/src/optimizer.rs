@@ -155,10 +155,16 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
             windows,
             input_cols,
         },
-        LogicalPlan::Aggregate { input, keys, aggs } => LogicalPlan::Aggregate {
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            grouping_sets,
+        } => LogicalPlan::Aggregate {
             input: Box::new(apply_indexes(db, *input)),
             keys,
             aggs,
+            grouping_sets,
         },
         LogicalPlan::Join {
             kind,
@@ -260,7 +266,12 @@ fn canonical_probe_key(
 /// nested shapes are covered.
 fn drop_count_star_projections(plan: LogicalPlan) -> LogicalPlan {
     match plan {
-        LogicalPlan::Aggregate { input, keys, aggs } => {
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            grouping_sets,
+        } => {
             let input = *input;
             let is_count_star_only = keys.is_empty()
                 && !aggs.is_empty()
@@ -291,6 +302,7 @@ fn drop_count_star_projections(plan: LogicalPlan) -> LogicalPlan {
                 input: Box::new(new_input),
                 keys,
                 aggs,
+                grouping_sets,
             }
         }
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
@@ -605,10 +617,16 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             on: on.map(|e| fold_expr(&cx, e)),
             left_cols,
         },
-        LogicalPlan::Aggregate { input, keys, aggs } => LogicalPlan::Aggregate {
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            grouping_sets,
+        } => LogicalPlan::Aggregate {
             input: Box::new(fold_plan(db, *input)),
             keys: keys.into_iter().map(|k| fold_expr(&cx, k)).collect(),
             aggs: fold_aggs(&cx, aggs),
+            grouping_sets,
         },
         LogicalPlan::Window {
             input,
@@ -2084,10 +2102,16 @@ fn order_chains(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             exprs,
             names,
         },
-        P::Aggregate { input, keys, aggs } => P::Aggregate {
+        P::Aggregate {
+            input,
+            keys,
+            aggs,
+            grouping_sets,
+        } => P::Aggregate {
             input: Box::new(order_chains(db, *input)),
             keys,
             aggs,
+            grouping_sets,
         },
         P::Distinct { input, on } => P::Distinct {
             input: Box::new(order_chains(db, *input)),
@@ -2910,26 +2934,39 @@ fn push_one_level(
         // above: a keyless aggregate still emits its one row over an empty
         // input, so filtering below would change COUNT(*) / SUM() over an
         // empty relation.
-        LogicalPlan::Aggregate { input, keys, aggs } => {
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            grouping_sets,
+        } => {
+            // A set that omits a key emits NULL for it, so a predicate on that
+            // key does not describe the input row: keep every conjunct above.
             let mut conjuncts = Vec::new();
             split_conjuncts(pred, &mut conjuncts);
             let mut keep = Vec::new();
             let mut push = Vec::new();
-            for c in conjuncts {
-                let mut cols = Vec::new();
-                columns_in(&c, &mut cols);
-                if cols.is_empty() || cols.iter().any(|i| *i >= keys.len()) {
-                    keep.push(c);
-                    continue;
-                }
-                // Rewrite the key positions into their own expressions
-                // (input space). A pushed conjunct evaluates once per input
-                // row instead of once per group, so a predicate holding a
-                // dynamic call — reached through a key expression included —
-                // stays above.
-                match rewrite_through_keys(&c, &keys) {
-                    Some(rewritten) if !rewritten.contains_dynamic_scalar() => push.push(rewritten),
-                    _ => keep.push(c),
+            if grouping_sets.is_some() {
+                keep = conjuncts;
+            } else {
+                for c in conjuncts {
+                    let mut cols = Vec::new();
+                    columns_in(&c, &mut cols);
+                    if cols.is_empty() || cols.iter().any(|i| *i >= keys.len()) {
+                        keep.push(c);
+                        continue;
+                    }
+                    // Rewrite the key positions into their own expressions
+                    // (input space). A pushed conjunct evaluates once per input
+                    // row instead of once per group, so a predicate holding a
+                    // dynamic call — reached through a key expression included —
+                    // stays above.
+                    match rewrite_through_keys(&c, &keys) {
+                        Some(rewritten) if !rewritten.contains_dynamic_scalar() => {
+                            push.push(rewritten)
+                        }
+                        _ => keep.push(c),
+                    }
                 }
             }
             let pushed = !push.is_empty();
@@ -2940,7 +2977,12 @@ fn push_one_level(
                 }),
                 None => input,
             };
-            let aggregate = LogicalPlan::Aggregate { input, keys, aggs };
+            let aggregate = LogicalPlan::Aggregate {
+                input,
+                keys,
+                aggs,
+                grouping_sets,
+            };
             match and_all(keep) {
                 // Nothing moved below: report unmoved so pushdown terminates.
                 Some(p) => (
@@ -3314,10 +3356,16 @@ fn pushdown_inner(plan: LogicalPlan, pdb: Option<&crate::storage::PinkDb>) -> Lo
                 left_cols,
             }
         }
-        LogicalPlan::Aggregate { input, keys, aggs } => LogicalPlan::Aggregate {
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            grouping_sets,
+        } => LogicalPlan::Aggregate {
             input: Box::new(pushdown_inner(*input, pdb)),
             keys,
             aggs,
+            grouping_sets,
         },
         LogicalPlan::Window {
             input,
@@ -3864,7 +3912,12 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
                 names,
             }
         }
-        LogicalPlan::Aggregate { input, keys, aggs } => {
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            grouping_sets,
+        } => {
             let inner = match plan_width(db, &input) {
                 Some(w) => {
                     let mut m = Live::none_of(w);
@@ -3884,6 +3937,7 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
                 input: Box::new(elim(db, *input, &inner)),
                 keys,
                 aggs,
+                grouping_sets,
             }
         }
         LogicalPlan::Window {
@@ -4675,6 +4729,7 @@ mod tests {
             input: Box::new(LogicalPlan::SingleRow),
             keys,
             aggs: vec![count_star()],
+            grouping_sets: None,
         }
     }
 
@@ -4693,7 +4748,10 @@ mod tests {
             predicate: bool_gt(col(0), 5),
         };
         let out = pushdown(plan);
-        let LogicalPlan::Aggregate { input, keys, aggs } = out else {
+        let LogicalPlan::Aggregate {
+            input, keys, aggs, ..
+        } = out
+        else {
             panic!("the aggregate must remain the root: {out:?}");
         };
         assert_eq!(keys, vec![key.clone()]);
@@ -4787,6 +4845,7 @@ mod tests {
                 }),
                 keys: vec![key],
                 aggs: vec![count_star()],
+                grouping_sets: None,
             }),
             predicate: bool_gt(col(0), 5),
         };

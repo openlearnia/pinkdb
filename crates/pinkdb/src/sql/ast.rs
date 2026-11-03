@@ -678,8 +678,13 @@ pub enum GroupSet {
     Rollup(Vec<Expr>),
     /// `CUBE(a, b)` → every subset of the keys.
     Cube(Vec<Expr>),
-    /// `GROUPING SETS ((a, b), (a), ())` exactly as written.
-    Sets(Vec<Vec<Expr>>),
+    /// `GROUPING SETS ((a, b), (a), ())` exactly as written. Each element is
+    /// another grouping item, so `CUBE`, `ROLLUP` and nested `GROUPING SETS`
+    /// expand at their place in the list.
+    Sets(Vec<GroupSet>),
+    /// One explicit grouping set, `(a, b)` or `()`; only used inside
+    /// [`GroupSet::Sets`].
+    Exprs(Vec<Expr>),
     /// `GROUP BY ALL`: one set of every non-aggregate select-list
     /// expression, in select-list order.
     All,

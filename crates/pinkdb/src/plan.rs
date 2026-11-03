@@ -95,6 +95,16 @@ pub enum MergeActionPlan {
     },
 }
 
+/// Expanded grouping sets for one aggregate. `keys` beyond `key_count` are
+/// `GROUPING()` mask slots; every row of `sets` is a sorted subset of the real
+/// key indices and has a sibling mask row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupingSetPlan {
+    pub key_count: usize,
+    pub sets: Vec<Vec<usize>>,
+    pub masks: Vec<Vec<i64>>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
     CreateTable {
@@ -677,6 +687,10 @@ pub enum LogicalPlan {
         /// Group keys, evaluated against the input (scan-relative).
         keys: Vec<BoundExpr>,
         aggs: Vec<BoundAgg>,
+        /// `Some` for GROUPING SETS / ROLLUP / CUBE: the expanded real-key
+        /// subsets and their GROUPING() mask values. The input is scanned
+        /// once and every set is fed from the same rows.
+        grouping_sets: Option<GroupingSetPlan>,
     },
     Project {
         input: Box<LogicalPlan>,
@@ -1395,7 +1409,9 @@ pub(crate) fn collect_tables_read(
                 expr_tables_read(on, default_ns, out);
             }
         }
-        LogicalPlan::Aggregate { input, keys, aggs } => {
+        LogicalPlan::Aggregate {
+            input, keys, aggs, ..
+        } => {
             collect_tables_read(input, default_ns, out);
             for e in keys.iter().chain(
                 aggs.iter()
@@ -1639,7 +1655,9 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
                 || contains_table_function(right)
                 || on.as_ref().is_some_and(expr_contains_table_function)
         }
-        LogicalPlan::Aggregate { input, keys, aggs } => {
+        LogicalPlan::Aggregate {
+            input, keys, aggs, ..
+        } => {
             contains_table_function(input)
                 || keys
                     .iter()
@@ -2065,7 +2083,7 @@ fn walk_scan_filters(
                 walk_expr_subquery_filters(on, out);
             }
         }
-        LogicalPlan::Aggregate { input, keys, aggs } => {
+        LogicalPlan::Aggregate { input, keys, aggs, .. } => {
             walk_scan_filters(input, &[], out);
             for e in keys
                 .iter()
@@ -2509,7 +2527,7 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut Vec<String>) {
                 exprs.push(on);
             }
         }
-        LogicalPlan::Aggregate { input, keys, aggs } => {
+        LogicalPlan::Aggregate { input, keys, aggs, .. } => {
             children.push(input);
             exprs.extend(keys.iter());
             exprs.extend(
@@ -2665,9 +2683,17 @@ fn walk_scan_projections(
         // The executor evaluates every key and aggregate argument, whatever
         // the consumer of the aggregate needs, so the input bound is the
         // union of all of them.
-        LogicalPlan::Aggregate { input, keys, aggs } => {
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            grouping_sets,
+        } => {
             let mut need = Needed::Cols(Vec::new());
-            for k in keys {
+            // GROUPING() mask slots are constants the executor fills in; they
+            // are not input columns.
+            let real_keys = grouping_sets.as_ref().map_or(keys.len(), |p| p.key_count);
+            for k in &keys[..real_keys] {
                 collect_expr_projections(k, &mut need, out);
             }
             for a in aggs {
@@ -3572,6 +3598,7 @@ mod scan_filter_tests {
                 input: Box::new(scan("t")),
                 keys: vec![col(0)],
                 aggs: Vec::new(),
+                grouping_sets: None,
             },
             cmp(BinaryOp::Eq, col(0), lit(1)),
         );

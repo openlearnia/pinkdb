@@ -1611,6 +1611,25 @@ impl Partial {
         self.held.bytes()
     }
 
+    /// Commit the bytes added since the last fold to the statement's pool.
+    pub(crate) fn finish_chunk(&mut self) -> Result<()> {
+        self.held.resize(self.bytes)
+    }
+
+    /// The grand-total group of an empty input: a keyless aggregate still
+    /// emits one row, so an empty grouping set does too.
+    pub(crate) fn ensure_empty_group(&mut self, aggs: &[BoundAgg]) {
+        if self.groups.is_empty() {
+            self.groups.push((
+                Vec::new(),
+                Group {
+                    keys: Vec::new(),
+                    accs: aggs.iter().map(Acc::for_agg).collect(),
+                },
+            ));
+        }
+    }
+
     pub(crate) fn for_rows(rows: usize, account: &crate::memory::Account) -> Partial {
         Partial {
             groups: Vec::new(),
@@ -1782,7 +1801,8 @@ pub(crate) fn fold_chunk(
         .collect::<Result<_>>()?;
     // Pass 1: one group id per row (first-seen order).
     let rows = sel.map_or(chunk.num_rows(), |s| s.len());
-    let gids = group_ids(partial, &key_vecs, aggs, rows, sel);
+    let key_refs: Vec<&Vector> = key_vecs.iter().map(|v| v.v()).collect();
+    let gids = group_ids(partial, &key_refs, aggs, rows, sel);
     // Pass 2: each aggregate runs as one typed loop over the chunk.
     // Accumulators are independent, so feeding agg by agg instead of row by
     // row gives every accumulator the same rows in the same order — results
@@ -1799,7 +1819,7 @@ pub(crate) fn fold_chunk(
     }
     // One pool resize per chunk, after the state grew: a runaway GROUP BY
     // fails at the chunk that crossed the limit, not at the end.
-    partial.held.resize(partial.bytes)?;
+    partial.finish_chunk()?;
     Ok(())
 }
 
@@ -2001,7 +2021,7 @@ const SMALL_KEY_SET: usize = 16;
 /// integer path never consults that index and skips the second insert.
 fn new_group(
     partial: &mut Partial,
-    key_vecs: &[EvalVec],
+    key_vecs: &[&Vector],
     aggs: &[BoundAgg],
     i: usize,
     enc: Vec<u8>,
@@ -2021,7 +2041,7 @@ fn new_group(
     partial.groups.push((
         enc,
         Group {
-            keys: key_vecs.iter().map(|kv| kv.v().get(i)).collect(),
+            keys: key_vecs.iter().map(|kv| kv.get(i)).collect(),
             accs: aggs.iter().map(Acc::for_agg).collect(),
         },
     ));
@@ -2033,9 +2053,9 @@ fn new_group(
 /// value; VARCHAR keys scan a small first-seen set); everything else hashes
 /// the row's encoded key. Every group still records its encoded key, so the
 /// cross-chunk merge is unchanged.
-fn group_ids(
+pub(crate) fn group_ids(
     partial: &mut Partial,
-    key_vecs: &[EvalVec],
+    key_vecs: &[&Vector],
     aggs: &[BoundAgg],
     rows: usize,
     sel: Option<&[u32]>,
@@ -2048,12 +2068,17 @@ fn group_ids(
     let encode = |buf: &mut Vec<u8>, i: usize| {
         buf.clear();
         for kv in key_vecs {
-            kv.v().encode_into(buf, i);
+            kv.encode_into(buf, i);
         }
     };
     let mut start = 0;
-    if let [single] = key_vecs {
-        let v = single.v();
+    // The typed single-key lanes keep only per-call maps, so they are correct
+    // only for an empty partial. A grouping set reuses one partial across
+    // chunks and falls through to the persistent index after the first.
+    if partial.groups.is_empty()
+        && let [single] = key_vecs
+    {
+        let v = *single;
         match v.data() {
             VectorData::Int32(_)
             | VectorData::Int64(_)
@@ -2146,6 +2171,14 @@ fn group_ids(
         && let Some(gids) = small_domain_gids(partial, key_vecs, aggs, rows, sel)
     {
         return gids;
+    }
+    // A grouping set reuses one partial across chunks. Its first chunk may
+    // have taken the typed integer lane, which keeps only a local map; seed
+    // the persistent index from those groups before hashing the next chunk.
+    if partial.index.is_empty() && !partial.groups.is_empty() {
+        for (idx, (enc, _)) in partial.groups.iter().enumerate() {
+            partial.index.insert(enc.clone(), idx);
+        }
     }
     let mut full_reserved = false;
     for k in start..rows {
@@ -2322,7 +2355,7 @@ fn varchar_codes(
 /// hashed path (a column with too many distinct values).
 fn small_domain_gids(
     partial: &mut Partial,
-    key_vecs: &[EvalVec],
+    key_vecs: &[&Vector],
     aggs: &[BoundAgg],
     rows: usize,
     sel: Option<&[u32]>,
@@ -2330,7 +2363,7 @@ fn small_domain_gids(
     let row = |k: usize| sel.map_or(k, |s| s[k] as usize);
     let mut columns = Vec::with_capacity(key_vecs.len());
     for kv in key_vecs {
-        columns.push(small_column_codes(kv.v(), rows, row)?);
+        columns.push(small_column_codes(kv, rows, row)?);
     }
     let size: usize = columns.iter().map(|(_, n)| (*n).max(1)).product();
     let mut slots = vec![usize::MAX; size];
@@ -2346,7 +2379,7 @@ fn small_domain_gids(
                 let i = row(k);
                 buf.clear();
                 for kv in key_vecs {
-                    kv.v().encode_into(&mut buf, i);
+                    kv.encode_into(&mut buf, i);
                 }
                 let g = new_group(partial, key_vecs, aggs, i, buf.clone(), true);
                 slots[code] = g;
@@ -3165,5 +3198,40 @@ mod tests {
                 assert_eq!(rows_of(&got), rows_of(&want), "keys {keys:?} sel {sel:?}");
             }
         }
+    }
+
+    #[test]
+    fn reused_int_key_partial_keeps_one_group_per_value() {
+        // GROUPING SETS run one partial per set across every input chunk. The
+        // first chunk's single-int lane leaves only the groups, not the index,
+        // so the second chunk must still find those groups instead of
+        // creating a second copy of each key.
+        let db = crate::storage::PinkDb::new();
+        let cx = Cx::new(&db);
+        let keys = vec![BoundExpr::Column {
+            index: 0,
+            dtype: DataType::Integer,
+        }];
+        let aggs = vec![BoundAgg {
+            func: AggFunc::Count,
+            arg: None,
+            dtype: DataType::Bigint,
+            distinct: false,
+            filter: None,
+            direct: None,
+            separator: None,
+        }];
+        let chunk = || {
+            let mut key = Vector::new_empty(DataType::Integer);
+            for i in 0..64 {
+                key.push_valid(Value::Integer(i % 2)).unwrap();
+            }
+            DataChunk::new(vec![key]).unwrap()
+        };
+        let mut partial = Partial::for_rows(0, cx.budget.memory());
+        for _ in 0..2 {
+            fold_chunk(&cx, &mut partial, &chunk(), None, &keys, &aggs).unwrap();
+        }
+        assert_eq!(partial.groups.len(), 2);
     }
 }
