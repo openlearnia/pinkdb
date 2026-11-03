@@ -197,6 +197,26 @@ def duck_refused(d):
     return d[0] == "error" and not d[1].startswith("harness:")
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def json_only(out):
+    """DuckDB's `-json` output without its warnings: v2.0.0 prints a colored
+    `WARNING:` block on stdout ahead of a statement's result (e.g. `PRAGMA
+    threads = …` is deprecated), which is skipped up to the next JSON
+    document."""
+    kept, warning = [], False
+    for line in ANSI.sub("", out).splitlines():
+        if line.strip() == "WARNING:":
+            warning = True
+            continue
+        if warning and not line.startswith("["):
+            continue
+        warning = False
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def duck_query(setup, sql):
     """Returns ("rows", rows) | ("error", msg)."""
     p = subprocess.run(["duckdb", "-json"], input=setup + "\n" + sql + "\n",
@@ -206,7 +226,7 @@ def duck_query(setup, sql):
         first = next((l for l in err.splitlines() if "Error" in l), err[:200])
         return ("error", first.strip())
     docs = []
-    for chunk in re.split(r"\n(?=\[)", p.stdout.strip()):
+    for chunk in re.split(r"\n(?=\[)", json_only(p.stdout).strip()):
         if chunk.strip():
             # Output that is not JSON (a DuckDB build printing a notice or a
             # plain-text result) fails this case, naming the SQL; it must not
