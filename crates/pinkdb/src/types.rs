@@ -809,16 +809,6 @@ fn div_pow10_round(v: i128, p: i128) -> Option<i128> {
     }
 }
 
-fn div_pow10_round_u128(v: u128, p: u128) -> Option<u128> {
-    debug_assert!(p > 0);
-    if p == 1 {
-        return Some(v);
-    }
-    let half = p / 2;
-    let (q, r) = (v / p, v % p);
-    Some(if r >= half { q.checked_add(1)? } else { q })
-}
-
 /// Rescale `v / 10^from` to a `to`-digit scale. Scaling up is exact (`None`
 /// on i128 overflow — the caller reports a DECIMAL overflow); scaling down
 /// rounds half away from zero (DuckDB's cast rule).
@@ -1016,12 +1006,27 @@ pub fn parse_decimal_str(s: &str, precision: u8, scale: u8) -> std::result::Resu
     Ok(value)
 }
 
-/// Parse a VARCHAR cell into a HUGEINT with DuckDB's INT128 cast rules:
-/// surrounding whitespace trimmed, `_` separators dropped, `0x`/`0b` strings
-/// read as bit patterns, and a fraction or exponent rounded half away from
-/// zero. The digits never pass through `f64`, so a 39-digit literal keeps
-/// every digit (DuckDB accepts exactly the same range).
-pub fn parse_i128_str(s: &str) -> Option<i128> {
+// Integer text casts follow DuckDB v2.0.0's `cast_operators.cpp`
+// (`HugeIntegerCastOperation`, `IntegerDecimalCastOperation`): the integer
+// digits accumulate in a 64-bit intermediate that is flushed into the result,
+// the fraction is scaled by the exponent and rounded half away from zero, and
+// HUGEINT gives up when a long non-zero fraction outgrows its 128-bit decimal.
+
+/// Fraction digits past this position cannot affect any `int16_t` exponent.
+const MAX_DECIMAL_DIGITS: usize = 32768;
+
+/// One integer literal split the way `TryIntegerCast` reads it:
+/// `[sign] integer [. fraction] [e [sign] exponent]`.
+struct IntText {
+    neg: bool,
+    int_part: String,
+    frac_part: String,
+    exponent: i16,
+}
+
+/// Split `s`, dropping `_` separators. `None` unless the shape is an integer
+/// literal; the exponent must fit `i16` (DuckDB parses it as `int16_t`).
+fn split_int_text(s: &str) -> Option<IntText> {
     let t = s.trim();
     let (neg, body) = match t.as_bytes().first()? {
         b'-' => (true, &t[1..]),
@@ -1029,23 +1034,8 @@ pub fn parse_i128_str(s: &str) -> Option<i128> {
         _ => (false, t),
     };
     let body: String = body.chars().filter(|c| *c != '_').collect();
-    // Hex/binary strings are bit patterns, and DuckDB refuses a sign on them
-    // (`'-0x07'::HUGEINT` is a conversion error).
-    let radix = if body.starts_with("0x") || body.starts_with("0X") {
-        Some(16)
-    } else if body.starts_with("0b") || body.starts_with("0B") {
-        Some(2)
-    } else {
-        None
-    };
-    if let Some(radix) = radix {
-        if neg {
-            return None;
-        }
-        return i128::try_from(u128::from_str_radix(&body[2..], radix).ok()?).ok();
-    }
-    let (mantissa, exp) = match body.split_once(['e', 'E']) {
-        Some((m, e)) => (m, e.parse::<i32>().ok()?),
+    let (mantissa, exponent) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i16>().ok()?),
         None => (body.as_str(), 0),
     };
     let (int_part, frac_part) = match mantissa.split_once('.') {
@@ -1058,38 +1048,380 @@ pub fn parse_i128_str(s: &str) -> Option<i128> {
     {
         return None;
     }
-    // DuckDB scales through a 38-digit decimal, so a positive exponent that
-    // leaves more than 38 fractional digits behind is a conversion error rather
-    // than a rounded value: `'1.<44 digits>1e5'` fails, `'1.<43 digits>1e5'`
-    // rounds (corpus `test_hugeint_exponent`).
-    if exp > 0 && frac_part.len() as i64 - exp as i64 > 38 {
+    Some(IntText {
+        neg,
+        int_part: int_part.to_string(),
+        frac_part: frac_part.to_string(),
+        exponent,
+    })
+}
+
+/// `0x`/`0b` bit patterns as `(negated, radix, digits)`; `None` for decimal.
+fn bit_pattern(s: &str) -> Option<(bool, u32, String)> {
+    let t = s.trim();
+    let (neg, body) = match t.as_bytes().first()? {
+        b'-' => (true, &t[1..]),
+        b'+' => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let radix = if body.starts_with("0x") || body.starts_with("0X") {
+        16
+    } else if body.starts_with("0b") || body.starts_with("0B") {
+        2
+    } else {
         return None;
-    }
-    let digits = format!("{int_part}{frac_part}");
-    // The magnitude of INT128's minimum is 2^127, which overflows `i128`, so
-    // the scaling runs in `u128` and only the final sign decides the range.
-    let mut magnitude: u128 = digits.parse().ok()?;
-    // value = digits * 10^exp, where the fraction already moved the point.
-    let exp = exp.checked_sub(frac_part.len() as i32)?;
-    if magnitude != 0 {
-        if exp >= 0 {
-            magnitude = magnitude.checked_mul(10u128.checked_pow(exp as u32)?)?;
+    };
+    let digits = body[2..].chars().filter(|c| *c != '_').collect();
+    Some((neg, radix, digits))
+}
+
+/// `IntegerDecimalCastOperation` state from DuckDB's
+/// `integer_cast_operator.hpp`: both INTEGER and BIGINT store into an
+/// `int64_t`, and INTEGER range-checks that value before the final round.
+struct Int64Digits {
+    result: i64,
+    decimal: i64,
+    decimal_digits: usize,
+}
+
+impl Int64Digits {
+    fn handle_digit(&mut self, b: u8, neg: bool) -> Option<()> {
+        let d = i64::from(b - b'0');
+        if neg {
+            if self.result < (i64::MIN + d) / 10 {
+                return None;
+            }
+            self.result = self.result * 10 - d;
         } else {
-            magnitude = match 10u128.checked_pow(-exp as u32) {
-                Some(p) => div_pow10_round_u128(magnitude, p)?,
-                // 10^39 exceeds u128, so the fraction is below half a unit.
-                None => 0,
-            };
+            if self.result > (i64::MAX - d) / 10 {
+                return None;
+            }
+            self.result = self.result * 10 + d;
         }
+        Some(())
     }
-    if neg {
-        if magnitude > 1u128 << 127 {
+
+    /// Digits past the cap, or past what the `i64` can hold, are dropped: the
+    /// first fraction digit is already fixed, so dropping later ones cannot
+    /// change the rounding.
+    fn handle_decimal(&mut self, b: u8) {
+        let d = i64::from(b - b'0');
+        if self.decimal_digits == MAX_DECIMAL_DIGITS || self.decimal > (i64::MAX - d) / 10 {
+            return;
+        }
+        self.decimal_digits += 1;
+        self.decimal = self.decimal * 10 + d;
+    }
+
+    fn handle_exponent(
+        &mut self,
+        exponent: i16,
+        neg: bool,
+        fits: &impl Fn(i64) -> bool,
+    ) -> Option<i64> {
+        if exponent < 0 {
+            let mut e = exponent;
+            while e < 0 {
+                e += 1;
+                self.decimal = self.result % 10;
+                self.result /= 10;
+                if self.result == 0 && self.decimal == 0 {
+                    break;
+                }
+            }
+            self.decimal = self.decimal.abs();
+            self.decimal_digits = 1;
+            return self.finalize(neg, fits);
+        }
+        let mut e = exponent;
+        while self.result != 0 && e > 0 {
+            self.result = self.result.checked_mul(10)?;
+            e -= 1;
+        }
+        if self.decimal == 0 {
+            return self.finalize(neg, fits);
+        }
+        let shift = i64::from(exponent) - self.decimal_digits as i64;
+        let mut remainder = 0;
+        if shift < 0 {
+            if shift.unsigned_abs() < 19 {
+                let mut power = 1i64;
+                for _ in 0..-shift {
+                    power *= 10;
+                }
+                remainder = self.decimal % power;
+                self.decimal /= power;
+            } else {
+                remainder = self.decimal;
+                self.decimal = 0;
+            }
+        } else {
+            for _ in 0..shift {
+                self.decimal = self.decimal.checked_mul(10)?;
+            }
+        }
+        // `decimal_digits` is unsigned in DuckDB, so a shift past zero wraps;
+        // the wrapped value then never equals 1 and disables rounding.
+        self.decimal_digits = self.decimal_digits.wrapping_sub(exponent as usize);
+        self.result = if neg {
+            self.result.checked_sub(self.decimal)?
+        } else {
+            self.result.checked_add(self.decimal)?
+        };
+        self.decimal = remainder;
+        self.finalize(neg, fits)
+    }
+
+    fn finalize(&mut self, neg: bool, fits: &impl Fn(i64) -> bool) -> Option<i64> {
+        if !fits(self.result) {
             return None;
         }
-        Some(0u128.wrapping_sub(magnitude) as i128)
-    } else {
-        i128::try_from(magnitude).ok()
+        while self.decimal > 10 {
+            self.decimal /= 10;
+            self.decimal_digits = self.decimal_digits.saturating_sub(1);
+        }
+        if self.decimal_digits == 1 && self.decimal >= 5 {
+            self.result = if neg {
+                self.result.checked_sub(1)?
+            } else {
+                self.result.checked_add(1)?
+            };
+            if !fits(self.result) {
+                return None;
+            }
+        }
+        Some(self.result)
     }
+}
+
+fn parse_i64_text(t: &IntText, fits: impl Fn(i64) -> bool) -> Option<i64> {
+    let mut st = Int64Digits {
+        result: 0,
+        decimal: 0,
+        decimal_digits: 0,
+    };
+    for b in t.int_part.bytes() {
+        st.handle_digit(b, t.neg)?;
+    }
+    for b in t.frac_part.bytes() {
+        st.handle_decimal(b);
+    }
+    st.handle_exponent(t.exponent, t.neg, &fits)
+}
+
+/// `HugeIntegerCastOperation` state: 64-bit intermediates flushed into a
+/// 128-bit result and decimal, so any digit count is accepted until the value
+/// itself overflows.
+#[derive(Default)]
+struct Int128Digits {
+    result: i128,
+    intermediate: i64,
+    digits: usize,
+    decimal: i128,
+    decimal_total_digits: usize,
+    decimal_intermediate: i64,
+    decimal_intermediate_digits: usize,
+}
+
+impl Int128Digits {
+    fn flush(&mut self) -> Option<()> {
+        if self.digits == 0 && self.intermediate == 0 {
+            return Some(());
+        }
+        if self.result != 0 {
+            if self.digits > 38 {
+                return None;
+            }
+            self.result = self.result.checked_mul(POW10_I128[self.digits])?;
+        }
+        self.result = self.result.checked_add(i128::from(self.intermediate))?;
+        self.digits = 0;
+        self.intermediate = 0;
+        Some(())
+    }
+
+    fn flush_decimal(&mut self) -> Option<()> {
+        if self.decimal_intermediate_digits == 0 && self.decimal_intermediate == 0 {
+            return Some(());
+        }
+        if self.decimal != 0 {
+            if self.decimal_intermediate_digits > 38 {
+                return None;
+            }
+            self.decimal = self
+                .decimal
+                .checked_mul(POW10_I128[self.decimal_intermediate_digits])?;
+        }
+        self.decimal = self
+            .decimal
+            .checked_add(i128::from(self.decimal_intermediate))?;
+        self.decimal_total_digits += self.decimal_intermediate_digits;
+        self.decimal_intermediate_digits = 0;
+        self.decimal_intermediate = 0;
+        Some(())
+    }
+
+    fn handle_digit(&mut self, b: u8, neg: bool) -> Option<()> {
+        let d = i64::from(b - b'0');
+        if neg {
+            if self.intermediate < (i64::MIN + d) / 10 {
+                self.flush()?;
+            }
+            self.intermediate = self.intermediate * 10 - d;
+        } else {
+            if self.intermediate > (i64::MAX - d) / 10 {
+                self.flush()?;
+            }
+            self.intermediate = self.intermediate * 10 + d;
+        }
+        self.digits += 1;
+        Some(())
+    }
+
+    fn handle_decimal(&mut self, b: u8) -> Option<()> {
+        self.flush()?;
+        if self.decimal_total_digits + self.decimal_intermediate_digits == MAX_DECIMAL_DIGITS {
+            return Some(());
+        }
+        let d = i64::from(b - b'0');
+        if self.decimal_intermediate > (i64::MAX - d) / 10 {
+            self.flush_decimal()?;
+        }
+        self.decimal_intermediate = self.decimal_intermediate * 10 + d;
+        self.decimal_intermediate_digits += 1;
+        Some(())
+    }
+
+    fn handle_exponent(&mut self, exponent: i16, neg: bool) -> Option<i128> {
+        self.flush()?;
+        // A negative exponent below -38 leaves only a fraction, which rounds
+        // to zero whatever the fraction holds.
+        if exponent < -38 {
+            self.result = 0;
+            return Some(0);
+        }
+        if exponent < 0 {
+            let power = POW10_I128[-exponent as usize];
+            self.decimal = (self.result % power).abs();
+            self.result /= power;
+            self.decimal_total_digits = -exponent as usize;
+            self.decimal_intermediate = 0;
+            self.decimal_intermediate_digits = 0;
+            return self.finalize(neg);
+        }
+        if self.result != 0 {
+            if exponent > 38 {
+                return None;
+            }
+            self.result = self.result.checked_mul(POW10_I128[exponent as usize])?;
+        }
+        self.flush_decimal()?;
+        if self.decimal == 0 {
+            return self.finalize(neg);
+        }
+        let shift = i128::from(exponent) - self.decimal_total_digits as i128;
+        let mut remainder = 0;
+        if shift < 0 {
+            if shift < -38 {
+                // All of the decimal is fractional.
+                remainder = self.decimal;
+                self.decimal = 0;
+            } else {
+                let power = POW10_I128[-shift as usize];
+                remainder = self.decimal % power;
+                self.decimal /= power;
+            }
+            self.decimal_total_digits -= exponent as usize;
+        } else {
+            if shift > 38 {
+                return None;
+            }
+            self.decimal = self.decimal.checked_mul(POW10_I128[shift as usize])?;
+        }
+        self.result = if neg {
+            self.result.checked_sub(self.decimal)?
+        } else {
+            self.result.checked_add(self.decimal)?
+        };
+        self.decimal = remainder;
+        self.finalize(neg)
+    }
+
+    fn finalize(&mut self, neg: bool) -> Option<i128> {
+        self.flush()?;
+        self.flush_decimal()?;
+        if self.decimal == 0 || self.decimal_total_digits == 0 {
+            return Some(self.result);
+        }
+        while self.decimal_total_digits > 38 {
+            self.decimal /= POW10_I128[38];
+            self.decimal_total_digits -= 38;
+        }
+        self.decimal /= POW10_I128[self.decimal_total_digits - 1];
+        if self.decimal >= 5 {
+            self.result = if neg {
+                self.result.checked_sub(1)?
+            } else {
+                self.result.checked_add(1)?
+            };
+        }
+        Some(self.result)
+    }
+}
+
+fn parse_i128_text(t: &IntText) -> Option<i128> {
+    let mut st = Int128Digits::default();
+    for b in t.int_part.bytes() {
+        st.handle_digit(b, t.neg)?;
+    }
+    st.flush()?;
+    for b in t.frac_part.bytes() {
+        st.handle_decimal(b)?;
+    }
+    st.handle_exponent(t.exponent, t.neg)
+}
+
+/// Parse a VARCHAR cell into an INTEGER with DuckDB's integer text rules:
+/// surrounding whitespace trimmed, `_` separators dropped, `0x`/`0b` strings
+/// read as bit patterns, and a fraction or exponent rounded half away from
+/// zero. The integer part must fit before the final round, so
+/// `'2147483647.5'` is out of range.
+pub fn parse_i32_str(s: &str) -> Option<i32> {
+    if let Some((neg, radix, digits)) = bit_pattern(s) {
+        if neg {
+            return None;
+        }
+        return i32::try_from(u128::from_str_radix(&digits, radix).ok()?).ok();
+    }
+    let t = split_int_text(s)?;
+    let v = parse_i64_text(&t, |v| i32::try_from(v).is_ok())?;
+    i32::try_from(v).ok()
+}
+
+/// Parse a VARCHAR cell into a BIGINT with DuckDB's integer text rules; see
+/// [`parse_i32_str`].
+pub fn parse_i64_str(s: &str) -> Option<i64> {
+    if let Some((neg, radix, digits)) = bit_pattern(s) {
+        if neg {
+            return None;
+        }
+        return i64::try_from(u128::from_str_radix(&digits, radix).ok()?).ok();
+    }
+    parse_i64_text(&split_int_text(s)?, |_| true)
+}
+
+/// Parse a VARCHAR cell into a HUGEINT with DuckDB's INT128 cast rules.
+/// The digits never pass through `f64`, so every digit survives. A long
+/// *zero* fraction is fine (`'1.<300 zeros>1e5'` is 100000), but a non-zero
+/// decimal that outgrows 128 bits is a conversion error, as in DuckDB.
+pub fn parse_i128_str(s: &str) -> Option<i128> {
+    if let Some((neg, radix, digits)) = bit_pattern(s) {
+        if neg {
+            return None;
+        }
+        return i128::try_from(u128::from_str_radix(&digits, radix).ok()?).ok();
+    }
+    parse_i128_text(&split_int_text(s)?)
 }
 
 // ---------- interval ----------
@@ -1902,6 +2234,141 @@ mod tests {
         );
         assert_eq!(decimal_cmp(1, 0, 999, 3), std::cmp::Ordering::Greater);
         assert_eq!(decimal_cmp(-1, 0, -999, 3), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn integer_text_cast_matches_duckdb() {
+        // INTEGER accumulates in an i64, range-checks it, then rounds.
+        assert_eq!(parse_i32_str("2147483647"), Some(i32::MAX));
+        assert_eq!(parse_i32_str("-2147483648"), Some(i32::MIN));
+        assert_eq!(parse_i32_str("2147483648"), None);
+        // The integer part itself must fit: 2147483647.5 rounds to 2147483648.
+        assert_eq!(parse_i32_str("2147483647.5"), None);
+        assert_eq!(parse_i32_str("-2147483648.5"), None);
+        assert_eq!(parse_i32_str("-2147483648.4"), Some(i32::MIN));
+        // Half away from zero; the sign comes from `NEGATIVE`, so -0.5 is -1.
+        assert_eq!(parse_i32_str("2.5"), Some(3));
+        assert_eq!(parse_i32_str("-2.5"), Some(-3));
+        assert_eq!(parse_i32_str("-0.5"), Some(-1));
+        assert_eq!(parse_i32_str("-0.4"), Some(0));
+        assert_eq!(parse_i32_str("1.4999"), Some(1));
+        assert_eq!(parse_i32_str("1.5000"), Some(2));
+        // The exponent shifts the point before the first digit decides:
+        // 1.45e1 = 14.5 -> 15, 1.45e0 = 1.45 -> 1, -0.05e2 = -5.
+        assert_eq!(parse_i32_str("1.45e1"), Some(15));
+        assert_eq!(parse_i32_str("1.45e0"), Some(1));
+        assert_eq!(parse_i32_str("-0.05e2"), Some(-5));
+        assert_eq!(parse_i32_str("15e-1"), Some(2));
+        assert_eq!(parse_i32_str("-15e-1"), Some(-2));
+        assert_eq!(parse_i32_str("5e-1"), Some(1));
+        assert_eq!(parse_i32_str("2e-1"), Some(0));
+        assert_eq!(parse_i32_str("1e-39"), Some(0));
+        assert_eq!(parse_i32_str("1e39"), None);
+        // Framing: signs, dots, separators, zeros, and an i16 exponent.
+        assert_eq!(parse_i32_str("  +0012  "), Some(12));
+        assert_eq!(parse_i32_str(".5"), Some(1));
+        assert_eq!(parse_i32_str("5."), Some(5));
+        assert_eq!(parse_i32_str("1_2.0_0"), Some(12));
+        assert_eq!(parse_i32_str("12.000"), Some(12));
+        assert_eq!(parse_i32_str(""), None);
+        assert_eq!(parse_i32_str("."), None);
+        assert_eq!(parse_i32_str("1e"), None);
+        assert_eq!(parse_i32_str("1e32768"), None);
+        // Bit patterns must fit the signed range and take no sign.
+        assert_eq!(parse_i32_str("0x7FFFFFFF"), Some(i32::MAX));
+        assert_eq!(parse_i32_str("0x80000000"), None);
+        assert_eq!(parse_i32_str("0b101"), Some(5));
+        assert_eq!(parse_i32_str("-0x7f"), None);
+    }
+
+    #[test]
+    fn bigint_text_cast_matches_duckdb() {
+        assert_eq!(parse_i64_str("9223372036854775807"), Some(i64::MAX));
+        assert_eq!(parse_i64_str("-9223372036854775808"), Some(i64::MIN));
+        assert_eq!(parse_i64_str("9223372036854775808"), None);
+        assert_eq!(parse_i64_str("9223372036854775807.5"), None);
+        // A long zero fraction still rounds: 1.0…01e5 = 100000.
+        let zeros = "0".repeat(300);
+        assert_eq!(parse_i64_str(&format!("1.{zeros}1e5")), Some(100000));
+        assert_eq!(parse_i64_str(&format!("0.{zeros}1e5")), Some(0));
+        // The i64 decimal drops digits it cannot hold, which cannot change the
+        // first fraction digit: 1.1<300 zeros>1e5 keeps 0.1e5 and is 110000.
+        assert_eq!(parse_i64_str(&format!("1.1{zeros}1e5")), Some(110000));
+        // 0.<20 zeros>5 is below 0.5; 0.4999…e1 is 4.999… -> 5.
+        assert_eq!(parse_i64_str(&format!("0.{}5", "0".repeat(20))), Some(0));
+        assert_eq!(parse_i64_str(&format!("0.4{}e1", "9".repeat(25))), Some(5));
+        assert_eq!(parse_i64_str("1e-39"), Some(0));
+        assert_eq!(parse_i64_str("1e19"), None);
+        assert_eq!(parse_i64_str("1e18"), Some(1_000_000_000_000_000_000));
+        assert_eq!(parse_i64_str("1.5"), Some(2));
+        assert_eq!(parse_i64_str("-1.5"), Some(-2));
+        assert_eq!(parse_i64_str("15e-1"), Some(2));
+    }
+
+    #[test]
+    fn hugeint_text_cast_matches_duckdb() {
+        assert_eq!(
+            parse_i128_str("170141183460469231731687303715884105727"),
+            Some(i128::MAX)
+        );
+        assert_eq!(
+            parse_i128_str("-170141183460469231731687303715884105728"),
+            Some(i128::MIN)
+        );
+        assert_eq!(
+            parse_i128_str("170141183460469231731687303715884105728"),
+            None
+        );
+        assert_eq!(
+            parse_i128_str("-170141183460469231731687303715884105729"),
+            None
+        );
+        // The fraction is flushed only when the exponent scales it, so any
+        // number of leading zeros is fine: 1.<300 zeros>1e5 = 100000.
+        let zeros = "0".repeat(300);
+        assert_eq!(parse_i128_str(&format!("1.{zeros}1e5")), Some(100000));
+        assert_eq!(parse_i128_str(&format!("0.{zeros}1e5")), Some(0));
+        assert_eq!(parse_i128_str(&format!("1.{zeros}1e-39")), Some(0));
+        // A decimal that already holds 19 digits cannot absorb another flush:
+        // 1.1<300 zeros>1e5 is a conversion error (corpus case 3).
+        assert_eq!(parse_i128_str(&format!("1.1{zeros}1e5")), None);
+        // Past 32768 digits are ignored — no i16 exponent can reach them — so
+        // both sides of the cap still return 100000.
+        assert_eq!(
+            parse_i128_str(&format!("1.{}1e5", "0".repeat(32767))),
+            Some(100000)
+        );
+        assert_eq!(
+            parse_i128_str(&format!("1.{}1e5", "0".repeat(32768))),
+            Some(100000)
+        );
+        // 38 nines fit the 128-bit decimal and round to 1; 39 outgrow it.
+        assert_eq!(parse_i128_str(&format!("0.{}", "9".repeat(38))), Some(1));
+        assert_eq!(parse_i128_str(&format!("0.{}", "9".repeat(39))), None);
+        assert_eq!(parse_i128_str("1e38"), Some(10i128.pow(38)));
+        assert_eq!(parse_i128_str("-1e38"), Some(-(10i128.pow(38))));
+        assert_eq!(parse_i128_str("1e39"), None);
+        assert_eq!(parse_i128_str("1e-39"), Some(0));
+        assert_eq!(parse_i128_str("5e-1"), Some(1));
+        assert_eq!(parse_i128_str("-5e-1"), Some(-1));
+        assert_eq!(parse_i128_str("2e-1"), Some(0));
+        assert_eq!(parse_i128_str("15e-1"), Some(2));
+        assert_eq!(parse_i128_str("-15e-1"), Some(-2));
+        // Rounding reads the first fraction digit after the shift:
+        // 1.45e1 = 14.5 -> 15, 1.45e0 = 1.45 -> 1, -0.05e2 = -5.
+        assert_eq!(parse_i128_str("1.45e1"), Some(15));
+        assert_eq!(parse_i128_str("1.45e0"), Some(1));
+        assert_eq!(parse_i128_str("-0.05e2"), Some(-5));
+        assert_eq!(parse_i128_str("-0.5"), Some(-1));
+        assert_eq!(parse_i128_str("-0.4"), Some(0));
+        // `0x`/`0b` are positive bit patterns; the sign is refused.
+        assert_eq!(
+            parse_i128_str("0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
+            Some(i128::MAX)
+        );
+        assert_eq!(parse_i128_str("0x80000000000000000000000000000000"), None);
+        assert_eq!(parse_i128_str("-0x7f"), None);
+        assert_eq!(parse_i128_str("0b101"), Some(5));
     }
 
     #[test]

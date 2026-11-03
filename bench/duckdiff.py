@@ -1665,10 +1665,40 @@ HUGEINT_QUERIES = [
     ("dialect-hugeint-double-bound",
      "SELECT (1.7014118346046923e38)::HUGEINT, (-1.7014118346046923e38)::HUGEINT;",
      False, True),
-    # Text with more fractional digits than DuckDB's 38-digit decimal
-    # intermediate is a conversion error, not a rounding to zero.
+    # DuckDB v2.0.0: a long *zero* fraction shifted past the decimal point is
+    # dropped as fractional, so every width returns 100000 (the alpha refused
+    # the HUGEINT form). Digits past 32768 are ignored.
     ("dialect-hugeint-text-precision",
-     "SELECT '" + "1." + "0" * 300 + "1e5'::HUGEINT;", False, True),
+     "SELECT '" + "1." + "0" * 300 + "1e5'::HUGEINT;", False, False),
+    ("dialect-bigint-text-precision",
+     "SELECT '" + "1." + "0" * 300 + "1e5'::BIGINT;", False, False),
+    ("dialect-integer-text-precision",
+     "SELECT '" + "1." + "0" * 300 + "1e5'::INTEGER;", False, False),
+    ("dialect-hugeint-text-precision-cap",
+     "SELECT '" + "1." + "0" * 32767 + "1e5'::HUGEINT;", False, False),
+    # A non-zero fraction that outgrows the 128-bit decimal still fails.
+    ("dialect-hugeint-text-fraction-overflow",
+     "SELECT '" + "1.1" + "0" * 300 + "1e5'::HUGEINT;", False, True),
+    # Scaling a non-zero integer past 38 digits fails; 1e-39 is 0.
+    ("dialect-hugeint-text-exponent-over-38",
+     "SELECT '1e39'::HUGEINT;", False, True),
+    ("dialect-hugeint-text-small-exponent",
+     "SELECT '1e-39'::HUGEINT;", False, False),
+    ("dialect-hugeint-text-rounding",
+     "SELECT '2.5'::HUGEINT, '-2.5'::HUGEINT, '1.4999'::HUGEINT, "
+     "'1.5000'::HUGEINT, '-0.5'::HUGEINT, '-0.4'::HUGEINT, '.5'::HUGEINT, "
+     "'5.'::HUGEINT, '0012'::HUGEINT, '12.000'::HUGEINT;", False, False),
+    ("dialect-integer-text-rounding",
+     "SELECT '2.5'::INTEGER, '-2.5'::INTEGER, '1.4999'::INTEGER, "
+     "'1.5000'::INTEGER, '.5'::INTEGER, '5.'::INTEGER, '0012'::INTEGER, "
+     "'12.000'::INTEGER, '2.5'::BIGINT, '-2.5'::BIGINT, "
+     "'1.5000'::BIGINT, '12.000'::BIGINT;", False, False),
+    ("dialect-integer-text-range",
+     "SELECT '2147483647.5'::INTEGER;", False, True),
+    ("dialect-bigint-text-range",
+     "SELECT '9223372036854775807.5'::BIGINT;", False, True),
+    ("dialect-bigint-text-exponent-range",
+     "SELECT '1e19'::BIGINT;", False, True),
     ("dialect-hugeint-narrows",
      "SELECT 42::HUGEINT::INTEGER, 42::HUGEINT::BIGINT, 42::HUGEINT::DOUBLE, "
      "0::HUGEINT::BOOLEAN, 1::HUGEINT::BOOLEAN, (-1)::HUGEINT::BOOLEAN, "
