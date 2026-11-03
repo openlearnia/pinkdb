@@ -377,23 +377,15 @@ pub(crate) fn constant_column(
     default: Option<&Value>,
     file_table: &pinkdb::DataTable,
 ) -> Result<pinkdb::storage::Column> {
+    let value = default.unwrap_or(&Value::Null);
     let mut chunks = Vec::with_capacity(file_table.columns[0].num_chunks());
     for c in 0..file_table.columns[0].num_chunks() {
         let rows = file_table.columns[0].chunk_rows(c);
-        let mut v = pinkdb::Vector::with_capacity(dtype, rows);
-        for _ in 0..rows {
-            match default {
-                Some(d) if !d.is_null() => {
-                    v.push_valid(d.clone()).map_err(|e| LakeError::Internal {
-                        message: format!("filling default of column \"{name}\": {e}"),
-                    })?
-                }
-                _ => v.push_null().map_err(|e| LakeError::Internal {
-                    message: format!("filling NULL default of column \"{name}\": {e}"),
-                })?,
-            }
-        }
-        chunks.push(std::sync::Arc::new(v));
+        let vector =
+            pinkdb::Vector::constant(dtype, value, rows).map_err(|e| LakeError::Internal {
+                message: format!("filling default of column \"{name}\": {e}"),
+            })?;
+        chunks.push(std::sync::Arc::new(vector));
     }
     pinkdb::storage::Column::from_chunks(
         name.to_string(),

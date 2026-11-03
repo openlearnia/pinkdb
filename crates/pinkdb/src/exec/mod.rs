@@ -3286,22 +3286,71 @@ pub(crate) fn lake_source(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Box<dyn 
 
 /// Read a streamed source to the end, one morsel at a time: the `Output` a
 /// plan above the scan consumes when it is evaluated node by node (a sort, a
-/// DDL, `EXPLAIN ANALYZE`). The rows are the streaming path's, in the same
-/// order, so only the memory differs.
+/// join's build side, a DDL, `EXPLAIN ANALYZE`). The rows are the streaming
+/// path's, in the same order, so only the memory differs.
+///
+/// Morsels decode on the engine's worker pool: each worker claims a morsel,
+/// decodes it into its own list, and the lists merge by morsel index, so the
+/// output is the serial one. Nothing is held across a decode and no worker
+/// waits on another (wave 133b's deadlock), and rayon runs a nested split on
+/// the caller, so this is correct from the main thread and from a worker.
 pub(crate) fn drain_source(cx: &Cx, source: Box<dyn MorselSource>) -> Result<Output> {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let names = source.names().to_vec();
     let types = source.types().to_vec();
+    let stop = AtomicBool::new(false);
+    let (mut claimed, workers) = (0..rayon::current_num_threads().max(1))
+        .into_par_iter()
+        .map(|_| {
+            let mut mine: Vec<(u64, Result<Vec<DataChunk>>)> = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                let morsel = match source.next_morsel() {
+                    Ok(Some(morsel)) => morsel,
+                    Ok(None) => break,
+                    Err(error) => {
+                        stop.store(true, Ordering::Relaxed);
+                        mine.push((u64::MAX, Err(error)));
+                        break;
+                    }
+                };
+                if let Err(error) = cx.check_deadline() {
+                    stop.store(true, Ordering::Relaxed);
+                    mine.push((u64::MAX, Err(error)));
+                    break;
+                }
+                let mut chunks: Vec<DataChunk> = Vec::new();
+                {
+                    let mut sink = |chunk: DataChunk| -> Result<()> {
+                        chunks.push(chunk);
+                        Ok(())
+                    };
+                    if let Err(error) = source.decode(morsel, &mut sink) {
+                        stop.store(true, Ordering::Relaxed);
+                        mine.push((morsel, Err(error)));
+                        break;
+                    }
+                }
+                mine.push((morsel, Ok(chunks)));
+            }
+            let decoded = u64::from(!mine.is_empty());
+            (mine, decoded)
+        })
+        .reduce(
+            || (Vec::new(), 0),
+            |(mut all, workers), (mine, decoded)| {
+                all.extend(mine);
+                (all, workers + decoded)
+            },
+        );
+    // Errors keep the serial order too: the lowest morsel index is the one the
+    // single-threaded drain would have hit first.
+    claimed.sort_unstable_by_key(|(morsel, _)| *morsel);
     let mut chunks = Vec::new();
-    let mut morsels = 0u64;
-    while let Some(morsel) = source.next_morsel()? {
-        morsels += 1;
-        source.decode(morsel, &mut |chunk| {
-            chunks.push(chunk);
-            Ok(())
-        })?;
+    for (_, decoded) in claimed {
+        chunks.extend(decoded?);
     }
     let mut io = source.io();
-    io.in_flight_peak = morsels.min(1);
+    io.in_flight_peak = workers;
     cx.db.record_scan(source.label(), io);
     cx.check_deadline()?;
     Ok(Output {
@@ -17428,5 +17477,133 @@ mod tests {
             scan_candidates(t, &[], &[(0, filter.clone())]).unwrap_or_default(),
             vec![1]
         );
+    }
+
+    /// A source of one-row morsels; morsel `i` holds the bigint `i` and every
+    /// decode records the thread it ran on.
+    #[derive(Debug)]
+    struct IndexedSource {
+        names: Vec<String>,
+        types: Vec<DataType>,
+        cursor: crate::morsel::MorselCursor,
+        threads: std::sync::Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
+    }
+
+    impl IndexedSource {
+        fn new(len: u64) -> IndexedSource {
+            IndexedSource {
+                names: vec!["x".to_string()],
+                types: vec![DataType::Bigint],
+                cursor: crate::morsel::MorselCursor::new(len),
+                threads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl MorselSource for IndexedSource {
+        fn names(&self) -> &[String] {
+            &self.names
+        }
+
+        fn types(&self) -> &[DataType] {
+            &self.types
+        }
+
+        fn label(&self) -> &str {
+            "indexed"
+        }
+
+        fn next_morsel(&self) -> Result<Option<u64>> {
+            Ok(self.cursor.claim())
+        }
+
+        fn decode(&self, morsel: u64, sink: &mut dyn FnMut(DataChunk) -> Result<()>) -> Result<()> {
+            self.threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            // Long enough that the pool splits the morsels instead of letting
+            // one worker claim the lot.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            sink(DataChunk::projected(
+                vec![std::sync::Arc::new(Vector::new_const(
+                    &V::Bigint(morsel as i64),
+                    1,
+                ))],
+                1,
+            ))
+        }
+
+        fn io(&self) -> crate::morsel::ScanIo {
+            crate::morsel::ScanIo::default()
+        }
+    }
+
+    /// The decoded rows of a drained scan, column 0.
+    fn rows_of(out: Output) -> Vec<i64> {
+        let mut rows = Vec::new();
+        for chunk in &out.chunks {
+            let column = chunk.expect_column(0).expect("column 0");
+            for row in 0..chunk.num_rows() {
+                match column.get(row) {
+                    V::Bigint(value) => rows.push(value),
+                    other => panic!("unexpected value {other:?}"),
+                }
+            }
+        }
+        rows
+    }
+
+    /// Drain `source` on a fresh thread — directly or from inside a rayon
+    /// scope there — and return the decoded rows. A drain that hangs fails the
+    /// test after a minute instead of stalling the harness.
+    fn drain_with_timeout(source: Box<dyn MorselSource>, inside_pool: bool) -> Vec<i64> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let db = PinkDb::new();
+            let cx = Cx::new(&db);
+            let rows = if inside_pool {
+                let mut drained = None;
+                rayon::scope(|scope| {
+                    let slot = &mut drained;
+                    scope.spawn(move |_| {
+                        *slot = Some(rows_of(drain_source(&cx, source).expect("drain")));
+                    });
+                });
+                drained.expect("the scope body did not run")
+            } else {
+                rows_of(drain_source(&cx, source).expect("drain"))
+            };
+            tx.send(rows).expect("the test is gone");
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(rows) => rows,
+            Err(_) => panic!("drain_source hung (inside_pool = {inside_pool})"),
+        }
+    }
+
+    /// Chunks come out in morsel order whichever thread drains them, and the
+    /// morsels decode on several workers: a plan node evaluated node by node
+    /// used to decode every morsel serially on the calling thread.
+    #[test]
+    fn drain_source_decodes_morsels_on_the_pool_in_order() {
+        let want: Vec<i64> = (0..64).collect();
+        for inside_pool in [false, true] {
+            let source = IndexedSource::new(64);
+            let threads = std::sync::Arc::clone(&source.threads);
+            assert_eq!(
+                drain_with_timeout(Box::new(source), inside_pool),
+                want,
+                "inside_pool = {inside_pool}"
+            );
+            let threads: std::collections::HashSet<_> =
+                threads.lock().unwrap().iter().copied().collect();
+            if rayon::current_num_threads() > 1 {
+                assert!(
+                    threads.len() > 1,
+                    "one worker decoded every morsel (inside_pool = {inside_pool})"
+                );
+            }
+        }
     }
 }
