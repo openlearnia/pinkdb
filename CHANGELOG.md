@@ -76,6 +76,11 @@ keeps one entry per group.
 
 - A reopened store starts in its default database; `USE` is per-connection,
   as in DuckDB.
+- Lakes DuckDB v2.0.0 can open: pinkdb writes DuckLake catalog version `1.1`
+  (the 2.0 alphas' `1.1-dev1` is refused, as DuckDB refuses it), restores
+  `ducklake_schema.parent_schema_id`, names 128-bit columns `int128`/`uint128`,
+  and types inlined rows in a Postgres catalog as DuckDB does. A test compares
+  every catalog table with a snapshot of DuckDB v2.0.0's.
 
 ## 2026-11-02
 ### Wave 133 — lake scans stream, prune to pages, and stay within the memory limit ✅

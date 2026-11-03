@@ -15,7 +15,17 @@ use pink_lake::{Commit, Lake};
 use pink_lake_parquet::{FORMAT_ID, register};
 use pinkdb::{DataTable, PinkDb, QueryResult, Value};
 
-const DUCKDB: &str = "/tmp/duckdb-2.0.0/duckdb";
+/// The DuckDB reference binary, found like the other interop tests do:
+/// `DUCKDB_BIN`, else `~/.local/bin/duckdb`. The interop tests skip when it is
+/// absent (and the gate fails a run that skipped them).
+fn duckdb_path() -> std::path::PathBuf {
+    std::env::var_os("DUCKDB_BIN")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                .join(".local/bin/duckdb")
+        })
+}
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -95,10 +105,10 @@ fn ids(rows: Vec<Vec<Value>>) -> Vec<i32> {
 /// Run a DuckDB script; `None` when the reference binary is absent. Returns
 /// `(success, stdout, stderr)`.
 fn duckdb(script: &str) -> Option<(bool, String, String)> {
-    if !Path::new(DUCKDB).exists() {
+    if !duckdb_path().exists() {
         return None;
     }
-    let output = Command::new(DUCKDB)
+    let output = Command::new(duckdb_path())
         .args(["-no-agent", "-noheader", "-list", "-separator", "\t"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -134,7 +144,7 @@ fn stats_rows(catalog: &Path) -> Vec<StatsRow> {
         catalog.display()
     );
     let Some((ok, out, err)) = duckdb(&script) else {
-        panic!("the interop tests need {}", DUCKDB);
+        panic!("the interop tests need {}", duckdb_path().display());
     };
     assert!(ok, "reading {catalog:?} failed: {err}");
     out.lines()
@@ -265,7 +275,7 @@ fn parquet_lake_prunes_paths() {
 /// `ducklake_file_variant_stats` table, the table DuckDB itself writes.
 #[test]
 fn duckdb_attaches_a_lake_with_path_statistics() {
-    if !Path::new(DUCKDB).exists() {
+    if !duckdb_path().exists() {
         return;
     }
     register().unwrap();
@@ -294,7 +304,7 @@ fn duckdb_attaches_a_lake_with_path_statistics() {
         catalog_path.display(),
         data.display()
     );
-    let output = Command::new(DUCKDB)
+    let output = Command::new(duckdb_path())
         .args(["-no-agent", "-noheader", "-list", "-separator", "\t"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -465,10 +475,11 @@ fn pinkdb_prunes_files_duckdb_wrote() {
         "{rows:#?}"
     );
 
-    // DuckLake's recorded `data_path` is the root whose `data/` holds the
-    // files, which is the pink lake root the local store expects.
+    // The lake opens at DuckLake's recorded `data_path` (`duck/data/`), and
+    // each file resolves under it through its schema and table paths, as
+    // DuckDB wrote it (`main/t/…`).
     let url = format!("sqlite:{}", duck_catalog.display());
-    let lake = Lake::open_with_catalog(&url, Some(duck_dir.to_str().unwrap())).unwrap();
+    let lake = Lake::open_with_catalog(&url, None).unwrap();
     // A fresh attachment per query, so the decode counter is per query.
     let run = |sql: &str| -> (Vec<Vec<Value>>, u64) {
         let report = lake.attach(None).unwrap();
@@ -490,7 +501,7 @@ fn pinkdb_prunes_files_duckdb_wrote() {
 /// footer, shredded schema and dictionary a `COPY … TO '….parquet'` writes.
 #[test]
 fn duckdb_reads_a_lake_file() {
-    if !Path::new(DUCKDB).exists() {
+    if !duckdb_path().exists() {
         return;
     }
     register().unwrap();
@@ -508,7 +519,7 @@ fn duckdb_reads_a_lake_file() {
     .filter_map(|entry| entry.ok().map(|entry| entry.path()))
     .min()
     .expect("a parquet data file");
-    let output = Command::new(DUCKDB)
+    let output = Command::new(duckdb_path())
         .args(["-no-agent", "-noheader", "-list", "-separator", "\t"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

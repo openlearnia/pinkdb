@@ -38,7 +38,7 @@ use std::time::Duration;
 use postgres::config::SslMode;
 use postgres::error::SqlState;
 use postgres::types::private::BytesMut;
-use postgres::types::{IsNull, ToSql, Type};
+use postgres::types::{Format, FromSql, IsNull, ToSql, Type};
 use postgres::{Client, Config, NoTls, Row};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -343,6 +343,15 @@ impl ToSql for Owned {
                 }
             }
             (Owned::Integer(v), &Type::BOOL) => ToSql::to_sql(&(*v != 0), ty, out),
+            // A narrow integer column's wire form is 2 or 4 bytes, not 8.
+            (Owned::Integer(v), &Type::INT4) => match i32::try_from(*v) {
+                Ok(v) => ToSql::to_sql(&v, ty, out),
+                Err(_) => Err(format!("{v} does not fit an INTEGER").into()),
+            },
+            (Owned::Integer(v), &Type::INT2) => match i16::try_from(*v) {
+                Ok(v) => ToSql::to_sql(&v, ty, out),
+                Err(_) => Err(format!("{v} does not fit a SMALLINT").into()),
+            },
             (Owned::Integer(v), _) => ToSql::to_sql(v, ty, out),
             (Owned::Real(v), _) => ToSql::to_sql(v, ty, out),
             (Owned::Text(v), _) => ToSql::to_sql(v, ty, out),
@@ -355,6 +364,16 @@ impl ToSql for Owned {
         // information_schema uses domain-over-name); the server coerces a
         // matching wire value. The variant's own `to_sql` writes the bytes.
         true
+    }
+
+    /// NUMERIC and INTERVAL have no `ToSql` impl for the canonical text this
+    /// layer carries, so those two go in text format and the server parses
+    /// them; every other type is encoded to its binary wire form above.
+    fn encode_format(&self, ty: &Type) -> Format {
+        match (self, ty) {
+            (Owned::Text(_), &Type::NUMERIC | &Type::INTERVAL) => Format::Text,
+            _ => Format::Binary,
+        }
     }
 
     fn to_sql_checked(
@@ -475,6 +494,18 @@ fn row_values(row: &Row) -> Result<SqlRow> {
                 Ok(Some(v)) => SqlValue::Blob(v),
                 _ => SqlValue::Null,
             },
+            Type::NUMERIC => match row.try_get::<_, Option<RawBytes>>(index) {
+                Ok(Some(raw)) => SqlValue::Text(numeric_text(&raw.0)),
+                _ => SqlValue::Null,
+            },
+            Type::INTERVAL => match row.try_get::<_, Option<RawBytes>>(index) {
+                Ok(Some(raw)) => SqlValue::Text(interval_text(&raw.0)),
+                _ => SqlValue::Null,
+            },
+            Type::UUID => match row.try_get::<_, Option<RawBytes>>(index) {
+                Ok(Some(raw)) => SqlValue::Text(uuid_text(&raw.0)),
+                _ => SqlValue::Null,
+            },
             _ => match row.try_get::<_, Option<String>>(index) {
                 Ok(Some(v)) => SqlValue::Text(v),
                 _ => SqlValue::Null,
@@ -483,6 +514,107 @@ fn row_values(row: &Row) -> Result<SqlRow> {
         values.push(value);
     }
     Ok(SqlRow::new(values))
+}
+
+/// The wire bytes of a column type the crate has no textual `FromSql` for.
+/// The result format is binary for every column, and `FromSql` sees the raw
+/// buffer, so NUMERIC, INTERVAL and UUID are decoded by hand below.
+struct RawBytes(Vec<u8>);
+
+impl<'a> FromSql<'a> for RawBytes {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(RawBytes(raw.to_vec()))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty, &Type::NUMERIC | &Type::INTERVAL | &Type::UUID)
+    }
+}
+
+/// `numeric`'s binary form: digit count, weight, sign, display scale, then
+/// base-10000 digits. Rendered with exactly `dscale` fraction digits so a
+/// decimal's scale survives the round trip.
+fn numeric_text(raw: &[u8]) -> String {
+    fn i16_at(raw: &[u8], at: usize) -> i16 {
+        i16::from_be_bytes([raw[at], raw[at + 1]])
+    }
+    if raw.len() < 8 {
+        return String::new();
+    }
+    let digits: Vec<u16> = raw[8..]
+        .chunks_exact(2)
+        .take(i16_at(raw, 0).max(0) as usize)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    let weight = i16_at(raw, 2);
+    let dscale = i16_at(raw, 6).max(0) as usize;
+    let mut out = match u16::from_be_bytes([raw[4], raw[5]]) {
+        0xC000 => return "NaN".to_string(),
+        0xD000 => return "Infinity".to_string(),
+        0xF000 => return "-Infinity".to_string(),
+        0x4000 => String::from("-"),
+        _ => String::new(),
+    };
+    let integer = if weight < 0 {
+        "0".to_string()
+    } else {
+        let mut integer = String::new();
+        for i in 0..=weight as usize {
+            let digit = digits.get(i).copied().unwrap_or(0);
+            if i == 0 {
+                integer.push_str(&digit.to_string());
+            } else {
+                integer.push_str(&format!("{digit:04}"));
+            }
+        }
+        let trimmed = integer.trim_start_matches('0');
+        if trimmed.is_empty() {
+            "0".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    out.push_str(&integer);
+    if dscale > 0 {
+        out.push('.');
+        let mut fraction = String::new();
+        let mut index = weight + 1;
+        while fraction.len() < dscale {
+            let digit = if index < 0 {
+                0
+            } else {
+                digits.get(index as usize).copied().unwrap_or(0)
+            };
+            fraction.push_str(&format!("{digit:04}"));
+            index += 1;
+        }
+        fraction.truncate(dscale);
+        out.push_str(&fraction);
+    }
+    out
+}
+
+/// `interval`'s binary form is microseconds, days, months.
+fn interval_text(raw: &[u8]) -> String {
+    if raw.len() < 16 {
+        return String::new();
+    }
+    let time = i64::from_be_bytes(raw[0..8].try_into().unwrap());
+    let days = i32::from_be_bytes(raw[8..12].try_into().unwrap());
+    let months = i32::from_be_bytes(raw[12..16].try_into().unwrap());
+    pinkdb::types::format_interval(months, days, time)
+}
+
+fn uuid_text(raw: &[u8]) -> String {
+    if raw.len() != 16 {
+        return String::new();
+    }
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(raw);
+    pinkdb::uuid::format(u128::from_be_bytes(bytes))
 }
 
 /// The TLS mode one connection uses.

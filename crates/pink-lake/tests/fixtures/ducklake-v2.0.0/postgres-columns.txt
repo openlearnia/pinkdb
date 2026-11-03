@@ -1,0 +1,197 @@
+ducklake_column|1|column_id|bigint|YES|NULL
+ducklake_column|2|begin_snapshot|bigint|YES|NULL
+ducklake_column|3|end_snapshot|bigint|YES|NULL
+ducklake_column|4|table_id|bigint|YES|NULL
+ducklake_column|5|column_order|bigint|YES|NULL
+ducklake_column|6|column_name|character varying|YES|NULL
+ducklake_column|7|column_type|character varying|YES|NULL
+ducklake_column|8|initial_default|character varying|YES|NULL
+ducklake_column|9|default_value|character varying|YES|NULL
+ducklake_column|10|nulls_allowed|boolean|YES|NULL
+ducklake_column|11|parent_column|bigint|YES|NULL
+ducklake_column|12|default_value_type|character varying|YES|NULL
+ducklake_column|13|default_value_dialect|character varying|YES|NULL
+ducklake_column_mapping|1|mapping_id|bigint|YES|NULL
+ducklake_column_mapping|2|table_id|bigint|YES|NULL
+ducklake_column_mapping|3|type|character varying|YES|NULL
+ducklake_column_tag|1|table_id|bigint|YES|NULL
+ducklake_column_tag|2|column_id|bigint|YES|NULL
+ducklake_column_tag|3|begin_snapshot|bigint|YES|NULL
+ducklake_column_tag|4|end_snapshot|bigint|YES|NULL
+ducklake_column_tag|5|key|character varying|YES|NULL
+ducklake_column_tag|6|value|character varying|YES|NULL
+ducklake_data_file|1|data_file_id|bigint|NO|NULL
+ducklake_data_file|2|table_id|bigint|YES|NULL
+ducklake_data_file|3|begin_snapshot|bigint|YES|NULL
+ducklake_data_file|4|end_snapshot|bigint|YES|NULL
+ducklake_data_file|5|file_order|bigint|YES|NULL
+ducklake_data_file|6|path|character varying|YES|NULL
+ducklake_data_file|7|path_is_relative|boolean|YES|NULL
+ducklake_data_file|8|file_format|character varying|YES|NULL
+ducklake_data_file|9|record_count|bigint|YES|NULL
+ducklake_data_file|10|file_size_bytes|bigint|YES|NULL
+ducklake_data_file|11|footer_size|bigint|YES|NULL
+ducklake_data_file|12|row_id_start|bigint|YES|NULL
+ducklake_data_file|13|partition_id|bigint|YES|NULL
+ducklake_data_file|14|encryption_key|character varying|YES|NULL
+ducklake_data_file|15|mapping_id|bigint|YES|NULL
+ducklake_data_file|16|partial_max|bigint|YES|NULL
+ducklake_data_file|17|row_group_count|bigint|YES|NULL
+ducklake_delete_file|1|delete_file_id|bigint|NO|NULL
+ducklake_delete_file|2|table_id|bigint|YES|NULL
+ducklake_delete_file|3|begin_snapshot|bigint|YES|NULL
+ducklake_delete_file|4|end_snapshot|bigint|YES|NULL
+ducklake_delete_file|5|data_file_id|bigint|YES|NULL
+ducklake_delete_file|6|path|character varying|YES|NULL
+ducklake_delete_file|7|path_is_relative|boolean|YES|NULL
+ducklake_delete_file|8|format|character varying|YES|NULL
+ducklake_delete_file|9|delete_count|bigint|YES|NULL
+ducklake_delete_file|10|file_size_bytes|bigint|YES|NULL
+ducklake_delete_file|11|footer_size|bigint|YES|NULL
+ducklake_delete_file|12|encryption_key|character varying|YES|NULL
+ducklake_delete_file|13|partial_max|bigint|YES|NULL
+ducklake_delete_file|14|row_group_count|bigint|YES|NULL
+ducklake_file_column_stats|1|data_file_id|bigint|YES|NULL
+ducklake_file_column_stats|2|table_id|bigint|YES|NULL
+ducklake_file_column_stats|3|column_id|bigint|YES|NULL
+ducklake_file_column_stats|4|column_size_bytes|bigint|YES|NULL
+ducklake_file_column_stats|5|value_count|bigint|YES|NULL
+ducklake_file_column_stats|6|null_count|bigint|YES|NULL
+ducklake_file_column_stats|7|min_value|character varying|YES|NULL
+ducklake_file_column_stats|8|max_value|character varying|YES|NULL
+ducklake_file_column_stats|9|contains_nan|boolean|YES|NULL
+ducklake_file_column_stats|10|extra_stats|character varying|YES|NULL
+ducklake_file_column_stats|11|min_is_exact|boolean|YES|NULL
+ducklake_file_column_stats|12|max_is_exact|boolean|YES|NULL
+ducklake_file_partition_value|1|data_file_id|bigint|YES|NULL
+ducklake_file_partition_value|2|table_id|bigint|YES|NULL
+ducklake_file_partition_value|3|partition_key_index|bigint|YES|NULL
+ducklake_file_partition_value|4|partition_value|character varying|YES|NULL
+ducklake_file_variant_stats|1|data_file_id|bigint|YES|NULL
+ducklake_file_variant_stats|2|table_id|bigint|YES|NULL
+ducklake_file_variant_stats|3|column_id|bigint|YES|NULL
+ducklake_file_variant_stats|4|variant_path|character varying|YES|NULL
+ducklake_file_variant_stats|5|shredded_type|character varying|YES|NULL
+ducklake_file_variant_stats|6|column_size_bytes|bigint|YES|NULL
+ducklake_file_variant_stats|7|value_count|bigint|YES|NULL
+ducklake_file_variant_stats|8|null_count|bigint|YES|NULL
+ducklake_file_variant_stats|9|min_value|character varying|YES|NULL
+ducklake_file_variant_stats|10|max_value|character varying|YES|NULL
+ducklake_file_variant_stats|11|contains_nan|boolean|YES|NULL
+ducklake_file_variant_stats|12|extra_stats|character varying|YES|NULL
+ducklake_files_scheduled_for_deletion|1|data_file_id|bigint|YES|NULL
+ducklake_files_scheduled_for_deletion|2|path|character varying|YES|NULL
+ducklake_files_scheduled_for_deletion|3|path_is_relative|boolean|YES|NULL
+ducklake_files_scheduled_for_deletion|4|schedule_start|timestamp with time zone|YES|NULL
+ducklake_inlined_data_tables|1|table_id|bigint|YES|NULL
+ducklake_inlined_data_tables|2|table_name|character varying|YES|NULL
+ducklake_inlined_data_tables|3|schema_version|bigint|YES|NULL
+ducklake_macro|1|schema_id|bigint|YES|NULL
+ducklake_macro|2|macro_id|bigint|YES|NULL
+ducklake_macro|3|macro_name|character varying|YES|NULL
+ducklake_macro|4|begin_snapshot|bigint|YES|NULL
+ducklake_macro|5|end_snapshot|bigint|YES|NULL
+ducklake_macro_impl|1|macro_id|bigint|YES|NULL
+ducklake_macro_impl|2|impl_id|bigint|YES|NULL
+ducklake_macro_impl|3|dialect|character varying|YES|NULL
+ducklake_macro_impl|4|sql|character varying|YES|NULL
+ducklake_macro_impl|5|type|character varying|YES|NULL
+ducklake_macro_parameters|1|macro_id|bigint|YES|NULL
+ducklake_macro_parameters|2|impl_id|bigint|YES|NULL
+ducklake_macro_parameters|3|column_id|bigint|YES|NULL
+ducklake_macro_parameters|4|parameter_name|character varying|YES|NULL
+ducklake_macro_parameters|5|parameter_type|character varying|YES|NULL
+ducklake_macro_parameters|6|default_value|character varying|YES|NULL
+ducklake_macro_parameters|7|default_value_type|character varying|YES|NULL
+ducklake_metadata|1|key|character varying|NO|NULL
+ducklake_metadata|2|value|character varying|NO|NULL
+ducklake_metadata|3|scope|character varying|YES|NULL
+ducklake_metadata|4|scope_id|bigint|YES|NULL
+ducklake_name_mapping|1|mapping_id|bigint|YES|NULL
+ducklake_name_mapping|2|column_id|bigint|YES|NULL
+ducklake_name_mapping|3|source_name|character varying|YES|NULL
+ducklake_name_mapping|4|target_field_id|bigint|YES|NULL
+ducklake_name_mapping|5|parent_column|bigint|YES|NULL
+ducklake_name_mapping|6|is_partition|boolean|YES|NULL
+ducklake_partition_column|1|partition_id|bigint|YES|NULL
+ducklake_partition_column|2|table_id|bigint|YES|NULL
+ducklake_partition_column|3|partition_key_index|bigint|YES|NULL
+ducklake_partition_column|4|column_id|bigint|YES|NULL
+ducklake_partition_column|5|transform|character varying|YES|NULL
+ducklake_partition_info|1|partition_id|bigint|YES|NULL
+ducklake_partition_info|2|table_id|bigint|YES|NULL
+ducklake_partition_info|3|begin_snapshot|bigint|YES|NULL
+ducklake_partition_info|4|end_snapshot|bigint|YES|NULL
+ducklake_schema|1|schema_id|bigint|NO|NULL
+ducklake_schema|2|schema_uuid|uuid|YES|NULL
+ducklake_schema|3|begin_snapshot|bigint|YES|NULL
+ducklake_schema|4|end_snapshot|bigint|YES|NULL
+ducklake_schema|5|schema_name|character varying|YES|NULL
+ducklake_schema|6|path|character varying|YES|NULL
+ducklake_schema|7|path_is_relative|boolean|YES|NULL
+ducklake_schema|8|parent_schema_id|bigint|YES|NULL
+ducklake_schema_versions|1|begin_snapshot|bigint|YES|NULL
+ducklake_schema_versions|2|schema_version|bigint|YES|NULL
+ducklake_schema_versions|3|table_id|bigint|YES|NULL
+ducklake_snapshot|1|snapshot_id|bigint|NO|NULL
+ducklake_snapshot|2|snapshot_time|timestamp with time zone|YES|NULL
+ducklake_snapshot|3|schema_version|bigint|YES|NULL
+ducklake_snapshot|4|next_catalog_id|bigint|YES|NULL
+ducklake_snapshot|5|next_file_id|bigint|YES|NULL
+ducklake_snapshot_changes|1|snapshot_id|bigint|NO|NULL
+ducklake_snapshot_changes|2|changes_made|character varying|YES|NULL
+ducklake_snapshot_changes|3|author|character varying|YES|NULL
+ducklake_snapshot_changes|4|commit_message|character varying|YES|NULL
+ducklake_snapshot_changes|5|commit_extra_info|character varying|YES|NULL
+ducklake_sort_expression|1|sort_id|bigint|YES|NULL
+ducklake_sort_expression|2|table_id|bigint|YES|NULL
+ducklake_sort_expression|3|sort_key_index|bigint|YES|NULL
+ducklake_sort_expression|4|expression|character varying|YES|NULL
+ducklake_sort_expression|5|dialect|character varying|YES|NULL
+ducklake_sort_expression|6|sort_direction|character varying|YES|NULL
+ducklake_sort_expression|7|null_order|character varying|YES|NULL
+ducklake_sort_info|1|sort_id|bigint|YES|NULL
+ducklake_sort_info|2|table_id|bigint|YES|NULL
+ducklake_sort_info|3|begin_snapshot|bigint|YES|NULL
+ducklake_sort_info|4|end_snapshot|bigint|YES|NULL
+ducklake_table|1|table_id|bigint|YES|NULL
+ducklake_table|2|table_uuid|uuid|YES|NULL
+ducklake_table|3|begin_snapshot|bigint|YES|NULL
+ducklake_table|4|end_snapshot|bigint|YES|NULL
+ducklake_table|5|schema_id|bigint|YES|NULL
+ducklake_table|6|table_name|character varying|YES|NULL
+ducklake_table|7|path|character varying|YES|NULL
+ducklake_table|8|path_is_relative|boolean|YES|NULL
+ducklake_table_column_stats|1|table_id|bigint|YES|NULL
+ducklake_table_column_stats|2|column_id|bigint|YES|NULL
+ducklake_table_column_stats|3|contains_null|boolean|YES|NULL
+ducklake_table_column_stats|4|contains_nan|boolean|YES|NULL
+ducklake_table_column_stats|5|min_value|character varying|YES|NULL
+ducklake_table_column_stats|6|max_value|character varying|YES|NULL
+ducklake_table_column_stats|7|extra_stats|character varying|YES|NULL
+ducklake_table_column_stats|8|min_is_exact|boolean|YES|NULL
+ducklake_table_column_stats|9|max_is_exact|boolean|YES|NULL
+ducklake_table_stats|1|table_id|bigint|YES|NULL
+ducklake_table_stats|2|record_count|bigint|YES|NULL
+ducklake_table_stats|3|next_row_id|bigint|YES|NULL
+ducklake_table_stats|4|file_size_bytes|bigint|YES|NULL
+ducklake_tag|1|object_id|bigint|YES|NULL
+ducklake_tag|2|begin_snapshot|bigint|YES|NULL
+ducklake_tag|3|end_snapshot|bigint|YES|NULL
+ducklake_tag|4|key|character varying|YES|NULL
+ducklake_tag|5|value|character varying|YES|NULL
+ducklake_view|1|view_id|bigint|YES|NULL
+ducklake_view|2|view_uuid|uuid|YES|NULL
+ducklake_view|3|begin_snapshot|bigint|YES|NULL
+ducklake_view|4|end_snapshot|bigint|YES|NULL
+ducklake_view|5|schema_id|bigint|YES|NULL
+ducklake_view|6|view_name|character varying|YES|NULL
+ducklake_view|7|dialect|character varying|YES|NULL
+ducklake_view|8|sql|character varying|YES|NULL
+ducklake_view|9|column_aliases|character varying|YES|NULL
+ducklake_view_column_tag|1|view_id|bigint|YES|NULL
+ducklake_view_column_tag|2|column_name|character varying|YES|NULL
+ducklake_view_column_tag|3|begin_snapshot|bigint|YES|NULL
+ducklake_view_column_tag|4|end_snapshot|bigint|YES|NULL
+ducklake_view_column_tag|5|key|character varying|YES|NULL
+ducklake_view_column_tag|6|value|character varying|YES|NULL
