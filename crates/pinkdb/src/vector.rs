@@ -203,6 +203,44 @@ impl VectorData {
             DataType::Uhugeint => VectorData::UInt128(Vec::with_capacity(cap)),
         }
     }
+
+    /// Append `n` placeholder payload entries in one go — the bulk form of
+    /// `Vector::push_placeholder`: only the validity mask marks them NULL.
+    fn extend_placeholders(&mut self, n: usize) {
+        match self {
+            VectorData::Boolean(v) => v.resize(v.len() + n, false),
+            VectorData::Int32(v) => v.resize(v.len() + n, 0),
+            VectorData::Int64(v) => v.resize(v.len() + n, 0),
+            VectorData::Float64(v) => v.resize(v.len() + n, 0.0),
+            VectorData::VarChar(v) => {
+                for _ in 0..n {
+                    v.push("");
+                }
+            }
+            VectorData::Date32(v) => v.resize(v.len() + n, 0),
+            VectorData::TimestampMicros(v) => v.resize(v.len() + n, 0),
+            VectorData::Decimal { values, .. } => values.resize(values.len() + n, 0),
+            VectorData::Interval(v) => v.resize(v.len() + n, Interval::default()),
+            VectorData::Variant(v) => {
+                v.resize(v.len() + n, Arc::new(crate::variant::Variant::Null));
+            }
+            VectorData::Array {
+                len, values, valid, ..
+            } => {
+                for _ in 0..n {
+                    for _ in 0..*len {
+                        values.push_zero();
+                    }
+                }
+                if let Some(mask) = valid {
+                    mask.resize(values.len().div_ceil(8), 0);
+                }
+            }
+            VectorData::Uuid(v) => v.resize(v.len() + n, 0),
+            VectorData::Int128(v) => v.resize(v.len() + n, 0),
+            VectorData::UInt128(v) => v.resize(v.len() + n, 0),
+        }
+    }
 }
 
 /// One typed column chunk with NULL bitmask.
@@ -352,6 +390,35 @@ impl Vector {
             validity[mask_len(n) - 1] = (1u64 << (n % 64)) - 1;
         }
         Vector::from_parts(data, validity, n)
+    }
+
+    /// Build `n` rows of `value` in one allocation: the constant column a scan
+    /// materializes (a column added after the file was written, filled with its
+    /// DEFAULT, or all NULL). NULLs are keyed on `dtype` — a NULL value carries
+    /// no type of its own, and the column's readers expect its dtype.
+    pub fn constant(dtype: DataType, value: &Value, n: usize) -> Result<Vector> {
+        debug_assert!(n <= CHUNK_SIZE, "constant vector exceeds CHUNK_SIZE");
+        if value.is_null() {
+            let mut data = VectorData::with_capacity(dtype, n);
+            data.extend_placeholders(n);
+            return Ok(Vector::from_parts(data, vec![0u64; mask_len(n)], n));
+        }
+        let vector = Vector::new_const(value, n);
+        if vector.dtype() == dtype {
+            return Ok(vector);
+        }
+        // The value's own type differs from the column's (`DEFAULT 1.5` is a
+        // DECIMAL(2,1) on a DECIMAL(10,2) column): one row-by-row push decides
+        // the coercion, exactly as a per-row fill would, and its result repeats.
+        let mut probe = Vector::with_capacity(dtype, 1);
+        probe.push_valid(value.clone())?;
+        let vector = Vector::new_const(&probe.get(0), n);
+        if vector.dtype() != dtype {
+            return Err(PinkDbError::Type(format!(
+                "type mismatch: cannot fill {dtype:?} column with a {value} default"
+            )));
+        }
+        Ok(vector)
     }
 
     /// Build a vector directly from raw parts (crate-internal fast paths):
@@ -1848,6 +1915,33 @@ mod tests {
         assert!(v.is_null(65));
         assert!(v.is_valid(128));
         assert!(v.is_null(129));
+    }
+
+    /// A DEFAULT typed narrower than its column (`DECIMAL(10,2) DEFAULT 1.5`,
+    /// the literal is DECIMAL(2,1) rescaled to scale 2) fills the column in
+    /// the column's own type, as a row-by-row fill would.
+    #[test]
+    fn constant_coerces_a_default_to_the_column_type() {
+        let column = DataType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        let default = Value::Decimal {
+            value: 150,
+            precision: 3,
+            scale: 2,
+        };
+        let v = Vector::constant(column, &default, 5).unwrap();
+        assert_eq!(v.dtype(), column);
+        assert_eq!(v.len(), 5);
+        for row in 0..5 {
+            assert_eq!(v.get(row).to_string(), "1.50");
+        }
+        let nulls = Vector::constant(column, &Value::Null, 3).unwrap();
+        assert_eq!(nulls.dtype(), column);
+        assert!((0..3).all(|row| nulls.get(row).is_null()));
+        // A value the column cannot hold is still refused.
+        assert!(Vector::constant(DataType::Integer, &Value::Varchar("x".into()), 2).is_err());
     }
 
     #[test]
