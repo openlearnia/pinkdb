@@ -15,8 +15,9 @@ use pinkdb::memory;
 use std::sync::MutexGuard;
 
 /// Rows of the small input; the large one is eight times this at the same
-/// group count.
-const ROWS: i64 = 60_000;
+/// group count. Above the pipeline's `DENSE_MIN_ROWS` (131,072): smaller inputs
+/// are never sampled, since their state is bounded by the input itself.
+const ROWS: i64 = 140_000;
 
 /// What one group may hold. A group row is its key words, hash, index slot and
 /// accumulator slots plus its VARCHAR key bytes — 400 B here at the widest,

@@ -46,8 +46,14 @@
 //! provider does exactly that, plus the projected column chunks of the row
 //! groups that survive pruning). A torn write therefore leaves the previous
 //! slot valid, naming a footer and a file length that are both on disk. The
-//! engine's `open` reads the whole file (it materializes every column eagerly,
-//! as before) but decodes the column chunks **in parallel**.
+//! engine's `open` keeps the file as the store's byte source: it reads the
+//! header slots and the footer only, and a column chunk's bytes are read —
+//! with a positioned read — and CRC-checked the first time a query decodes one
+//! of its pages. A damaged chunk therefore fails the statement that reads it
+//! (`corrupt file: a column chunk fails its checksum …`), while a damaged
+//! footer still fails at open. Chunks are decoded in parallel. `from_pink_bytes`,
+//! the wasm build and an encrypted store read from an in-memory source instead:
+//! a `PINKENC1` container is decrypted whole, so it has no file to read lazily.
 //!
 //! `free_ranges` is a sorted `(offset, len)` list of data-region ranges no row
 //! group references — the holes an incremental checkpoint leaves behind. The
@@ -679,7 +685,13 @@ static CRC32C_TABLES: [[u32; 256]; 8] = crc32c_tables();
 /// The check value of the standard test vector (`"123456789"`) is
 /// `0xE3069283`.
 pub fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
+    !crc32c_update(!0, bytes)
+}
+
+/// Continue a CRC32C over `bytes` from `crc`, the state [`crc32c`] left behind
+/// for the preceding bytes. A streamed check seeds with `!0` and inverts the
+/// final state, exactly like [`crc32c`].
+pub(crate) fn crc32c_update(mut crc: u32, bytes: &[u8]) -> u32 {
     let (chunks, remainder) = bytes.as_chunks::<8>();
     for c in chunks {
         let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
@@ -697,7 +709,7 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
     for &b in remainder {
         crc = (crc >> 8) ^ CRC32C_TABLES[0][((crc ^ b as u32) & 0xFF) as usize];
     }
-    !crc
+    crc
 }
 
 // ---------- writer ----------
@@ -3885,16 +3897,36 @@ impl PinkDb {
     /// [`copy_through`] sees the same coordinate space after a reopen and
     /// after an in-process save.
     fn repoint_carried(carry: Vec<u8>, repoints: Vec<(&DataTable, TableCarry)>, encrypted: bool) {
-        if carry.is_empty() {
+        if carry.is_empty() || repoints.is_empty() {
             return;
         }
         let mut bytes = vec![0u8; DATA_START as usize];
         bytes.extend_from_slice(&carry);
-        let image = crate::storage::StoreImage::new(bytes, encrypted);
+        let source = crate::storage::StoreSource::memory(bytes, encrypted);
+        Self::repoint_written(repoints, &source);
+    }
+
+    /// Point the chunks a save re-encoded at the bytes it wrote to `source`.
+    ///
+    /// A clean chunk copied through is repointed with its group, so one
+    /// descriptor per column chunk serves every page of it.
+    fn repoint_written(
+        repoints: Vec<(&DataTable, TableCarry)>,
+        source: &Arc<crate::storage::StoreSource>,
+    ) {
         for (t, carried) in repoints {
-            for (column, chunks) in t.columns.iter().zip(carried) {
-                for (i, offset, length, rows) in chunks {
-                    column.repoint_chunk(i, &image, DATA_START + offset, length, rows);
+            for (ci, chunks) in carried.into_iter().enumerate() {
+                for cc in chunks {
+                    let chunk = crate::storage::EncodedColumnChunk::new(
+                        Arc::clone(source),
+                        cc.dir.offset,
+                        cc.dir.length,
+                        cc.dir.crc32c,
+                        cc.dir.page_count,
+                    );
+                    for (p, &rows) in cc.rows.iter().enumerate() {
+                        t.columns[ci].repoint_chunk(cc.first + p, &chunk, p as u32, rows as usize);
+                    }
                 }
             }
         }
@@ -4323,19 +4355,34 @@ impl PinkDb {
             .map(|(_, _, t)| t)
             .collect();
         let flags = self.image_flags(&all_tables);
+        // A range a live handle can still read (a running query's or a
+        // snapshot's chunk from an earlier checkpoint) is free in the footer
+        // but must not be overwritten yet: hold it back from this pass and
+        // leave it in the footer's list. The next checkpoint reuses it once
+        // the handle is gone.
+        let held = self.sweep_superseded();
+        let withheld: Vec<(u64, u64)> = held.iter().map(|r| (r.offset, r.len)).collect();
+        #[cfg(debug_assertions)]
+        self.assert_handles_withheld(&old_footer.free_ranges, &withheld);
+        let mut superseded: Vec<crate::storage::SupersededRange> = Vec::new();
         let mut writer = CheckpointWriter {
             file,
             cursor: old_slot.file_len,
             free: old_footer.free_ranges.clone(),
             reuse,
+            withheld,
         };
-        let mut carry: Vec<u8> = Vec::new();
         let mut repoints: Vec<(&DataTable, TableCarry)> = Vec::new();
         let mut freed: Vec<(u64, u64)> = Vec::new();
         let mut seen_old: std::collections::HashSet<(String, String, String)> =
             std::collections::HashSet::new();
         let mut saved: Vec<SavedTableStats> = Vec::new();
         let db_dirs = self.catalog_dirs(flags, |ns, name, t| {
+            // Ranges a handle stopped naming (an update replaced the chunk, a
+            // save moved it) may still be read by a snapshot or a scan.
+            for column in &t.columns {
+                superseded.extend(column.take_superseded());
+            }
             let key = (
                 ns.db().to_ascii_lowercase(),
                 ns.schema().to_ascii_lowercase(),
@@ -4373,7 +4420,7 @@ impl PinkDb {
                     continue;
                 }
                 let group = encode_row_group(ns, name, t, first, last, true)?;
-                let (group, table_carry) = write_group(&mut writer, group, &mut carry)?;
+                let (group, table_carry) = write_group(&mut writer, group)?;
                 for (ci, acc) in group.accs.iter().enumerate() {
                     accs[ci].merge(acc);
                 }
@@ -4423,17 +4470,24 @@ impl PinkDb {
         let freed = merge_ranges(freed);
         let mut footer_free = writer.free.clone();
         footer_free.extend_from_slice(&freed);
+        footer_free.extend_from_slice(&writer.withheld);
         footer_free = merge_ranges(footer_free);
         let max_group_end = max_group_end(&db_dirs);
         let footer = self.build_footer(flags, &footer_free, &db_dirs)?;
         let estimate = footer.len() as u64;
         // Only ranges free in the *current* footer are safe to overwrite
         // before the new slot lands; the old footer and superseded groups
-        // still belong to the checkpoint the other slot names.
-        let allocatable = writer.free.clone();
-        let (footer_offset, mut final_free) =
-            alloc_footer(&mut writer, &allocatable, estimate, max_group_end);
+        // still belong to the checkpoint the other slot names. The writer
+        // withholds the parts a live handle names even inside a hole.
+        let (footer_offset, mut final_free) = alloc_footer(&mut writer, estimate, max_group_end);
+        // Holes the footer did not take, plus everything this pass freed: the
+        // new footer's list. With reuse off the writer left `free` untouched,
+        // so that is the base.
+        if !writer.reuse {
+            final_free = writer.free.clone();
+        }
         final_free.extend_from_slice(&freed);
+        final_free.extend_from_slice(&writer.withheld);
         final_free.retain(|&(offset, len)| offset.saturating_add(len) <= footer_offset);
         final_free = merge_ranges(final_free);
         let footer = self.build_footer(flags, &final_free, &db_dirs)?;
@@ -4491,7 +4545,23 @@ impl PinkDb {
         if writer.file.metadata()?.len() > file_len {
             writer.file.set_len(file_len)?;
         }
-        Self::repoint_carried(carry, repoints, false);
+        // The superseded ranges are free in the new footer, and the new file
+        // is the truth from here on: repoint every chunk this pass wrote at
+        // it, so a streaming scan never reads a range the next checkpoint may
+        // reuse.
+        self.superseded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(superseded);
+        // Repoint before returning: the caller's lease guard and the write
+        // lock are still held, and the WAL roll (which bumps the epoch other
+        // handles refresh on) has not happened yet. A checkpoint's own writes
+        // are complete and durable at this point.
+        let source =
+            crate::storage::StoreSource::file(Arc::new(writer.file.try_clone()?), file_len);
+        Self::repoint_written(repoints, &source);
+        #[cfg(test)]
+        REPOINT_GENERATION.with(|g| g.set(Some(wal_generation)));
         Ok(())
     }
 
@@ -4560,6 +4630,13 @@ impl PinkDb {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
+        // Unix: a handle that opened the old file keeps reading that inode,
+        // so its chunks stay valid after the rename. Windows has no such
+        // guarantee: the rename fails while another process holds the file
+        // open without `FILE_SHARE_DELETE`, and a handle that does hold it
+        // keeps the old file readable only until the last such handle closes.
+        // The pure-Rust fallback has no `FILE_SHARE_DELETE` of its own, so a
+        // concurrent save there reports an error rather than a half-swap.
         crate::wal::sync_parent_dir(path);
         Ok(())
     }
@@ -4573,11 +4650,15 @@ impl PinkDb {
     /// feature the error says to rebuild with it; with the feature it points
     /// at [`PinkDb::open_with_key`].
     pub fn open(path: &str) -> Result<PinkDb> {
-        let data = std::fs::read(path)?;
-        if crate::crypto::is_container(&data) {
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        let take = len.min(8) as usize;
+        let mut magic = [0u8; 8];
+        crate::storage::pread_exact(&file, 0, &mut magic[..take])?;
+        if crate::crypto::is_container(&magic[..take]) {
             return Err(crate::crypto::encrypted_error(path));
         }
-        Self::load_image(crate::storage::StoreImage::new(data, false))
+        Self::load_source(crate::storage::StoreSource::file(Arc::new(file), len))
     }
 
     /// [`PinkDb::open`] for an encrypted container, decrypting with `key`.
@@ -4600,7 +4681,7 @@ impl PinkDb {
                 )));
             }
             let plain = crate::crypto::open_container(&data, key, 0)?;
-            let mut db = Self::load_image(crate::storage::StoreImage::new(plain, true))?;
+            let mut db = Self::load_source(crate::storage::StoreSource::memory(plain, true))?;
             db.encryption_key = Some(key.clone());
             Ok(db)
         }
@@ -4634,23 +4715,23 @@ impl PinkDb {
                 ));
             }
             let plain = crate::crypto::open_container(data, key, 0)?;
-            let mut db = Self::load_image(crate::storage::StoreImage::new(plain, true))?;
+            let mut db = Self::load_source(crate::storage::StoreSource::memory(plain, true))?;
             db.encryption_key = Some(key.clone());
             Ok(db)
         }
     }
 
     /// Decode a serialized `.pink` image (`PINKDB07`): copy it into the
-    /// retained store image a lazily opened store decodes from.
+    /// in-memory source a lazily opened store decodes from.
     fn load_bytes(data: &[u8]) -> Result<PinkDb> {
-        Self::load_image(crate::storage::StoreImage::new(data.to_vec(), false))
+        Self::load_source(crate::storage::StoreSource::memory(data.to_vec(), false))
     }
 
     /// The one loader: the footer, then every table's chunk handles over the
-    /// retained image (see [`load_table_data`]). Nothing is decoded here.
-    fn load_image(image: Arc<crate::storage::StoreImage>) -> Result<PinkDb> {
-        let data = image.bytes();
-        let footer = read_store_footer(data)?;
+    /// store source (see [`load_table_data`]). Nothing is decoded here and a
+    /// file source is not read past the footer.
+    fn load_source(source: Arc<crate::storage::StoreSource>) -> Result<PinkDb> {
+        let footer = read_source_footer(&source)?;
         // Start from an empty store: a file may legitimately have no `main`
         // (it was dropped) and `open` must round-trip exactly.
         let mut db = PinkDb::with_databases(Vec::<String>::new());
@@ -4697,7 +4778,7 @@ impl PinkDb {
             for sdir in &dbdir.schemas {
                 let ns = SchemaPath::new(&dbdir.name, &sdir.name);
                 for tdir in &sdir.tables {
-                    load_table_data(&image, &mut db, &ns, tdir)?;
+                    load_table_data(&source, &mut db, &ns, tdir)?;
                 }
             }
         }
@@ -4808,12 +4889,17 @@ pub fn is_pinkdb(bytes: &[u8]) -> bool {
     bytes.len() >= 8 && &bytes[..8] == MAGIC_V7
 }
 
-/// Where one re-encoded column chunk sits in the save's carry buffer: `(chunk
-/// index, offset of the page, page length, rows)`.
-type CarriedChunk = (usize, u64, u64, usize);
+/// Where one re-encoded column chunk sits in the save: its first chunk index,
+/// the row count of every page, and the directory entry the save will write
+/// (`offset` is relative to the group until the group is placed).
+struct CarriedColumnChunk {
+    first: usize,
+    rows: Arc<[u32]>,
+    dir: ColumnChunkDir,
+}
 
-/// Every re-encoded column chunk's [`CarriedChunk`]s, per column.
-type TableCarry = Vec<Vec<CarriedChunk>>;
+/// Every re-encoded column chunk in the save, per column.
+type TableCarry = Vec<Vec<CarriedColumnChunk>>;
 
 /// The test-only knobs of a write: a non-empty `free_ranges` section, and a
 /// second header slot with a newer iteration.
@@ -4828,19 +4914,10 @@ struct Hooks {
 #[derive(Default)]
 struct Hooks;
 
-/// One column chunk's bytes in a freshly encoded row group: either copied
-/// from the retained image or built by the encoder.
-enum GroupPieceSource {
-    Borrowed {
-        image: Arc<crate::storage::StoreImage>,
-        start: u64,
-        end: u64,
-    },
-    Owned(Vec<u8>),
-}
-
+/// One column chunk's bytes in a freshly encoded row group, whether they were
+/// copied through from the store or built by the encoder.
 struct GroupPiece {
-    source: GroupPieceSource,
+    bytes: Vec<u8>,
 }
 
 /// One row group encoded but not yet placed: its column offsets are relative
@@ -4851,9 +4928,9 @@ struct GroupBuild {
     chunk_rows: Vec<u32>,
     columns: Vec<ColumnChunkDir>,
     pieces: Vec<GroupPiece>,
-    /// Per column: `(chunk index, offset relative to the piece, length, rows)`
-    /// for every chunk the save will repoint at the carried image.
-    carry: Vec<Vec<(usize, u64, u64, usize)>>,
+    /// Per column: the column chunks this save re-encoded, so their handles
+    /// can be repointed once the bytes are written.
+    carry: Vec<Vec<CarriedColumnChunk>>,
     accs: Vec<ChunkColumnStats>,
 }
 
@@ -4869,6 +4946,7 @@ fn encode_row_group(
 ) -> Result<GroupBuild> {
     let chunk_rows: Vec<u32> = (first..last).map(|i| t.chunk_rows(i) as u32).collect();
     let rows: u64 = chunk_rows.iter().map(|&r| r as u64).sum();
+    let rows_arc: Arc<[u32]> = chunk_rows.clone().into();
     let copies: Vec<Option<CopyThrough>> = t
         .columns
         .iter()
@@ -4911,7 +4989,7 @@ fn encode_row_group(
     let mut encoded = encoded.into_iter();
     let mut columns: Vec<ColumnChunkDir> = Vec::with_capacity(t.columns.len());
     let mut pieces = Vec::with_capacity(t.columns.len());
-    let mut carry: Vec<Vec<(usize, u64, u64, usize)>> = Vec::with_capacity(t.columns.len());
+    let mut carry: Vec<Vec<CarriedColumnChunk>> = Vec::with_capacity(t.columns.len());
     let mut accs: Vec<ChunkColumnStats> = t
         .columns
         .iter()
@@ -4959,28 +5037,20 @@ fn encode_row_group(
                 max: acc.max,
             });
             running += length;
-            // Keep every encoded column in the retained image, including
-            // chunks built in memory: the next checkpoint can then copy this
-            // row group through instead of re-encoding it. Repointing drops
-            // the decoded payload, so this does not double the resident data.
-            let mut carried = Vec::new();
-            let mut page_offset = index_len as u64;
-            for (i, page) in pages.iter().enumerate() {
-                carried.push((
-                    first + i,
-                    page_offset,
-                    page.frame.len() as u64,
-                    chunk_rows[i] as usize,
-                ));
-                page_offset += page.frame.len() as u64;
-            }
-            carry.push(carried);
-            pieces.push(GroupPiece {
-                source: GroupPieceSource::Owned(bytes),
-            });
+            // The save repoints this column chunk's handles at the bytes it
+            // writes, so the record carries the group-relative directory
+            // entry the footer will get.
+            carry.push(vec![CarriedColumnChunk {
+                first,
+                rows: Arc::clone(&rows_arc),
+                dir: columns.last().expect("just pushed").clone(),
+            }]);
+            pieces.push(GroupPiece { bytes });
             continue;
         };
-        let bytes = &copy.image.bytes()[copy.start as usize..copy.end as usize];
+        let bytes = copy
+            .source
+            .read_vec(copy.start, (copy.end - copy.start) as usize)?;
         let mut acc = ChunkColumnStats::empty();
         let mut encodings = 0u32;
         for (i, &(rel, _)) in copy.pages.iter().enumerate() {
@@ -4991,9 +5061,9 @@ fn encode_row_group(
         columns.push(ColumnChunkDir {
             offset: running,
             length: bytes.len() as u64,
-            page_count: copy.pages.len() as u32,
+            page_count: copy.page_count,
             encodings,
-            crc32c: crc32c(bytes),
+            crc32c: crc32c(&bytes),
             null_count: acc.null_count,
             nan_count: acc.nan_count,
             min: acc.min,
@@ -5002,20 +5072,12 @@ fn encode_row_group(
         running += bytes.len() as u64;
         // The group is copied to a new offset; its clean chunks move with it,
         // so they need the same repointing as the encoded ones.
-        carry.push(
-            copy.pages
-                .iter()
-                .enumerate()
-                .map(|(i, &(rel, len))| (first + i, rel as u64, len as u64, chunk_rows[i] as usize))
-                .collect(),
-        );
-        pieces.push(GroupPiece {
-            source: GroupPieceSource::Borrowed {
-                image: copy.image,
-                start: copy.start,
-                end: copy.end,
-            },
-        });
+        carry.push(vec![CarriedColumnChunk {
+            first,
+            rows: Arc::clone(&rows_arc),
+            dir: columns.last().expect("just pushed").clone(),
+        }]);
+        pieces.push(GroupPiece { bytes });
     }
     Ok(GroupBuild {
         rows,
@@ -5058,7 +5120,7 @@ fn write_table<S: Sink>(
     // The row groups: 60 engine chunks each.
     let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
     let mut row_groups: Vec<RowGroupDir> = Vec::with_capacity(n_groups);
-    let mut table_carry: TableCarry = vec![Vec::new(); schema.len()];
+    let mut table_carry: TableCarry = (0..schema.len()).map(|_| Vec::new()).collect();
     for g in 0..n_groups {
         let first = g * CHUNKS_PER_ROW_GROUP;
         let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
@@ -5072,31 +5134,16 @@ fn write_table<S: Sink>(
             accs: group_accs,
         } = group;
         let mut columns = Vec::with_capacity(relative.len());
-        for (ci, piece) in pieces.into_iter().enumerate() {
+        for (ci, (piece, chunk_carry)) in pieces.into_iter().zip(group_carry).enumerate() {
             let offset = data.offset();
-            match &piece.source {
-                GroupPieceSource::Borrowed { image, start, end } => {
-                    let bytes = &image.bytes()[*start as usize..*end as usize];
-                    data.bytes(bytes)?;
-                    let base = carry.len() as u64;
-                    carry.extend_from_slice(bytes);
-                    table_carry[ci].extend(
-                        group_carry[ci]
-                            .iter()
-                            .map(|&(i, rel, len, rows)| (i, base + rel, len, rows)),
-                    );
-                }
-                GroupPieceSource::Owned(bytes) => {
-                    data.bytes(bytes)?;
-                    let base = carry.len() as u64;
-                    carry.extend_from_slice(bytes);
-                    table_carry[ci].extend(
-                        group_carry[ci]
-                            .iter()
-                            .map(|&(i, rel, len, rows)| (i, base + rel, len, rows)),
-                    );
-                }
-            }
+            data.bytes(&piece.bytes)?;
+            // The carry holds the data region only; the write offsets are
+            // absolute file offsets, so a repointed handle needs no prefix.
+            carry.extend_from_slice(&piece.bytes);
+            table_carry[ci].extend(chunk_carry.into_iter().map(|mut cc| {
+                cc.dir.offset = offset;
+                cc
+            }));
             columns.push(ColumnChunkDir {
                 offset,
                 ..relative[ci].clone()
@@ -5223,26 +5270,51 @@ pub(crate) fn last_checkpoint_reused_holes() -> Option<bool> {
     LAST_CHECKPOINT_REUSED.with(|last| last.get())
 }
 
+// A test hook: the WAL generation the last incremental checkpoint's repoint
+// ran under. It must be the pre-roll generation, which pins the repoint before
+// the roll (and therefore while the lease guard and the write lock are held).
+#[cfg(test)]
+thread_local! {
+    static REPOINT_GENERATION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn last_repoint_generation() -> Option<u64> {
+    REPOINT_GENERATION.with(|g| g.get())
+}
+
 /// A file opened for an in-place checkpoint: writes go at explicit offsets,
 /// and `free` is the old footer's hole list, the only space an encoded row
 /// group may take without growing the file. `reuse == false` (another handle
 /// has the store open somewhere) keeps every write past the end instead: a
-/// hole might still be a live reader's bytes.
+/// hole might still be a live reader's bytes. `withheld` is the subset a
+/// live handle still names: free in the footer, never allocated here.
 struct CheckpointWriter {
     file: std::fs::File,
     cursor: u64,
     free: Vec<(u64, u64)>,
     reuse: bool,
+    withheld: Vec<(u64, u64)>,
 }
 
 impl CheckpointWriter {
-    /// First-fit allocation from the old holes; `cursor` is the end of the
-    /// old logical file, so an append never reuses a superseded range in the
-    /// same pass (those become free for the next checkpoint).
+    /// The holes this pass may overwrite: the old list minus every part a
+    /// live handle still names. Empty unless the probe made this handle the
+    /// only one open.
+    fn holes(&self) -> Vec<(u64, u64)> {
+        if !self.reuse {
+            return Vec::new();
+        }
+        subtract_ranges(&self.free, &self.withheld)
+    }
+
+    /// First-fit allocation from the holes; `cursor` is the end of the old
+    /// logical file, so an append never reuses a superseded range in the same
+    /// pass (those become free for the next checkpoint).
     fn alloc(&mut self, len: u64) -> u64 {
-        if self.reuse
-            && let Some(at) = first_fit(&mut self.free, len, 0)
-        {
+        let mut holes = self.holes();
+        if let Some(at) = first_fit(&mut holes, len, 0) {
+            self.free = holes;
             return at;
         }
         let at = self.cursor;
@@ -5251,6 +5323,13 @@ impl CheckpointWriter {
     }
 
     fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        debug_assert!(
+            !self.withheld.iter().any(|&(h, hl)| {
+                h < offset.saturating_add(bytes.len() as u64) && offset < h.saturating_add(hl)
+            }),
+            "writing {} bytes at {offset} over bytes a live handle still names",
+            bytes.len()
+        );
         pwrite_all(&self.file, offset, bytes)?;
         Ok(())
     }
@@ -5261,7 +5340,6 @@ impl CheckpointWriter {
 fn write_group(
     writer: &mut CheckpointWriter,
     group: GroupBuild,
-    carry: &mut Vec<u8>,
 ) -> Result<(GroupBuild, TableCarry)> {
     let GroupBuild {
         rows,
@@ -5277,33 +5355,18 @@ fn write_group(
     let base = writer.alloc(len);
     let mut columns = Vec::with_capacity(relative.len());
     let mut table_carry = Vec::with_capacity(relative.len());
-    for (ci, piece) in pieces.into_iter().enumerate() {
+    for (ci, (piece, chunk_carry)) in pieces.into_iter().zip(specs).enumerate() {
         let offset = base + relative[ci].offset;
-        match &piece.source {
-            GroupPieceSource::Borrowed { image, start, end } => {
-                let bytes = &image.bytes()[*start as usize..*end as usize];
-                writer.write(offset, bytes)?;
-                let base = carry.len() as u64;
-                carry.extend_from_slice(bytes);
-                table_carry.push(
-                    specs[ci]
-                        .iter()
-                        .map(|&(i, rel, len, rows)| (i, base + rel, len, rows))
-                        .collect(),
-                );
-            }
-            GroupPieceSource::Owned(bytes) => {
-                writer.write(offset, bytes)?;
-                let base = carry.len() as u64;
-                carry.extend_from_slice(bytes);
-                table_carry.push(
-                    specs[ci]
-                        .iter()
-                        .map(|&(i, rel, len, rows)| (i, base + rel, len, rows))
-                        .collect(),
-                );
-            }
-        }
+        writer.write(offset, &piece.bytes)?;
+        table_carry.push(
+            chunk_carry
+                .into_iter()
+                .map(|mut cc| {
+                    cc.dir.offset = offset;
+                    cc
+                })
+                .collect(),
+        );
         columns.push(ColumnChunkDir {
             offset,
             ..relative[ci].clone()
@@ -5347,7 +5410,7 @@ fn reusable_group(t: &DataTable, old: &RowGroupDir, first: usize, last: usize) -
         let dir = &old.columns[ci];
         if copy.start != dir.offset
             || copy.end != dir.offset.saturating_add(dir.length)
-            || copy.pages.len() != dir.page_count as usize
+            || copy.page_count != dir.page_count
         {
             return false;
         }
@@ -5365,6 +5428,8 @@ fn first_fit(free: &mut Vec<(u64, u64)>, len: u64, min_offset: u64) -> Option<u6
             } else {
                 free[i] = (offset + len, available - len);
             }
+            #[cfg(test)]
+            FIRST_FITS.with(|fits| fits.set(fits.get() + 1));
             return Some(offset);
         }
         i += 1;
@@ -5372,23 +5437,62 @@ fn first_fit(free: &mut Vec<(u64, u64)>, len: u64, min_offset: u64) -> Option<u6
     None
 }
 
+// A test hook: how many times this thread's incremental checkpoint reused a
+// freed range for a row group.
+#[cfg(test)]
+thread_local! {
+    static FIRST_FITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn first_fits() -> u64 {
+    FIRST_FITS.with(|fits| fits.get())
+}
+
+/// `ranges` minus every byte inside `blocked`, in offset order. A range is
+/// split rather than dropped: a hole may be half a live handle's bytes and
+/// half reusable.
+fn subtract_ranges(ranges: &[(u64, u64)], blocked: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::with_capacity(ranges.len());
+    for &(start, len) in ranges {
+        let mut from = start;
+        let end = start.saturating_add(len);
+        for &(b, bl) in blocked {
+            let b_end = b.saturating_add(bl);
+            if b_end <= from || end <= b {
+                continue;
+            }
+            if b > from {
+                out.push((from, b - from));
+            }
+            from = b_end;
+            if from >= end {
+                break;
+            }
+        }
+        if from < end {
+            out.push((from, end - from));
+        }
+    }
+    out
+}
+
 fn alloc_footer(
     writer: &mut CheckpointWriter,
-    free: &[(u64, u64)],
     len: u64,
     min_offset: u64,
 ) -> (u64, Vec<(u64, u64)>) {
-    let free: &[(u64, u64)] = if writer.reuse { free } else { &[] };
-    for (i, &(offset, available)) in free.iter().enumerate() {
+    let holes = writer.holes();
+    for (i, &(offset, available)) in holes.iter().enumerate() {
         if offset >= min_offset && available >= len {
             // Everything at or after the footer is outside the data region;
             // only the holes before it can stay in the new free list.
-            return (offset, free[..i].to_vec());
+            return (offset, holes[..i].to_vec());
         }
     }
     let offset = writer.cursor.max(min_offset);
     writer.cursor = offset + len;
-    (offset, free.to_vec())
+    (offset, holes)
 }
 
 fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
@@ -5432,14 +5536,14 @@ fn read_checkpoint_file(
         return Ok(None);
     }
     let mut header = [0u8; 2 * HEADER_SLOT_LEN];
-    pread_exact(file, 0, &mut header)?;
+    crate::storage::pread_exact(file, 0, &mut header)?;
     let Some((idx, slot)) = valid_slot(&header, physical_len) else {
         return Ok(None);
     };
     let len = usize::try_from(slot.footer_len)
         .map_err(|_| PinkDbError::Execution("corrupt file: footer too large".to_string()))?;
     let mut footer = vec![0u8; len];
-    pread_exact(file, slot.footer_offset, &mut footer)?;
+    crate::storage::pread_exact(file, slot.footer_offset, &mut footer)?;
     if crc32c(&footer) != slot.footer_crc32c {
         return Err(PinkDbError::Execution(
             "corrupt file: footer checksum mismatch".to_string(),
@@ -5449,31 +5553,10 @@ fn read_checkpoint_file(
     Ok(Some((idx, slot, footer)))
 }
 
-fn pread_exact(file: &std::fs::File, mut offset: u64, mut buf: &mut [u8]) -> Result<()> {
-    while !buf.is_empty() {
-        #[cfg(unix)]
-        let read = std::os::unix::fs::FileExt::read_at(file, buf, offset);
-        #[cfg(windows)]
-        let read = std::os::windows::fs::FileExt::seek_read(file, buf, offset);
-        #[cfg(not(any(unix, windows)))]
-        let read: std::io::Result<usize> = Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "positioned reads are not supported on this platform",
-        ));
-        let read = read?;
-        if read == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "checkpoint target ended before its footer",
-            )
-            .into());
-        }
-        offset += read as u64;
-        buf = &mut buf[read..];
-    }
-    Ok(())
-}
-
+#[cfg_attr(
+    not(any(unix, windows)),
+    allow(unused_mut, unused_variables, unused_assignments)
+)]
 fn pwrite_all(file: &std::fs::File, mut offset: u64, mut buf: &[u8]) -> Result<()> {
     while !buf.is_empty() {
         #[cfg(unix)]
@@ -5502,49 +5585,41 @@ fn pwrite_all(file: &std::fs::File, mut offset: u64, mut buf: &[u8]) -> Result<(
 /// A row group's column chunk as it sits in the retained store image: the
 /// bytes' range there and each page's `(rel, len)` index entry.
 struct CopyThrough {
-    image: Arc<crate::storage::StoreImage>,
+    source: Arc<crate::storage::StoreSource>,
     start: u64,
     end: u64,
-    pages: Vec<(u32, u32)>,
+    page_count: u32,
+    pages: Arc<[(u32, u32)]>,
 }
 
 /// The copy-through form of chunks `first..last` of `column`, when every one
-/// of them is clean, they still share one image, and the stored page index
+/// of them is clean and still shares one stored column chunk whose page index
 /// points at the pages the footer describes. `None` falls back to decoding and
 /// encoding the group.
 fn copy_through(column: &crate::storage::Column, first: usize, last: usize) -> Option<CopyThrough> {
-    let (image, chunks) = column.stored_group(first, last)?;
+    let chunk = column.stored_chunk(first, last)?;
+    let pages = chunk.pages().ok()?;
+    let start = chunk.offset();
+    let end = start.checked_add(chunk.length())?;
     // The page index sits immediately before the first page, as the encoder
     // wrote it: a 4-byte page count, then `(rel, len)` per page.
-    let index_len = 4 + chunks.len() * 8;
-    let start = chunks.first()?.offset.checked_sub(index_len as u64)?;
-    let last_chunk = chunks.last()?;
-    let end = last_chunk.offset.checked_add(last_chunk.length)?;
-    let bytes = image.bytes().get(start as usize..end as usize)?;
-    let mut r = Reader::new(bytes);
-    if usize::try_from(r.u32().ok()?).ok()? != chunks.len() {
-        return None;
-    }
-    let mut pages = Vec::with_capacity(chunks.len());
-    let mut rel = index_len as u64;
-    for chunk in &chunks {
-        let at = u64::from(r.u32().ok()?);
-        let len = u64::from(r.u32().ok()?);
-        if at != rel || len != chunk.length {
+    let mut rel = 4 + pages.len() as u64 * 8;
+    for &(at, len) in pages.iter() {
+        if u64::from(at) != rel {
             return None;
         }
-        pages.push((u32::try_from(at).ok()?, u32::try_from(len).ok()?));
-        rel += len;
+        rel += u64::from(len);
     }
     // The pages must fill the chunk exactly; anything else is not a chunk this
     // save can copy.
-    if rel != end - start {
+    if rel != chunk.length() {
         return None;
     }
     Some(CopyThrough {
-        image,
+        source: Arc::clone(chunk.source()),
         start,
         end,
+        page_count: chunk.page_count(),
         pages,
     })
 }
@@ -5854,22 +5929,29 @@ pub fn footer_location(bytes: &[u8], file_len: u64) -> Result<(u64, u64, u32)> {
     }
     let header = &bytes[..bytes.len().min(2 * HEADER_SLOT_LEN)];
     let Some((_, slot)) = valid_slot(header, file_len) else {
-        return Err(match header.first_chunk::<8>() {
-            Some(magic) if &magic[..7] == b"PINKDB0" && magic[7].is_ascii_digit() => {
-                if magic[7] < b'7' {
-                    older_pinkdb_error(magic[7] - b'0')
-                } else if magic[7] > b'7' {
-                    newer_pinkdb_error(magic[7] - b'0')
-                } else {
-                    // The right magic with no valid slot: the header itself
-                    // is damaged.
-                    corrupt_file("no header slot is valid (the file is damaged)")
-                }
-            }
-            _ => PinkDbError::Execution("not a .pink file (bad magic)".to_string()),
-        });
+        return Err(unsupported_magic(header));
     };
     Ok((slot.footer_offset, slot.footer_len, slot.footer_crc32c))
+}
+
+/// The refusal for a header whose magic names a format this build cannot read,
+/// or no format at all. Shared by the slice and the source open paths so both
+/// say the same thing.
+fn unsupported_magic(header: &[u8]) -> PinkDbError {
+    match header.first_chunk::<8>() {
+        Some(magic) if &magic[..7] == b"PINKDB0" && magic[7].is_ascii_digit() => {
+            if magic[7] < b'7' {
+                older_pinkdb_error(magic[7] - b'0')
+            } else if magic[7] > b'7' {
+                newer_pinkdb_error(magic[7] - b'0')
+            } else {
+                // The right magic with no valid slot: the header itself is
+                // damaged.
+                corrupt_file("no header slot is valid (the file is damaged)")
+            }
+        }
+        _ => PinkDbError::Execution("not a .pink file (bad magic)".to_string()),
+    }
 }
 
 /// Re-seal the header slot that names the footer after the footer's bytes were
@@ -6162,6 +6244,43 @@ pub(crate) fn footer_free_ranges_for_test(path: &std::path::Path) -> Result<Vec<
     Ok(read_store_footer(&data)?.free_ranges)
 }
 
+/// Read and validate the footer a [`StoreSource`](crate::storage::StoreSource)
+/// names: the header slots, the footer's range, and the footer's CRC32C.
+///
+/// This is everything an open reads; no byte of the data region is touched. A
+/// file source pays two positioned reads (the 8 KiB header and the footer), a
+/// memory source borrows both.
+fn read_source_footer(source: &crate::storage::StoreSource) -> Result<StoreFooter> {
+    let file_len = source.len();
+    let header_len = (2 * HEADER_SLOT_LEN) as u64;
+    // A v6 file's trailer magic is the one older layout whose magic is not at
+    // offset 0, so the last eight bytes are read too.
+    let mut tail = [0u8; 8];
+    if file_len >= 8 {
+        source.read(file_len - 8, &mut tail)?;
+        if &tail == b"PINKDB06" && file_len > header_len {
+            return Err(older_pinkdb_error(6));
+        }
+    }
+    let mut header = vec![0u8; header_len.min(file_len) as usize];
+    if !header.is_empty() {
+        source.read(0, &mut header)?;
+    }
+    let Some((_idx, slot)) = valid_slot(&header, file_len) else {
+        return Err(unsupported_magic(&header));
+    };
+    let footer_len =
+        usize::try_from(slot.footer_len).map_err(|_| corrupt_file("the footer is out of range"))?;
+    let footer = source.read_vec(slot.footer_offset, footer_len)?;
+    if crc32c(&footer) != slot.footer_crc32c {
+        return Err(corrupt_file(
+            "the footer checksum does not match (the file is damaged)",
+        ));
+    }
+    parse_store_footer(&footer, slot.footer_offset)
+}
+
+#[cfg(test)]
 fn read_store_footer(data: &[u8]) -> Result<StoreFooter> {
     let (offset, len, crc) = footer_location(data, data.len() as u64)?;
     let start = offset as usize;
@@ -6510,25 +6629,22 @@ fn check_free_ranges(ranges: &[(u64, u64)], databases: &[DbDir], data_end: u64) 
 ///
 /// The verification sweep is what keeps a corrupt file failing at open: the
 /// checksum covers exactly the bytes the chunk will later decode from.
+/// Load one table's data region: check every column chunk's static shape and
+/// install one shared descriptor per column chunk, with a handle per page.
+///
+/// The CRC32C sweep is gone (wave 136c): a chunk's checksum and page index are
+/// verified on its first decode, so a damaged chunk fails the statement that
+/// reads it rather than the open. What remains here reads nothing: every
+/// offset, length and page count must be inside the file and agree with the
+/// footer.
 fn load_table_data(
-    image: &Arc<crate::storage::StoreImage>,
+    source: &Arc<crate::storage::StoreSource>,
     db: &mut PinkDb,
     ns: &SchemaPath,
     tdir: &TableDir,
 ) -> Result<()> {
-    let data = image.bytes();
     let n_cols = tdir.schema.len();
-    // The verified page ranges per column: `pages[column][row group][page]`,
-    // absolute `(offset, length)` pairs in the image.
-    let pages: Vec<Vec<Vec<(u64, u64)>>> = (0..n_cols)
-        .into_par_iter()
-        .map(|ci| {
-            tdir.row_groups
-                .par_iter()
-                .map(|rg| verify_column_chunk(data, &rg.columns[ci]))
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let file_len = source.len();
     // The row count must agree with the row groups.
     let total_rows: usize = tdir.row_groups.iter().map(|rg| rg.rows as usize).sum();
     if total_rows != tdir.row_count as usize {
@@ -6537,18 +6653,35 @@ fn load_table_data(
             tdir.name, tdir.row_count
         )));
     }
+    for rg in &tdir.row_groups {
+        if rg.columns.len() != n_cols {
+            return Err(corrupt_file(
+                "a row group does not have one chunk per column",
+            ));
+        }
+        for dir in &rg.columns {
+            check_column_chunk(dir, file_len, rg.chunk_rows.len())?;
+        }
+    }
     // Assemble the handles chunk by chunk: every column shares the boundaries
-    // the footer recorded, so nothing needs decoding here.
+    // the footer recorded, so nothing needs decoding here. One descriptor per
+    // column chunk, shared by all of its pages.
     let mut columns: Vec<Vec<Arc<crate::storage::ChunkHandle>>> = Vec::with_capacity(n_cols);
-    for column_pages in &pages {
+    for ci in 0..n_cols {
         let mut handles = Vec::with_capacity(tdir.row_groups.len() * CHUNKS_PER_ROW_GROUP);
-        for (g, rg) in tdir.row_groups.iter().enumerate() {
+        for rg in &tdir.row_groups {
+            let dir = &rg.columns[ci];
+            let chunk = crate::storage::EncodedColumnChunk::new(
+                Arc::clone(source),
+                dir.offset,
+                dir.length,
+                dir.crc32c,
+                dir.page_count,
+            );
             for (p, &rows) in rg.chunk_rows.iter().enumerate() {
-                let (offset, length) = column_pages[g][p];
                 handles.push(Arc::new(crate::storage::ChunkHandle::new_encoded(
-                    Arc::clone(image),
-                    offset,
-                    length,
+                    Arc::clone(&chunk),
+                    p as u32,
                     rows as usize,
                 )));
             }
@@ -6564,9 +6697,11 @@ fn load_table_data(
     Ok(())
 }
 
-/// Verify one column chunk without decoding it: its bounds, its CRC32C and its
-/// page index. Returns every page's absolute byte range in the image.
-fn verify_column_chunk(data: &[u8], dir: &ColumnChunkDir) -> Result<Vec<(u64, u64)>> {
+/// The structural checks an open can make without reading a byte: the chunk's
+/// range is inside the file, and the footer's page count, chunk row count and
+/// smallest possible index all agree. The CRC32C and the page ranges
+/// themselves are checked on the chunk's first read.
+fn check_column_chunk(dir: &ColumnChunkDir, file_len: u64, chunk_rows: usize) -> Result<()> {
     let start = usize::try_from(dir.offset).map_err(|_| {
         PinkDbError::Execution("corrupt file: the column chunk offset is out of range".to_string())
     })?;
@@ -6576,50 +6711,27 @@ fn verify_column_chunk(data: &[u8], dir: &ColumnChunkDir) -> Result<Vec<(u64, u6
     let end = start.checked_add(len).ok_or_else(|| {
         PinkDbError::Execution("corrupt file: the column chunk range overflows".to_string())
     })?;
-    if end > data.len() {
+    if end as u64 > file_len {
         return Err(PinkDbError::Execution(
             "corrupt file: the column chunk is outside the file".to_string(),
         ));
     }
-    let bytes = &data[start..end];
-    if crc32c(bytes) != dir.crc32c {
-        return Err(PinkDbError::Execution(
-            "corrupt file: a column chunk fails its checksum (the file is damaged)".to_string(),
-        ));
-    }
-    // The page index, then the pages.
-    let mut r = Reader::new(bytes);
-    let page_count = r.u32()? as usize;
-    if page_count != dir.page_count as usize {
+    if dir.page_count as usize != chunk_rows {
         return Err(PinkDbError::Execution(
             "corrupt file: the column chunk's page count disagrees with the footer".to_string(),
         ));
     }
-    // Each page-index entry is 8 bytes: never size an allocation from the
-    // unvalidated count.
-    if page_count > r.remaining() / 8 {
-        return r.err("the column chunk's page count exceeds the chunk");
+    // The page index alone: never size a read from an unvalidated count.
+    if dir.length < 4 + dir.page_count as u64 * 8 {
+        return Err(corrupt_file(
+            "the column chunk's page count exceeds the chunk",
+        ));
     }
-    let mut pages = Vec::with_capacity(page_count);
-    for _ in 0..page_count {
-        let off = r.u32()? as usize;
-        let len = r.u32()? as usize;
-        let end = off.checked_add(len).ok_or_else(|| {
-            PinkDbError::Execution("corrupt file: a page range overflows".to_string())
-        })?;
-        if end > bytes.len() {
-            return Err(PinkDbError::Execution(
-                "corrupt file: a page is outside the column chunk".to_string(),
-            ));
-        }
-        pages.push((dir.offset + off as u64, len as u64));
-    }
-    Ok(pages)
+    Ok(())
 }
 
 /// Decode one page's bytes: its encoding tag, then its payload. The enclosing
-/// chunk's CRC32C was verified when the store opened (or when the bytes were
-/// read).
+/// chunk's CRC32C was verified when the chunk was first read.
 pub(crate) fn decode_page(bytes: &[u8], dtype: DataType) -> Result<Vector> {
     let mut pr = Reader::new(bytes);
     let tag = pr.u8()?;
@@ -8779,7 +8891,9 @@ mod tests {
         for i in DATA_START as usize..footer_at as usize {
             let mut bad = bytes.clone();
             bad[i] ^= 0x01;
-            let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
+            // The open succeeds (it reads no chunk bytes); every read fails.
+            let mut db = PinkDb::load_bytes(&bad).expect("an open must not read the chunk");
+            let err = db.execute("SELECT i, v FROM t").unwrap_err().to_string();
             assert!(err.contains("checksum"), "byte {i}: {err}");
             detected += 1;
         }
@@ -11511,18 +11625,94 @@ mod tests {
 
     /// The open-time CRC sweep catches a damaged chunk without decoding it.
     #[test]
-    fn a_corrupt_chunk_fails_at_open() {
+    fn a_corrupt_chunk_fails_when_it_is_read() {
         let db = wide_db(100);
         let bytes = db.to_bytes().unwrap();
         let footer = read_store_footer(&bytes).unwrap();
         let dir = &footer.databases[0].schemas[0].tables[0].row_groups[0].columns[0];
         let mut bad = bytes.clone();
         bad[dir.offset as usize + 4] ^= 0xff;
-        let err = PinkDb::load_bytes(&bad)
-            .map(|_| ())
-            .unwrap_err()
-            .to_string();
+        // No chunk bytes are read at open, so the damage surfaces on the read.
+        let mut db = PinkDb::load_bytes(&bad).expect("an open must not read the chunk");
+        let err = db.execute("SELECT a FROM w").unwrap_err().to_string();
         assert!(err.contains("fails its checksum"), "corrupt chunk: {err}");
+    }
+
+    /// An open reads the two header slots and the footer, and nothing of the
+    /// data region: chunk bytes come from the file when a statement reads
+    /// them (wave 136c).
+    /// One descriptor per column chunk: a second, fresh descriptor over the
+    /// same bytes would look unreferenced to the checkpoint's withhold check.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_second_descriptor_over_one_column_chunk_is_refused() {
+        let db = wide_db(5000);
+        let path = temp_file("one_descriptor");
+        db.save(path.to_str().unwrap()).unwrap();
+        let db = PinkDb::open(path.to_str().unwrap()).unwrap();
+        let table = db.table("w").unwrap();
+        let chunks = table.columns[0].num_chunks();
+        let chunk = table.columns[0].stored_chunk(0, chunks).unwrap();
+        let source = std::sync::Arc::clone(chunk.source());
+        let (offset, length) = (chunk.offset(), chunk.length());
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::storage::EncodedColumnChunk::new(source, offset, length, 0, 1);
+        }));
+        assert!(
+            refused.is_err(),
+            "a second descriptor over the same bytes must be refused"
+        );
+        drop(chunk);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A hole with a live handle's bytes inside it: only the free parts are
+    /// reusable, and the held part never is.
+    #[test]
+    fn a_hole_is_reusable_around_a_held_sub_range() {
+        assert_eq!(
+            subtract_ranges(&[(1000, 300)], &[(1100, 100)]),
+            vec![(1000, 100), (1200, 100)]
+        );
+        let path = temp_file("half_hole");
+        let mut writer = CheckpointWriter {
+            file: std::fs::File::create(&path).unwrap(),
+            cursor: 10_000,
+            free: vec![(1000, 300)],
+            reuse: true,
+            withheld: vec![(1100, 100)],
+        };
+        assert_eq!(writer.alloc(50), 1000);
+        assert_eq!(writer.alloc(50), 1050);
+        assert_eq!(writer.alloc(100), 1200);
+        assert_eq!(writer.alloc(1), 10_000, "the held part is never allocated");
+        drop(writer);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn an_open_reads_only_the_header_and_the_footer() {
+        let db = wide_db(5000);
+        let path = temp_file("lazy_source");
+        db.save(path.to_str().unwrap()).unwrap();
+        let file = std::fs::read(&path).unwrap();
+        let (_, footer_len) = footer_span(&file).unwrap();
+        let before = crate::storage::source_read_bytes();
+        let db = PinkDb::open(path.to_str().unwrap()).unwrap();
+        let open_read = crate::storage::source_read_bytes() - before;
+        assert_eq!(
+            open_read,
+            2 * HEADER_SLOT_LEN as u64 + 8 + footer_len,
+            "an open reads the header slots, the tail marker and the footer"
+        );
+        // The first decode reads the chunk's bytes (from the file, here on
+        // this thread; a scan's own reads happen on its worker).
+        let after_open = crate::storage::source_read_bytes();
+        let table = db.table("w").unwrap();
+        table.columns[0].chunk(0).unwrap();
+        let decode_read = crate::storage::source_read_bytes() - after_open;
+        assert!(decode_read > 0, "a decode reads the chunk it needs");
+        std::fs::remove_file(&path).ok();
     }
 
     /// An index map is built on first use (decoding only the indexed column)

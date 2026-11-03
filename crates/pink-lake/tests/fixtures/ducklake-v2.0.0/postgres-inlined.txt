@@ -1,0 +1,15 @@
+1|_ducklake_row_id|bigint
+2|_ducklake_begin_snapshot|bigint
+3|_ducklake_end_snapshot|bigint
+4|b|boolean
+5|i|integer
+6|g|bigint
+7|h|character varying
+8|uh|character varying
+9|d|double precision
+10|n|numeric
+11|v|bytea
+12|dt|character varying
+13|ts|character varying
+14|iv|interval
+15|u|uuid

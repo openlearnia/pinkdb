@@ -9,6 +9,30 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-11-03
+### Wave 136 (step c-1) — a lazily opened store reads only its footer ✅
+
+An open no longer reads the data region: chunk bytes come from the file when a
+statement decodes them.
+
+- **Open**: `open` reads the two header slots and the footer, through a new
+  `StoreSource` (a file with positioned reads, or memory for wasm, in-memory
+  stores and encrypted files, whose container is decrypted whole). TPC-H SF1
+  (323 MB) now opens at 27.8 MB peak RSS in 0.01 s instead of 339 MB in 0.07 s;
+  QuackLab's v7 store (15.6 MB) at 7.1 MB instead of 25.6 MB.
+- **Checksums on first read**: a column chunk's CRC32C and page index are
+  verified the first time its bytes are read — streamed in 128 KiB blocks, so
+  no buffer the size of the chunk — and cached. A damaged chunk now fails the
+  statement that reads it, with the same message as before; a damaged footer
+  still fails at open.
+- **Checkpoint holes wait for their readers**: an incremental checkpoint may
+  overwrite a range only once the chunk descriptors that named it are gone; a
+  range superseded while a snapshot or a running scan still reads it stays free
+  for one more checkpoint. Reuse is granted only when the open-lock sidecar
+  says no other process has the store open: a checkpoint subtracts a live
+  reader's sub-ranges from the free list, a store that loses the sidecar fails
+  its next statement closed, and another process's checkpoint resets the
+  cached checksums of the chunks this store reads.
+
 ### Wave 136w — faster checkpoints, commits and Parquet loads ✅
 
 - **Incremental checkpoints:** a checkpoint rewrites only the row groups that
@@ -52,6 +76,11 @@ keeps one entry per group.
 
 - A reopened store starts in its default database; `USE` is per-connection,
   as in DuckDB.
+- Lakes DuckDB v2.0.0 can open: pinkdb writes DuckLake catalog version `1.1`
+  (the 2.0 alphas' `1.1-dev1` is refused, as DuckDB refuses it), restores
+  `ducklake_schema.parent_schema_id`, names 128-bit columns `int128`/`uint128`,
+  and types inlined rows in a Postgres catalog as DuckDB does. A test compares
+  every catalog table with a snapshot of DuckDB v2.0.0's.
 
 ## 2026-11-02
 ### Wave 133 — lake scans stream, prune to pages, and stay within the memory limit ✅

@@ -1,0 +1,15 @@
+0|_ducklake_row_id|BIGINT
+1|_ducklake_begin_snapshot|BIGINT
+2|_ducklake_end_snapshot|BIGINT
+3|b|BIGINT
+4|i|BIGINT
+5|g|BIGINT
+6|h|VARCHAR
+7|uh|VARCHAR
+8|d|VARCHAR
+9|n|VARCHAR
+10|v|VARCHAR
+11|dt|VARCHAR
+12|ts|VARCHAR
+13|iv|VARCHAR
+14|u|VARCHAR
