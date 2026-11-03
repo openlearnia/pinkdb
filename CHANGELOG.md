@@ -9,6 +9,20 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-11-03
+### Wave 133c — lake queries 4× faster ✅
+
+TPC-H at scale factor 1 from a Parquet lake runs 4.2× faster than before
+(geometric mean; every query faster, the slowest ones 14–27×), now 2–7× DuckDB
+v2.0.0's time on its own storage, down from 3–77×. Store tables are unchanged.
+
+- **No per-chunk table building**: a lake scan hands the engine each decoded
+  chunk as is. It no longer computes statistics, copies columns or fills
+  unrequested columns with NULLs row by row, which took most of a scan's time.
+- **Parallel reads below joins and sorts**: a lake table read whole (a join's
+  build side, a sort's input) is decoded by all worker threads, in order,
+  instead of by one.
+- Columns added after a file was written read their `DEFAULT` in bulk.
+
 ### Wave 136 (step c-1) — a lazily opened store reads only its footer ✅
 
 An open no longer reads the data region: chunk bytes come from the file when a
