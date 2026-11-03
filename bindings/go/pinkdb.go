@@ -96,7 +96,7 @@ import (
 
 // SupportedABI is the C ABI version this binding speaks. Open and OpenMemory
 // refuse a linked library that reports a different version.
-const SupportedABI = 1
+const SupportedABI = (1 << 16) | 1
 
 // Errors returned by this package in addition to the native error messages
 // from pinkdb_last_error.
@@ -693,10 +693,11 @@ func integerRangeError(index int, value uint64) error {
 // checkABI fails when the linked library is not the ABI version this package
 // targets. Called by Open/OpenMemory before any handle is created.
 func checkABI() error {
-	if v := uint32(C.pinkdb_abi_version()); v != SupportedABI {
+	// Same major, at least this minor: a newer minor only adds calls.
+	if v := uint32(C.pinkdb_abi_version()); v>>16 != SupportedABI>>16 || v&0xffff < SupportedABI&0xffff {
 		return fmt.Errorf(
-			"pinkdb: ABI version mismatch: linked pinkdb-ffi reports version %d, this binding requires version %d",
-			v, SupportedABI)
+			"pinkdb: ABI version mismatch: linked pinkdb-ffi reports version %d.%d, this binding requires %d.%d or a later minor",
+			v>>16, v&0xffff, SupportedABI>>16, SupportedABI&0xffff)
 	}
 	return nil
 }

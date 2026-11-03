@@ -1,14 +1,23 @@
 /*
- * pinkdb C ABI v1 — https://github.com/openlearnia/pinkdb
+ * pinkdb C ABI v1.1 — https://github.com/openlearnia/pinkdb
  *
  * Built as `libpinkdb_ffi.dylib` (cdylib) and `libpinkdb_ffi.a` (staticlib)
  * from the `pinkdb-ffi` crate. Link with `-lpinkdb_ffi`.
  *
+ * Versioning: `PINKDB_ABI_VERSION` is `major << 16 | minor`. Adding a
+ * function, a type tag or a struct field at the end bumps the minor; removing
+ * or renaming a function, or changing an existing layout, bumps the major.
+ * A caller may accept a newer library with the same major. Structs that cross
+ * the boundary by value carry a `struct_size` field when a later minor may
+ * grow them (`pink_value` predates that rule and keeps its v1 layout).
+ *
  * Contract
  * --------
  * - Every pointer returned by this library is freed with the matching
- *   `pinkdb_*_free` function (`pinkdb_result_free`, `pinkdb_prepared_free`
- *   and `pinkdb_close`). Never free the same pointer twice.
+ *   `pinkdb_*_free` function (`pinkdb_result_free`, `pinkdb_prepared_free`,
+ *   `pinkdb_disconnect`, `pinkdb_close_database`, `pinkdb_destroy_config`
+ *   and `pinkdb_close`). `errmsg` strings use `pinkdb_free`. Never free the
+ *   same pointer twice.
  * - Text pointers (`pinkdb_result_column_name`, `pinkdb_result_name`,
  *   `pinkdb_result_profile_kind`, `pink_value.text_ptr`, `pinkdb_last_error`,
  *   `pinkdb_last_error_class`)
@@ -16,20 +25,28 @@
  *   that owner is freed or the next FFI call on the same thread. Copy them if
  *   you need them longer. `text_ptr` is followed by a NUL byte but may contain
  *   embedded NULs — always trust `text_len`.
- * - Handles are NOT thread-safe: never call into one handle from two threads
- *   at once (serialize calls, e.g. with a mutex — the Go and Python bindings
- *   do). A durable file may be opened by several handles/processes; writes are
- *   serialized by a per-file write lease, and concurrent transactions use
- *   optimistic COMMIT validation (a conflict is a retryable error, never a
- *   silent lost update). In-memory handles are independent. Errors are
- *   thread-local; `pinkdb_last_error` returns NULL
- *   when the last call on the calling thread succeeded.
+ * - v1 handles are NOT thread-safe: never call into one handle from two
+ *   threads at once. A durable file may be opened by several processes;
+ *   writes are serialized by a per-file write lease, and concurrent
+ *   transactions use optimistic COMMIT validation (a conflict is a retryable
+ *   error, never a silent lost update). In-memory stores are independent.
+ *   The v1 errors are thread-local; `pinkdb_last_error` returns NULL when the
+ *   last v1 call on the calling thread succeeded.
+ * - Databases may be opened and shared across threads. A connection belongs
+ *   to one thread at a time (create it on any thread, then hand it over), with
+ *   one exception: `pinkdb_interrupt` may be called from another thread while
+ *   a statement runs on that connection.
  * - SQL is passed as (pointer, length) and must be valid UTF-8. Passing a
  *   NULL pointer with a non-zero length, or invalid UTF-8, is an error.
- * - Error reporting: functions that return a pointer return NULL on failure;
- *   index/kind accessors return 0/-1 for out-of-range indices; call
+ * - v1 error reporting: functions that return a pointer return NULL on
+ *   failure; index/kind accessors return 0/-1 for out-of-range indices; call
  *   `pinkdb_last_error` for the message and `pinkdb_last_error_class` for its
  *   class.
+ * - New API error reporting: `pinkdb_query` and `pinkdb_query_prepared`
+ *   always return a result, successful or failed; read its error with
+ *   `pinkdb_result_error`/`pinkdb_result_error_class` until
+ *   `pinkdb_result_free`. Functions with an `errmsg` out-parameter set it to
+ *   a string (free with `pinkdb_free`) on failure and NULL on success.
  */
 
 #ifndef PINKDB_H
@@ -37,6 +54,16 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+#define PINKDB_ABI_VERSION_MAJOR 1
+#define PINKDB_ABI_VERSION_MINOR 1
+#define PINKDB_ABI_VERSION ((PINKDB_ABI_VERSION_MAJOR << 16) | PINKDB_ABI_VERSION_MINOR)
+
+/* Library (not ABI) version, from the Cargo package version. */
+#define PINKDB_VERSION_MAJOR 0
+#define PINKDB_VERSION_MINOR 1
+#define PINKDB_VERSION_PATCH 0
+#define PINKDB_VERSION "0.1.0"
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,6 +73,9 @@ extern "C" {
 typedef struct pinkdb_handle pinkdb_handle;
 typedef struct pinkdb_result pinkdb_result;
 typedef struct pinkdb_prepared pinkdb_prepared;
+typedef struct pinkdb_database pinkdb_database;
+typedef struct pinkdb_connection pinkdb_connection;
+typedef struct pinkdb_config pinkdb_config;
 
 /* Statement kind tags (pinkdb_result_kind). */
 enum {
@@ -152,7 +182,9 @@ typedef struct pink_value {
     size_t text_len;
 } pink_value;
 
-/* ABI version of the linked library (currently 1). */
+/* ABI version of the linked library, `major << 16 | minor` (1.1 is
+ * 0x00010001). Compare it with PINKDB_ABI_VERSION; a same-major version is
+ * forward compatible. */
 uint32_t pinkdb_abi_version(void);
 
 /* Open a durable database (checkpoint + WAL) at a filesystem path.
@@ -329,6 +361,124 @@ uint32_t pinkdb_result_profile_columns(const pinkdb_result *result,
 const char *pinkdb_result_profile_kind(const pinkdb_result *result,
                                        size_t statement);
 
+/*
+ * Database / connection API (ABI 1.1)
+ * -----------------------------------
+ * A database owns the store; connections own independent sessions. Open one
+ * database, connect once per thread, and disconnect every connection before
+ * closing the database.
+ */
+
+/* Create an empty configuration. Free with pinkdb_destroy_config. Never
+ * returns NULL in practice; NULL on allocation failure. */
+pinkdb_config *pinkdb_create_config(void);
+
+/* Set one option, returning 1 on success and 0 on an unknown name or invalid
+ * value. `name` and `value` are NUL-terminated UTF-8 and are read only for
+ * this call. Names are case-insensitive:
+ *
+ *   read_only                 "true"/"false" (default false)
+ *   access_mode               "automatic", "read_only", "read_write"
+ *   memory_limit              DuckDB-style size ("1GB", "512MB", "-1" = none)
+ *   threads                   positive integer
+ *   wal_sync_method           "full", "fsync", "fdatasync"
+ *   allow_sql_load_extension  "true"/"false" (default false)
+ *
+ * memory_limit is process-wide and applies when the database is opened.
+ * read_only/access_mode refuse every non-query statement; they are enforced
+ * by this library, not by file permissions.
+ * On failure, pinkdb_config_error holds the message naming the option. */
+int32_t pinkdb_config_set(pinkdb_config *config, const char *name,
+                          const char *value);
+
+/* Copy a 32-byte raw key into the configuration. The key is never logged or
+ * echoed. Returns 1, or 0 for a NULL pointer or a length other than 32.
+ * Keyed stores require a build with the `encryption` feature; opening one
+ * without it fails with a clear error. In-memory stores cannot be keyed. */
+int32_t pinkdb_config_set_encryption_key(pinkdb_config *config,
+                                         const unsigned char *key,
+                                         size_t key_len);
+
+/* Last configuration failure, or NULL. Borrowed from the configuration and
+ * valid until the next set call or pinkdb_destroy_config. */
+const char *pinkdb_config_error(const pinkdb_config *config);
+
+/* Destroy a configuration. NULL-safe. Databases opened with it keep their
+ * copies of every setting. */
+void pinkdb_destroy_config(pinkdb_config *config);
+
+/* Open a database. `path` NULL or ":memory:" is in-memory; otherwise durable.
+ * `config` may be NULL for defaults. Returns 1 on success, 0 on failure.
+ * On failure *out_database is NULL and *errmsg is a string to free with
+ * pinkdb_free; on success *errmsg is NULL. Both out parameters must be
+ * non-NULL. The database may be used from several threads. */
+int32_t pinkdb_open_ext(const char *path, const pinkdb_config *config,
+                        pinkdb_database **out_database, char **errmsg);
+
+/* Close the database. NULL-safe. Existing connections keep the store alive
+ * until disconnected, but later queries on them fail with "invalid_argument".
+ * Free with this call (not pinkdb_free). Do not call this concurrently with
+ * any other function that uses the same database handle. */
+void pinkdb_close_database(pinkdb_database *database);
+
+/* Create an independent connection (session) on an open database. May be
+ * called from any thread. Returns 1 and stores the connection, or 0 on a
+ * NULL/closed database or allocation failure. Free with
+ * pinkdb_disconnect. */
+int32_t pinkdb_connect(pinkdb_database *database,
+                       pinkdb_connection **out_connection);
+
+/* Disconnect. NULL-safe. Do not use the pointer afterwards. */
+void pinkdb_disconnect(pinkdb_connection *connection);
+
+/* Stop the statement currently running on `connection`. Call from another
+ * thread while that statement runs. The statement stops at the executor's
+ * next cancellation checkpoint with the "interrupted" error class. A flag set
+ * before the next query starts is cleared by that query. NULL-safe; no other
+ * call on the connection may run concurrently. */
+void pinkdb_interrupt(pinkdb_connection *connection);
+
+/* Execute one or more SQL statements on a connection. Returns 1 when they
+ * all ran, 0 when one failed; either way *out_result is a result owned by the
+ * caller (free with pinkdb_result_free). Inspect a failed result with
+ * pinkdb_result_error/class. *out_result must be non-NULL.
+ *
+ * SECURITY: the LOAD EXTENSION policy is fixed when the database is opened;
+ * see allow_sql_load_extension above. */
+int32_t pinkdb_query(pinkdb_connection *connection, const char *sql,
+                     size_t sql_len, pinkdb_result **out_result);
+
+/* Prepare one statement with `?` placeholders on a connection. Returns 1, or
+ * 0 with *out_prepared NULL and *errmsg a string to free with pinkdb_free;
+ * on success *errmsg is NULL. Both out parameters must be non-NULL. The
+ * prepared statement may be executed on any connection of the same database
+ * and is freed with pinkdb_prepared_free. */
+int32_t pinkdb_prepare_ext(pinkdb_connection *connection, const char *sql,
+                           size_t sql_len, pinkdb_prepared **out_prepared,
+                           char **errmsg);
+
+/* Execute a prepared statement with one pink_value per placeholder in
+ * textual order. Returns and reports exactly like pinkdb_query. Values are
+ * read only for the call (VARCHAR payloads are copied). */
+int32_t pinkdb_query_prepared(pinkdb_connection *connection,
+                              const pinkdb_prepared *prepared,
+                              const pink_value *values, size_t value_count,
+                              pinkdb_result **out_result);
+
+/* Error carried by a result, or NULL when it succeeded. Owned by the result;
+ * valid until pinkdb_result_free. */
+const char *pinkdb_result_error(const pinkdb_result *result);
+
+/* Stable error class of pinkdb_result_error, or NULL when the result
+ * succeeded. Static string: never free. Same class names as
+ * pinkdb_last_error_class, plus "permission" (read-only refusal) and
+ * "interrupted" (pinkdb_interrupt). */
+const char *pinkdb_result_error_class(const pinkdb_result *result);
+
+/* Free an errmsg string from pinkdb_open_ext/pinkdb_prepare_ext. NULL-safe.
+ * Not a general-purpose free: only pass strings this library returned. */
+void pinkdb_free(void *ptr);
+
 /* Last error on the calling thread (NUL-terminated), or NULL when the last
  * call on this thread succeeded. Valid until the next FFI call on this
  * thread. */
@@ -347,6 +497,8 @@ const char *pinkdb_last_error(void);
  *   "csv"              a CSV import/export error
  *   "invalid_argument" the caller passed a bad argument (NULL handle, invalid
  *                      UTF-8, a value that cannot be bound, ...)
+ *   "permission"       the database is read-only and the statement writes
+ *   "interrupted"      pinkdb_interrupt stopped the statement
  *   "internal"         a caught panic; the handle is still usable
  *
  * The string is static: never free it, and it stays valid across later calls

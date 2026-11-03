@@ -170,7 +170,7 @@ _EPOCH_DATE = _datetime.date(1970, 1, 1)
 _EPOCH_DATETIME = _datetime.datetime(1970, 1, 1)
 
 #: ABI version this binding targets (``pinkdb_abi_version``).
-_ABI_VERSION = 1
+_ABI_VERSION = (1 << 16) | 1
 
 
 class Warning(Exception):  # noqa: A001 - the name PEP 249 requires
@@ -397,10 +397,13 @@ except OSError as exc:  # wrong architecture, not a shared library, ...
 _bind(_LIB, library_path)
 
 _loaded_abi_version = int(_LIB.pinkdb_abi_version())
-if _loaded_abi_version != _ABI_VERSION:
+# Same major, at least this minor: a newer minor only adds calls.
+if (_loaded_abi_version >> 16 != _ABI_VERSION >> 16
+        or (_loaded_abi_version & 0xFFFF) < (_ABI_VERSION & 0xFFFF)):
     raise Error(
         f"pinkdb-ffi ABI version mismatch: {library_path!r} reports version "
-        f"{_loaded_abi_version}, this binding requires version {_ABI_VERSION}"
+        f"{_loaded_abi_version >> 16}.{_loaded_abi_version & 0xFFFF}, this binding "
+        f"requires {_ABI_VERSION >> 16}.{_ABI_VERSION & 0xFFFF} or a later minor"
     )
 
 
