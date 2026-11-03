@@ -1,0 +1,4 @@
+# Ignores its own deadline for an hour: only the parent's kill of the child
+# process ends it.
+statement ok
+SELECT pinkdb_slt_hang()

@@ -1456,20 +1456,27 @@ fn number_value(text: &str) -> std::result::Result<Value, &'static str> {
 }
 
 /// Integer literal → `Value` with DuckDB's magnitude rule (INTEGER when it
-/// fits i32, BIGINT when it fits i64, else HUGEINT); out-of-i128-range text is
-/// a parse error, exactly like the lexer's `Token::Integer` overflow error.
+/// fits i32, BIGINT when it fits i64, HUGEINT when it fits i128, else
+/// UHUGEINT); out-of-u128-range text is a parse error, exactly like the
+/// lexer's `Token::Integer` overflow error.
 fn int_value(text: &str) -> std::result::Result<Value, &'static str> {
-    let n: i128 = text
-        .replace('_', "")
-        .parse()
-        .map_err(|_| "integer literal out of range")?;
-    if let Ok(n) = i32::try_from(n) {
-        Ok(Value::Integer(n))
-    } else if let Ok(n) = i64::try_from(n) {
-        Ok(Value::Bigint(n))
-    } else {
-        Ok(Value::Hugeint(n))
+    let digits = text.replace('_', "");
+    if let Ok(n) = digits.parse::<i128>() {
+        if let Ok(n) = i32::try_from(n) {
+            return Ok(Value::Integer(n));
+        }
+        if let Ok(n) = i64::try_from(n) {
+            return Ok(Value::Bigint(n));
+        }
+        return Ok(Value::Hugeint(n));
     }
+    // A negative literal below i128::MIN is DuckDB's BIGNUM, which pinkdb
+    // does not have; only the positive side may reach UHUGEINT.
+    if digits.starts_with('-') {
+        return Err("integer literal out of range");
+    }
+    let n: u128 = digits.parse().map_err(|_| "integer literal out of range")?;
+    Ok(Value::Uhugeint(n))
 }
 
 /// The value of an `AT (TIMESTAMP => …)` literal, in either accepted form:
@@ -2886,6 +2893,7 @@ peg::parser! {
         /// requires the word's shape).
         rule copy_format_name() -> String
             = s:ident_raw() ws() { s.to_ascii_lowercase() }
+            / s:string_lit() { s.to_ascii_lowercase() }
 
         rule drop() -> Statement
             = kw(Keyword::Drop) word("schema") ife:if_exists() t:schema_ref()
@@ -3628,7 +3636,14 @@ peg::parser! {
             // i128::MIN (which does not fit i128 on its own) parses; postfix
             // casts still bind to the literal (`-5::HUGEINT`).
             = minus() n:int_text() ws() rest:(op:postfix_op() { op })* {? neg_int_literal(n, rest) }
-            / minus() e:unary() { Expr::Unary { op: UnaryOp::Negate, expr: Box::new(e) } }
+            // A bare UHUGEINT magnitude is DuckDB's BIGNUM once signed, which
+            // pinkdb does not have; a cast after it stays a runtime negation.
+            / minus() e:unary() {?
+                  match e {
+                      Expr::Literal(Value::Uhugeint(_)) => Err("integer literal out of range"),
+                      e => Ok(Expr::Unary { op: UnaryOp::Negate, expr: Box::new(e) }),
+                  }
+              }
             / plus() e:unary() { Expr::Unary { op: UnaryOp::Plus, expr: Box::new(e) } }
             / cast_postfix()
 
@@ -5125,7 +5140,7 @@ mod tests {
         "SELECT t.5;",
         "SELECT 5.e2;",
         "SELECT 1.e2;",
-        "SELECT 170141183460469231731687303715884105728;",
+        "SELECT 340282366920938463463374607431768211456;",
         "SELECT -170141183460469231731687303715884105729;",
         "SELECT `x`;",
         "SELECT 1)",
@@ -5431,14 +5446,18 @@ mod tests {
         // (the binder keeps `Cast(Literal(...))`; `tests/hugeint.rs` checks
         // the value it produces).
         assert!(parse("SELECT -5::HUGEINT;").is_ok());
+        assert_eq!(
+            lit("SELECT 170141183460469231731687303715884105728;"),
+            Value::Uhugeint(1u128 << 127)
+        );
         // `1.` is not a float (the dot stays a token), a bare exponent marker
-        // is not a number, and text past i128 is a parse error.
+        // is not a number, and text past u128 is a parse error.
         for sql in [
             "SELECT 1.;",
             "SELECT 1.e2;",
             "SELECT 5.;",
             "SELECT 1e+;",
-            "SELECT 170141183460469231731687303715884105728;",
+            "SELECT 340282366920938463463374607431768211456;",
             "SELECT -170141183460469231731687303715884105729;",
         ] {
             assert!(matches!(parse(sql), Err(PinkDbError::Parse(_))), "{sql}");

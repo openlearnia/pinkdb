@@ -123,6 +123,22 @@ fn to_array(v: &Vector, arrow: &arrow_schema::DataType) -> Result<ArrayRef> {
                 })?;
             std::sync::Arc::new(arr)
         }
+        // DuckDB's ArrowConverter keeps a 128-bit integer's bits in a
+        // Decimal128(38,0), so a UHUGEINT above i128::MAX reads as a negative
+        // decimal, exactly as the release writes it.
+        (VectorData::Int128(values), ArrowType::Decimal128(38, 0)) => {
+            let arr = Decimal128Array::new(ScalarBuffer::from(values.clone()), nulls)
+                .with_precision_and_scale(38, 0)
+                .map_err(|e| PinkDbError::Execution(format!("cannot write HUGEINT: {e}")))?;
+            std::sync::Arc::new(arr)
+        }
+        (VectorData::UInt128(values), ArrowType::Decimal128(38, 0)) => {
+            let values: Vec<i128> = values.iter().map(|&x| x as i128).collect();
+            let arr = Decimal128Array::new(ScalarBuffer::from(values), nulls)
+                .with_precision_and_scale(38, 0)
+                .map_err(|e| PinkDbError::Execution(format!("cannot write UHUGEINT: {e}")))?;
+            std::sync::Arc::new(arr)
+        }
         (VectorData::Interval(values), ArrowType::Interval(_)) => {
             let items: Vec<Option<ArrowMonthDayNano>> = values
                 .iter()

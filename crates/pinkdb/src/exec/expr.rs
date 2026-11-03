@@ -1688,6 +1688,39 @@ pub(crate) fn coerce_to(v: &Vector, target: DataType) -> Result<Vector> {
             let data = VectorData::Float64(src.iter().map(|&x| x as f64).collect());
             Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
         }
+        // UHUGEINT with DOUBLE (and every signed mix, which the binder types
+        // DOUBLE) widens the same way.
+        (VectorData::UInt128(src), DataType::Double) => {
+            let data = VectorData::Float64(src.iter().map(|&x| x as f64).collect());
+            Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
+        }
+        // UHUGEINT with DECIMAL: a value past i128 cannot be represented at
+        // any decimal scale, so it is DuckDB's out-of-range cast error.
+        (VectorData::UInt128(src), DataType::Decimal { precision, scale }) => {
+            let mut values: Vec<i128> = Vec::with_capacity(src.len());
+            for (i, &x) in src.iter().enumerate() {
+                if v.is_null(i) {
+                    values.push(0);
+                    continue;
+                }
+                let y = i128::try_from(x)
+                    .ok()
+                    .and_then(|y| crate::types::int_to_decimal(y, precision, scale))
+                    .ok_or_else(|| {
+                        PinkDbError::Execution(format!(
+                            "Conversion Error: Could not cast value {x} to \
+                             DECIMAL({precision},{scale})"
+                        ))
+                    })?;
+                values.push(y);
+            }
+            let data = VectorData::Decimal {
+                values,
+                precision,
+                scale,
+            };
+            Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
+        }
         // DECIMAL → DOUBLE: `/` widens both sides to DOUBLE (DuckDB rule);
         // explicit casts and comparisons use the exact rescale rules.
         (VectorData::Decimal { values, scale, .. }, DataType::Double) => {
@@ -1781,6 +1814,35 @@ fn coerce_value(v: Value, target: DataType) -> Result<Value> {
                 })
         }
         (Value::Bigint(i), DataType::Double) => Ok(Value::Double(i as f64)),
+        // UHUGEINT is the unsigned 128-bit counterpart: the integer widths
+        // coerce in and out with the same range checks, and no signed value
+        // below zero can enter.
+        (Value::Integer(i), DataType::Uhugeint) => u128::try_from(i)
+            .map(Value::Uhugeint)
+            .map_err(|_| wide_out_of_range(&Value::Integer(i), DataType::Uhugeint)),
+        (Value::Bigint(i), DataType::Uhugeint) => u128::try_from(i)
+            .map(Value::Uhugeint)
+            .map_err(|_| wide_out_of_range(&Value::Bigint(i), DataType::Uhugeint)),
+        (Value::Uhugeint(x), DataType::Uhugeint) => Ok(Value::Uhugeint(x)),
+        (Value::Uhugeint(x), DataType::Hugeint) => i128::try_from(x)
+            .map(Value::Hugeint)
+            .map_err(|_| wide_out_of_range(&Value::Uhugeint(x), DataType::Hugeint)),
+        (Value::Uhugeint(x), DataType::Integer) => i32::try_from(x)
+            .map(Value::Integer)
+            .map_err(|_| wide_out_of_range(&Value::Uhugeint(x), DataType::Integer)),
+        (Value::Uhugeint(x), DataType::Bigint) => i64::try_from(x)
+            .map(Value::Bigint)
+            .map_err(|_| wide_out_of_range(&Value::Uhugeint(x), DataType::Bigint)),
+        (Value::Uhugeint(x), DataType::Double) => Ok(Value::Double(x as f64)),
+        (Value::Uhugeint(x), DataType::Decimal { precision, scale }) => i128::try_from(x)
+            .ok()
+            .and_then(|y| crate::types::int_to_decimal(y, precision, scale))
+            .map(|v| Value::decimal(v, scale))
+            .ok_or_else(|| {
+                PinkDbError::Execution(format!(
+                    "Conversion Error: Could not cast value {x} to DECIMAL({precision},{scale})"
+                ))
+            }),
         (
             Value::Decimal {
                 value: x,
@@ -1861,6 +1923,9 @@ fn negate_value(v: Value, dtype: DataType) -> Result<Value> {
             .checked_neg()
             .map(Value::Hugeint)
             .ok_or_else(wide_neg_overflow),
+        // UHUGEINT negation only has the value zero in range.
+        (Value::Uhugeint(0), DataType::Uhugeint) => Ok(Value::Uhugeint(0)),
+        (Value::Uhugeint(_), DataType::Uhugeint) => Err(wide_neg_overflow()),
         (Value::Double(x), DataType::Double) => Ok(Value::Double(-x)),
         (
             Value::Decimal {
@@ -2081,6 +2146,18 @@ fn decimal_operand(v: &Vector) -> Result<(std::borrow::Cow<'_, [i128]>, u8)> {
             0,
         ),
         VectorData::Int128(src) => (std::borrow::Cow::Borrowed(src), 0),
+        VectorData::UInt128(src) => {
+            let mut out: Vec<i128> = Vec::with_capacity(src.len());
+            for &x in src {
+                let y = i128::try_from(x).map_err(|_| {
+                    PinkDbError::Execution(format!(
+                        "Conversion Error: Could not cast value {x} to DECIMAL"
+                    ))
+                })?;
+                out.push(y);
+            }
+            (std::borrow::Cow::Owned(out), 0)
+        }
         other => {
             return Err(PinkDbError::Execution(format!(
                 "decimal multiplication needs numeric operands, got {:?}",
@@ -2114,10 +2191,18 @@ fn arith_typed(op: BinaryOp, int_div: bool, l: &Vector, r: &Vector) -> Result<Op
             }
             _ => Ok(None),
         },
-        (VectorData::Float64(a), VectorData::Float64(b)) => match op {
-            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
-                Ok(Some(arith_f64(op, int_div, l, r, a, b)?))
+        (VectorData::UInt128(a), VectorData::UInt128(b)) => match op {
+            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Modulo => {
+                Ok(Some(arith_uint128(op, l, r, a, b)?))
             }
+            _ => Ok(None),
+        },
+        (VectorData::Float64(a), VectorData::Float64(b)) => match op {
+            BinaryOp::Add
+            | BinaryOp::Subtract
+            | BinaryOp::Multiply
+            | BinaryOp::Divide
+            | BinaryOp::Modulo => Ok(Some(arith_f64(op, int_div, l, r, a, b)?)),
             _ => Ok(None),
         },
         // Both sides are already coerced to the result DECIMAL's scale, so
@@ -2391,6 +2476,28 @@ fn wide_rem_overflow(x: i128, y: i128) -> PinkDbError {
     ))
 }
 
+/// DuckDB's unsigned 128-bit overflow text (`UINT128` rather than `INT128`).
+fn wide_overflow_u(op: BinaryOp, x: u128, y: u128) -> PinkDbError {
+    let (what, sign) = match op {
+        BinaryOp::Add => ("addition", '+'),
+        BinaryOp::Subtract => ("subtraction", '-'),
+        BinaryOp::Multiply => ("multiplication", '*'),
+        _ => unreachable!("wide_overflow_u called with {op:?}"),
+    };
+    PinkDbError::Execution(format!(
+        "Out of Range Error: Overflow in {what} of UINT128 ({x} {sign} {y})!"
+    ))
+}
+
+/// The division-by-zero error `%` shares with the signed 128-bit path.
+fn wide_mod_zero(x: impl std::fmt::Display, y: impl std::fmt::Display) -> PinkDbError {
+    PinkDbError::Execution(format!(
+        "Invalid Input Error: Division by zero in expression ({x} % {y}). Use TRY(...) to return \
+         NULL for this expression, or SET error_on_division_by_zero=false to return NULL for all \
+         divisions by zero."
+    ))
+}
+
 /// `-(MIN HUGEINT)` leaves the signed range.
 fn wide_neg_overflow() -> PinkDbError {
     PinkDbError::Execution("Out of Range Error: Overflow in negation of numeric value!".to_string())
@@ -2482,6 +2589,32 @@ fn arith_int128(op: BinaryOp, l: &Vector, r: &Vector, a: &[i128], b: &[i128]) ->
     Ok(out)
 }
 
+/// UHUGEINT `+`/`-`/`*`/`%`: checked in `u128` with DuckDB's UINT128 texts.
+/// `%` truncates toward zero; there is no `MIN / -1` case to overflow.
+fn arith_uint128(op: BinaryOp, l: &Vector, r: &Vector, a: &[u128], b: &[u128]) -> Result<Vector> {
+    let mut out = Vector::with_capacity(DataType::Uhugeint, a.len());
+    for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
+        if l.is_null(i) || r.is_null(i) {
+            out.push_null()?;
+            continue;
+        }
+        let v = match op {
+            BinaryOp::Add => x.checked_add(y).ok_or_else(|| wide_overflow_u(op, x, y))?,
+            BinaryOp::Subtract => x.checked_sub(y).ok_or_else(|| wide_overflow_u(op, x, y))?,
+            BinaryOp::Multiply => x.checked_mul(y).ok_or_else(|| wide_overflow_u(op, x, y))?,
+            BinaryOp::Modulo => {
+                if y == 0 {
+                    return Err(wide_mod_zero(x, y));
+                }
+                x % y
+            }
+            op => unreachable!("binder types {op:?} on UHUGEINT"),
+        };
+        out.push_u128(v)?;
+    }
+    Ok(out)
+}
+
 /// DOUBLE `+`/`-`/`*`/`/` with IEEE semantics. `int_div` keeps the old
 /// int/int rule even after widening: a zero divisor errors (a float operand
 /// would instead produce Inf/NaN).
@@ -2510,6 +2643,7 @@ fn arith_f64(
             BinaryOp::Multiply => x * y,
             // Binder forces DOUBLE for `/`, so int/int arrives widened here.
             BinaryOp::Divide => x / y,
+            BinaryOp::Modulo => x % y,
             _ => unreachable!("arith_f64: {op:?}"),
         };
         out.push_float64(v)?;
@@ -2725,6 +2859,22 @@ fn arith_values(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
             };
             v.map(Value::Hugeint).ok_or_else(|| wide_overflow(op, a, b))
         }
+        (Value::Uhugeint(a), Value::Uhugeint(b)) => {
+            let v = match op {
+                BinaryOp::Add => a.checked_add(b),
+                BinaryOp::Subtract => a.checked_sub(b),
+                BinaryOp::Multiply => a.checked_mul(b),
+                BinaryOp::Modulo => {
+                    if b == 0 {
+                        return Err(wide_mod_zero(a, b));
+                    }
+                    Some(a % b)
+                }
+                op => unreachable!("binder types {op:?} on UHUGEINT"),
+            };
+            v.map(Value::Uhugeint)
+                .ok_or_else(|| wide_overflow_u(op, a, b))
+        }
         (Value::Double(a), Value::Double(b)) => {
             let v = match op {
                 BinaryOp::Add => a + b,
@@ -2732,6 +2882,7 @@ fn arith_values(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
                 BinaryOp::Multiply => a * b,
                 // Binder forces DOUBLE for `/`, so int/int arrives widened here.
                 BinaryOp::Divide => a / b,
+                BinaryOp::Modulo => a % b,
                 _ => unreachable!("binder types {op:?} on DOUBLE"),
             };
             Ok(Value::Double(v))
@@ -3296,6 +3447,16 @@ fn eval_scalar_fast(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Resul
                     }
                     Ok(Some(out))
                 }
+                (VectorData::UInt128(s), DataType::Uhugeint) => {
+                    for (i, &x) in s.iter().enumerate() {
+                        if v.is_null(i) {
+                            out.push_null()?;
+                        } else {
+                            out.push_u128(x)?;
+                        }
+                    }
+                    Ok(Some(out))
+                }
                 (VectorData::Float64(s), DataType::Double) => {
                     for (i, &x) in s.iter().enumerate() {
                         if v.is_null(i) {
@@ -3527,6 +3688,7 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
             Value::Hugeint(i) => i.checked_abs().map(Value::Hugeint).ok_or_else(|| {
                 PinkDbError::Execution(format!("Out of Range Error: Overflow on abs({i})"))
             }),
+            Value::Uhugeint(x) => Ok(Value::Uhugeint(*x)),
             Value::Double(x) => Ok(Value::Double(x.abs())),
             v => Err(PinkDbError::Execution(format!("abs of {v}"))),
         },
@@ -4853,8 +5015,21 @@ fn wide_out_of_range(v: &Value, target: DataType) -> PinkDbError {
 
 /// DuckDB writes a DOUBLE's positive exponent with a sign (`1e+300`), and
 /// only ever in exponent form for the magnitudes a 128-bit cast refuses.
+/// DuckDB renders a DOUBLE the way `fmt` does: shortest round-trip, plain
+/// decimal while the exponent is in `[-4, 16)`, scientific (with a signed
+/// exponent) outside it. Overflow texts show the value this way.
 fn duckdb_double_text(x: f64) -> String {
+    if x.is_nan() || x.is_infinite() {
+        return format!("{x}").to_lowercase();
+    }
     let s = format!("{x:e}");
+    let exp: i32 = s
+        .split_once('e')
+        .and_then(|(_, e)| e.parse().ok())
+        .unwrap_or(0);
+    if (-4..16).contains(&exp) {
+        return format!("{x}");
+    }
     match s.split_once('e') {
         Some((mantissa, exp)) if !exp.starts_with(['+', '-']) => format!("{mantissa}e+{exp}"),
         _ => s,
@@ -4872,10 +5047,27 @@ fn parse_hugeint(s: &str) -> Result<Value> {
         })
 }
 
-/// DOUBLE → HUGEINT: round half away from zero, refusing anything outside the
-/// i128 range (2^127 is exact in f64, so the bounds compare exactly).
+/// Round a DECIMAL payload to an integer, ties away from zero (DuckDB's
+/// decimal→integer rule). `2 * r` can exceed `i128`, so the comparison uses
+/// `u128`.
+fn decimal_to_i128(x: i128, scale: u8) -> i128 {
+    if scale == 0 {
+        return x;
+    }
+    let p = POW10_I128[scale as usize];
+    let (q, r) = (x / p, x % p);
+    if r.unsigned_abs().saturating_mul(2) >= p as u128 {
+        q + r.signum()
+    } else {
+        q
+    }
+}
+
+/// DOUBLE → HUGEINT: round to the nearest integer, ties to even (DuckDB's
+/// `nearbyint`), refusing anything outside the i128 range (2^127 is exact in
+/// f64, so the bounds compare exactly).
 fn f64_to_hugeint(x: f64) -> Result<Value> {
-    let r = x.round();
+    let r = x.round_ties_even();
     let bound = (1u128 << 127) as f64;
     // DuckDB's bounds are exclusive: ±2^127 as a DOUBLE is already out of range,
     // even though -2^127 is a valid INT128 (corpus `hugeint_try_cast`).
@@ -4883,6 +5075,18 @@ fn f64_to_hugeint(x: f64) -> Result<Value> {
         Ok(Value::Hugeint(r as i128))
     } else {
         Err(wide_out_of_range(&Value::Double(x), DataType::Hugeint))
+    }
+}
+
+/// DOUBLE → UHUGEINT: the same ties-to-even rounding, in the half-open range
+/// `[0, 2^128)`.
+fn f64_to_uhugeint(x: f64) -> Result<Value> {
+    let r = x.round_ties_even();
+    let bound = ((1u128 << 127) as f64) * 2.0;
+    if r >= 0.0 && r < bound {
+        Ok(Value::Uhugeint(r as u128))
+    } else {
+        Err(wide_out_of_range(&Value::Double(x), DataType::Uhugeint))
     }
 }
 
@@ -4911,7 +5115,36 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
         (Value::Integer(i), DataType::Hugeint) => Ok(Value::Hugeint(i as i128)),
         (Value::Bigint(i), DataType::Hugeint) => Ok(Value::Hugeint(i as i128)),
         (Value::Double(x), DataType::Hugeint) => f64_to_hugeint(x),
+        (Value::Integer(i), DataType::Uhugeint) => u128::try_from(i)
+            .map(Value::Uhugeint)
+            .map_err(|_| wide_out_of_range(&Value::Integer(i), DataType::Uhugeint)),
+        (Value::Bigint(i), DataType::Uhugeint) => u128::try_from(i)
+            .map(Value::Uhugeint)
+            .map_err(|_| wide_out_of_range(&Value::Bigint(i), DataType::Uhugeint)),
+        (Value::Double(x), DataType::Uhugeint) => f64_to_uhugeint(x),
         (Value::Varchar(s), DataType::Hugeint) => parse_hugeint(&s),
+        (Value::Varchar(s), DataType::Uhugeint) => crate::types::parse_u128_str(&s)
+            .map(Value::Uhugeint)
+            .ok_or_else(|| {
+                PinkDbError::Execution(format!(
+                    "Conversion Error: Could not convert string '{s}' to UINT128"
+                ))
+            }),
+        (Value::Hugeint(x), DataType::Uhugeint) => u128::try_from(x)
+            .map(Value::Uhugeint)
+            .map_err(|_| wide_out_of_range(&Value::Hugeint(x), DataType::Uhugeint)),
+        (Value::Uhugeint(x), DataType::Integer) => i32::try_from(x)
+            .map(Value::Integer)
+            .map_err(|_| wide_out_of_range(&Value::Uhugeint(x), DataType::Integer)),
+        (Value::Uhugeint(x), DataType::Bigint) => i64::try_from(x)
+            .map(Value::Bigint)
+            .map_err(|_| wide_out_of_range(&Value::Uhugeint(x), DataType::Bigint)),
+        (Value::Uhugeint(x), DataType::Hugeint) => i128::try_from(x)
+            .map(Value::Hugeint)
+            .map_err(|_| wide_out_of_range(&Value::Uhugeint(x), DataType::Hugeint)),
+        (Value::Uhugeint(x), DataType::Double) => Ok(Value::Double(x as f64)),
+        (Value::Uhugeint(x), DataType::Boolean) => Ok(Value::Boolean(x != 0)),
+        (Value::Boolean(b), DataType::Uhugeint) => Ok(Value::Uhugeint(b as u128)),
         (Value::Hugeint(x), DataType::Integer) => i32::try_from(x)
             .map(Value::Integer)
             .map_err(|_| wide_out_of_range(&Value::Hugeint(x), DataType::Integer)),
@@ -4928,14 +5161,23 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
             },
             DataType::Hugeint,
         ) => {
-            let y = if scale == 0 {
-                x
-            } else {
-                let p = POW10_I128[scale as usize];
-                let (q, r) = (x / p, x % p);
-                if 2 * r.abs() >= p { q + r.signum() } else { q }
-            };
+            let y = decimal_to_i128(x, scale);
             Ok(Value::Hugeint(y))
+        }
+        // DECIMAL → UHUGEINT rounds the same way, then refuses a negative
+        // result with DuckDB's UINT128 text.
+        (
+            Value::Decimal {
+                value: x, scale, ..
+            },
+            DataType::Uhugeint,
+        ) => {
+            let y = decimal_to_i128(x, scale);
+            u128::try_from(y).map(Value::Uhugeint).map_err(|_| {
+                PinkDbError::Execution(format!(
+                    "Conversion Error: Failed to cast decimal value {y} to type UINT128"
+                ))
+            })
         }
         // HUGEINT → DECIMAL rescales exactly, then checks the precision.
         (Value::Hugeint(x), DataType::Decimal { precision, scale }) => {
@@ -4947,6 +5189,16 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
                     ))
                 })
         }
+        // UHUGEINT → DECIMAL needs the value to fit an i128's 38 digits.
+        (Value::Uhugeint(x), DataType::Decimal { precision, scale }) => i128::try_from(x)
+            .ok()
+            .and_then(|y| crate::types::int_to_decimal(y, precision, scale))
+            .map(|v| Value::decimal(v, scale))
+            .ok_or_else(|| {
+                PinkDbError::Execution(format!(
+                    "Conversion Error: Could not cast value {x} to DECIMAL({precision},{scale})"
+                ))
+            }),
         (
             Value::Decimal {
                 value: x,
@@ -5067,6 +5319,9 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
         // VARCHAR → INTERVAL (INTERVAL → VARCHAR rides the generic
         // "everything formats to VARCHAR" arm above).
         // VARCHAR → UUID: DuckDB accepts braces and upper case on input.
+        // UUID and UHUGEINT are both 128-bit payloads in DuckDB.
+        (Value::Uuid(bits), DataType::Uhugeint) => Ok(Value::Uhugeint(bits)),
+        (Value::Uhugeint(x), DataType::Uuid) => Ok(Value::Uuid(x)),
         (Value::Varchar(s), DataType::Uuid) => crate::uuid::parse(&s)
             .map(Value::Uuid)
             .ok_or_else(|| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS UUID"))),

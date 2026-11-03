@@ -344,3 +344,12 @@ Named so review does not read their absence as an oversight:
 3. Agreed: cross-width grouping is tested in step 1.
 4. Steps 1–3 run as one brief (no file, protocol or ABI change); step 4 on
    its own; 5–7 each separately; 8 after 7; 9 last.
+5. Parquet, corrected against the v2.0.0 release (2026-11-02): the release
+   writes HUGEINT and UHUGEINT columns as a plain `DOUBLE` with no metadata,
+   and reads them back as `DOUBLE` — its own
+   `parquet_write_hugeint.test` / `parquet_write_uhugeint.test` expect
+   `typeof(h) = DOUBLE`. pinkdb matches the release (a cast to `DOUBLE`, so
+   values above 2^53 lose the same low bits), replacing the exact FLBA(16)
+   layout this plan originally chose. Arrow export stays `Decimal128(38,0)`,
+   as DuckDB's ArrowConverter writes both widths (UHUGEINT keeps its raw 128
+   bits, so values above `i128::MAX` read as a negative decimal).

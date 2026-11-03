@@ -54,7 +54,7 @@ pub struct ScanIo {
     /// Bytes those requests read.
     pub bytes: u64,
     /// The most morsels decoded and not yet folded (filled in by the
-    /// pipeline; a drained source reports 1).
+    /// pipeline; a drained source reports the workers that decoded).
     pub in_flight_peak: u64,
 }
 

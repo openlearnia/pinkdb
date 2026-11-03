@@ -263,7 +263,11 @@ impl Resolved {
     /// The row groups a scan of this call will visit (`None` when the call
     /// resolved to no files at all).
     pub fn total_rows(&self) -> u64 {
-        self.files.iter().map(|f| f.meta.rows).sum()
+        // Footer counts are untrusted: two files claiming `u64::MAX / 2` rows
+        // each must saturate, not overflow.
+        self.files
+            .iter()
+            .fold(0u64, |rows, file| rows.saturating_add(file.meta.rows))
     }
 }
 

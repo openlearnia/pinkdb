@@ -3186,9 +3186,11 @@ pub(crate) fn num_cmp(x: f64, y: f64) -> std::cmp::Ordering {
 ///
 /// Signed/unsigned promotion follows DuckDB's `MaxLogicalType`: a negative
 /// HUGEINT sorts below every UHUGEINT, and same-signedness values compare as
-/// their exact 128-bit values. DECIMAL is exact at scale 0 for HUGEINT; a
-/// UHUGEINT can exceed `i128`, so it compares through DOUBLE like DuckDB's
-/// UHUGEINT/DECIMAL promotion.
+/// their exact 128-bit values. HUGEINT with UHUGEINT is DOUBLE in DuckDB, so
+/// those two compare through DOUBLE; INTEGER/BIGINT with UHUGEINT widen to a
+/// wider signed integer, which is the exact ordering used here. DECIMAL is
+/// exact at scale 0 for HUGEINT; a UHUGEINT can exceed `i128`, so it compares
+/// through DOUBLE like DuckDB's UHUGEINT/DECIMAL promotion.
 fn wide_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
     let int128 = |v: &Value| -> Option<(bool, u128)> {
@@ -3203,6 +3205,8 @@ fn wide_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     let ord = match (a, b) {
         (Value::Hugeint(x), Value::Double(y)) => num_cmp(*x as f64, *y),
         (Value::Double(x), Value::Hugeint(y)) => num_cmp(*x, *y as f64),
+        (Value::Uhugeint(x), Value::Hugeint(y)) => num_cmp(*x as f64, *y as f64),
+        (Value::Hugeint(x), Value::Uhugeint(y)) => num_cmp(*x as f64, *y as f64),
         (Value::Uhugeint(x), Value::Double(y)) => num_cmp(*x as f64, *y),
         (Value::Double(x), Value::Uhugeint(y)) => num_cmp(*x, *y as f64),
         (Value::Hugeint(x), Value::Decimal { value, scale, .. }) => {

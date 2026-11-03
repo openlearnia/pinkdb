@@ -9324,9 +9324,9 @@ mod tests {
         }
     }
 
-    /// UHUGEINT has no SQL producer before step 8 (no literal, cast or INSERT
-    /// coercion), so the 16-byte payload, the statistics tag and the zone-map
-    /// extremes are pinned at the codec instead.
+    /// The 16-byte payload, statistics tag and zone-map extremes are pinned
+    /// here at the codec; the SQL-level UHUGEINT round trip is covered by
+    /// `tests/hugeint.rs`.
     #[test]
     fn uhugeint_payload_and_statistics_span_the_u128_range() {
         let values = [

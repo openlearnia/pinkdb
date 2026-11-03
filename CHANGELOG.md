@@ -9,6 +9,20 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-11-03
+### Wave 133c — lake queries 4× faster ✅
+
+TPC-H at scale factor 1 from a Parquet lake runs 4.2× faster than before
+(geometric mean; every query faster, the slowest ones 14–27×), now 2–7× DuckDB
+v2.0.0's time on its own storage, down from 3–77×. Store tables are unchanged.
+
+- **No per-chunk table building**: a lake scan hands the engine each decoded
+  chunk as is. It no longer computes statistics, copies columns or fills
+  unrequested columns with NULLs row by row, which took most of a scan's time.
+- **Parallel reads below joins and sorts**: a lake table read whole (a join's
+  build side, a sort's input) is decoded by all worker threads, in order,
+  instead of by one.
+- Columns added after a file was written read their `DEFAULT` in bulk.
+
 ### Wave 136 (step c-2) — the decoded cache lives inside `memory_limit` ✅
 
 Decoded chunks are a cache, not a pin: they use whatever room `memory_limit`
@@ -79,19 +93,17 @@ statement decodes them.
   17) and returned to the C API and the Node, Python and Go bindings (as exact
   decimal text).
 
-### Wave 136 (step c-0) — GROUP BY state bounded by groups for wide keys ✅
+### Wave 136 (step c-0) — wide-key GROUP BY state: bounded, then disabled ⏸
 
-A GROUP BY on VARCHAR keys whose state would grow with the input rows now
-keeps one entry per group.
-
-- **Memory**: QuackLab's `od_pairs_rollup` (245,570 rows, 30,303 groups,
-  two VARCHAR keys) peaks at 13.4 MiB instead of 91 MiB; pinkdb-server on the
-  QuackLab chart load (16 clients x 10 rounds) peaks at 412 MB instead of
-  1,060 MB.
-- **Known regression, to be fixed by step c-0b**: the bounded path is serial,
-  so `od_pairs_rollup` at 12 threads takes 63 ms instead of 13–21 ms (1
-  thread: 47 -> 66 ms). Integer-key aggregates (all of TPC-H) are unchanged,
-  and results are bit-identical.
+Step c-0 added a lane that bounded the state of a GROUP BY on VARCHAR keys by
+its groups instead of its input rows (QuackLab's `od_pairs_rollup`: 91 MiB ->
+13.4 MiB per run). **It is disabled again**: an interleaved A/B against the
+binary before it showed the lane 5–15x slower than first measured
+(`od_pairs_rollup` 170–850 ms against 34 ms), because it built and merged a
+full group per input row. `od_pairs_rollup` is back to ~34 ms at ~91 MiB per
+run. Bounding this state returns with a radix-partitioned aggregate table
+(step c-0b, ROADMAP row 124). Its other changes stay: the GROUP BY state tests,
+and a small-input check that skips the sample on inputs under 131,072 rows.
 
 ### Fixes ✅
 

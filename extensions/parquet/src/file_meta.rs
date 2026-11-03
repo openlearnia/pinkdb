@@ -99,6 +99,82 @@ impl FileMeta {
         })
     }
 
+    /// Refuse a footer whose column chunks cannot describe the rows they
+    /// claim, before any buffer is sized from those counts.
+    ///
+    /// Ported from DuckDB's `ValidateColumnMetadata`
+    /// (duckdb/extension/parquet/parquet_column_schema.cpp): a negative value
+    /// count is corrupt, and a flat (non-nested, `max_repeat == 0`) column
+    /// stores exactly one value per row of its row group. A nested column is
+    /// exempt from the count check (its leaves follow repetition levels) but
+    /// not from the negative check.
+    ///
+    /// Also bounds every chunk's bytes by the file: page and dictionary reads
+    /// are sized from them, so a chunk that runs past the end of the file is
+    /// corrupt rather than a large allocation.
+    pub fn validate(&self) -> Result<()> {
+        for (rg_index, rg) in self.row_groups.iter().enumerate() {
+            for column in &self.columns {
+                // A flat column has one leaf and no repetition above it; an
+                // ARRAY or shredded VARIANT column has several values per row.
+                let flat = column.leaves == 1
+                    && column.shred.is_none()
+                    && !matches!(column.ty, DataType::Array { .. });
+                for offset in 0..column.leaves {
+                    let Some(chunk) = rg.chunks.get(column.leaf + offset) else {
+                        return Err(corrupt(
+                            &self.path,
+                            format!(
+                                "Row group {rg_index} has no column chunk for column \"{}\"
+                                (chunk {offset} of {})",
+                                column.name, column.leaves
+                            ),
+                        ));
+                    };
+                    if chunk.num_values < 0 {
+                        return Err(corrupt(
+                            &self.path,
+                            format!("Column has invalid number of values ({})", chunk.num_values),
+                        ));
+                    }
+                    // `num_values` is non-negative from here on.
+                    if flat && chunk.num_values as u64 != rg.rows {
+                        return Err(corrupt(
+                            &self.path,
+                            format!(
+                                "Column has {} values but row group has {} rows",
+                                chunk.num_values, rg.rows
+                            ),
+                        ));
+                    }
+                    // The chunk's pages start at its dictionary page when it
+                    // has one and must end inside the file.
+                    let start = match chunk.dictionary_page_offset {
+                        Some(offset) if offset >= 0 => Some(offset as u64),
+                        _ if chunk.data_page_offset >= 0 => Some(chunk.data_page_offset as u64),
+                        _ => None,
+                    };
+                    if let Some(start) = start
+                        && chunk.compressed_size > 0
+                    {
+                        let end = start.saturating_add(chunk.compressed_size as u64);
+                        if end > self.file_size {
+                            return Err(corrupt(
+                                &self.path,
+                                format!(
+                                    "Row group {rg_index} column \"{}\" spans bytes \
+                                     {start}..{end} of a {}-byte file",
+                                    column.name, self.file_size
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The column leaf index of the first column named `name`
     /// (case-insensitively, like every SQL name).
     pub fn column_index(&self, name: &str) -> Option<usize> {
@@ -106,6 +182,14 @@ impl FileMeta {
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(name))
     }
+}
+
+/// A corrupt-metadata error in DuckDB's wording (its `InvalidInputException`
+/// class; pinkdb's `Execution` is the invalid-input class).
+fn corrupt(path: &str, why: impl std::fmt::Display) -> PinkDbError {
+    PinkDbError::Execution(format!(
+        "Failed to read file \"{path}\": metadata is corrupt. {why}"
+    ))
 }
 
 /// Read one ranged object's metadata through a [`crate::ranged::RangeSource`]

@@ -13,6 +13,7 @@
 //! Postgres section needs a server in `PINKDB_TEST_POSTGRES_URL` (one
 //! throwaway database or server, like the other Postgres suites); unset
 //! prints one skip line.
+#![cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

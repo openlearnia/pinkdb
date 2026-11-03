@@ -33,7 +33,31 @@ mod mock_s3;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn scratch(tag: &str) -> PathBuf {
+/// A test's scratch directory, removed when dropped: at the end of the test
+/// and also when it panics, so a failing run leaves nothing in `$TMPDIR`.
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for Scratch {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(tag: &str) -> Scratch {
     let dir = std::env::temp_dir().join(format!(
         "pink_lake_ducklake_{tag}_{}_{}",
         std::process::id(),
@@ -41,7 +65,7 @@ fn scratch(tag: &str) -> PathBuf {
     ));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    Scratch(dir)
 }
 
 fn cleanup(dir: &Path) {
@@ -1637,7 +1661,7 @@ fn an_absolute_catalog_path_outside_the_data_root_is_refused() {
 
 #[cfg(feature = "catalog-postgres")]
 struct TestPostgres {
-    dir: PathBuf,
+    dir: Scratch,
 }
 
 /// One throwaway server at a time: the tests that start one share port 55433.

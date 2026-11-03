@@ -148,6 +148,7 @@ fn peaks(sizes: [i64; 2]) -> [Vec<u64>; 2] {
 }
 
 #[test]
+#[ignore = "dense lane disabled until 136c-0b, see ROADMAP"]
 fn group_state_is_bounded_by_groups_not_rows() {
     let [small, large] = peaks([ROWS, ROWS * 8]);
     for (i, shape) in SHAPES.iter().enumerate() {

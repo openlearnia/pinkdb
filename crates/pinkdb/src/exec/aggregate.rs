@@ -698,6 +698,14 @@ impl Acc {
                     };
                     self.add_hugeint(d[i]);
                 }
+                // A UHUGEINT cell sums through DOUBLE, as DuckDB's implicit
+                // cast does; the accumulator has to leave the exact path.
+                VectorData::UInt128(d) => {
+                    *self = Acc::SumFloat {
+                        sum: exact_sum(*sum, *wraps) as f64 + d[i] as f64,
+                        non_null: true,
+                    };
+                }
                 // A DOUBLE cell flips the accumulator to float (same rule as
                 // `update`).
                 VectorData::Float64(d) => {
@@ -716,6 +724,10 @@ impl Acc {
                     *non_null = true;
                 }
                 VectorData::Int64(d) => {
+                    *sum += d[i] as f64;
+                    *non_null = true;
+                }
+                VectorData::UInt128(d) => {
                     *sum += d[i] as f64;
                     *non_null = true;
                 }
@@ -759,6 +771,7 @@ impl Acc {
                 VectorData::Int32(d) => avg.add_int(d[i] as i128),
                 VectorData::Int64(d) => avg.add_int(d[i] as i128),
                 VectorData::Int128(d) => avg.add_int(d[i]),
+                VectorData::UInt128(d) => avg.add_f64(d[i] as f64),
                 VectorData::Float64(d) => avg.add_f64(d[i]),
                 VectorData::Decimal { values, scale, .. } => avg.add_decimal(values[i], *scale),
                 _ => {}
@@ -804,6 +817,12 @@ impl Acc {
                     *non_null = true;
                 }
                 Some(Value::Hugeint(i)) => self.add_hugeint(*i),
+                Some(Value::Uhugeint(u)) => {
+                    *self = Acc::SumFloat {
+                        sum: exact_sum(*sum, *wraps) as f64 + *u as f64,
+                        non_null: true,
+                    };
+                }
                 Some(Value::Double(x)) => {
                     *self = Acc::SumFloat {
                         sum: exact_sum(*sum, *wraps) as f64 + *x,
@@ -828,6 +847,10 @@ impl Acc {
                     *sum += *i as f64;
                     *non_null = true;
                 }
+                Some(Value::Uhugeint(u)) => {
+                    *sum += *u as f64;
+                    *non_null = true;
+                }
                 Some(Value::Double(x)) => {
                     *sum += *x;
                     *non_null = true;
@@ -846,6 +869,7 @@ impl Acc {
                 Some(Value::Integer(i)) => avg.add_int(*i as i128),
                 Some(Value::Bigint(i)) => avg.add_int(*i as i128),
                 Some(Value::Hugeint(i)) => avg.add_int(*i),
+                Some(Value::Uhugeint(u)) => avg.add_f64(*u as f64),
                 Some(Value::Double(x)) => avg.add_f64(*x),
                 Some(Value::Decimal {
                     value: x, scale, ..

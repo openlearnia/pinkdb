@@ -613,9 +613,6 @@ struct PlannedFile {
     file: AttachedFile,
     plan: Option<FilePlan>,
     morsels: Option<Box<dyn crate::format::FileMorsels>>,
-    /// The physical columns the morsel chunks carry (a placeholder for the
-    /// rest), for the projection.
-    present: Vec<bool>,
 }
 
 /// A planned lake scan: what the engine's pipeline shares between its workers.
@@ -676,14 +673,7 @@ impl ScanPlan {
                 };
                 let mut rows = 0u64;
                 morsels.decode(*morsel as usize, &mut |chunk| {
-                    rows += push_physical(
-                        &self.entry,
-                        &planned.file,
-                        plan,
-                        &planned.present,
-                        chunk,
-                        sink,
-                    )?;
+                    rows += push_physical(&self.entry, &planned.file, plan, chunk, sink)?;
                     Ok(())
                 })?;
                 let expected = morsels.rows(*morsel as usize);
@@ -822,42 +812,39 @@ fn planned_file(
     } else {
         None
     };
-    let (morsels, present) = match &plan {
-        Some(plan) => {
-            let mut present = vec![false; plan.physical_schema.len()];
-            for &index in &plan.decoded {
-                present[index] = true;
-            }
-            let morsels = entry
-                .format
-                .morsels(&data_file, &plan.decoded, &plan.filters)?;
-            (morsels, present)
-        }
-        None => (None, Vec::new()),
+    let morsels = match &plan {
+        Some(plan) => entry
+            .format
+            .morsels(&data_file, &plan.decoded, &plan.filters)?,
+        None => None,
     };
     Ok(PlannedFile {
         file: file.clone(),
         plan,
         morsels,
-        present,
     })
 }
 
 /// Project one decoded physical chunk onto the table's logical schema and hand
-/// its chunks to `sink`, returning the rows pushed.
+/// it to `sink`, returning the rows pushed.
+///
+/// The sink gets the engine's scan-chunk shape straight from the decoder: a
+/// requested column is `num_rows` long (the decoded vector, shared), one the
+/// file predates is its DEFAULT as a constant, and a column the projection did
+/// not request is a zero-length placeholder. No `DataTable`, statistics pass or
+/// re-split stands between the provider and the scan.
 fn push_physical(
     entry: &AttachedEntry,
     file: &AttachedFile,
     plan: &FilePlan,
-    present: &[bool],
     chunk: DataChunk,
     sink: &mut dyn FnMut(DataChunk) -> std::result::Result<(), PinkDbError>,
 ) -> pinkdb::Result<u64> {
     let key = entry.key();
+    let num_rows = chunk.num_rows();
     // The chunk has either the file's full physical width or just the requested
     // columns, in order, and a column it did not decode is a zero-length
-    // placeholder (see `DataChunk::projected`). The projection needs the full
-    // physical width.
+    // placeholder (see `DataChunk::projected`).
     let width = plan.physical_schema.len();
     let full_width = chunk.columns.len() == width;
     if !full_width && chunk.columns.len() != plan.decoded.len() {
@@ -867,52 +854,70 @@ fn push_physical(
             chunk.columns.len()
         )));
     }
-    let mut columns = Vec::with_capacity(width);
-    for (index, (name, dtype)) in plan.physical_schema.iter().enumerate() {
-        let held = if full_width {
-            Some(Arc::clone(&chunk.columns[index]))
-        } else {
-            plan.decoded
-                .binary_search(&index)
-                .ok()
-                .map(|position| Arc::clone(&chunk.columns[position]))
-        };
-        let vector = match held {
-            Some(vector) if vector.len() == chunk.num_rows() => vector,
-            _ => {
-                let mut vector = pinkdb::Vector::with_capacity(*dtype, chunk.num_rows());
-                for _ in 0..chunk.num_rows() {
-                    vector.push_null()?;
-                }
-                Arc::new(vector)
-            }
-        };
-        columns.push(pinkdb::storage::Column::from_chunks(
-            name.clone(),
-            *dtype,
-            None,
-            vec![vector],
-        )?);
-    }
-    let decoded = DataTable::from_columns(entry.table.clone(), columns, chunk.num_rows())?;
-    let (table, _present) = match &entry.record {
-        Some(schema) => schema
-            .project_table(&plan.mapping, &decoded, present, &entry.table)
-            .map_err(scan_error)?,
-        None => (decoded, present.to_vec()),
+    // The logical schema: the record's columns (type and DEFAULT), or, for an
+    // entry without a schema record, the file's own columns one to one.
+    let logical: Vec<(pinkdb::DataType, Option<&pinkdb::Value>)> = match &entry.record {
+        Some(record) => record
+            .columns
+            .iter()
+            .map(|column| (column.dtype, column.default.as_ref()))
+            .collect(),
+        None => plan
+            .physical_schema
+            .iter()
+            .map(|(_, dtype)| (*dtype, None))
+            .collect(),
     };
-    let mut rows = 0u64;
-    for index in 0..table.num_chunks() {
-        let out = table.scan_chunk(index)?.ok_or_else(|| {
-            PinkDbError::Execution(format!(
-                "internal: chunk {index} of \"{}\" disappeared",
-                file.rel
-            ))
-        })?;
-        rows += out.num_rows() as u64;
-        sink(out)?;
+    if logical.len() != plan.wanted.len() {
+        return Err(PinkDbError::Execution(format!(
+            "internal: table \"{key}\": data file \"{}\" planned {} logical columns, the \
+             schema has {}",
+            file.rel,
+            plan.wanted.len(),
+            logical.len()
+        )));
     }
-    Ok(rows)
+    let mut columns = Vec::with_capacity(logical.len());
+    for (index, (dtype, default)) in logical.into_iter().enumerate() {
+        let vector = if !plan.wanted[index] {
+            Arc::new(pinkdb::Vector::with_capacity(dtype, 0))
+        } else if let Some(physical) = plan.mapping.physical[index] {
+            let position = if full_width {
+                physical
+            } else {
+                plan.decoded.binary_search(&physical).map_err(|_| {
+                    PinkDbError::Execution(format!(
+                        "internal: table \"{key}\": data file \"{}\" did not decode column \
+                         {physical}",
+                        file.rel
+                    ))
+                })?
+            };
+            let vector = chunk
+                .columns
+                .get(position)
+                .filter(|vector| vector.len() == num_rows)
+                .ok_or_else(|| {
+                    PinkDbError::Execution(format!(
+                        "internal: table \"{key}\": data file \"{}\" pushed column {physical} \
+                         short of {num_rows} rows",
+                        file.rel
+                    ))
+                })?;
+            // The decoder's own vector: a projected chunk is read-only.
+            Arc::clone(vector)
+        } else {
+            // The file predates the column: every row reads its DEFAULT.
+            Arc::new(pinkdb::Vector::constant(
+                dtype,
+                default.unwrap_or(&pinkdb::Value::Null),
+                num_rows,
+            )?)
+        };
+        columns.push(vector);
+    }
+    sink(DataChunk::projected(columns, num_rows))?;
+    Ok(num_rows as u64)
 }
 
 /// The engine's form of a lake error: its message carries the lake's own
@@ -1178,11 +1183,14 @@ fn requested_mask(n_cols: usize, columns: Option<&[usize]>) -> Vec<bool> {
 /// column needs, others decode whole and project in memory.
 #[cfg_attr(not(test), allow(unused_variables))]
 /// One data file's physical decode plan: what the file holds, how those
-/// columns map onto the table's logical schema, which physical columns the
-/// request must decode, and the pushed predicates in physical indices.
+/// columns map onto the table's logical schema, which logical columns the
+/// request wants, which physical columns it must decode, and the pushed
+/// predicates in physical indices.
 struct FilePlan {
     physical_schema: Vec<(String, pinkdb::DataType)>,
     mapping: crate::schema::FileMapping,
+    /// One flag per logical column: `columns` as the scan asked for it.
+    wanted: Vec<bool>,
     decoded: Vec<usize>,
     filters: Vec<pinkdb::attached::PrunePredicate>,
 }
@@ -1286,6 +1294,7 @@ fn file_plan(
     Ok(Some(FilePlan {
         physical_schema,
         mapping,
+        wanted,
         decoded,
         filters,
     }))

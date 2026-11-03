@@ -12,6 +12,7 @@
 //! | BOOLEAN | BOOLEAN |
 //! | INTEGER | INT32 |
 //! | BIGINT | INT64 |
+//! | HUGEINT / UHUGEINT | DOUBLE (a cast, as DuckDB 2.0 writes them; read back as DOUBLE) |
 //! | DOUBLE | DOUBLE (exact bits: NaN, `-0.0`, ±inf preserved) |
 //! | VARCHAR | BYTE_ARRAY + STRING (UTF-8) |
 //! | DATE | INT32 + DATE |
@@ -364,18 +365,11 @@ fn physical_type(dtype: DataType, column: &str) -> Result<PhysicalType, WriteErr
         DataType::Integer | DataType::Date => PhysicalType::INT32,
         DataType::Bigint | DataType::Timestamp => PhysicalType::INT64,
         DataType::Double => PhysicalType::DOUBLE,
+        // DuckDB 2.0 writes 128-bit integers as a plain DOUBLE with no
+        // metadata, and reads them back as DOUBLE (`parquet_write_hugeint`).
+        DataType::Hugeint | DataType::Uhugeint => PhysicalType::DOUBLE,
         DataType::Varchar => PhysicalType::BYTE_ARRAY,
         DataType::Uuid => PhysicalType::FIXED_LEN_BYTE_ARRAY,
-        // HUGEINT arrives in step 7 of `docs/slt-3-hugeint-plan.md` as
-        // FIXED_LEN_BYTE_ARRAY(16) plus the `duckdb.int128` marker; until
-        // then a column of it cannot be written rather than silently
-        // becoming DOUBLE.
-        DataType::Hugeint | DataType::Uhugeint => {
-            return Err(WriteError::UnsupportedType {
-                column: column.to_string(),
-                message: format!("{} is not yet supported in Parquet", dtype.name()),
-            });
-        }
         DataType::Decimal { precision, .. } => {
             if precision <= 9 {
                 PhysicalType::INT32
@@ -474,11 +468,12 @@ fn build_schema(
             builder = builder.with_id(Some(ids.0));
         }
         match dtype {
-            // `physical_type` refuses them before this match.
-            DataType::Hugeint | DataType::Uhugeint => {
-                unreachable!("physical_type refuses 128-bit integer columns")
-            }
-            DataType::Boolean | DataType::Integer | DataType::Bigint | DataType::Double => {}
+            DataType::Boolean
+            | DataType::Integer
+            | DataType::Bigint
+            | DataType::Double
+            | DataType::Hugeint
+            | DataType::Uhugeint => {}
             DataType::Varchar => {
                 builder = builder
                     .with_converted_type(ConvertedType::UTF8)
@@ -537,12 +532,19 @@ fn write_column(
     name: &str,
 ) -> Result<(), WriteError> {
     match dtype {
-        DataType::Hugeint | DataType::Uhugeint => {
-            return Err(WriteError::UnsupportedType {
-                column: name.to_string(),
-                message: format!("{} is not yet supported in Parquet", dtype.name()),
-            });
-        }
+        DataType::Hugeint | DataType::Uhugeint => write_typed(
+            column.typed::<DoubleType>(),
+            rows,
+            cursor,
+            name,
+            |v| match v {
+                // DuckDB's write is a cast to DOUBLE, so a value above 2^53
+                // loses the same low bits the release's file does.
+                Value::Hugeint(x) => Ok(*x as f64),
+                Value::Uhugeint(x) => Ok(*x as f64),
+                _ => Err(wrong_type(v, *dtype)),
+            },
+        )?,
         DataType::Boolean => write_typed(
             column.typed::<BoolType>(),
             rows,
