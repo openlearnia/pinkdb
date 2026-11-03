@@ -212,8 +212,9 @@ fn returns_rows(stmt: &crate::sql::ast::Statement) -> bool {
     )
 }
 
-/// SQL → JavaScript. Integers and booleans/strings/doubles map directly;
-/// DATE, TIMESTAMP, DECIMAL and INTERVAL arrive as their canonical text
+/// SQL → JavaScript. Integers (HUGEINT included) and booleans/strings/doubles
+/// map directly; DATE, TIMESTAMP, DECIMAL and INTERVAL arrive as their
+/// canonical text
 /// (exact, and what `CAST(x AS VARCHAR)` prints).
 fn to_js(v: &Value) -> JsValue {
     match v {
@@ -221,6 +222,19 @@ fn to_js(v: &Value) -> JsValue {
         Value::Boolean(b) => JsValue::Bool(*b),
         Value::Integer(i) => JsValue::Int(i64::from(*i)),
         Value::Bigint(i) => JsValue::Int(*i),
+        // A HUGEINT (every integer SUM is one) is a number when it is in the
+        // safe range and a BigInt beyond it; the engine side decides by
+        // magnitude. A UHUGEINT past `i128` has no exact JavaScript integer
+        // form here and arrives as its decimal text.
+        Value::Hugeint(i) => match i64::try_from(*i) {
+            Ok(small) => JsValue::Int(small),
+            Err(_) => JsValue::BigInt(*i),
+        },
+        Value::Uhugeint(u) => match (i64::try_from(*u), i128::try_from(*u)) {
+            (Ok(small), _) => JsValue::Int(small),
+            (Err(_), Ok(wide)) => JsValue::BigInt(wide),
+            (Err(_), Err(_)) => JsValue::Str(u.to_string()),
+        },
         Value::Double(x) => JsValue::Double(*x),
         Value::Varchar(s) => JsValue::Str(s.clone()),
         other => JsValue::Str(other.to_string()),
@@ -228,7 +242,7 @@ fn to_js(v: &Value) -> JsValue {
 }
 
 /// JavaScript → SQL, typed like a literal: integers that fit `INTEGER` are
-/// `INTEGER`, larger ones `BIGINT`.
+/// `INTEGER`, larger ones `BIGINT`, and a `BigInt` past `i64` is `HUGEINT`.
 fn from_js(v: JsValue) -> Value {
     match v {
         JsValue::Null => Value::Null,
@@ -237,6 +251,7 @@ fn from_js(v: JsValue) -> Value {
             Ok(small) => Value::Integer(small),
             Err(_) => Value::Bigint(i),
         },
+        JsValue::BigInt(i) => Value::Hugeint(i),
         JsValue::Double(x) => Value::Double(x),
         JsValue::Str(s) => Value::Varchar(s),
     }

@@ -9,6 +9,13 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-11-03</h2>
+<h3>Wave 133c — lake queries 4× faster ✅</h3>
+<p>TPC-H at scale factor 1 from a Parquet lake runs 4.2× faster than before (geometric mean; every query faster, the slowest ones 14–27×), now 2–7× DuckDB v2.0.0's time on its own storage, down from 3–77×. Store tables are unchanged.</p>
+<ul>
+<li><strong>No per-chunk table building</strong>: a lake scan hands the engine each decoded chunk as is. It no longer computes statistics, copies columns or fills unrequested columns with NULLs row by row, which took most of a scan's time.</li>
+<li><strong>Parallel reads below joins and sorts</strong>: a lake table read whole (a join's build side, a sort's input) is decoded by all worker threads, in order, instead of by one.</li>
+<li>Columns added after a file was written read their <code>DEFAULT</code> in bulk.</li>
+</ul>
 <h3>Wave 136 (step c-1) — a lazily opened store reads only its footer ✅</h3>
 <p>An open no longer reads the data region: chunk bytes come from the file when a statement decodes them.</p>
 <ul>
@@ -27,12 +34,8 @@ progress log</a>.</p>
 <li><code>SUM</code> over <code>INTEGER</code>, <code>BIGINT</code> and <code>HUGEINT</code> returns <code>HUGEINT</code>, as in DuckDB, so large sums no longer overflow; <code>AVG(HUGEINT)</code> is <code>DOUBLE</code>.</li>
 <li><code>HUGEINT</code> values are stored, logged, sent over the wire protocol (version 17) and returned to the C API and the Node, Python and Go bindings (as exact decimal text).</li>
 </ul>
-<h3>Wave 136 (step c-0) — GROUP BY state bounded by groups for wide keys ✅</h3>
-<p>A GROUP BY on VARCHAR keys whose state would grow with the input rows now keeps one entry per group.</p>
-<ul>
-<li><strong>Memory</strong>: QuackLab's <code>od_pairs_rollup</code> (245,570 rows, 30,303 groups, two VARCHAR keys) peaks at 13.4 MiB instead of 91 MiB; pinkdb-server on the QuackLab chart load (16 clients x 10 rounds) peaks at 412 MB instead of 1,060 MB.</li>
-<li><strong>Known regression, to be fixed by step c-0b</strong>: the bounded path is serial, so <code>od_pairs_rollup</code> at 12 threads takes 63 ms instead of 13–21 ms (1 thread: 47 -&gt; 66 ms). Integer-key aggregates (all of TPC-H) are unchanged, and results are bit-identical.</li>
-</ul>
+<h3>Wave 136 (step c-0) — wide-key GROUP BY state: bounded, then disabled ⏸</h3>
+<p>Step c-0 added a lane that bounded the state of a GROUP BY on VARCHAR keys by its groups instead of its input rows (QuackLab's <code>od_pairs_rollup</code>: 91 MiB -&gt; 13.4 MiB per run). <strong>It is disabled again</strong>: an interleaved A/B against the binary before it showed the lane 5–15x slower than first measured (<code>od_pairs_rollup</code> 170–850 ms against 34 ms), because it built and merged a full group per input row. <code>od_pairs_rollup</code> is back to ~34 ms at ~91 MiB per run. Bounding this state returns with a radix-partitioned aggregate table (step c-0b, ROADMAP row 124). Its other changes stay: the GROUP BY state tests, and a small-input check that skips the sample on inputs under 131,072 rows.</p>
 <h3>Fixes ✅</h3>
 <ul>
 <li>A reopened store starts in its default database; <code>USE</code> is per-connection, as in DuckDB.</li>

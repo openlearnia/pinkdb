@@ -107,3 +107,51 @@ Gates: full gate `tmerge133b` on `841e3f8` (86/90; the 4 lake failures were disk
 rerun clean: `logs/rerun133b-lake-*.log`, EXIT=0), targeted gate `t133b` on `9529227` (18/19; the
 Postgres interop failure was a time-zone flake in a wave-132 test, fixed in `ca2edae` and rerun
 inside the failing window: `logs/t133b-pgfix.log`, EXIT=0).
+
+## 133c — the lake read hot path (added 2026-11-03)
+
+A `sample` profile of TPC-H SF 1 on a Parquet lake (133b binary) showed that most of a lake scan's
+time was not Parquet decoding:
+
+1. **`push_physical` (pink-lake) ≈ 85% of lake-scan CPU.** For every decoded chunk it filled each
+   undecoded column with NULLs one `push_null` at a time, built a `DataTable` through `from_columns`
+   (an exact HLL + zone-map pass over every column), had `project_table` build a second one (another
+   stats pass), then re-split it with `scan_chunk`. Parquet decoding itself was under 10%.
+2. **`exec::drain_source` decoded serially.** A plan node evaluated node by node (a join's build side
+   under `probe_through_selection`, a sort's input) drained the lake on the calling thread: Q4 and
+   Q17 spent ~92% of the query there while the pool idled.
+
+Fixes (pi session `w133c`, brief `briefs/w133c.md`; review: `crates/pink-lake` only plus two generic
+core pieces):
+- `push_physical` returns the logical-width chunk with `DataChunk::projected`: decoded columns are
+  shared, unrequested ones are zero-length placeholders, a column the file predates is its DEFAULT
+  through one `Vector::constant` (a DEFAULT typed narrower than its column, `DECIMAL(10,2) DEFAULT
+  1.5`, is coerced once, as the row-by-row fill did — a regression caught in review). No `DataTable`,
+  statistics or re-split on the scan path; an entry without a schema record maps the file's columns
+  one to one, as before.
+- `drain_source` claims morsels on the rayon pool; each worker decodes into its own list, the lists
+  merge by morsel index (the serial order, and the serial first error). No channel, no lock across a
+  decode, nobody waits on another worker (133b's deadlock), correct from the main thread and from a
+  worker.
+- Tests: a core unit test (64 morsels, two call sites, a timeout), `crates/pink-lake-parquet/tests/
+  projected_scan.rs` (projected reads across rename/add-column with DEFAULTs on a > 1-row-group table;
+  a join over a drained lake scan equal to the same query on a store copy), `Vector::constant`
+  coercion.
+
+## Measured (133c)
+
+Interleaved A/B, TPC-H SF 1, release CLIs with the gate's features
+(`~/Desktop/projects/pinkdb-wt/ab-133c/`): A = `main` + clippy fix `3832368`, B = 133c.
+
+| storage | rounds | 133c / main (geomean) |
+|---|---|---|
+| Parquet pinkdb lake (`ATTACH 'lake:…' (READ_ONLY)`) | 7, under load | **0.239** (4.2× faster; sum 10.7 → 2.1 s; every query faster: Q4 1.48 s → 55 ms, Q21 1.89 s → 122 ms, Q17 1.06 s → 78 ms; least gain Q13/Q16 ≈ 0.66) |
+| store tables | 5, under load | 1.066 (Q17 2.07, Q19 1.61, Q13 1.33 — rerun with 11 rounds: 0.88, 1.00, 1.11, geomean 0.989; 133c touches no store path) |
+
+Against DuckDB v2.0.0 (its own store; bench suite, one cold run each, SF 1): the Parquet lake is now
+**2.2–7.5×** DuckDB's time (Q13 2.16 … Q2 7.5), down from 3–77× after 133b. 22/22 results equal.
+
+Gates: full gate `t133c` on `7ef8edf` (on main `32c9a9d` + clippy fix): 89 steps pass, including every
+DuckDB v2.0.0 interop step and the stricter VARIANT/ARRAY step. The one failure was the gate's own
+Postgres sharing port 55433 with the interop tests' servers; the step is split and both halves pass
+(`logs/t133c-pgfix.log`, 49 tests, no skips).

@@ -25,7 +25,9 @@ use parquet::file::reader::RowGroupReader;
 use parquet::schema::types::Type;
 use pinkdb::variant::Variant;
 use pinkdb::variant_shred::{self, ShredKind, decode_metadata, decode_value};
-use pinkdb::{DataType, PinkDbError, Result, Value as EngineValue, Vector};
+use pinkdb::{CHUNK_SIZE, DataType, PinkDbError, Result, Value as EngineValue, Vector};
+
+use crate::scan::ChunkLens;
 
 /// One `{ value, typed_value }` pair of the spec — a shredded object field or
 /// a shredded array element.
@@ -361,18 +363,18 @@ pub fn read_column(
     row_group: &dyn RowGroupReader,
     first_leaf: usize,
     column: &VariantColumn,
-    lens: &[usize],
+    lens: ChunkLens,
     name: &str,
 ) -> Result<Vec<Vector>> {
-    let rows: usize = lens.iter().sum();
+    let rows = lens.rows();
     let mut leaves = Vec::with_capacity(column.leaves);
     for offset in 0..column.leaves {
         leaves.push(read_leaf(row_group, first_leaf + offset, rows, name)?);
     }
-    let mut out = Vec::with_capacity(lens.len());
+    let mut out = Vec::with_capacity(lens.chunks().min(CHUNK_SIZE));
     let mut done = 0usize;
     let mut dictionary: Option<(Vec<u8>, Vec<Arc<str>>)> = None;
-    for &count in lens {
+    for count in lens {
         let mut vector = Vector::with_capacity(DataType::Variant, count);
         for row in done..done + count {
             let keys = dictionary_for(row, column, &leaves, &mut dictionary)?;
@@ -660,8 +662,10 @@ fn collect_leaf<T: parquet::data_type::DataType>(
     column: &str,
     wrap: impl Fn(&T::T, &mut Vec<u8>) -> LeafValue,
 ) -> Result<LeafData> {
-    let mut out: Vec<Entry> = Vec::with_capacity(rows);
-    let mut offsets: Vec<u32> = Vec::with_capacity(rows + 1);
+    // The hints are capped at a vector's worth: the row count came from the
+    // footer, and these buffers grow with the records actually read.
+    let mut out: Vec<Entry> = Vec::with_capacity(rows.min(CHUNK_SIZE));
+    let mut offsets: Vec<u32> = Vec::with_capacity(rows.min(CHUNK_SIZE) + 1);
     let mut bytes: Vec<u8> = Vec::new();
     let mut values: Vec<T::T> = Vec::new();
     let mut defs: Vec<i16> = Vec::new();
