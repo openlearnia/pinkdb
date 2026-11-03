@@ -27,7 +27,11 @@ statement decodes them.
 - **Checkpoint holes wait for their readers**: an incremental checkpoint may
   overwrite a range only once the chunk descriptors that named it are gone; a
   range superseded while a snapshot or a running scan still reads it stays free
-  for one more checkpoint.
+  for one more checkpoint. Reuse is granted only when the open-lock sidecar
+  says no other process has the store open: a checkpoint subtracts a live
+  reader's sub-ranges from the free list, a store that loses the sidecar fails
+  its next statement closed, and another process's checkpoint resets the
+  cached checksums of the chunks this store reads.
 ### Wave 136 (step c-0) — GROUP BY state bounded by groups for wide keys ✅
 
 A GROUP BY on VARCHAR keys whose state would grow with the input rows now

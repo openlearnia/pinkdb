@@ -4296,20 +4296,16 @@ impl PinkDb {
         // the handle is gone.
         let held = self.sweep_superseded();
         let withheld: Vec<(u64, u64)> = held.iter().map(|r| (r.offset, r.len)).collect();
+        #[cfg(debug_assertions)]
+        self.assert_handles_withheld(&old_footer.free_ranges, &withheld);
         let mut superseded: Vec<crate::storage::SupersededRange> = Vec::new();
         let mut writer = CheckpointWriter {
             file,
             cursor: old_slot.file_len,
             free: old_footer.free_ranges.clone(),
             reuse,
+            withheld,
         };
-        if !withheld.is_empty() {
-            writer.free.retain(|&(offset, len)| {
-                !withheld
-                    .iter()
-                    .any(|&(h, hl)| h < offset.saturating_add(len) && offset < h.saturating_add(hl))
-            });
-        }
         let mut repoints: Vec<(&DataTable, TableCarry)> = Vec::new();
         let mut freed: Vec<(u64, u64)> = Vec::new();
         let mut seen_old: std::collections::HashSet<(String, String, String)> =
@@ -4408,19 +4404,24 @@ impl PinkDb {
         let freed = merge_ranges(freed);
         let mut footer_free = writer.free.clone();
         footer_free.extend_from_slice(&freed);
-        footer_free.extend_from_slice(&withheld);
+        footer_free.extend_from_slice(&writer.withheld);
         footer_free = merge_ranges(footer_free);
         let max_group_end = max_group_end(&db_dirs);
         let footer = self.build_footer(flags, &footer_free, &db_dirs)?;
         let estimate = footer.len() as u64;
         // Only ranges free in the *current* footer are safe to overwrite
         // before the new slot lands; the old footer and superseded groups
-        // still belong to the checkpoint the other slot names.
-        let allocatable = writer.free.clone();
-        let (footer_offset, mut final_free) =
-            alloc_footer(&mut writer, &allocatable, estimate, max_group_end);
+        // still belong to the checkpoint the other slot names. The writer
+        // withholds the parts a live handle names even inside a hole.
+        let (footer_offset, mut final_free) = alloc_footer(&mut writer, estimate, max_group_end);
+        // Holes the footer did not take, plus everything this pass freed: the
+        // new footer's list. With reuse off the writer left `free` untouched,
+        // so that is the base.
+        if !writer.reuse {
+            final_free = writer.free.clone();
+        }
         final_free.extend_from_slice(&freed);
-        final_free.extend_from_slice(&withheld);
+        final_free.extend_from_slice(&writer.withheld);
         final_free.retain(|&(offset, len)| offset.saturating_add(len) <= footer_offset);
         final_free = merge_ranges(final_free);
         let footer = self.build_footer(flags, &final_free, &db_dirs)?;
@@ -4486,9 +4487,15 @@ impl PinkDb {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .extend(superseded);
+        // Repoint before returning: the caller's lease guard and the write
+        // lock are still held, and the WAL roll (which bumps the epoch other
+        // handles refresh on) has not happened yet. A checkpoint's own writes
+        // are complete and durable at this point.
         let source =
             crate::storage::StoreSource::file(Arc::new(writer.file.try_clone()?), file_len);
         Self::repoint_written(repoints, &source);
+        #[cfg(test)]
+        REPOINT_GENERATION.with(|g| g.set(Some(wal_generation)));
         Ok(())
     }
 
@@ -4557,6 +4564,13 @@ impl PinkDb {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
+        // Unix: a handle that opened the old file keeps reading that inode,
+        // so its chunks stay valid after the rename. Windows has no such
+        // guarantee: the rename fails while another process holds the file
+        // open without `FILE_SHARE_DELETE`, and a handle that does hold it
+        // keeps the old file readable only until the last such handle closes.
+        // The pure-Rust fallback has no `FILE_SHARE_DELETE` of its own, so a
+        // concurrent save there reports an error rather than a half-swap.
         crate::wal::sync_parent_dir(path);
         Ok(())
     }
@@ -5201,26 +5215,51 @@ pub(crate) fn last_checkpoint_reused_holes() -> Option<bool> {
     LAST_CHECKPOINT_REUSED.with(|last| last.get())
 }
 
+// A test hook: the WAL generation the last incremental checkpoint's repoint
+// ran under. It must be the pre-roll generation, which pins the repoint before
+// the roll (and therefore while the lease guard and the write lock are held).
+#[cfg(test)]
+thread_local! {
+    static REPOINT_GENERATION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn last_repoint_generation() -> Option<u64> {
+    REPOINT_GENERATION.with(|g| g.get())
+}
+
 /// A file opened for an in-place checkpoint: writes go at explicit offsets,
 /// and `free` is the old footer's hole list, the only space an encoded row
 /// group may take without growing the file. `reuse == false` (another handle
 /// has the store open somewhere) keeps every write past the end instead: a
-/// hole might still be a live reader's bytes.
+/// hole might still be a live reader's bytes. `withheld` is the subset a
+/// live handle still names: free in the footer, never allocated here.
 struct CheckpointWriter {
     file: std::fs::File,
     cursor: u64,
     free: Vec<(u64, u64)>,
     reuse: bool,
+    withheld: Vec<(u64, u64)>,
 }
 
 impl CheckpointWriter {
-    /// First-fit allocation from the old holes; `cursor` is the end of the
-    /// old logical file, so an append never reuses a superseded range in the
-    /// same pass (those become free for the next checkpoint).
+    /// The holes this pass may overwrite: the old list minus every part a
+    /// live handle still names. Empty unless the probe made this handle the
+    /// only one open.
+    fn holes(&self) -> Vec<(u64, u64)> {
+        if !self.reuse {
+            return Vec::new();
+        }
+        subtract_ranges(&self.free, &self.withheld)
+    }
+
+    /// First-fit allocation from the holes; `cursor` is the end of the old
+    /// logical file, so an append never reuses a superseded range in the same
+    /// pass (those become free for the next checkpoint).
     fn alloc(&mut self, len: u64) -> u64 {
-        if self.reuse
-            && let Some(at) = first_fit(&mut self.free, len, 0)
-        {
+        let mut holes = self.holes();
+        if let Some(at) = first_fit(&mut holes, len, 0) {
+            self.free = holes;
             return at;
         }
         let at = self.cursor;
@@ -5229,6 +5268,13 @@ impl CheckpointWriter {
     }
 
     fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        debug_assert!(
+            !self.withheld.iter().any(|&(h, hl)| {
+                h < offset.saturating_add(bytes.len() as u64) && offset < h.saturating_add(hl)
+            }),
+            "writing {} bytes at {offset} over bytes a live handle still names",
+            bytes.len()
+        );
         pwrite_all(&self.file, offset, bytes)?;
         Ok(())
     }
@@ -5348,23 +5394,50 @@ pub(crate) fn first_fits() -> u64 {
     FIRST_FITS.with(|fits| fits.get())
 }
 
+/// `ranges` minus every byte inside `blocked`, in offset order. A range is
+/// split rather than dropped: a hole may be half a live handle's bytes and
+/// half reusable.
+fn subtract_ranges(ranges: &[(u64, u64)], blocked: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::with_capacity(ranges.len());
+    for &(start, len) in ranges {
+        let mut from = start;
+        let end = start.saturating_add(len);
+        for &(b, bl) in blocked {
+            let b_end = b.saturating_add(bl);
+            if b_end <= from || end <= b {
+                continue;
+            }
+            if b > from {
+                out.push((from, b - from));
+            }
+            from = b_end;
+            if from >= end {
+                break;
+            }
+        }
+        if from < end {
+            out.push((from, end - from));
+        }
+    }
+    out
+}
+
 fn alloc_footer(
     writer: &mut CheckpointWriter,
-    free: &[(u64, u64)],
     len: u64,
     min_offset: u64,
 ) -> (u64, Vec<(u64, u64)>) {
-    let free: &[(u64, u64)] = if writer.reuse { free } else { &[] };
-    for (i, &(offset, available)) in free.iter().enumerate() {
+    let holes = writer.holes();
+    for (i, &(offset, available)) in holes.iter().enumerate() {
         if offset >= min_offset && available >= len {
             // Everything at or after the footer is outside the data region;
             // only the holes before it can stay in the new free list.
-            return (offset, free[..i].to_vec());
+            return (offset, holes[..i].to_vec());
         }
     }
     let offset = writer.cursor.max(min_offset);
     writer.cursor = offset + len;
-    (offset, free.to_vec())
+    (offset, holes)
 }
 
 fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
@@ -5425,6 +5498,10 @@ fn read_checkpoint_file(
     Ok(Some((idx, slot, footer)))
 }
 
+#[cfg_attr(
+    not(any(unix, windows)),
+    allow(unused_mut, unused_variables, unused_assignments)
+)]
 fn pwrite_all(file: &std::fs::File, mut offset: u64, mut buf: &[u8]) -> Result<()> {
     while !buf.is_empty() {
         #[cfg(unix)]
@@ -11437,6 +11514,55 @@ mod tests {
     /// An open reads the two header slots and the footer, and nothing of the
     /// data region: chunk bytes come from the file when a statement reads
     /// them (wave 136c).
+    /// One descriptor per column chunk: a second, fresh descriptor over the
+    /// same bytes would look unreferenced to the checkpoint's withhold check.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_second_descriptor_over_one_column_chunk_is_refused() {
+        let db = wide_db(5000);
+        let path = temp_file("one_descriptor");
+        db.save(path.to_str().unwrap()).unwrap();
+        let db = PinkDb::open(path.to_str().unwrap()).unwrap();
+        let table = db.table("w").unwrap();
+        let chunks = table.columns[0].num_chunks();
+        let chunk = table.columns[0].stored_chunk(0, chunks).unwrap();
+        let source = std::sync::Arc::clone(chunk.source());
+        let (offset, length) = (chunk.offset(), chunk.length());
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::storage::EncodedColumnChunk::new(source, offset, length, 0, 1);
+        }));
+        assert!(
+            refused.is_err(),
+            "a second descriptor over the same bytes must be refused"
+        );
+        drop(chunk);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A hole with a live handle's bytes inside it: only the free parts are
+    /// reusable, and the held part never is.
+    #[test]
+    fn a_hole_is_reusable_around_a_held_sub_range() {
+        assert_eq!(
+            subtract_ranges(&[(1000, 300)], &[(1100, 100)]),
+            vec![(1000, 100), (1200, 100)]
+        );
+        let path = temp_file("half_hole");
+        let mut writer = CheckpointWriter {
+            file: std::fs::File::create(&path).unwrap(),
+            cursor: 10_000,
+            free: vec![(1000, 300)],
+            reuse: true,
+            withheld: vec![(1100, 100)],
+        };
+        assert_eq!(writer.alloc(50), 1000);
+        assert_eq!(writer.alloc(50), 1050);
+        assert_eq!(writer.alloc(100), 1200);
+        assert_eq!(writer.alloc(1), 10_000, "the held part is never allocated");
+        drop(writer);
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn an_open_reads_only_the_header_and_the_footer() {
         let db = wide_db(5000);

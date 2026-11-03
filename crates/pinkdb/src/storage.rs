@@ -114,6 +114,11 @@ impl StoreSource {
         }
     }
 
+    /// `true` for a file-backed source: chunk bytes come from positioned reads.
+    pub(crate) fn is_file(&self) -> bool {
+        matches!(self.data, SourceData::File { .. })
+    }
+
     /// A borrow of `len` bytes at `offset`, when the source is in memory. The
     /// decoders take this when they can: a memory image needs no copy at all.
     pub(crate) fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
@@ -196,6 +201,10 @@ pub(crate) fn source_read_bytes() -> u64 {
 
 /// Fill `buf` from `offset` with a positioned read, so concurrent workers do
 /// not move a shared file cursor.
+#[cfg_attr(
+    not(any(unix, windows)),
+    allow(unused_mut, unused_variables, unused_assignments)
+)]
 pub(crate) fn pread_exact(file: &std::fs::File, mut offset: u64, mut buf: &mut [u8]) -> Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::FileExt;
@@ -207,10 +216,13 @@ pub(crate) fn pread_exact(file: &std::fs::File, mut offset: u64, mut buf: &mut [
         #[cfg(windows)]
         let read = file.seek_read(buf, offset);
         #[cfg(not(any(unix, windows)))]
-        let read: std::io::Result<usize> = Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "positioned reads are not supported on this platform",
-        ));
+        let read: std::io::Result<usize> = {
+            let (_, _) = (file, offset);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "positioned reads are not supported on this platform",
+            ))
+        };
         let n = read?;
         if n == 0 {
             return Err(PinkDbError::Execution(
@@ -279,6 +291,8 @@ impl EncodedColumnChunk {
         crc32c: u32,
         page_count: u32,
     ) -> Arc<Self> {
+        #[cfg(debug_assertions)]
+        claim_bytes(&source, offset, length);
         Arc::new(Self {
             source,
             offset,
@@ -287,6 +301,14 @@ impl EncodedColumnChunk {
             page_count,
             state: Mutex::new(BytesState::default()),
         })
+    }
+
+    /// Forget the checksum and the page index: after another process's
+    /// checkpoint the bytes may have moved, so the next read checks again.
+    pub(crate) fn reset_verified(&self) {
+        let mut state = self.lock();
+        state.verified = false;
+        state.pages = None;
     }
 
     pub(crate) fn source(&self) -> &Arc<StoreSource> {
@@ -348,6 +370,20 @@ impl EncodedColumnChunk {
         }
         let index_len = 4 + self.page_count as usize * 8;
         let bytes = self.source.read_vec(self.offset, index_len)?;
+        self.parse_pages(&bytes)
+    }
+
+    /// Parse the page index out of bytes that begin at the chunk's offset.
+    fn parse_pages(&self, bytes: &[u8]) -> Result<Arc<[(u32, u32)]>> {
+        if let Some(pages) = self.lock().pages.clone() {
+            return Ok(pages);
+        }
+        let index_len = 4 + self.page_count as usize * 8;
+        if bytes.len() < index_len {
+            return Err(PinkDbError::Execution(
+                "corrupt file: the column chunk is shorter than its page index".to_string(),
+            ));
+        }
         let count = u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes")) as usize;
         if count != self.page_count as usize {
             return Err(PinkDbError::Execution(
@@ -372,19 +408,107 @@ impl EncodedColumnChunk {
     }
 
     /// Read one page and decode it. A memory source decodes its slice in
-    /// place; a file source reads the page into the thread's scratch first.
+    /// place. A file source's *first* page pays one read of the whole chunk:
+    /// the checksum covers those bytes and the page decodes from the same
+    /// buffer, so a scan never reads the chunk twice. Later pages of the same
+    /// chunk read only themselves.
     fn decode_page(&self, page: u32, dtype: DataType) -> Result<Vector> {
-        let pages = self.pages()?;
-        let &(rel, len) = pages.get(page as usize).ok_or_else(page_outside)?;
-        let offset = self.offset + u64::from(rel);
-        if let Some(bytes) = self.source.slice(offset, len as usize) {
+        if !self.source.is_file() {
+            let pages = self.pages()?;
+            let &(rel, len) = pages.get(page as usize).ok_or_else(page_outside)?;
+            let offset = self.offset + u64::from(rel);
+            let bytes = self
+                .source
+                .slice(offset, len as usize)
+                .ok_or_else(page_outside)?;
             return crate::persist::decode_page(bytes, dtype);
         }
+        let verifying = !self.lock().verified;
         with_scratch(|scratch| {
-            scratch.resize(len as usize, 0);
-            self.source.read(offset, &mut scratch[..len as usize])?;
-            crate::persist::decode_page(&scratch[..len as usize], dtype)
+            if verifying {
+                let len = self.length as usize;
+                scratch.resize(len, 0);
+                self.source.read(self.offset, &mut scratch[..len])?;
+                if crate::persist::crc32c(&scratch[..len]) != self.crc32c {
+                    return Err(checksum_error());
+                }
+                self.lock().verified = true;
+            }
+            let pages = if verifying {
+                self.parse_pages(&scratch[..self.length as usize])?
+            } else {
+                self.pages()?
+            };
+            let &(rel, len) = pages.get(page as usize).ok_or_else(page_outside)?;
+            let (rel, len) = (rel as usize, len as usize);
+            if verifying {
+                return crate::persist::decode_page(&scratch[rel..rel + len], dtype);
+            }
+            scratch.resize(len, 0);
+            self.source
+                .read(self.offset + rel as u64, &mut scratch[..len])?;
+            crate::persist::decode_page(&scratch[..len], dtype)
         })
+    }
+}
+
+/// Debug builds: one descriptor per column chunk. A second descriptor naming
+/// the same bytes of the same source would make the checkpoint's withhold
+/// check see no live reference and overwrite bytes a reader still holds, so
+/// the second one is refused. Entries hold a `Weak` (not a raw address): a
+/// freed source's address can be reused by the next allocation, which would
+/// make an unrelated store look like a duplicate.
+#[cfg(debug_assertions)]
+struct Claim {
+    source: std::sync::Weak<StoreSource>,
+    offset: u64,
+    length: u64,
+}
+
+#[cfg(debug_assertions)]
+fn claims() -> std::sync::MutexGuard<'static, Vec<Claim>> {
+    static LIVE: std::sync::Mutex<Vec<Claim>> = std::sync::Mutex::new(Vec::new());
+    let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    live.retain(|claim| claim.source.strong_count() > 0);
+    live
+}
+
+#[cfg(debug_assertions)]
+fn claim_bytes(source: &Arc<StoreSource>, offset: u64, length: u64) {
+    let mut live = claims();
+    let duplicate = live.iter().any(|claim| {
+        claim.offset == offset
+            && claim.length == length
+            && std::sync::Weak::ptr_eq(&claim.source, &Arc::downgrade(source))
+    });
+    assert!(
+        !duplicate,
+        "two descriptors name the column chunk at {offset} (+{length} bytes)"
+    );
+    live.push(Claim {
+        source: Arc::downgrade(source),
+        offset,
+        length,
+    });
+}
+
+#[cfg(debug_assertions)]
+fn release_bytes(source: &Arc<StoreSource>, offset: u64, length: u64) {
+    let weak = Arc::downgrade(source);
+    let mut live = claims();
+    if let Some(i) = live.iter().position(|claim| {
+        claim.offset == offset
+            && claim.length == length
+            && std::sync::Weak::ptr_eq(&claim.source, &weak)
+    }) {
+        live.swap_remove(i);
+    }
+}
+
+impl Drop for EncodedColumnChunk {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        release_bytes(&self.source, self.offset, self.length);
     }
 }
 
@@ -1022,6 +1146,17 @@ impl Column {
     /// checkpoint drains them once their last reader is gone.
     pub(crate) fn take_superseded(&self) -> Vec<SupersededRange> {
         std::mem::take(&mut *self.superseded.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Drop every cached checksum in this column: after another process's
+    /// checkpoint the file may have moved under us, so the next read of a
+    /// file-backed chunk re-checks it once.
+    pub(crate) fn reset_verified(&self) {
+        for handle in &self.chunks {
+            if let Some(encoded) = handle.stored() {
+                encoded.chunk.reset_verified();
+            }
+        }
     }
 
     /// Install the chunk list a lazily opened table read from the footer: still
@@ -3631,18 +3766,59 @@ pub(crate) struct SupersededRange {
 
 impl PinkDb {
     /// Drain the wait list, keeping only the ranges a live handle still
-    /// names, and return them for this checkpoint to reserve. A range whose
-    /// handle has dropped is free at once: from here on nothing writes its
-    /// bytes.
+    /// names, and return them for this checkpoint to reserve. The kept ranges
+    /// stay listed: a checkpoint that holds one back must hold it back again
+    /// until the handle drops. A range whose handle has dropped is free at
+    /// once: from here on nothing writes its bytes.
     pub(crate) fn sweep_superseded(&self) -> Vec<SupersededRange> {
         let mut list = self.superseded.lock().unwrap_or_else(|e| e.into_inner());
-        let mut held = Vec::with_capacity(list.len());
-        for range in list.drain(..) {
-            if range.chunk.strong_count() > 0 {
-                held.push(range);
+        list.retain(|range| range.chunk.strong_count() > 0);
+        list.clone()
+    }
+
+    /// Drop every cached checksum in the store; see [`Column::reset_verified`].
+    pub(crate) fn reset_verified(&self) {
+        for db in self.databases.values() {
+            for schema in db.schemas.values() {
+                for table in schema.tables.values() {
+                    for column in &table.columns {
+                        column.reset_verified();
+                    }
+                }
             }
         }
-        held
+    }
+
+    /// Debug build: a live handle's bytes must be held back from this pass's
+    /// allocator whenever they fall inside one of its holes.
+    #[cfg(debug_assertions)]
+    pub(crate) fn assert_handles_withheld(&self, holes: &[(u64, u64)], withheld: &[(u64, u64)]) {
+        for db in self.databases.values() {
+            for schema in db.schemas.values() {
+                for table in schema.tables.values() {
+                    for column in &table.columns {
+                        for i in 0..column.num_chunks() {
+                            let Some(chunk) = column.stored_chunk(i, i + 1) else {
+                                continue;
+                            };
+                            let (offset, length) = (chunk.offset(), chunk.length());
+                            let end = offset.saturating_add(length);
+                            let in_hole = holes
+                                .iter()
+                                .any(|&(h, hl)| h < end && offset < h.saturating_add(hl));
+                            let covered = withheld
+                                .iter()
+                                .any(|&(h, hl)| h <= offset && end <= h.saturating_add(hl));
+                            debug_assert!(
+                                !in_hole || covered,
+                                "a live handle names {length} bytes at {offset} inside a hole \
+                                 this pass would allocate from"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -4912,6 +5088,9 @@ impl PinkDb {
     pub(crate) fn ensure_wal_healthy(&self) -> Result<()> {
         if let Some(wal) = self.durable_handle() {
             let guard = wal.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(msg) = crate::wal::sidecar_lost(guard.checkpoint_path()) {
+                return Err(PinkDbError::Execution(msg));
+            }
             if let Some(msg) = guard.failure() {
                 return Err(PinkDbError::Execution(format!(
                     "the database stopped after a WAL write failure ({msg}); \

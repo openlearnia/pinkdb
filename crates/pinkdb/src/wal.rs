@@ -550,7 +550,8 @@ impl Sidecar {
     /// (see [`HoleProbe`]), so the caller disposes of the returned probe to
     /// get the shared lock back.
     fn probe(&self) -> HoleProbe<'_> {
-        let exclusive = flock(&self.file, libc::LOCK_EX | libc::LOCK_NB).is_ok()
+        let exclusive = sidecar_lost_by_sidecar(&self.path).is_none()
+            && flock(&self.file, libc::LOCK_EX | libc::LOCK_NB).is_ok()
             // A deleted or replaced sidecar locks nothing: read that as "some
             // other handle may be open" and append.
             && self.identity_current();
@@ -627,11 +628,86 @@ impl Drop for HoleProbe<'_> {
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Some(sidecar) = self.sidecar {
+            #[cfg(test)]
+            let injected = FAIL_NEXT_SIDECAR_DROP.with(|f| f.replace(false));
+            #[cfg(not(test))]
+            let injected = false;
             // Blocking: an opener that queued for the shared lock while this
             // checkpoint held it must hold it before the next checkpoint probes.
-            let _ = flock(&sidecar.file, libc::LOCK_SH);
+            let restored = if injected {
+                Err(())
+            } else {
+                flock(&sidecar.file, libc::LOCK_SH).map_err(|_| ())
+            };
+            if restored.is_err() || !sidecar.identity_current() {
+                // Fail closed: with the shared lock gone another handle may
+                // have taken the exclusive one and be reusing these holes, so
+                // this store must not read or reuse them any more.
+                note_sidecar_lost(&sidecar.path);
+            }
         }
     }
+}
+
+/// Stores whose open-lock sidecar was lost: keyed by the sidecar path, since
+/// that is what the lock belonged to. Empty in a well-behaved process.
+static SIDECAR_LOST: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Fast path for the per-statement check: `false` until some store loses one.
+static SIDECAR_LOST_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn note_sidecar_lost(sidecar: &Path) {
+    let mut lost = SIDECAR_LOST.lock().unwrap_or_else(|e| e.into_inner());
+    if lost.iter().any(|p| p == sidecar) {
+        return;
+    }
+    lost.push(sidecar.to_path_buf());
+    SIDECAR_LOST_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "pinkdb: warning: lost the open-lock sidecar {}; hole reuse is off and the store \
+         must be reopened",
+        sidecar.display()
+    );
+}
+
+fn sidecar_lost_by_sidecar(sidecar: &Path) -> Option<String> {
+    if !SIDECAR_LOST_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let lost = SIDECAR_LOST.lock().unwrap_or_else(|e| e.into_inner());
+    lost.iter().any(|p| p == sidecar).then(|| {
+        format!(
+            "the store's open-lock sidecar ({}) was replaced or lost its lock; reopen the store",
+            sidecar.display()
+        )
+    })
+}
+
+/// Why this store must fail closed, keyed by its `.pink` path: `None` while
+/// the open-lock sidecar is intact.
+pub(crate) fn sidecar_lost(checkpoint: &Path) -> Option<String> {
+    sidecar_lost_by_sidecar(&open_sidecar_path(checkpoint))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_SIDECAR_DROP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test hook: make the next [`HoleProbe`] drop report a lost lock.
+#[cfg(test)]
+pub(crate) fn fail_next_sidecar_drop() {
+    FAIL_NEXT_SIDECAR_DROP.with(|f| f.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_sidecar_lost() {
+    SIDECAR_LOST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    SIDECAR_LOST_ANY.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 // ---------- the write lease ----------
@@ -5227,6 +5303,14 @@ impl PinkDb {
         }
     }
 
+    /// Test hook: the live WAL generation, which every checkpoint bumps.
+    #[cfg(test)]
+    pub(crate) fn wal_generation(&self) -> Option<u64> {
+        self.wal
+            .as_ref()
+            .map(|w| w.lock().unwrap_or_else(|p| p.into_inner()).generation)
+    }
+
     /// Refresh the in-memory store from disk if anything was published (or
     /// replaced), taking a short lease. No-op when fresh; used by read paths.
     pub(crate) fn refresh_if_stale(&mut self) -> Result<()> {
@@ -5273,6 +5357,9 @@ impl PinkDb {
         }
         match self.refresh_inner(&mut wal, guard) {
             Ok(()) => {
+                // Another handle's checkpoint may have moved every chunk: the
+                // cached checksum results are no longer trustworthy.
+                self.reset_verified();
                 guard.cache_epoch_now();
                 Ok(true)
             }
@@ -7685,6 +7772,150 @@ mod tests {
             vec!["v0".to_string(), "v1".to_string(), "v2".to_string()]
         );
         cleanup(&p);
+    }
+
+    /// The repoint must run inside the checkpoint: under the pre-roll WAL
+    /// generation, while the lease guard and the write lock are still held.
+    #[test]
+    fn the_repoint_lands_before_the_wal_roll() {
+        let p = tmp_ckpt("repoint_order");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
+        db.checkpoint().unwrap();
+        let before = db.wal_generation().unwrap();
+        db.execute("INSERT INTO t VALUES (3);").unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(
+            crate::persist::last_repoint_generation(),
+            Some(before),
+            "the repoint must run under the generation the checkpoint replaces"
+        );
+        assert!(
+            db.wal_generation().unwrap() > before,
+            "the checkpoint rolls the WAL after the save"
+        );
+        let table = db.table("t").unwrap();
+        let chunk = table.columns[0].stored_chunk(0, 1).unwrap();
+        assert!(
+            chunk.source().is_file(),
+            "after the repoint the chunks read the checkpoint file"
+        );
+        cleanup(&p);
+    }
+
+    /// A lost open-lock sidecar must fail the store closed: reuse off, and the
+    /// next statement on that store says to reopen it.
+    #[test]
+    fn a_lost_sidecar_fails_the_store_closed() {
+        let p = tmp_ckpt("sidecar_lost");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1);").unwrap();
+        db.checkpoint().unwrap();
+        db.execute("INSERT INTO t VALUES (2);").unwrap();
+        crate::wal::fail_next_sidecar_drop();
+        db.checkpoint().unwrap();
+        let err = db.execute("SELECT 1;").unwrap_err().to_string();
+        assert!(err.contains("open-lock sidecar"), "{err}");
+        db.checkpoint().unwrap();
+        assert_eq!(
+            crate::persist::last_checkpoint_reused_holes(),
+            Some(false),
+            "a lost sidecar must also stop hole reuse"
+        );
+        crate::wal::clear_sidecar_lost();
+        drop(db);
+        cleanup(&p);
+    }
+
+    /// Another process holding the store open pins every range: A's two
+    /// checkpoints append, and B still reads its rows afterwards.
+    #[test]
+    fn a_second_process_holds_its_ranges_across_checkpoints() {
+        let p = tmp_ckpt("cross_process_holes");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER, v VARCHAR);")
+            .unwrap();
+        let values = (0..130_000)
+            .map(|i| format!("({i}, 'v{i}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        db.execute(&format!("INSERT INTO t VALUES {values};"))
+            .unwrap();
+        db.checkpoint().unwrap();
+        let ready = p.with_extension("ready");
+        let go = p.with_extension("go");
+        let _ = std::fs::remove_file(&ready);
+        let _ = std::fs::remove_file(&go);
+        let exe = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "wal::tests::a_second_process_child_holds_a_read",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("PINKDB_HOLE_CHILD", &*p)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never opened the store"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        db.execute("UPDATE t SET v = 'x' WHERE a = 123000;")
+            .unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(
+            crate::persist::last_checkpoint_reused_holes(),
+            Some(false),
+            "another process has the store open, so no hole may be reused"
+        );
+        db.execute("UPDATE t SET v = 'y' WHERE a = 123000;")
+            .unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(
+            crate::persist::last_checkpoint_reused_holes(),
+            Some(false),
+            "the second checkpoint must append as well"
+        );
+        std::fs::write(&go, b"1").unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "child failed: {out:?}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("130000"), "the child lost rows: {text}");
+        assert!(text.contains("v=y"), "the child must see A's rows: {text}");
+        drop(db);
+        cleanup(&p);
+    }
+
+    /// The child half of [`a_second_process_holds_its_ranges_across_checkpoints`].
+    #[test]
+    #[ignore = "child process helper for a_second_process_holds_its_ranges_across_checkpoints"]
+    fn a_second_process_child_holds_a_read() {
+        let Ok(p) = std::env::var("PINKDB_HOLE_CHILD") else {
+            return;
+        };
+        let p = PathBuf::from(p);
+        let mut db = durable(&p);
+        std::fs::write(p.with_extension("ready"), b"1").unwrap();
+        let go = p.with_extension("go");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !go.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parent never released us"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let rows = ints(&mut db, "SELECT count(*) FROM t;");
+        let text = strings(&mut db, "SELECT v FROM t WHERE a = 123000;");
+        println!("rows={} v={}", rows[0], text.join(","));
     }
 
     fn image_layout(p: &Path) -> Vec<(String, Vec<(u64, u64)>)> {
