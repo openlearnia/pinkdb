@@ -520,9 +520,15 @@ pub trait LakeFormat: fmt::Debug + Send + Sync {
 pub trait FileMorsels: Send + Sync {
     /// How many morsels the plan hands out.
     fn count(&self) -> usize;
-    /// The rows morsel `index` decodes to (fewer than its row group when the
-    /// page index proved pages cannot match).
+    /// The rows morsel `index` would decode to without a pushed predicate
+    /// (fewer than its row group when the page index proved pages cannot
+    /// match). A decode emits these rows less [`dropped`](Self::dropped).
     fn rows(&self, index: usize) -> u64;
+    /// The rows morsel `index` dropped because a pushed predicate rejected
+    /// them: they are not in the decode's output.
+    fn dropped(&self, _index: usize) -> u64 {
+        0
+    }
     /// Decode morsel `index`, handing `sink` its chunks. A sink error is the
     /// engine's (the scan is being torn down) and must come back unchanged;
     /// a decode error is the file's.

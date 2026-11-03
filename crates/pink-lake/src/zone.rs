@@ -189,13 +189,27 @@ pub(crate) fn predicate_prunes(
             _ => return false,
         }
     }
+    // Every list value has to be comparable to the column: a value the zones
+    // cannot order must not prune (the engine's `IN` may still match it).
+    for value in predicate.values.iter().filter(|value| !value.is_null()) {
+        match value.data_type() {
+            Some(literal_dtype) if comparable(*column_dtype, literal_dtype) => {}
+            _ => return false,
+        }
+    }
     if facts.rows == 0 {
         return true;
     }
     let Some(zone) = zone_for_predicate(facts, keys, schema, predicate.column) else {
         return false;
     };
-    zone_prunes(&zone, facts.rows, predicate.op, predicate.value.as_ref())
+    zone_prunes(
+        &zone,
+        facts.rows,
+        predicate.op,
+        predicate.value.as_ref(),
+        &predicate.values,
+    )
 }
 
 /// True when **any** predicate proves the file cannot contribute a matching
@@ -225,8 +239,9 @@ pub(crate) fn zone_prunes(
     rows: u64,
     op: PruneOp,
     literal: Option<&Value>,
+    values: &[Value],
 ) -> bool {
-    prunes_with(zone, rows, op, literal, |a, b| {
+    prunes_with(zone, rows, op, literal, values, |a, b| {
         Some(pinkdb::plan::compare_values(a, b))
     })
 }
@@ -269,6 +284,7 @@ fn path_prunes(
         facts.rows,
         predicate.op,
         predicate.value.as_ref(),
+        &predicate.values,
         |a, b| {
             let to_variant = |value: &Value| match value {
                 Value::Variant(v) => Some((**v).clone()),
@@ -294,6 +310,7 @@ fn prunes_with(
     rows: u64,
     op: PruneOp,
     literal: Option<&Value>,
+    values: &[Value],
     compare: impl Fn(&Value, &Value) -> Option<std::cmp::Ordering>,
 ) -> bool {
     let all_null = zone.null_count == Some(rows);
@@ -376,6 +393,30 @@ fn prunes_with(
             zone.max
                 .as_ref()
                 .is_some_and(|max| matches!(compare(max, literal), Some(o) if o.is_lt()))
+        }
+        PruneOp::In => {
+            if all_null {
+                return true;
+            }
+            let (Some(min), Some(max)) = (&zone.min, &zone.max) else {
+                return false;
+            };
+            // A row matches only by equalling one of the non-NULL list
+            // values, so the zone needs one of them inside its bounds.
+            let mut inside = false;
+            for value in values.iter().filter(|value| !value.is_null()) {
+                match (compare(min, value), compare(value, max)) {
+                    (Some(low), Some(high)) => {
+                        if !low.is_gt() && !high.is_gt() {
+                            inside = true;
+                            break;
+                        }
+                    }
+                    // No order (a NaN against VARIANT bounds): nothing proven.
+                    _ => return false,
+                }
+            }
+            !inside
         }
     }
 }
@@ -463,6 +504,11 @@ mod tests {
     use super::*;
     use pinkdb::PrunePredicate;
 
+    /// `zone_prunes` for a predicate that carries no list values.
+    fn zone_misses(zone: &ColumnStats, rows: u64, op: PruneOp, literal: Option<&Value>) -> bool {
+        zone_prunes(zone, rows, op, literal, &[])
+    }
+
     fn zone(nulls: Option<u64>, min: Option<Value>, max: Option<Value>) -> ColumnStats {
         ColumnStats {
             null_count: nulls,
@@ -490,39 +536,39 @@ mod tests {
         let z = zone(Some(0), Some(Value::Integer(10)), Some(Value::Integer(20)));
         let lit = |i: i32| Value::Integer(i);
         // Eq outside [min, max] prunes; inside does not.
-        assert!(zone_prunes(&z, 5, PruneOp::Eq, Some(&lit(9))));
-        assert!(zone_prunes(&z, 5, PruneOp::Eq, Some(&lit(21))));
-        assert!(!zone_prunes(&z, 5, PruneOp::Eq, Some(&lit(10))));
-        assert!(!zone_prunes(&z, 5, PruneOp::Eq, Some(&lit(15))));
+        assert!(zone_misses(&z, 5, PruneOp::Eq, Some(&lit(9))));
+        assert!(zone_misses(&z, 5, PruneOp::Eq, Some(&lit(21))));
+        assert!(!zone_misses(&z, 5, PruneOp::Eq, Some(&lit(10))));
+        assert!(!zone_misses(&z, 5, PruneOp::Eq, Some(&lit(15))));
         // Ranges.
-        assert!(zone_prunes(&z, 5, PruneOp::Lt, Some(&lit(10))));
-        assert!(!zone_prunes(&z, 5, PruneOp::Lt, Some(&lit(11))));
-        assert!(zone_prunes(&z, 5, PruneOp::LtEq, Some(&lit(9))));
-        assert!(zone_prunes(&z, 5, PruneOp::Gt, Some(&lit(20))));
-        assert!(!zone_prunes(&z, 5, PruneOp::Gt, Some(&lit(19))));
-        assert!(zone_prunes(&z, 5, PruneOp::GtEq, Some(&lit(21))));
+        assert!(zone_misses(&z, 5, PruneOp::Lt, Some(&lit(10))));
+        assert!(!zone_misses(&z, 5, PruneOp::Lt, Some(&lit(11))));
+        assert!(zone_misses(&z, 5, PruneOp::LtEq, Some(&lit(9))));
+        assert!(zone_misses(&z, 5, PruneOp::Gt, Some(&lit(20))));
+        assert!(!zone_misses(&z, 5, PruneOp::Gt, Some(&lit(19))));
+        assert!(zone_misses(&z, 5, PruneOp::GtEq, Some(&lit(21))));
         // NotEq prunes only an exact single-value file.
-        assert!(!zone_prunes(&z, 5, PruneOp::NotEq, Some(&lit(10))));
+        assert!(!zone_misses(&z, 5, PruneOp::NotEq, Some(&lit(10))));
         let exact = zone(Some(0), Some(Value::Integer(10)), Some(Value::Integer(10)));
-        assert!(zone_prunes(&exact, 5, PruneOp::NotEq, Some(&lit(10))));
-        assert!(!zone_prunes(&exact, 5, PruneOp::NotEq, Some(&lit(11))));
+        assert!(zone_misses(&exact, 5, PruneOp::NotEq, Some(&lit(10))));
+        assert!(!zone_misses(&exact, 5, PruneOp::NotEq, Some(&lit(11))));
         // IS NULL / IS NOT NULL need an exact NULL count.
-        assert!(zone_prunes(&z, 5, PruneOp::IsNull, None));
-        assert!(!zone_prunes(&z, 5, PruneOp::IsNotNull, None));
+        assert!(zone_misses(&z, 5, PruneOp::IsNull, None));
+        assert!(!zone_misses(&z, 5, PruneOp::IsNotNull, None));
         let unknown = ColumnStats::unknown();
-        assert!(!zone_prunes(&unknown, 5, PruneOp::IsNull, None));
-        assert!(!zone_prunes(&unknown, 5, PruneOp::IsNotNull, None));
-        assert!(!zone_prunes(&unknown, 5, PruneOp::Eq, Some(&lit(1))));
+        assert!(!zone_misses(&unknown, 5, PruneOp::IsNull, None));
+        assert!(!zone_misses(&unknown, 5, PruneOp::IsNotNull, None));
+        assert!(!zone_misses(&unknown, 5, PruneOp::Eq, Some(&lit(1))));
         // An all-NULL file: only IS NULL can match.
         let all_null = zone(Some(5), None, None);
-        assert!(zone_prunes(&all_null, 5, PruneOp::IsNotNull, None));
-        assert!(zone_prunes(&all_null, 5, PruneOp::Eq, Some(&lit(1))));
-        assert!(zone_prunes(&all_null, 5, PruneOp::Lt, Some(&lit(1))));
-        assert!(!zone_prunes(&all_null, 5, PruneOp::IsNull, None));
+        assert!(zone_misses(&all_null, 5, PruneOp::IsNotNull, None));
+        assert!(zone_misses(&all_null, 5, PruneOp::Eq, Some(&lit(1))));
+        assert!(zone_misses(&all_null, 5, PruneOp::Lt, Some(&lit(1))));
+        assert!(!zone_misses(&all_null, 5, PruneOp::IsNull, None));
         // A value only bounded on one side prunes only from that side.
         let half = zone(Some(0), None, Some(Value::Integer(20)));
-        assert!(zone_prunes(&half, 5, PruneOp::Gt, Some(&lit(20))));
-        assert!(!zone_prunes(&half, 5, PruneOp::Lt, Some(&lit(1))));
+        assert!(zone_misses(&half, 5, PruneOp::Gt, Some(&lit(20))));
+        assert!(!zone_misses(&half, 5, PruneOp::Lt, Some(&lit(1))));
         // Zero rows: an empty file can never match (the caller checks it).
         let empty = FileFacts {
             rows: 0,
@@ -535,6 +581,42 @@ mod tests {
             &[],
             &schema(),
             &PrunePredicate::compare(0, PruneOp::Eq, lit(1)),
+        ));
+    }
+
+    #[test]
+    fn in_lists_prune_only_when_every_value_is_outside_the_bounds() {
+        let z = zone(Some(0), Some(Value::Integer(10)), Some(Value::Integer(20)));
+        let lit = |i: i32| Value::Integer(i);
+        let list = |values: &[i32]| -> Vec<Value> { values.iter().map(|i| lit(*i)).collect() };
+        let prunes = |values: &[Value]| -> bool { zone_prunes(&z, 5, PruneOp::In, None, values) };
+        // One value inside the bounds keeps the file, even with others outside.
+        assert!(!prunes(&list(&[15])));
+        assert!(!prunes(&list(&[9, 15])));
+        assert!(!prunes(&list(&[10])));
+        assert!(!prunes(&list(&[20])));
+        // Every value outside the bounds prunes.
+        assert!(prunes(&list(&[9, 21])));
+        assert!(prunes(&list(&[21, 9])));
+        // Nothing non-NULL in the list can match: an empty list and a list of
+        // NULLs only match no row.
+        assert!(prunes(&[]));
+        assert!(prunes(&[Value::Null]));
+        assert!(!prunes(&[Value::Null, lit(15)]));
+        // A bound on one side only proves nothing about the other side.
+        let half = zone(Some(0), None, Some(Value::Integer(20)));
+        assert!(!zone_prunes(&half, 5, PruneOp::In, None, &list(&[25])));
+        assert!(!zone_prunes(&half, 5, PruneOp::In, None, &list(&[21, 40])));
+        // An all-NULL column matches no `IN` row.
+        let all_null = zone(Some(5), None, None);
+        assert!(zone_prunes(&all_null, 5, PruneOp::In, None, &list(&[1])));
+        // Unknown bounds prove nothing.
+        assert!(!zone_prunes(
+            &ColumnStats::unknown(),
+            5,
+            PruneOp::In,
+            None,
+            &list(&[1])
         ));
     }
 

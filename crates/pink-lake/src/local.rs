@@ -13,25 +13,74 @@
 //! original wave-34/35 directory behavior, unchanged (same files, same
 //! atomicity, same errors) — the trait is what wave 36 adds for S3.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
 use super::storage::{Head, LocalCopy, ObjectInfo, Storage};
 use crate::{LakeError, Result, fresh_id};
 
+/// How many data files [`LocalStorage`] keeps open at once.
+const OPEN_HANDLES: usize = 64;
+
 /// Directory-and-file I/O rooted at one lake directory.
 #[derive(Debug)]
 pub(crate) struct LocalStorage {
     root: PathBuf,
+    /// Open data files by resolved path. A lake data file is immutable — a
+    /// change writes a new file — so a handle stays valid as long as it is
+    /// cached; the map is bounded and cleared when full.
+    open: Mutex<HashMap<PathBuf, Arc<File>>>,
+    /// How many files this storage opened (a test observes handle reuse).
+    #[cfg(test)]
+    opens: std::sync::atomic::AtomicU64,
 }
 
 impl LocalStorage {
     pub(crate) fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
+            open: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            opens: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// The open handle for `path`, opening it on first use.
+    fn handle(&self, path: &Path, context: &str) -> Result<Arc<File>> {
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(file) = open.get(path) {
+            return Ok(Arc::clone(file));
+        }
+        let file = Arc::new(File::open(path).map_err(|e| LakeError::Io {
+            context: context.to_string(),
+            source: e,
+        })?);
+        if open.len() >= OPEN_HANDLES {
+            open.clear();
+        }
+        open.insert(path.to_path_buf(), Arc::clone(&file));
+        #[cfg(test)]
+        self.opens
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(file)
+    }
+
+    /// Drop a cached handle so the next read opens the file again.
+    fn forget(&self, path: &Path) {
+        self.open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(path);
+    }
+
+    /// How many files this storage opened (a test observes handle reuse).
+    #[cfg(test)]
+    fn opens(&self) -> u64 {
+        self.opens.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Resolve `rel` below the lake root, rejecting anything that `join`
@@ -195,15 +244,6 @@ impl Storage for LocalStorage {
             return Ok(Vec::new());
         }
         let path = self.checked_path(rel)?;
-        let mut file = File::open(&path).map_err(|e| LakeError::Io {
-            context: context.to_string(),
-            source: e,
-        })?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| LakeError::Io {
-                context: context.to_string(),
-                source: e,
-            })?;
         let mut bytes = vec![
             0u8;
             usize::try_from(len).map_err(|_| LakeError::Io {
@@ -213,7 +253,7 @@ impl Storage for LocalStorage {
                 )),
             })?
         ];
-        file.read_exact(&mut bytes).map_err(|e| LakeError::Io {
+        let failed = |e| LakeError::Io {
             context: format!(
                 "{} (byte range {offset}..{} of {})",
                 context,
@@ -221,8 +261,19 @@ impl Storage for LocalStorage {
                 path.display()
             ),
             source: e,
-        })?;
-        Ok(bytes)
+        };
+        let file = self.handle(&path, context)?;
+        match read_at(&file, &mut bytes, offset) {
+            Ok(()) => Ok(bytes),
+            // A cached handle whose read failed (the file was replaced under
+            // it, or the filesystem dropped it) is dropped and reopened once.
+            Err(_) => {
+                self.forget(&path);
+                let file = self.handle(&path, context)?;
+                read_at(&file, &mut bytes, offset).map_err(failed)?;
+                Ok(bytes)
+            }
+        }
     }
 
     fn ranged_reads(&self) -> bool {
@@ -441,6 +492,22 @@ fn create_unique_tmp(path: &Path) -> std::io::Result<(PathBuf, File)> {
     ))
 }
 
+/// Read `bytes` at `offset` without moving the file's position, so one cached
+/// handle serves concurrent readers.
+#[cfg(unix)]
+fn read_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(bytes, offset)
+}
+
+#[cfg(not(unix))]
+fn read_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file;
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(bytes)
+}
+
 /// Create `path` and missing parents with mode 0700. Existing directories are
 /// left exactly as their owner made them.
 fn create_dir_all_private(path: &Path) -> std::io::Result<()> {
@@ -515,6 +582,62 @@ mod tests {
             storage.abs("data/main.t/abc.pink"),
             root.join("data/main.t/abc.pink")
         );
+    }
+
+    #[test]
+    fn range_reads_reuse_one_open_handle() {
+        let root = std::env::temp_dir().join(format!("pinkdb-handles-{}", fresh_id()));
+        fs::create_dir_all(&root).unwrap();
+        let storage = LocalStorage::new(&root);
+        let bytes: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        storage.put("data/main.t/a.pink", &bytes).unwrap();
+        for (start, len) in [(0, 8u64), (1, 7), (100, 32), (4088, 8)] {
+            assert_eq!(
+                storage
+                    .read_range("data/main.t/a.pink", start, len, "test")
+                    .unwrap(),
+                bytes[start as usize..(start + len) as usize]
+            );
+            assert_eq!(
+                storage.opens(),
+                1,
+                "range read {start} opened the file again"
+            );
+        }
+        storage.put("data/main.t/b.pink", b"other").unwrap();
+        assert_eq!(
+            storage
+                .read_range("data/main.t/b.pink", 0, 5, "test")
+                .unwrap(),
+            b"other"
+        );
+        assert_eq!(storage.opens(), 2, "a second file gets its own handle");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A missing file still reports exactly what a whole-file read reports;
+    /// nothing is cached for it.
+    #[test]
+    fn a_missing_file_still_errors_with_the_io_context() {
+        let root = std::env::temp_dir().join(format!("pinkdb-missing-{}", fresh_id()));
+        fs::create_dir_all(&root).unwrap();
+        let storage = LocalStorage::new(&root);
+        let context = "reading a data file";
+        let ranged = storage
+            .read_range("data/main.t/gone.pink", 0, 4, context)
+            .unwrap_err()
+            .to_string();
+        let whole = storage
+            .read("data/main.t/gone.pink", context)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(ranged, whole, "a range read reports what a whole read does");
+        assert!(
+            ranged.starts_with("lake I/O error (reading a data file): "),
+            "{ranged}"
+        );
+        assert_eq!(storage.opens(), 0, "a failed open cached a handle");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

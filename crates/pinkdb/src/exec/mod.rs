@@ -3230,10 +3230,9 @@ fn scan_candidates(
     let mut keep = Vec::with_capacity(t.num_chunks());
     for chunk in 0..t.num_chunks() {
         let rows = t.chunk_rows(chunk) as u64;
-        let static_ok = prunes.iter().all(|p| {
-            t.zone(p.column, chunk)
-                .may_match(rows, p.op, p.value.as_ref())
-        });
+        let static_ok = prunes
+            .iter()
+            .all(|p| t.zone(p.column, chunk).may_match_predicate(rows, p));
         if !static_ok {
             continue;
         }
@@ -8891,6 +8890,7 @@ fn prune_op_symbol(op: PruneOp) -> &'static str {
         PruneOp::GtEq => ">=",
         PruneOp::IsNull => "IS NULL",
         PruneOp::IsNotNull => "IS NOT NULL",
+        PruneOp::In => "IN",
     }
 }
 
@@ -9196,6 +9196,11 @@ fn explain_into(
                         match (&filter.op, &filter.value) {
                             (PruneOp::IsNull, _) => format!("{name} IS NULL"),
                             (PruneOp::IsNotNull, _) => format!("{name} IS NOT NULL"),
+                            (PruneOp::In, _) => {
+                                let values: Vec<String> =
+                                    filter.values.iter().map(|v| v.to_string()).collect();
+                                format!("{name} IN ({})", values.join(", "))
+                            }
                             (op, Some(value)) => {
                                 format!("{name} {} {value}", prune_op_symbol(*op))
                             }
@@ -17508,6 +17513,29 @@ mod tests {
         // may skip a chunk that could match.
         assert_eq!(
             kept(&[PrunePredicate::compare(0, PruneOp::Eq, V::Integer(9000))]),
+            Vec::<usize>::new()
+        );
+        // `IN` prunes a chunk only when no (non-NULL) list value can be inside
+        // its bounds; a NULL element matches no row and an empty list none.
+        let list = |values: &[i32]| -> Vec<V> { values.iter().map(|v| V::Integer(*v)).collect() };
+        assert_eq!(
+            kept(&[PrunePredicate::in_list(0, list(&[7047, 9000]))]),
+            vec![2]
+        );
+        assert_eq!(
+            kept(&[PrunePredicate::in_list(0, list(&[0, 5000]))]),
+            vec![1, 2]
+        );
+        assert_eq!(
+            kept(&[PrunePredicate::in_list(0, list(&[9000, 9001]))]),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            kept(&[PrunePredicate::in_list(0, vec![V::Null, V::Integer(7047)])]),
+            vec![2]
+        );
+        assert_eq!(
+            kept(&[PrunePredicate::in_list(0, Vec::new())]),
             Vec::<usize>::new()
         );
         // The dynamic filter's bounds prune exactly like a literal range
