@@ -1147,6 +1147,9 @@ impl Vector {
                 copy!(d, s)
             }
             (VectorData::Interval(d), VectorData::Interval(s)) => copy!(d, s),
+            (VectorData::Uuid(d), VectorData::Uuid(s)) => copy!(d, s),
+            (VectorData::Int128(d), VectorData::Int128(s)) => copy!(d, s),
+            (VectorData::UInt128(d), VectorData::UInt128(s)) => copy!(d, s),
             (VectorData::VarChar(d), VectorData::VarChar(s)) => {
                 for (&k, &j) in dst.iter().zip(src_rows) {
                     d.set(k, &s[j]);

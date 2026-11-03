@@ -331,8 +331,8 @@ fn special_values(dtype: DataType) -> Vec<Value> {
                 ))
             })
             .collect(),
-        // No `engine_types()` entry lists these yet (step 5 of the HUGEINT
-        // plan), so a contract table never carries one.
+        // `engine_types()` does not list the 128-bit integers, so a contract
+        // table never carries one.
         DataType::Hugeint | DataType::Uhugeint => {
             unreachable!("no 128-bit integer column in a format contract table")
         }

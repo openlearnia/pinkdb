@@ -45,14 +45,25 @@ fn db() -> PinkDb {
     db
 }
 
+/// One cell as text, so two query shapes compare by value and not by the Rust
+/// type that carries it (`count(*)` is BIGINT, a `sum` over it is HUGEINT).
+fn cell(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Integer(i) => i.to_string(),
+        Value::Bigint(i) => i.to_string(),
+        Value::Hugeint(i) => i.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Every result row, formatted, so two query shapes can be compared without
 /// knowing their column types.
 fn rows(db: &mut PinkDb, sql: &str) -> Vec<Vec<String>> {
     match db.execute(sql).unwrap().pop().unwrap() {
-        QueryResult::Selected { rows, .. } => rows
-            .iter()
-            .map(|r| r.iter().map(|v| format!("{v:?}")).collect())
-            .collect(),
+        QueryResult::Selected { rows, .. } => {
+            rows.iter().map(|r| r.iter().map(cell).collect()).collect()
+        }
         other => panic!("expected rows from {sql}, got {other:?}"),
     }
 }
@@ -62,6 +73,8 @@ fn scalar(db: &mut PinkDb, sql: &str) -> i64 {
         QueryResult::Selected { rows, .. } => match &rows[0][0] {
             Value::Bigint(v) => *v,
             Value::Integer(v) => *v as i64,
+            // `sum(...)` over an integer column is HUGEINT; these pins are small.
+            Value::Hugeint(v) => i64::try_from(*v).expect("fits in i64"),
             other => panic!("expected an integer count from {sql}, got {other:?}"),
         },
         other => panic!("expected rows from {sql}, got {other:?}"),

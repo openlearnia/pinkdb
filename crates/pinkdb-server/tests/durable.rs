@@ -207,7 +207,7 @@ fn concurrent_clients_survive_kill_with_exactly_once_replay() {
     let expected_sum: i64 = (0..total).sum();
     assert_eq!(
         rows(client.execute("SELECT SUM(id) FROM t;").unwrap()),
-        vec![vec![Value::Bigint(expected_sum)]]
+        vec![vec![Value::Hugeint(i128::from(expected_sum))]]
     );
     drop(client);
     kill(&mut child);

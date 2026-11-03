@@ -3088,8 +3088,8 @@ mod tests {
                     .unwrap()
             ),
             vec![
-                vec![Value::Integer(1), Value::Bigint(10)],
-                vec![Value::Integer(2), Value::Bigint(6)],
+                vec![Value::Integer(1), Value::Hugeint(10)],
+                vec![Value::Integer(2), Value::Hugeint(6)],
             ]
         );
         // Order by the select-list order, both directions.
@@ -3099,8 +3099,8 @@ mod tests {
                     .unwrap()
             ),
             vec![
-                vec![Value::Integer(2), Value::Bigint(6)],
-                vec![Value::Integer(1), Value::Bigint(10)],
+                vec![Value::Integer(2), Value::Hugeint(6)],
+                vec![Value::Integer(1), Value::Hugeint(10)],
             ]
         );
         // A plain select list groups by every column.

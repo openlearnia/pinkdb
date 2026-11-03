@@ -474,7 +474,7 @@ func decodeCell(raw json.RawMessage) (any, error) {
 			return math.Inf(-1), nil
 		}
 		return strconv.ParseFloat(text, 64)
-	case "varchar", "decimal", "interval":
+	case "varchar", "decimal", "interval", "hugeint", "uhugeint":
 		var text string
 		return text, json.Unmarshal(pair[1], &text)
 	case "date":

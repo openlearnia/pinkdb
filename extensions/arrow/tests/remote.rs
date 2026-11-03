@@ -135,7 +135,7 @@ fn http_arrow_reads_whole_object() {
             &mut db,
             &format!("SELECT COUNT(*), SUM(i), COUNT(s) FROM read_arrow('{url}');")
         ),
-        vec![vec![Value::Bigint(3), Value::Bigint(6), Value::Bigint(2)]]
+        vec![vec![Value::Bigint(3), Value::Hugeint(6), Value::Bigint(2)]]
     );
     // The replacement scan claims the remote .arrow path.
     assert_eq!(
@@ -212,7 +212,7 @@ fn http_arrow_durable_replay_re_reads() {
     .unwrap();
     assert_eq!(
         select(&mut db, "SELECT COUNT(*), SUM(i) FROM dst;"),
-        vec![vec![Value::Bigint(3), Value::Bigint(6)]]
+        vec![vec![Value::Bigint(3), Value::Hugeint(6)]]
     );
     drop(db);
 
@@ -220,7 +220,7 @@ fn http_arrow_durable_replay_re_reads() {
     let mut db = PinkDb::open_durable(path.to_str().unwrap()).unwrap();
     assert_eq!(
         select(&mut db, "SELECT COUNT(*), SUM(i) FROM dst;"),
-        vec![vec![Value::Bigint(3), Value::Bigint(6)]]
+        vec![vec![Value::Bigint(3), Value::Hugeint(6)]]
     );
     drop(db);
 
@@ -248,7 +248,7 @@ fn s3_arrow_reads_whole_object() {
             &mut db,
             "SELECT COUNT(*), SUM(i), COUNT(s) FROM read_arrow('s3://bucket/lake/probe.arrow');"
         ),
-        vec![vec![Value::Bigint(3), Value::Bigint(6), Value::Bigint(2)]]
+        vec![vec![Value::Bigint(3), Value::Hugeint(6), Value::Bigint(2)]]
     );
     let ranges: Vec<String> = mock
         .requests()

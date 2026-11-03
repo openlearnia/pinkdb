@@ -1033,13 +1033,13 @@ mod tests {
             &mut db,
             &format!("SELECT SUM(a) FROM read_csv('{path}', errors := 'warn');"),
         );
-        assert_eq!(got, vec![vec![Value::Bigint(7)]]);
+        assert_eq!(got, vec![vec![Value::Hugeint(7)]]);
         // DuckDB's name for the same thing, and the switch back to strict.
         let got = rows(
             &mut db,
             &format!("SELECT SUM(a) FROM read_csv('{path}', ignore_errors := true);"),
         );
-        assert_eq!(got, vec![vec![Value::Bigint(7)]]);
+        assert_eq!(got, vec![vec![Value::Hugeint(7)]]);
         let err = db
             .execute(&format!(
                 "SELECT COUNT(*) FROM read_csv('{path}', ignore_errors := false);"
@@ -1176,7 +1176,7 @@ mod tests {
             &mut db,
             &format!("SELECT SUM(total) FROM read_csv('{url}');"),
         );
-        assert_eq!(got, vec![vec![Value::Bigint(100)]]);
+        assert_eq!(got, vec![vec![Value::Hugeint(100)]]);
         assert_eq!(
             server
                 .requests()
@@ -1328,7 +1328,7 @@ mod tests {
             &mut db,
             "SELECT SUM(a) FROM read_csv('s3://bucket/data.csv');",
         );
-        assert_eq!(got, vec![vec![Value::Bigint(3)]]);
+        assert_eq!(got, vec![vec![Value::Hugeint(3)]]);
         assert!(mock.verified_requests() >= 1, "Signed requests only");
         assert!(
             mock.requests().iter().any(|r| r == "GET /bucket/data.csv"),
@@ -1373,7 +1373,7 @@ mod tests {
             &mut db,
             "SELECT SUM(a) FROM read_csv('s3://bucket/secret/data.csv');",
         );
-        assert_eq!(got, vec![vec![Value::Bigint(3)]]);
+        assert_eq!(got, vec![vec![Value::Hugeint(3)]]);
         assert!(mock.verified_requests() >= 1, "signed with the secret");
 
         let error = db
@@ -1408,7 +1408,10 @@ mod tests {
         );
         assert_eq!(
             got,
-            vec![vec![Value::Bigint(800_000), Value::Bigint(sum as i64)]]
+            vec![vec![
+                Value::Bigint(800_000),
+                Value::Hugeint(i128::from(sum))
+            ]]
         );
 
         let spans = spans(&mock.ranges());
@@ -1458,7 +1461,10 @@ mod tests {
         );
         assert_eq!(
             got,
-            vec![vec![Value::Bigint(800_000), Value::Bigint(sum as i64)]],
+            vec![vec![
+                Value::Bigint(800_000),
+                Value::Hugeint(i128::from(sum))
+            ]],
             "the retried scan lost or duplicated rows"
         );
         let mut spans = spans(&mock.ranges());
@@ -1508,14 +1514,20 @@ mod tests {
         let sql = "SELECT COUNT(*), SUM(id) FROM read_csv('s3://bucket/big.csv');";
         assert_eq!(
             rows(&mut db, sql),
-            vec![vec![Value::Bigint(800_000), Value::Bigint(sum as i64)]]
+            vec![vec![
+                Value::Bigint(800_000),
+                Value::Hugeint(i128::from(sum))
+            ]]
         );
         // Only ranged GETs count: the size HEAD carries no Range.
         let after_first = spans(&mock.ranges()).len();
         assert!(after_first > 1, "{:?}", mock.ranges());
         assert_eq!(
             rows(&mut db, sql),
-            vec![vec![Value::Bigint(800_000), Value::Bigint(sum as i64)]]
+            vec![vec![
+                Value::Bigint(800_000),
+                Value::Hugeint(i128::from(sum))
+            ]]
         );
         assert_eq!(
             spans(&mock.ranges()).len(),
@@ -1544,7 +1556,10 @@ mod tests {
                 .unwrap();
             match out {
                 QueryResult::Selected { rows, .. } => {
-                    assert_eq!(rows, vec![vec![Value::Bigint(count), Value::Bigint(sum)]]);
+                    assert_eq!(
+                        rows,
+                        vec![vec![Value::Bigint(count), Value::Hugeint(i128::from(sum))]]
+                    );
                 }
                 other => panic!("expected rows, got {other:?}"),
             }

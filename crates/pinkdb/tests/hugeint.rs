@@ -159,18 +159,29 @@ fn text_to_hugeint_matches_duckdb() {
         err(&mut db, "SELECT 'abc'::HUGEINT;"),
         "Conversion Error: Could not convert string 'abc' to INT128"
     );
-    // Beyond 38 fractional digits DuckDB gives up instead of rounding
-    // (corpus `test_hugeint_exponent`).
-    for v in [
-        format!("0.{}1e5", "0".repeat(300)),
-        format!("1.{}1e5", "0".repeat(300)),
-        format!("1.1{}1e5", "0".repeat(300)),
-    ] {
-        assert_eq!(
-            err(&mut db, &format!("SELECT '{v}'::HUGEINT;")),
-            format!("Conversion Error: Could not convert string '{v}' to INT128")
-        );
-    }
+    // A long *zero* fraction is still fine: the release flushes it only when
+    // the exponent scales it. A non-zero fraction that outgrows the 128-bit
+    // decimal fails (the local corpus file
+    // `types/hugeint/test_hugeint_exponent.test` still expects the alpha rule
+    // for the first two).
+    let zeros = "0".repeat(300);
+    assert_eq!(
+        text(
+            &mut db,
+            &format!("SELECT '0.{zeros}1e5'::HUGEINT, '1.{zeros}1e5'::HUGEINT;")
+        ),
+        ["0", "100000"]
+    );
+    let v = format!("1.1{zeros}1e5");
+    assert_eq!(
+        err(&mut db, &format!("SELECT '{v}'::HUGEINT;")),
+        format!("Conversion Error: Could not convert string '{v}' to INT128")
+    );
+    // A zero integer rounds by sign, not by the (signless) zero result.
+    assert_eq!(
+        text(&mut db, "SELECT '-0.5'::HUGEINT, '-0.4'::HUGEINT;"),
+        ["-1", "0"]
+    );
     assert_eq!(
         err(&mut db, "SELECT '1e39'::HUGEINT;"),
         "Conversion Error: Could not convert string '1e39' to INT128"
@@ -501,16 +512,172 @@ fn hugeint_keys_group_with_the_narrower_integers() {
 }
 
 #[test]
-fn hugeint_reaching_a_storage_boundary_names_the_boundary() {
+fn hugeint_and_uhugeint_round_trip_through_pink_storage() {
     let mut db = PinkDb::new();
-    db.execute("CREATE TABLE s (h HUGEINT); INSERT INTO s VALUES (1);")
+    // UHUGEINT values arrive in step 8 (no literal or cast produces one yet),
+    // so this column only proves the tag, footer and NULL round trip; the
+    // 16-byte u128 payload is covered by persist's corpus, which writes
+    // u128::MAX directly.
+    db.execute(&format!(
+        "CREATE TABLE s (h HUGEINT, u UHUGEINT);
+         INSERT INTO s VALUES
+           ({MAX}, NULL),
+           ({MIN}, NULL),
+           (NULL, NULL),
+           (0, NULL);"
+    ))
+    .unwrap();
+    let before = rows(&mut db, "SELECT h, u FROM s ORDER BY h;");
+    let bytes = db.to_pink_bytes().unwrap();
+    let mut back = PinkDb::from_pink_bytes(&bytes).unwrap();
+    assert_eq!(rows(&mut back, "SELECT h, u FROM s ORDER BY h;"), before);
+    // The 128-bit bounds reach the zone map, so the pruned scan still answers
+    // the extremes exactly.
+    assert_eq!(
+        row(&mut back, "SELECT min(h), max(h), min(u), count(u) FROM s;"),
+        vec![
+            Value::Hugeint(i128::MIN),
+            Value::Hugeint(i128::MAX),
+            Value::Null,
+            Value::Bigint(0),
+        ]
+    );
+}
+
+// ---------- step 4: SUM's result type ----------
+
+#[test]
+fn sum_over_both_integer_types_is_hugeint() {
+    let mut db = PinkDb::new();
+    db.execute(
+        "CREATE TABLE s (i INTEGER, g BIGINT);
+         INSERT INTO s VALUES (1, 2), (4, 5), (NULL, NULL);",
+    )
+    .unwrap();
+    // DuckDB: SUM over TINYINT..BIGINT is HUGEINT; AVG stays DOUBLE.
+    assert_eq!(
+        text(
+            &mut db,
+            "SELECT typeof(sum(i)), typeof(sum(g)), typeof(avg(i)), typeof(avg(g)) FROM s;"
+        ),
+        ["HUGEINT", "HUGEINT", "DOUBLE", "DOUBLE"]
+    );
+    assert_eq!(
+        text(&mut db, "SELECT sum(i), sum(g), avg(i) FROM s;"),
+        ["5", "7", "2.5"]
+    );
+    // An aggregate over an empty table is still typed HUGEINT.
+    assert_eq!(
+        text(&mut db, "SELECT typeof(sum(i)), sum(i) FROM s WHERE false;"),
+        ["HUGEINT", "NULL"]
+    );
+}
+
+#[test]
+fn sum_of_bigint_past_i64_is_exact() {
+    let mut db = PinkDb::new();
+    db.execute(
+        "CREATE TABLE b (x BIGINT);
+         INSERT INTO b VALUES (9223372036854775807), (9223372036854775807), (-9223372036854775808);",
+    )
+    .unwrap();
+    assert_eq!(
+        texts(&mut db, "SELECT sum(x) FROM b;"),
+        ["9223372036854775806"]
+    );
+    // SUM(INTEGER) can leave i32 the same way.
+    db.execute("CREATE TABLE i (x INTEGER); INSERT INTO i VALUES (2147483647), (2147483647);")
         .unwrap();
-    let e = db
-        .to_pink_bytes()
-        .expect_err("a .pink file has no HUGEINT layout yet")
-        .to_string();
-    assert!(
-        e.contains("HUGEINT is not yet supported in .pink storage"),
-        "{e}"
+    assert_eq!(texts(&mut db, "SELECT sum(x) FROM i;"), ["4294967294"]);
+}
+
+#[test]
+fn sum_of_hugeint_is_exact_until_i128_overflows() {
+    let mut db = PinkDb::new();
+    db.execute(&format!(
+        "CREATE TABLE h (x HUGEINT);
+         INSERT INTO h VALUES ({MAX}), ({MIN}), (NULL);"
+    ))
+    .unwrap();
+    // MAX + MIN = -1: the two extremes cancel without an error.
+    assert_eq!(text(&mut db, "SELECT sum(x) FROM h;"), ["-1"]);
+    db.execute(&format!(
+        "CREATE TABLE big (x HUGEINT);
+         INSERT INTO big VALUES ({MAX}), (0), (1);"
+    ))
+    .unwrap();
+    let e = err(&mut db, "SELECT sum(x) FROM big;");
+    assert_eq!(
+        e,
+        format!("Overflow in HUGEINT addition: {MAX} + 1"),
+        "DuckDB's message, without its `Out of Range Error:` prefix"
+    );
+    // The same message for a window sum: every Finalize is checked.
+    let e = err(&mut db, "SELECT sum(x) OVER () FROM big;");
+    assert!(e.contains("Overflow in HUGEINT addition"), "{e}");
+}
+
+#[test]
+fn avg_over_hugeint_is_a_double() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE a (x HUGEINT); INSERT INTO a VALUES (1), (2), (NULL);")
+        .unwrap();
+    assert_eq!(text(&mut db, "SELECT avg(x), sum(x) FROM a;"), ["1.5", "3"]);
+    // Two extremes cannot be summed: DuckDB reports the HUGEINT overflow
+    // rather than a wrapped average.
+    db.execute(&format!(
+        "CREATE TABLE b (x HUGEINT); INSERT INTO b VALUES ({MAX}), ({MAX});"
+    ))
+    .unwrap();
+    assert_eq!(
+        err(&mut db, "SELECT avg(x) FROM b;"),
+        "Overflow in HUGEINT addition"
+    );
+}
+
+#[test]
+fn sum_results_reach_storage_ctas_and_narrow_columns() {
+    let mut db = PinkDb::new();
+    db.execute(
+        "CREATE TABLE s (i INTEGER);
+         INSERT INTO s VALUES (1), (2), (3);",
+    )
+    .unwrap();
+    // CTAS materializes the HUGEINT column, and it survives a .pink round trip.
+    db.execute("CREATE TABLE t AS SELECT sum(i) AS total FROM s;")
+        .unwrap();
+    assert_eq!(
+        text(&mut db, "SELECT typeof(total), total FROM t;"),
+        ["HUGEINT", "6"]
+    );
+    let bytes = db.to_pink_bytes().unwrap();
+    let mut back = PinkDb::from_pink_bytes(&bytes).unwrap();
+    assert_eq!(
+        text(&mut back, "SELECT typeof(total), total FROM t;"),
+        ["HUGEINT", "6"]
+    );
+    // INSERT .. SELECT narrows into a BIGINT column exactly when it fits.
+    back.execute("CREATE TABLE n (x BIGINT);").unwrap();
+    back.execute("INSERT INTO n SELECT sum(i) FROM s;").unwrap();
+    assert_eq!(text(&mut back, "SELECT x FROM n;"), ["6"]);
+}
+
+#[test]
+fn sum_results_combine_with_decimals_and_integers() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE s (i INTEGER); INSERT INTO s VALUES (1), (2), (NULL);")
+        .unwrap();
+    // A SUM column is an ordinary HUGEINT operand afterwards: DECIMAL
+    // arithmetic scales it, integer arithmetic widens it, `/` is float.
+    assert_eq!(
+        texts(
+            &mut db,
+            "SELECT sum(i) * 0.5, sum(i) + 10, sum(i) / 2, sum(i) % 2 FROM s;"
+        ),
+        ["1.5 13 1.5 1"]
+    );
+    assert_eq!(
+        text(&mut db, "SELECT typeof(sum(i) * 0.5) FROM s;"),
+        ["DECIMAL(38,1)"]
     );
 }

@@ -987,7 +987,7 @@ mod tests {
         // Aggregate root.
         assert_eq!(
             query(&mut db, "SELECT SUM(i), COUNT(*) FROM big;"),
-            vec![vec![Value::Bigint(sum), Value::Bigint(total)]]
+            vec![vec![Value::Hugeint(i128::from(sum)), Value::Bigint(total)]]
         );
         let (peak, read) = scan_accounting(&mut db)[0];
         assert_eq!(read, chunks as i64, "every morsel is read");
@@ -2288,7 +2288,7 @@ mod tests {
         // own decode.
         assert_eq!(
             query(&mut db, "SELECT SUM(a) FROM t AT (VERSION => 2);"),
-            vec![vec![Value::Bigint(3)]]
+            vec![vec![Value::Hugeint(3)]]
         );
         assert_eq!(lake.loads.load(Ordering::Relaxed), 1);
     }

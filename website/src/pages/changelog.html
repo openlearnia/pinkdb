@@ -14,8 +14,19 @@ progress log</a>.</p>
 <ul>
 <li><strong>Open</strong>: <code>open</code> reads the two header slots and the footer, through a new <code>StoreSource</code> (a file with positioned reads, or memory for wasm, in-memory stores and encrypted files, whose container is decrypted whole). TPC-H SF1 (323 MB) now opens at 27.8 MB peak RSS in 0.01 s instead of 339 MB in 0.07 s; QuackLab's v7 store (15.6 MB) at 7.1 MB instead of 25.6 MB.</li>
 <li><strong>Checksums on first read</strong>: a column chunk's CRC32C and page index are verified the first time its bytes are read — streamed in 128 KiB blocks, so no buffer the size of the chunk — and cached. A damaged chunk now fails the statement that reads it, with the same message as before; a damaged footer still fails at open.</li>
-</ul>
 <li><strong>Checkpoint holes wait for their readers</strong>: an incremental checkpoint may overwrite a range only once the chunk descriptors that named it are gone; a range superseded while a snapshot or a running scan still reads it stays free for one more checkpoint. Reuse is granted only when the open-lock sidecar says no other process has the store open: a checkpoint subtracts a live reader's sub-ranges from the free list, a store that loses the sidecar fails its next statement closed, and another process's checkpoint resets the cached checksums of the chunks this store reads.</li>
+</ul>
+<h3>Wave 136w — faster checkpoints, commits and Parquet loads ✅</h3>
+<ul>
+<li><strong>Incremental checkpoints:</strong> a checkpoint rewrites only the row groups that changed, into freed space or at the end of the file, and publishes them through the other header slot. TPC-H SF 1: <code>CHECKPOINT</code> after a one-row <code>UPDATE</code> 2.03 s → 0.09 s (DuckDB 0.08 s), after a 1,000-row <code>INSERT</code> 0.10 s, with nothing changed 1.92 s → 0.06 s. Freed space is reused (50 update-and-checkpoint rounds grow the file 3.9 %); past 50 % free space the next checkpoint compacts. Encrypted stores still rewrite in full.</li>
+<li><strong>Group commit:</strong> concurrent sessions share one WAL sync. <code>SET wal_sync_method = 'full' | 'fsync' | 'fdatasync'</code> picks the sync call; <code>full</code> (the default) flushes the drive cache on macOS, <code>fsync</code> is DuckDB's choice (2,000 single-row commits on macOS: 7.75 s with <code>full</code>, 0.13 s with <code>fsync</code>).</li>
+<li><strong>Parquet loads</strong> decode typed batches in parallel: <code>lineitem</code> SF 1 from Parquet 5.3 s → 1.0 s, on par with DuckDB, with 44 % less peak memory.</li>
+</ul>
+<h3>HUGEINT, and <code>SUM</code> typed like DuckDB ✅</h3>
+<ul>
+<li><code>SUM</code> over <code>INTEGER</code>, <code>BIGINT</code> and <code>HUGEINT</code> returns <code>HUGEINT</code>, as in DuckDB, so large sums no longer overflow; <code>AVG(HUGEINT)</code> is <code>DOUBLE</code>.</li>
+<li><code>HUGEINT</code> values are stored, logged, sent over the wire protocol (version 17) and returned to the C API and the Node, Python and Go bindings (as exact decimal text).</li>
+</ul>
 <h3>Wave 136 (step c-0) — GROUP BY state bounded by groups for wide keys ✅</h3>
 <p>A GROUP BY on VARCHAR keys whose state would grow with the input rows now keeps one entry per group.</p>
 <ul>

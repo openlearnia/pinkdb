@@ -65,6 +65,8 @@ fn int(v: &Value) -> i64 {
     match v {
         Value::Bigint(n) => *n,
         Value::Integer(n) => *n as i64,
+        // SUM returns HUGEINT; these fixtures only sum small values.
+        Value::Hugeint(n) => i64::try_from(*n).expect("fits in i64"),
         other => panic!("expected an integer, got {other:?}"),
     }
 }

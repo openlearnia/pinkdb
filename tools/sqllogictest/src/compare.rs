@@ -229,9 +229,11 @@ pub fn value_matches(expected: &str, actual: &str, data_type: &DataType) -> bool
         DataType::Boolean => parse_bool(expected)
             .zip(parse_bool(actual))
             .is_some_and(|(left, right)| left == right),
-        DataType::Integer | DataType::Bigint => parse_integer_text(expected)
-            .zip(parse_integer_text(actual))
-            .is_some_and(|(left, right)| left == right),
+        DataType::Integer | DataType::Bigint | DataType::Hugeint | DataType::Uhugeint => {
+            parse_integer_text(expected)
+                .zip(parse_integer_text(actual))
+                .is_some_and(|(left, right)| left == right)
+        }
         DataType::Double => expected
             .parse::<f64>()
             .ok()

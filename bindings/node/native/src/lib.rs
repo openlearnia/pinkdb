@@ -8,7 +8,8 @@
 //!
 //! Type mapping (documented in `bindings/node/README.md`):
 //! BOOLEAN → boolean, INTEGER → number, BIGINT → BigInt, DOUBLE → number,
-//! VARCHAR/DECIMAL/INTERVAL → string, DATE/TIMESTAMP → string in the engine's
+//! VARCHAR/DECIMAL/INTERVAL/HUGEINT/UHUGEINT → string, DATE/TIMESTAMP → string
+//! in the engine's
 //! canonical form (a JS `Date` cannot carry a µs timestamp or a calendar date
 //! without a timezone assumption), DOUBLE-based ARRAY → `Float64Array`,
 //! FLOAT-based ARRAY → `Float32Array`.
@@ -26,8 +27,9 @@ use pinkdb_ffi as ffi;
 use pinkdb_ffi::{
     PINKDB_TYPE_ARRAY, PINKDB_TYPE_ARRAY_FLOAT, PINKDB_TYPE_BIGINT, PINKDB_TYPE_BOOLEAN,
     PINKDB_TYPE_DATE,
-    PINKDB_TYPE_DECIMAL, PINKDB_TYPE_DOUBLE, PINKDB_TYPE_INTEGER, PINKDB_TYPE_INTERVAL,
-    PINKDB_TYPE_NULL, PINKDB_TYPE_TIMESTAMP, PINKDB_TYPE_VARCHAR, PinkHandle,
+    PINKDB_TYPE_DECIMAL, PINKDB_TYPE_DOUBLE, PINKDB_TYPE_HUGEINT, PINKDB_TYPE_INTEGER,
+    PINKDB_TYPE_INTERVAL, PINKDB_TYPE_NULL, PINKDB_TYPE_TIMESTAMP, PINKDB_TYPE_UHUGEINT,
+    PINKDB_TYPE_VARCHAR, PinkHandle,
     PinkPrepared, PinkResult, PinkValue, array_tag_len,
 };
 
@@ -61,7 +63,10 @@ const KIND_NAMES: [&str; 27] = [
     "dropped_schema",
 ];
 
-const TYPE_NAMES: [&str; 11] = [
+// Indices follow the C ABI's PINKDB_TYPE_* tags; 10 is VARIANT, 11 and 12 are
+// the ARRAY kinds (named from their tag's upper bits before this table is
+// consulted), 13 and 14 are the 128-bit integers.
+const TYPE_NAMES: [&str; 15] = [
     "null",
     "boolean",
     "integer",
@@ -73,6 +78,10 @@ const TYPE_NAMES: [&str; 11] = [
     "decimal",
     "interval",
     "variant",
+    "double[]",
+    "float[]",
+    "hugeint",
+    "uhugeint",
 ];
 
 fn kind_name(kind: i32) -> &'static str {
@@ -149,7 +158,11 @@ fn value_to_js(env: &Env, value: &PinkValue) -> Result<JsUnknown> {
             bigint.into_unknown()?
         }
         PINKDB_TYPE_DOUBLE => env.create_double(value.double)?.into_unknown(),
-        PINKDB_TYPE_VARCHAR | PINKDB_TYPE_DECIMAL | PINKDB_TYPE_INTERVAL => {
+        PINKDB_TYPE_VARCHAR
+        | PINKDB_TYPE_DECIMAL
+        | PINKDB_TYPE_INTERVAL
+        | PINKDB_TYPE_HUGEINT
+        | PINKDB_TYPE_UHUGEINT => {
             env.create_string_from_std(text_of(value)?)?.into_unknown()
         }
         PINKDB_TYPE_DATE => {

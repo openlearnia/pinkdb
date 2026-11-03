@@ -71,6 +71,8 @@ fn count(db: &mut PinkDb, sql: &str) -> i64 {
     match &query(db, sql)[0][0] {
         Value::Integer(v) => i64::from(*v),
         Value::Bigint(v) => *v,
+        // SUM returns HUGEINT; these tests only sum small values.
+        Value::Hugeint(v) => i64::try_from(*v).expect("fits in i64"),
         other => panic!("expected an integer count, got {other:?}"),
     }
 }
@@ -2842,7 +2844,9 @@ fn ducklake_functions_run_through_sql_and_match_duckdb() {
     let data = dir.join("data");
     std::fs::create_dir_all(&data).unwrap();
     let attach = format!("ducklake:postgres:{}", server.conninfo());
-    let prefix = attach_script(&attach, &data);
+    // pinkdb casts a TIMESTAMPTZ to DATE in UTC while DuckDB uses the session
+    // zone, so the snapshot dates would otherwise depend on the machine's zone.
+    let prefix = format!("{}SET TimeZone = 'UTC';\n", attach_script(&attach, &data));
     let setup = format!(
         "{prefix}         CREATE SCHEMA l.s2;
          CREATE TABLE l.s2.u (x INTEGER);

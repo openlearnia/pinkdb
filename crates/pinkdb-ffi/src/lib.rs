@@ -118,6 +118,10 @@ pub const PINKDB_TYPE_ARRAY: i32 = 11;
 /// (N << 8)`) and `text`/`text_len` hold `N * 4` little-endian `f32` bytes.
 /// FLOAT is an array-only element kind here (the engine has no `FLOAT` scalar).
 pub const PINKDB_TYPE_ARRAY_FLOAT: i32 = 12;
+/// v1 additive: HUGEINT/UHUGEINT marshal as decimal text (like DECIMAL), so
+/// `text`/`text_len` carry the exact digits and `i`/`d` stay zero.
+pub const PINKDB_TYPE_HUGEINT: i32 = 13;
+pub const PINKDB_TYPE_UHUGEINT: i32 = 14;
 
 // ----- thread-local error -----
 
@@ -427,12 +431,20 @@ impl Cell {
                     text: Some(b),
                 }
             }
-            Value::Hugeint(_) => {
-                return Err("HUGEINT is not yet supported in the C ABI".to_string());
-            }
-            Value::Uhugeint(_) => {
-                return Err("UHUGEINT is not yet supported in the C ABI".to_string());
-            }
+            Value::Hugeint(x) => Cell {
+                tag: PINKDB_TYPE_HUGEINT,
+                is_null: false,
+                i: 0,
+                d: 0.0,
+                text: Some(nul_terminated(&x.to_string())),
+            },
+            Value::Uhugeint(x) => Cell {
+                tag: PINKDB_TYPE_UHUGEINT,
+                is_null: false,
+                i: 0,
+                d: 0.0,
+                text: Some(nul_terminated(&x.to_string())),
+            },
         })
     }
 
@@ -467,19 +479,6 @@ pub const fn float_array_tag(len: u32) -> i32 {
     PINKDB_TYPE_ARRAY_FLOAT | ((len as i32) << 8)
 }
 
-/// 128-bit integers have no C-ABI tag yet (step 6 of the HUGEINT plan), and a
-/// `PinkValue` could not carry one anyway, so refuse the whole result rather
-/// than hand back a tag the client cannot interpret.
-fn refuse_wide_types(types: &[DataType]) -> std::result::Result<(), String> {
-    match types
-        .iter()
-        .find(|t| matches!(t, DataType::Hugeint | DataType::Uhugeint))
-    {
-        Some(t) => Err(format!("{} is not yet supported in the C ABI", t.name())),
-        None => Ok(()),
-    }
-}
-
 fn dtype_tag(t: DataType) -> i32 {
     match t {
         DataType::Array { len, elem } => {
@@ -500,11 +499,8 @@ fn dtype_tag(t: DataType) -> i32 {
         DataType::Interval => PINKDB_TYPE_INTERVAL,
         DataType::Variant => PINKDB_TYPE_VARIANT,
         DataType::Uuid => PINKDB_TYPE_VARCHAR,
-        // `build_result` refuses a result carrying one of these before a tag
-        // is asked for.
-        DataType::Hugeint | DataType::Uhugeint => {
-            unreachable!("build_result refuses 128-bit integer columns")
-        }
+        DataType::Hugeint => PINKDB_TYPE_HUGEINT,
+        DataType::Uhugeint => PINKDB_TYPE_UHUGEINT,
     }
 }
 
@@ -619,17 +615,14 @@ fn build_result(results: Vec<QueryResult>) -> std::result::Result<PinkResult, St
         .into_iter()
         .map(|r| {
             Ok(match r {
-                QueryResult::Selected { names, types, rows } => {
-                    refuse_wide_types(&types)?;
-                    StmtData::Sel(SelStmt {
-                        names: names.iter().map(|n| nul_terminated(n)).collect(),
-                        types: types.into_iter().map(dtype_tag).collect(),
-                        rows: rows
-                            .iter()
-                            .map(|row| row.iter().map(Cell::from_value).collect())
-                            .collect::<std::result::Result<Vec<_>, _>>()?,
-                    })
-                }
+                QueryResult::Selected { names, types, rows } => StmtData::Sel(SelStmt {
+                    names: names.iter().map(|n| nul_terminated(n)).collect(),
+                    types: types.into_iter().map(dtype_tag).collect(),
+                    rows: rows
+                        .iter()
+                        .map(|row| row.iter().map(Cell::from_value).collect())
+                        .collect::<std::result::Result<Vec<_>, _>>()?,
+                }),
                 // `CALL` (wave 44): a call whose own result is a result set is
                 // presented as that row set (the statement stream needs no new
                 // C-ABI entry); any other call outcome is a simple statement whose
@@ -642,17 +635,14 @@ fn build_result(results: Vec<QueryResult>) -> std::result::Result<PinkResult, St
                     result: Some(inner),
                     ..
                 } => match *inner {
-                    QueryResult::Selected { names, types, rows } => {
-                        refuse_wide_types(&types)?;
-                        StmtData::Sel(SelStmt {
-                            names: names.into_iter().map(|n| nul_terminated(&n)).collect(),
-                            types: types.into_iter().map(dtype_tag).collect(),
-                            rows: rows
-                                .iter()
-                                .map(|row| row.iter().map(Cell::from_value).collect())
-                                .collect::<std::result::Result<Vec<_>, _>>()?,
-                        })
-                    }
+                    QueryResult::Selected { names, types, rows } => StmtData::Sel(SelStmt {
+                        names: names.into_iter().map(|n| nul_terminated(&n)).collect(),
+                        types: types.into_iter().map(dtype_tag).collect(),
+                        rows: rows
+                            .iter()
+                            .map(|row| row.iter().map(Cell::from_value).collect())
+                            .collect::<std::result::Result<Vec<_>, _>>()?,
+                    }),
                     _ => StmtData::Simple {
                         kind: PINKDB_STMT_CREATED,
                         count: statements,
@@ -1844,16 +1834,19 @@ mod tests {
     }
 
     #[test]
-    fn hugeint_results_name_the_c_abi_boundary() {
-        let results = vec![QueryResult::Selected {
-            names: vec!["h".to_string()],
-            types: vec![DataType::Hugeint],
-            rows: vec![vec![Value::Hugeint(1)]],
-        }];
-        let Err(err) = build_result(results) else {
-            panic!("the C ABI has no 128-bit tag")
-        };
-        assert_eq!(err, "HUGEINT is not yet supported in the C ABI");
+    fn hugeint_cells_carry_decimal_text() {
+        let values = [Value::Hugeint(i128::MIN), Value::Uhugeint(u128::MAX)];
+        for v in values {
+            let cell = Cell::from_value(&v).expect("128-bit cell");
+            let text = cell.text.as_deref().expect("text cell");
+            assert_eq!(
+                std::str::from_utf8(&text[..text.len() - 1]).unwrap(),
+                v.to_string()
+            );
+            assert!(text.ends_with(&[0u8]));
+        }
+        assert_eq!(dtype_tag(DataType::Hugeint), PINKDB_TYPE_HUGEINT);
+        assert_eq!(dtype_tag(DataType::Uhugeint), PINKDB_TYPE_UHUGEINT);
     }
 
     #[test]

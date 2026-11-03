@@ -157,7 +157,7 @@ fn two_pool_threads_stream_a_multi_row_group_lake() {
     });
     assert_eq!(
         rows,
-        vec![vec![Value::Bigint(total * (total - 1) / 2)]],
+        vec![vec![Value::Hugeint(i128::from(total * (total - 1) / 2))]],
         "every row of every row group reached the aggregate"
     );
     let (files_read, files_pruned, peak) = io;
@@ -179,7 +179,7 @@ fn an_aggregate_over_a_lake_reports_the_files_it_read_and_pruned() {
     });
     assert_eq!(
         answer,
-        vec![vec![Value::Bigint(700), Value::Bigint(700 * 699)]],
+        vec![vec![Value::Bigint(700), Value::Hugeint(700 * 699)]],
         "the pruned scan kept exactly the matching rows"
     );
     let (files_read, files_pruned, _peak) = io;

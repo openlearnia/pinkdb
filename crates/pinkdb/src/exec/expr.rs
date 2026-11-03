@@ -2080,6 +2080,7 @@ fn decimal_operand(v: &Vector) -> Result<(std::borrow::Cow<'_, [i128]>, u8)> {
             std::borrow::Cow::Owned(src.iter().map(|&x| x as i128).collect()),
             0,
         ),
+        VectorData::Int128(src) => (std::borrow::Cow::Borrowed(src), 0),
         other => {
             return Err(PinkDbError::Execution(format!(
                 "decimal multiplication needs numeric operands, got {:?}",
@@ -4993,16 +4994,12 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
                 "cannot CAST \"{s}\" AS BOOLEAN"
             ))),
         },
-        (Value::Varchar(s), DataType::Integer) => s
-            .trim()
-            .parse::<i32>()
+        (Value::Varchar(s), DataType::Integer) => crate::types::parse_i32_str(&s)
             .map(Value::Integer)
-            .map_err(|_| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS INTEGER"))),
-        (Value::Varchar(s), DataType::Bigint) => s
-            .trim()
-            .parse::<i64>()
+            .ok_or_else(|| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS INTEGER"))),
+        (Value::Varchar(s), DataType::Bigint) => crate::types::parse_i64_str(&s)
             .map(Value::Bigint)
-            .map_err(|_| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS BIGINT"))),
+            .ok_or_else(|| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS BIGINT"))),
         (Value::Varchar(s), DataType::Double) => s
             .trim()
             .parse::<f64>()

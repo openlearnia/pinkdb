@@ -69,7 +69,7 @@ def _decode_param(cell):
         return datetime.datetime.fromisoformat(value)
     if type_name == "decimal":
         return decimal.Decimal(value)
-    if type_name in ("varchar", "interval"):
+    if type_name in ("varchar", "interval", "hugeint", "uhugeint"):
         return value
     raise AssertionError(f"corpus: unknown parameter type {type_name}")
 
@@ -218,7 +218,7 @@ class ConformanceTest(unittest.TestCase):
             )
         elif type_name == "decimal":
             self.assertEqual(actual, decimal.Decimal(expected_value), where)
-        else:  # varchar, interval
+        else:  # varchar, interval, hugeint, uhugeint
             self.assertEqual(actual, expected_value, where)
 
     def assert_stream(self, connection, step, where):

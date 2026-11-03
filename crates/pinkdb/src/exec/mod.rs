@@ -9972,14 +9972,14 @@ mod tests {
         for (row, (key, (c, sx, sn))) in got.iter().zip(&expect_s) {
             let key = key.clone().map(V::Varchar).unwrap_or(V::Null);
             let sx = sx.map(V::Double).unwrap_or(V::Null);
-            let sn = sn.map(V::Bigint).unwrap_or(V::Null);
+            let sn = sn.map(|x| V::Hugeint(i128::from(x))).unwrap_or(V::Null);
             assert_eq!(row, &vec![key, V::Bigint(*c), sx, sn]);
         }
         let got = select(&mut db, "SELECT k, COUNT(*), SUM(n) FROM g GROUP BY k;");
         assert_eq!(got.len(), expect_k.len());
         for (row, (key, (c, sn))) in got.iter().zip(&expect_k) {
             let key = key.map(V::Bigint).unwrap_or(V::Null);
-            let sn = sn.map(V::Bigint).unwrap_or(V::Null);
+            let sn = sn.map(|x| V::Hugeint(i128::from(x))).unwrap_or(V::Null);
             assert_eq!(row, &vec![key, V::Bigint(*c), sn]);
         }
     }
@@ -10020,19 +10020,22 @@ mod tests {
             .unwrap();
         assert!(err(&mut db, "SELECT x + 1 FROM o;").contains("Overflow in addition of INTEGER"));
         assert!(err(&mut db, "SELECT -x - 2 FROM o;").contains("Overflow"));
-        // SUM accumulates wide: only a final result outside BIGINT errors…
-        assert!(err(&mut db, "SELECT SUM(y) FROM o;").contains("Overflow in SUM"));
+        // SUM accumulates in HUGEINT: past i64 is exact, not an error…
+        assert_eq!(
+            select(&mut db, "SELECT SUM(y) FROM o;"),
+            vec![vec![V::Hugeint(9223372036854775808)]]
+        );
         // …and an intermediate excursion that comes back in range is exact.
         db.execute("INSERT INTO o VALUES (0, -9223372036854775807);")
             .unwrap();
         assert_eq!(
             select(&mut db, "SELECT SUM(y) FROM o;"),
-            vec![vec![V::Bigint(1)]]
+            vec![vec![V::Hugeint(1)]]
         );
-        // SUM(INTEGER) never overflows BIGINT at realistic row counts.
+        // SUM(INTEGER) widens to HUGEINT too.
         assert_eq!(
             select(&mut db, "SELECT SUM(x) FROM o;"),
-            vec![vec![V::Bigint(2147483648)]]
+            vec![vec![V::Hugeint(2147483648)]]
         );
     }
 
@@ -10192,19 +10195,19 @@ mod tests {
         db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
         assert_eq!(
             select(&mut db, "SELECT SUM(x) + (1+1) FROM t;"),
-            vec![vec![V::Bigint(5)]]
+            vec![vec![V::Hugeint(5)]]
         );
         assert_eq!(
             select(&mut db, "SELECT 1+1, SUM(x) FROM t;"),
-            vec![vec![V::Integer(2), V::Bigint(3)]]
+            vec![vec![V::Integer(2), V::Hugeint(3)]]
         );
         assert_eq!(
             select(&mut db, "SELECT SUM(x) + abs(1) FROM t;"),
-            vec![vec![V::Bigint(4)]]
+            vec![vec![V::Hugeint(4)]]
         );
         assert_eq!(
             select(&mut db, "SELECT SUM(x) FROM t HAVING SUM(x) > 1+1;"),
-            vec![vec![V::Bigint(3)]]
+            vec![vec![V::Hugeint(3)]]
         );
     }
 
@@ -10667,13 +10670,13 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                vec![V::Null, V::Bigint(2), V::Bigint(7)],
-                vec![s(""), V::Bigint(2), V::Bigint(9)],
-                vec![s("a"), V::Bigint(1), V::Bigint(2)],
-                vec![s("abcdefghijkl"), V::Bigint(2), V::Bigint(12)],
-                vec![s("abcdefghijklm"), V::Bigint(1), V::Bigint(4)],
-                vec![s("abcd0000"), V::Bigint(1), V::Bigint(5)],
-                vec![s("abcd0001"), V::Bigint(1), V::Bigint(6)],
+                vec![V::Null, V::Bigint(2), V::Hugeint(7)],
+                vec![s(""), V::Bigint(2), V::Hugeint(9)],
+                vec![s("a"), V::Bigint(1), V::Hugeint(2)],
+                vec![s("abcdefghijkl"), V::Bigint(2), V::Hugeint(12)],
+                vec![s("abcdefghijklm"), V::Bigint(1), V::Hugeint(4)],
+                vec![s("abcd0000"), V::Bigint(1), V::Hugeint(5)],
+                vec![s("abcd0001"), V::Bigint(1), V::Hugeint(6)],
             ]
         );
     }
@@ -11697,7 +11700,7 @@ mod tests {
             vec![vec![
                 V::Bigint(5),
                 V::Bigint(2),
-                V::Bigint(125),
+                V::Hugeint(125),
                 V::Double(62.5),
                 V::Integer(25),
                 V::Integer(100),
@@ -12476,7 +12479,7 @@ mod tests {
             vec![vec![
                 V::Varchar("west".to_string()),
                 V::Integer(20),
-                V::Bigint(30)
+                V::Hugeint(30)
             ]]
         );
 
@@ -12518,9 +12521,9 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                vec![V::Integer(1), V::Bigint(50)],
-                vec![V::Integer(2), V::Bigint(50)],
-                vec![V::Null, V::Bigint(10)],
+                vec![V::Integer(1), V::Hugeint(50)],
+                vec![V::Integer(2), V::Hugeint(50)],
+                vec![V::Null, V::Hugeint(10)],
             ]
         );
     }
@@ -12535,10 +12538,10 @@ mod tests {
             &mut db,
             "SELECT amount, SUM(amount) OVER (ORDER BY amount) AS run FROM sales ORDER BY amount;",
         );
-        let runs: Vec<i64> = rows
+        let runs: Vec<i128> = rows
             .iter()
             .map(|r| match r[1] {
-                V::Bigint(x) => x,
+                V::Hugeint(x) => x,
                 _ => panic!(),
             })
             .collect();
@@ -12552,10 +12555,10 @@ mod tests {
             "SELECT amount, SUM(amount) OVER (ORDER BY amount ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS w
              FROM sales ORDER BY amount;",
         );
-        let got: Vec<i64> = rows
+        let got: Vec<i128> = rows
             .iter()
             .map(|r| match r[1] {
-                V::Bigint(x) => x,
+                V::Hugeint(x) => x,
                 _ => panic!(),
             })
             .collect();
@@ -12826,11 +12829,11 @@ mod tests {
                  AS s FROM rp ORDER BY k;"
             ),
             vec![
-                vec![V::Integer(1), V::Bigint(51)],
-                vec![V::Integer(2), V::Bigint(112)],
-                vec![V::Integer(2), V::Bigint(112)],
-                vec![V::Integer(3), V::Bigint(102)],
-                vec![V::Integer(3), V::Bigint(102)],
+                vec![V::Integer(1), V::Hugeint(51)],
+                vec![V::Integer(2), V::Hugeint(112)],
+                vec![V::Integer(2), V::Hugeint(112)],
+                vec![V::Integer(3), V::Hugeint(102)],
+                vec![V::Integer(3), V::Hugeint(102)],
             ]
         );
         // RANGE offsets need a numeric/DATE key and at most one ORDER BY key.
@@ -13096,9 +13099,9 @@ mod tests {
         );
         assert_eq!(rows[0], vec![V::Null]);
         assert_eq!(rows[1], vec![V::Null]);
-        assert_eq!(rows[2], vec![V::Bigint(1)]);
-        assert_eq!(rows[3], vec![V::Bigint(3)]);
-        assert_eq!(rows[4], vec![V::Bigint(6)]);
+        assert_eq!(rows[2], vec![V::Hugeint(1)]);
+        assert_eq!(rows[3], vec![V::Hugeint(3)]);
+        assert_eq!(rows[4], vec![V::Hugeint(6)]);
     }
 
     /// FOLLOWING / UNBOUNDED FOLLOWING end bounds, plus a float SUM/AVG
@@ -13212,8 +13215,8 @@ mod tests {
              FROM wt;",
         );
         assert_eq!(rows.len(), 20_000);
-        assert_eq!(rows[0][0], V::Bigint(1));
-        assert_eq!(rows[19_999][0], V::Bigint(200_010_000));
+        assert_eq!(rows[0][0], V::Hugeint(1));
+        assert_eq!(rows[19_999][0], V::Hugeint(200_010_000));
     }
 
     #[test]
@@ -14412,7 +14415,7 @@ mod tests {
             &mut db,
             "SELECT SUM(CASE WHEN id = 3 THEN 10 ELSE 1 END) FROM t;",
         );
-        assert_eq!(rows, vec![vec![V::Bigint(12)]]);
+        assert_eq!(rows, vec![vec![V::Hugeint(12)]]);
     }
 
     // --- wave 17: sort tuning (byte-arena keys + top-N over SORT) ---
@@ -15072,7 +15075,7 @@ mod tests {
                     V::Varchar("west".to_string()),
                     V::Bigint(4),
                     V::Bigint(4),
-                    V::Bigint(20),
+                    V::Hugeint(20),
                     V::Double(5.0),
                     V::Integer(3),
                     V::Integer(7),
@@ -15081,7 +15084,7 @@ mod tests {
                     V::Varchar("east".to_string()),
                     V::Bigint(4),
                     V::Bigint(2),
-                    V::Bigint(10),
+                    V::Hugeint(10),
                     V::Double(5.0),
                     V::Integer(5),
                     V::Integer(5),
@@ -15101,7 +15104,7 @@ mod tests {
         // 8 matches; totals sum 69.5 → ×2 = 139.0; x sums 30 → ×3 = 90.
         assert_eq!(
             pipelined,
-            vec![vec![V::Bigint(8), V::Double(139.0), V::Bigint(90)]]
+            vec![vec![V::Bigint(8), V::Double(139.0), V::Hugeint(90)]]
         );
     }
 
@@ -15159,10 +15162,10 @@ mod tests {
                  FROM fa JOIN fb ON fa.id = fb.id GROUP BY fb.region;"
             ),
             vec![
-                vec![V::Varchar("W1".to_string()), V::Bigint(2), V::Bigint(10)],
-                vec![V::Varchar("E1".to_string()), V::Bigint(2), V::Bigint(5)],
-                vec![V::Varchar("W2".to_string()), V::Bigint(2), V::Bigint(10)],
-                vec![V::Varchar("E2".to_string()), V::Bigint(2), V::Bigint(5)],
+                vec![V::Varchar("W1".to_string()), V::Bigint(2), V::Hugeint(10)],
+                vec![V::Varchar("E1".to_string()), V::Bigint(2), V::Hugeint(5)],
+                vec![V::Varchar("W2".to_string()), V::Bigint(2), V::Hugeint(10)],
+                vec![V::Varchar("E2".to_string()), V::Bigint(2), V::Hugeint(5)],
             ]
         );
         assert_eq!(
@@ -15212,8 +15215,8 @@ mod tests {
         assert_eq!(
             pipelined,
             vec![
-                vec![V::Varchar("a".to_string()), V::Bigint(4), V::Bigint(80)],
-                vec![V::Varchar("b".to_string()), V::Bigint(1), V::Bigint(20)],
+                vec![V::Varchar("a".to_string()), V::Bigint(4), V::Hugeint(80)],
+                vec![V::Varchar("b".to_string()), V::Bigint(1), V::Hugeint(20)],
             ]
         );
     }
@@ -15355,7 +15358,7 @@ mod tests {
                  FROM (SELECT fa.region, COUNT(*) AS c
                        FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.region) s;"
             ),
-            vec![vec![V::Bigint(2), V::Bigint(8)]]
+            vec![vec![V::Bigint(2), V::Hugeint(8)]]
         );
         // Same shape inside a CTE.
         assert_eq!(
@@ -15430,7 +15433,7 @@ mod tests {
         assert_eq!(pipelined, fallback);
         assert_eq!(
             pipelined,
-            vec![vec![V::Integer(1), V::Bigint(2500), V::Bigint(6_247_500)]]
+            vec![vec![V::Integer(1), V::Bigint(2500), V::Hugeint(6_247_500)]]
         );
     }
 
@@ -15842,7 +15845,7 @@ mod tests {
                 &mut db,
                 "SELECT SUM(CAST(vb.s AS INTEGER)) FROM va JOIN vb ON va.k = vb.k;"
             ),
-            vec![vec![V::Bigint(3)]]
+            vec![vec![V::Hugeint(3)]]
         );
     }
 
@@ -16001,8 +16004,8 @@ mod tests {
         assert_eq!(
             pipelined,
             vec![
-                vec![V::Integer(1), V::Bigint(1), V::Bigint(2)],
-                vec![V::Integer(2), V::Bigint(4), V::Bigint(8)],
+                vec![V::Integer(1), V::Bigint(1), V::Hugeint(2)],
+                vec![V::Integer(2), V::Bigint(4), V::Hugeint(8)],
             ]
         );
         // Mirrored DOUBLE = INTEGER: groups keyed by the left (DOUBLE) side,
@@ -16018,8 +16021,8 @@ mod tests {
         assert_eq!(
             pipelined,
             vec![
-                vec![V::Double(2.0), V::Bigint(4), V::Bigint(82)],
-                vec![V::Double(1.0), V::Bigint(1), V::Bigint(10)],
+                vec![V::Double(2.0), V::Bigint(4), V::Hugeint(82)],
+                vec![V::Double(1.0), V::Bigint(1), V::Hugeint(10)],
             ]
         );
     }
@@ -16070,8 +16073,8 @@ mod tests {
         assert_eq!(
             pipelined,
             vec![
-                vec![V::Bigint(i64::MIN), V::Bigint(1), V::Bigint(20)],
-                vec![V::Bigint(i64::MAX), V::Bigint(2), V::Bigint(40)],
+                vec![V::Bigint(i64::MIN), V::Bigint(1), V::Hugeint(20)],
+                vec![V::Bigint(i64::MAX), V::Bigint(2), V::Hugeint(40)],
             ]
         );
         // DATE keys ride the same int path (raw day payloads).
@@ -16104,7 +16107,7 @@ mod tests {
             pipelined[0][0]
         );
         assert_eq!(pipelined[0][1], V::Bigint(4));
-        assert_eq!(pipelined[0][2], V::Bigint(80));
+        assert_eq!(pipelined[0][2], V::Hugeint(80));
         assert_eq!(
             select(
                 &mut db,
@@ -16249,7 +16252,7 @@ mod tests {
                 &mut db,
                 "SELECT COUNT(*), COUNT(1), SUM(fa.x) FROM fa JOIN fb ON fa.id = fb.id;"
             ),
-            vec![vec![V::Bigint(8), V::Bigint(8), V::Bigint(30)]]
+            vec![vec![V::Bigint(8), V::Bigint(8), V::Hugeint(30)]]
         );
         // Fast-path shape: dedup leaves exactly one aggregate and the helper
         // emits exactly one column (the outer Project duplicates it).

@@ -168,8 +168,8 @@ fn a_reordered_chain_returns_the_same_rows() {
         rows(&mut db, comma),
         vec![vec![
             Value::Bigint(2),
-            Value::Bigint(30),
-            Value::Bigint(300)
+            Value::Hugeint(30),
+            Value::Hugeint(300)
         ]]
     );
     // Every neighbouring pair has an equality, so nothing stays a cross join.
@@ -241,7 +241,7 @@ fn a_chain_under_nested_decorrelated_joins_starts_from_its_filtered_table() {
         vec![vec![
             Value::Bigint(400),
             Value::Bigint(20),
-            Value::Bigint(8010400)
+            Value::Hugeint(8010400)
         ]]
     );
 }

@@ -77,6 +77,7 @@ fn cell(v: &Value) -> String {
         Value::Boolean(b) => b.to_string(),
         Value::Integer(i) => i.to_string(),
         Value::Bigint(i) => i.to_string(),
+        Value::Hugeint(i) => i.to_string(),
         Value::Double(f) => f.to_string(),
         Value::Varchar(s) => s.clone(),
         other => format!("{other:?}"),

@@ -307,7 +307,7 @@ fn answers_a_tpch_style_question() {
          GROUP BY c.name ORDER BY revenue DESC, c.name LIMIT 3",
     );
     assert!(!is_error, "{text}");
-    assert!(text.contains("revenue:BIGINT"), "{text}");
+    assert!(text.contains("revenue:HUGEINT"), "{text}");
     let echo = text.find("| Echo |").expect("Echo is the top customer");
     let acme = text.find("| Acme |").expect("Acme is second");
     let cedar = text.find("| Cedar |").expect("Cedar is third");

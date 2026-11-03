@@ -87,11 +87,13 @@ fn requests_round_trip() {
 /// wave 95c adds the `SetVariable` `Done` kind (v12); wave 107a adds the ARRAY
 /// value (tag 11) and dtype (tag 10) tags (v13); wave 139b adds the UUID value
 /// (tag 12) and dtype (tag 11) tags (v15); wave 136a adds the memory limit and
-/// peak to the profile frame (v16).
+/// peak to the profile frame (v16); HUGEINT step 6 adds the HUGEINT value
+/// (tag 13) and dtype (tag 12) tags and the UHUGEINT value (tag 14) and dtype
+/// (tag 13) tags (v17).
 /// A change here is a protocol change and must bump [`PROTOCOL_VERSION`].
 #[test]
-fn protocol_v16_pins_the_memory_profile_and_keeps_the_v15_surface() {
-    assert_eq!(PROTOCOL_VERSION, 16);
+fn protocol_v17_pins_the_hugeint_tags_and_keeps_the_v16_surface() {
+    assert_eq!(PROTOCOL_VERSION, 17);
     assert_eq!(msg_type::LOGIN, 6);
     assert_eq!(msg_type::LOGGED_IN, 18);
     assert_eq!(msg_type::SET_PROFILING, 7);

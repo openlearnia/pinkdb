@@ -32,6 +32,32 @@ statement decodes them.
   reader's sub-ranges from the free list, a store that loses the sidecar fails
   its next statement closed, and another process's checkpoint resets the
   cached checksums of the chunks this store reads.
+
+### Wave 136w — faster checkpoints, commits and Parquet loads ✅
+
+- **Incremental checkpoints:** a checkpoint rewrites only the row groups that
+  changed, into freed space or at the end of the file, and publishes them
+  through the other header slot. TPC-H SF 1: `CHECKPOINT` after a one-row
+  `UPDATE` 2.03 s → 0.09 s (DuckDB 0.08 s), after a 1,000-row `INSERT`
+  0.10 s, with nothing changed 1.92 s → 0.06 s. Freed space is reused (50
+  update-and-checkpoint rounds grow the file 3.9 %); past 50 % free space the
+  next checkpoint compacts. Encrypted stores still rewrite in full.
+- **Group commit:** concurrent sessions share one WAL sync.
+  `SET wal_sync_method = 'full' | 'fsync' | 'fdatasync'` picks the sync call;
+  `full` (the default) flushes the drive cache on macOS, `fsync` is DuckDB's
+  choice (2,000 single-row commits on macOS: 7.75 s with `full`, 0.13 s with
+  `fsync`).
+- **Parquet loads** decode typed batches in parallel: `lineitem` SF 1 from
+  Parquet 5.3 s → 1.0 s, on par with DuckDB, with 44 % less peak memory.
+
+### HUGEINT, and `SUM` typed like DuckDB ✅
+
+- `SUM` over `INTEGER`, `BIGINT` and `HUGEINT` returns `HUGEINT`, as in DuckDB,
+  so large sums no longer overflow; `AVG(HUGEINT)` is `DOUBLE`.
+- `HUGEINT` values are stored, logged, sent over the wire protocol (version
+  17) and returned to the C API and the Node, Python and Go bindings (as exact
+  decimal text).
+
 ### Wave 136 (step c-0) — GROUP BY state bounded by groups for wide keys ✅
 
 A GROUP BY on VARCHAR keys whose state would grow with the input rows now

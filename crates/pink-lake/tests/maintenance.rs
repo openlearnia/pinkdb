@@ -185,6 +185,8 @@ fn as_i64(value: &Value) -> i64 {
     match value {
         Value::Integer(i) => *i as i64,
         Value::Bigint(i) => *i,
+        // SUM returns HUGEINT; these tests only sum small values.
+        Value::Hugeint(i) => i64::try_from(*i).expect("fits in i64"),
         other => panic!("expected an integer, got {other:?}"),
     }
 }

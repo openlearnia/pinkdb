@@ -355,7 +355,7 @@ fn columns_nulls_and_aggregates_pass_through() {
     );
     assert_eq!(
         rows(&mut db, "SELECT SUM(lnk_double_it(a)) FROM t;"),
-        vec![vec![Value::Bigint(8)]]
+        vec![vec![Value::Hugeint(8)]]
     );
     assert_eq!(
         rows(&mut db, "SELECT lnk_is_even(a) FROM t ORDER BY a;"),
@@ -626,7 +626,7 @@ fn durable_records_touching_linked_functions_replay() {
         );
         assert_eq!(
             rows(&mut db, "SELECT SUM(lnk_double_it(a)) FROM t;"),
-            vec![vec![Value::Bigint(76)]]
+            vec![vec![Value::Hugeint(76)]]
         );
     }
 

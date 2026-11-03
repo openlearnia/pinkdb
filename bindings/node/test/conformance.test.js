@@ -39,6 +39,8 @@ function decodeParam(cell) {
     case 'timestamp':
     case 'decimal':
     case 'interval':
+    case 'hugeint':
+    case 'uhugeint':
       return value;
     default:
       throw new Error(`corpus: unknown parameter type ${type}`);

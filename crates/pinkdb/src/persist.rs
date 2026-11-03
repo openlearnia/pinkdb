@@ -405,6 +405,10 @@ const SV_TIMESTAMP: u8 = 7;
 const SV_DECIMAL: u8 = 8;
 const SV_INTERVAL: u8 = 9;
 const SV_UUID: u8 = 10;
+/// A HUGEINT bound: 16-byte little-endian i128.
+const SV_HUGEINT: u8 = 11;
+/// A UHUGEINT bound: 16-byte little-endian u128.
+const SV_UHUGEINT: u8 = 12;
 
 /// Constraint-section kinds (one byte per constraint).
 const CK_PRIMARY_KEY: u8 = 0;
@@ -585,8 +589,8 @@ pub struct SavedTableStats {
 /// [`crate::stats::Zone`] the local tables keep and the scans prune with.
 type ChunkColumnStats = crate::stats::Zone;
 
-fn dtype_tag(t: DataType) -> Result<u8> {
-    Ok(match t {
+fn dtype_tag(t: DataType) -> u8 {
+    match t {
         DataType::Boolean => 0,
         DataType::Integer => 1,
         DataType::Bigint => 2,
@@ -607,16 +611,10 @@ fn dtype_tag(t: DataType) -> Result<u8> {
         DataType::Array { .. } => 10,
         // UUID is a fixed 16-byte payload, so the tag carries no parameters.
         DataType::Uuid => 11,
-        // The 128-bit integers have no layout in this format yet (step 5 of
-        // `docs/slt-3-hugeint-plan.md`). Refusing here keeps every writer
-        // from emitting a tag a reader would reject as corrupt.
-        DataType::Hugeint | DataType::Uhugeint => {
-            return Err(PinkDbError::Execution(format!(
-                "{} is not yet supported in .pink storage",
-                t.name()
-            )));
-        }
-    })
+        // The 128-bit integers are fixed 16-byte payloads too (PLAIN only).
+        DataType::Hugeint => 12,
+        DataType::Uhugeint => 13,
+    }
 }
 
 fn dtype_from_tag(b: u8) -> Result<DataType> {
@@ -630,8 +628,12 @@ fn dtype_from_tag(b: u8) -> Result<DataType> {
         6 => Ok(DataType::Timestamp),
         9 => Ok(DataType::Variant),
         11 => Ok(DataType::Uuid),
+        12 => Ok(DataType::Hugeint),
+        13 => Ok(DataType::Uhugeint),
+        // A tag this build does not know comes from a newer writer (the
+        // format version stays 6, so there is no version to point at).
         _ => Err(PinkDbError::Execution(format!(
-            "corrupt file: bad dtype tag {b}"
+            "unsupported .pink dtype tag {b}; upgrade pinkdb"
         ))),
     }
 }
@@ -2325,10 +2327,36 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
                 consider_best(&mut best, ENC_FSST, fsst);
             }
         }
-        // Guarded by `write_table`'s refusal: a table with a 128-bit column
-        // never reaches the encoder (step 5 gives it a layout).
+        // HUGEINT/UHUGEINT: `u32 row count | raw 16-byte little-endian
+        // values`, the same shape as wide DECIMAL and UUID. Invalid rows are
+        // zeroed so the bytes stay deterministic; the validity bitmap wins on
+        // decode.
+        // shortcut: PLAIN only (no RLE/bit-packing for 128-bit); upgrade when
+        // a corpus shows a win.
         DataType::Hugeint | DataType::Uhugeint => {
-            unreachable!("128-bit integer chunks have no .pink layout yet")
+            let nulls = v.has_nulls();
+            let mut w = Writer::new();
+            let n = match v.data() {
+                VectorData::Int128(values) => {
+                    w.u32(values.len() as u32);
+                    for (i, &x) in values.iter().enumerate() {
+                        let x = if nulls && !v.is_valid(i) { 0 } else { x };
+                        w.bytes(&x.to_le_bytes());
+                    }
+                    values.len()
+                }
+                VectorData::UInt128(values) => {
+                    w.u32(values.len() as u32);
+                    for (i, &x) in values.iter().enumerate() {
+                        let x = if nulls && !v.is_valid(i) { 0 } else { x };
+                        w.bytes(&x.to_le_bytes());
+                    }
+                    values.len()
+                }
+                _ => unreachable!("128-bit chunk has a non-integer payload"),
+            };
+            debug_assert_eq!(w.buf.len(), 4 + 16 * n);
+            best = Some((ENC_PLAIN, w.buf));
         }
     }
     best.expect("at least plain encoding")
@@ -2771,6 +2799,28 @@ fn decode_payload(dtype: DataType, tag: u8, r: &mut Reader) -> Result<(VectorDat
                 values.push(u128::from_le_bytes(arr));
             }
             Ok((VectorData::Uuid(values), n))
+        }
+        (DataType::Hugeint, ENC_PLAIN) => {
+            let n = r.chunk_count("chunk length")?;
+            let mut values = Vec::with_capacity(n);
+            for _ in 0..n {
+                let b = r.take(16)?;
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(b);
+                values.push(i128::from_le_bytes(arr));
+            }
+            Ok((VectorData::Int128(values), n))
+        }
+        (DataType::Uhugeint, ENC_PLAIN) => {
+            let n = r.chunk_count("chunk length")?;
+            let mut values = Vec::with_capacity(n);
+            for _ in 0..n {
+                let b = r.take(16)?;
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(b);
+                values.push(u128::from_le_bytes(arr));
+            }
+            Ok((VectorData::UInt128(values), n))
         }
         (DataType::Interval, ENC_PLAIN) => {
             let n = r.chunk_count("chunk length")?;
@@ -3319,10 +3369,14 @@ fn write_stat_value(w: &mut Writer, v: Option<&Value>) {
     match v {
         None => w.u8(SV_NONE),
         Some(Value::Array(_)) => w.u8(SV_NONE),
-        // Guarded by `write_table`'s refusal, and no reader can produce a
-        // 128-bit value from a saved zone map: keep the file self-consistent
-        // rather than inventing a tag before step 5.
-        Some(Value::Hugeint(_) | Value::Uhugeint(_)) => w.u8(SV_NONE),
+        Some(Value::Hugeint(x)) => {
+            w.u8(SV_HUGEINT);
+            w.bytes(&x.to_le_bytes());
+        }
+        Some(Value::Uhugeint(x)) => {
+            w.u8(SV_UHUGEINT);
+            w.bytes(&x.to_le_bytes());
+        }
         Some(Value::Boolean(b)) => {
             w.u8(SV_BOOL);
             w.u8(*b as u8);
@@ -3421,6 +3475,18 @@ fn read_stat_value(r: &mut Reader) -> Result<Option<Value>> {
             let mut arr = [0u8; 16];
             arr.copy_from_slice(b);
             Some(Value::Uuid(u128::from_le_bytes(arr)))
+        }
+        SV_HUGEINT => {
+            let b = r.take(16)?;
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(b);
+            Some(Value::Hugeint(i128::from_le_bytes(arr)))
+        }
+        SV_UHUGEINT => {
+            let b = r.take(16)?;
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(b);
+            Some(Value::Uhugeint(u128::from_le_bytes(arr)))
         }
         other => {
             return Err(PinkDbError::Execution(format!(
@@ -4022,7 +4088,7 @@ impl PinkDb {
                     fw.u32(tdir.schema.len() as u32);
                     for (col, dtype) in &tdir.schema {
                         fw.str(col);
-                        fw.u8(dtype_tag(*dtype)?);
+                        fw.u8(dtype_tag(*dtype));
                         if let DataType::Decimal { precision, scale } = dtype {
                             fw.u8(*precision);
                             fw.u8(*scale);
@@ -5047,17 +5113,6 @@ fn write_table<S: Sink>(
 ) -> Result<(TableDir, TableCarry)> {
     let schema = t.schema();
     let n_chunks = t.num_chunks();
-    // The .pink format has no 128-bit integer layout yet (step 5 of
-    // `docs/slt-3-hugeint-plan.md`). Refuse before encoding any page, so a
-    // table with such a column cannot reach the writer at all.
-    for (col, dtype) in &schema {
-        if matches!(dtype, DataType::Hugeint | DataType::Uhugeint) {
-            return Err(PinkDbError::Execution(format!(
-                "{} is not yet supported in .pink storage (column \"{col}\")",
-                dtype.name()
-            )));
-        }
-    }
     // The per-column statistics of the whole table (the lake's stats
     // block), accumulated as each row group is encoded.
     let mut accs: Vec<ChunkColumnStats> =
@@ -7056,7 +7111,7 @@ fn write_procedure_defs(w: &mut Writer, defs: &[crate::procedure::ProcedureDef])
         w.u32(def.params.len() as u32);
         for (name, dtype) in &def.params {
             w.str(name);
-            w.u8(dtype_tag(*dtype)?);
+            w.u8(dtype_tag(*dtype));
             // DECIMAL rides its precision/scale, exactly like the schema.
             if let DataType::Decimal { precision, scale } = dtype {
                 w.u8(*precision);
@@ -7591,6 +7646,20 @@ fn encode_chunk(dtype: DataType, values: &[Value]) -> (u8, Vec<u8>) {
     encode_chunk_typed(&vector_from_values(dtype, values))
 }
 
+/// `u32 rows | 16-byte LE values | NULLs zeroed`: the 16-byte PLAIN shape
+/// shared by UUID and the 128-bit integers (test helper).
+#[cfg(test)]
+fn plain_wide(values: &[u128], v: &Vector) -> Vec<u8> {
+    let nulls = v.has_nulls();
+    let mut w = Writer::new();
+    w.u32(values.len() as u32);
+    for (i, &x) in values.iter().enumerate() {
+        let x = if nulls && !v.is_valid(i) { 0 } else { x };
+        w.bytes(&x.to_le_bytes());
+    }
+    w.buf
+}
+
 /// The PLAIN payload of a vector (test helper: forced-tag round trips).
 #[cfg(test)]
 fn plain_payload(v: &Vector) -> Vec<u8> {
@@ -7606,9 +7675,18 @@ fn plain_payload(v: &Vector) -> Vec<u8> {
         DataType::Varchar => enc_strs_plain(&varchar_payload(v)),
         DataType::Variant => variant_payload(v),
         DataType::Array { .. } => array_payload(v, 1),
-        // `write_table` refuses 128-bit columns before any page is encoded.
-        DataType::Hugeint | DataType::Uhugeint => {
-            unreachable!("128-bit integers have no PLAIN layout")
+        // 128-bit integers share the UUID's 16-byte PLAIN shape.
+        DataType::Hugeint => {
+            let VectorData::Int128(values) = v.data() else {
+                unreachable!()
+            };
+            plain_wide(&values.iter().map(|&x| x as u128).collect::<Vec<_>>(), v)
+        }
+        DataType::Uhugeint => {
+            let VectorData::UInt128(values) = v.data() else {
+                unreachable!()
+            };
+            plain_wide(values, v)
         }
         DataType::Uuid => {
             let VectorData::Uuid(values) = v.data() else {
@@ -9120,10 +9198,21 @@ mod tests {
                 3 => 0x8000_0000_0000_4000_8000_0000_0000_0000,
                 _ => (i as u128) << 64 | i as u128,
             }),
-            // Not in the corpus dtype list: no .pink layout exists yet.
-            DataType::Hugeint | DataType::Uhugeint => {
-                unreachable!("128-bit integers have no .pink round trip")
-            }
+            DataType::Hugeint => Value::Hugeint(match i % 6 {
+                0 => 0,
+                1 => i128::MIN,
+                2 => i128::MAX,
+                3 => -i128::from(i as i64) * 1_000_003,
+                4 => i128::from(i as i64) << 40,
+                _ => i128::from(i as i64),
+            }),
+            DataType::Uhugeint => Value::Uhugeint(match i % 5 {
+                0 => 0,
+                1 => u128::MAX,
+                2 => i128::MAX as u128 + 1,
+                3 => u128::from(i as u64) << 64,
+                _ => i as u128,
+            }),
             DataType::Interval => Value::Interval {
                 months: match i % 5 {
                     0 => 0,
@@ -9230,6 +9319,42 @@ mod tests {
         }
     }
 
+    /// UHUGEINT has no SQL producer before step 8 (no literal, cast or INSERT
+    /// coercion), so the 16-byte payload, the statistics tag and the zone-map
+    /// extremes are pinned at the codec instead.
+    #[test]
+    fn uhugeint_payload_and_statistics_span_the_u128_range() {
+        let values = [
+            Value::Uhugeint(0),
+            Value::Uhugeint(1),
+            Value::Null,
+            Value::Uhugeint(i128::MAX as u128 + 1),
+            Value::Uhugeint(u128::MAX),
+        ];
+        let v = vector_from_values(DataType::Uhugeint, &values);
+        let (tag, payload) = encode_chunk_typed(&v);
+        assert_eq!(tag, ENC_PLAIN);
+        let validity = encode_validity(&v);
+        let mut w = Writer::new();
+        w.u8(tag);
+        w.u32(validity.len() as u32);
+        w.bytes(&validity);
+        w.bytes(&payload);
+        let mut r = Reader::new(&w.buf);
+        let t = r.u8().unwrap();
+        let back = decode_chunk_typed(DataType::Uhugeint, t, &mut r).unwrap();
+        assert_eq!(back.len(), values.len());
+        for (i, want) in values.iter().enumerate() {
+            assert_eq!(&back.get(i), want, "row {i}");
+        }
+        for x in [u128::MAX, i128::MAX as u128 + 1, 0] {
+            let mut w = Writer::new();
+            write_stat_value(&mut w, Some(&Value::Uhugeint(x)));
+            let mut r = Reader::new(&w.buf);
+            assert_eq!(read_stat_value(&mut r).unwrap(), Some(Value::Uhugeint(x)));
+        }
+    }
+
     /// Compare two stores bit-exactly (NaN payloads and -0.0 included).
     fn assert_bits_equal(a: &Value, b: &Value) {
         match (a, b) {
@@ -9266,6 +9391,7 @@ mod tests {
                             },
                         ),
                         ("iv".to_string(), DataType::Interval),
+                        ("h".to_string(), DataType::Hugeint),
                     ],
                 )
                 .unwrap();
@@ -9289,6 +9415,7 @@ mod tests {
                                 null_every,
                             ),
                             corpus_value(DataType::Interval, i, null_every),
+                            corpus_value(DataType::Hugeint, i, null_every),
                         ])
                         .unwrap();
                     }
@@ -10220,9 +10347,9 @@ mod tests {
                     DataType::Date => Value::Date(r as i32),
                     DataType::Timestamp => Value::Timestamp(r as i64),
                     DataType::Uuid => Value::Uuid(u128::from(r) << 64 | u128::from(r >> 1)),
-                    // `write_table` refuses these before any page is encoded.
-                    DataType::Hugeint | DataType::Uhugeint => {
-                        unreachable!("128-bit integers have no .pink layout")
+                    DataType::Hugeint => Value::Hugeint((i128::from(r) << 64) | i128::from(r >> 1)),
+                    DataType::Uhugeint => {
+                        Value::Uhugeint((u128::from(r) << 64) | u128::from(r >> 1))
                     }
                     DataType::Decimal { scale, .. } => Value::decimal(r as i128, scale),
                     DataType::Interval => Value::Interval {

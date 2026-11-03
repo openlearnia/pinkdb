@@ -67,6 +67,8 @@ fn int(db: &mut PinkDb, sql: &str) -> i64 {
     match db.execute(sql).unwrap().pop().expect("one statement") {
         QueryResult::Selected { rows, .. } => match rows[0][0] {
             Value::Bigint(v) => v,
+            // SUM returns HUGEINT; these tests only sum small values.
+            Value::Hugeint(v) => i64::try_from(v).expect("fits in i64"),
             ref other => panic!("{sql}: expected a BIGINT, got {other:?}"),
         },
         other => panic!("{sql}: expected rows, got {other:?}"),

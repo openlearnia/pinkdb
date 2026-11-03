@@ -204,7 +204,7 @@ fn durable_replay_resolves_the_process_global_source() {
     let mut db = PinkDb::open_durable(store.to_str().unwrap()).unwrap();
     assert_eq!(
         query(&mut db, "SELECT COUNT(*), SUM(a) FROM dst;"),
-        vec![vec![Value::Bigint(2), Value::Bigint(5)]]
+        vec![vec![Value::Bigint(2), Value::Hugeint(5)]]
     );
     std::fs::remove_dir_all(&dir).ok();
 }

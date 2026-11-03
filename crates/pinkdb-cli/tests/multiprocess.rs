@@ -285,6 +285,8 @@ fn ints(db: &mut PinkDb, sql: &str) -> Vec<i64> {
             .map(|r| match &r[0] {
                 Value::Integer(i) => *i as i64,
                 Value::Bigint(i) => *i,
+                // SUM returns HUGEINT; these tests only sum small values.
+                Value::Hugeint(i) => i64::try_from(*i).expect("fits in i64"),
                 other => panic!("expected an integer, got {other:?}"),
             })
             .collect(),
