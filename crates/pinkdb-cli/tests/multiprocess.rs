@@ -1453,3 +1453,77 @@ fn kill9_in_checkpoint_window_with_active_writer() {
     drop(again);
     cleanup(&ckpt);
 }
+
+/// 136w6: an in-place checkpoint may reuse ranges freed by an earlier
+/// checkpoint only while no other handle — in this process or in another one —
+/// has the store open. A live CLI process holds the store's shared sidecar
+/// lock, so A appends; once that process exits, A reuses the freed group again.
+#[test]
+fn checkpoint_reuses_holes_only_after_the_other_process_exits() {
+    let dir = scratch("openholes");
+    let ckpt = dir.join("db.pink");
+    let path = ckpt.to_str().unwrap();
+    let (mut a, _) = PinkDb::open_durable_with(path, SyncPolicy::Sync).unwrap();
+    a.execute("CREATE TABLE big (a INTEGER);").unwrap();
+    a.execute("CREATE TABLE dirty (a INTEGER, v VARCHAR);")
+        .unwrap();
+    // `dirty` is one row group (ROW_GROUP_ROWS is 122_880) of distinct values,
+    // so re-encoding it frees a range far larger than the footer.
+    let mut sql = String::from("INSERT INTO big VALUES ");
+    for i in 0..60_000 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({i})"));
+    }
+    sql.push(';');
+    a.execute(&sql).unwrap();
+    sql = String::from("INSERT INTO dirty VALUES ");
+    for i in 0..20_000 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({i},'{i:024}')"));
+    }
+    sql.push(';');
+    a.execute(&sql).unwrap();
+    a.checkpoint().unwrap();
+    let full = std::fs::metadata(&ckpt).unwrap().len();
+
+    let mut b = Cli::spawn(&dir, None);
+    b.open("db.pink");
+    b.marker("SELECT count(*) FROM dirty;", "b-open");
+
+    a.execute("UPDATE dirty SET v = 'x' WHERE a = 1;").unwrap();
+    a.checkpoint().unwrap();
+    let appended = std::fs::metadata(&ckpt).unwrap().len();
+    let open_growth = appended - full;
+    assert!(
+        open_growth > 16_384,
+        "another open handle must force an append-only checkpoint, grew {open_growth}"
+    );
+
+    b.quit();
+
+    a.execute("UPDATE dirty SET v = 'y' WHERE a = 1;").unwrap();
+    a.checkpoint().unwrap();
+    a.execute("UPDATE dirty SET v = 'z' WHERE a = 1;").unwrap();
+    a.checkpoint().unwrap();
+    let reused = std::fs::metadata(&ckpt).unwrap().len();
+    assert!(
+        reused.saturating_sub(appended) * 2 < open_growth,
+        "after the other process exits the freed group is reused: \
+         full={full} appended={appended} reused={reused}"
+    );
+    drop(a);
+
+    let (mut db, _) = PinkDb::open_durable_with(path, SyncPolicy::Sync).unwrap();
+    assert_eq!(ints(&mut db, "SELECT count(*) FROM big;"), vec![60_000]);
+    assert_eq!(ints(&mut db, "SELECT count(*) FROM dirty;"), vec![20_000]);
+    assert_eq!(
+        ints(&mut db, "SELECT count(*) FROM dirty WHERE v = 'z';"),
+        vec![1]
+    );
+    drop(db);
+    cleanup(&ckpt);
+}
