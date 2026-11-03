@@ -4154,13 +4154,18 @@ impl PinkDb {
     /// plaintext v7 file with room, otherwise write a full image to `tmp`.
     /// `tmp` is what the WAL publishes in the full-rewrite case; the in-place
     /// case commits through the other header slot and leaves `tmp` untouched.
+    /// `probe` decides whether freed ranges may be overwritten (see
+    /// [`crate::wal::HoleProbe`]).
     pub(crate) fn save_checkpoint_sync(
         &self,
         tmp: &std::path::Path,
         target: &std::path::Path,
         wal_generation: u64,
         next_generation: u64,
+        probe: &crate::wal::HoleProbe<'_>,
     ) -> Result<CheckpointSave> {
+        #[cfg(test)]
+        LAST_CHECKPOINT_REUSED.with(|last| last.set(None));
         if self.encryption_key.is_some() {
             return Err(PinkDbError::Execution(
                 "an encrypted store cannot take an in-place checkpoint".to_string(),
@@ -4204,6 +4209,7 @@ impl PinkDb {
             iteration,
             wal_generation,
             next_generation,
+            probe,
         )?;
         Ok(CheckpointSave::Incremental)
     }
@@ -4211,7 +4217,8 @@ impl PinkDb {
     /// Rewrite `file` in place: clean row groups keep their footer entries,
     /// dirty ones are re-encoded into the old footer's free ranges (or the
     /// end of the file), and the new footer is written after every row group
-    /// before the other slot names it.
+    /// before the other slot names it. Holes are reused only while `probe`
+    /// holds the store's exclusive open-lock; otherwise the pass appends.
     #[allow(clippy::too_many_arguments)]
     fn checkpoint_in_place(
         &self,
@@ -4223,7 +4230,11 @@ impl PinkDb {
         iteration: u64,
         wal_generation: u64,
         next_generation: u64,
+        probe: &crate::wal::HoleProbe<'_>,
     ) -> Result<()> {
+        let reuse = probe.exclusive();
+        #[cfg(test)]
+        LAST_CHECKPOINT_REUSED.with(|last| last.set(Some(reuse)));
         let mut old_tables: HashMap<(String, String, String), &TableDir> = HashMap::new();
         for db in &old_footer.databases {
             for schema in &db.schemas {
@@ -4250,6 +4261,7 @@ impl PinkDb {
             file,
             cursor: old_slot.file_len,
             free: old_footer.free_ranges.clone(),
+            reuse,
         };
         let mut carry: Vec<u8> = Vec::new();
         let mut repoints: Vec<(&DataTable, TableCarry)> = Vec::new();
@@ -5143,13 +5155,29 @@ fn checkpoint_fault() -> Option<CheckpointFault> {
     CHECKPOINT_FAULT.with(|f| f.get())
 }
 
+#[cfg(test)]
+thread_local! {
+    static LAST_CHECKPOINT_REUSED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the last plaintext checkpoint on this thread reused freed ranges
+/// (`true`) or appended only (`false`); `None` when it was a full rewrite, or
+/// before the first one.
+#[cfg(test)]
+pub(crate) fn last_checkpoint_reused_holes() -> Option<bool> {
+    LAST_CHECKPOINT_REUSED.with(|last| last.get())
+}
+
 /// A file opened for an in-place checkpoint: writes go at explicit offsets,
 /// and `free` is the old footer's hole list, the only space an encoded row
-/// group may take without growing the file.
+/// group may take without growing the file. `reuse == false` (another handle
+/// has the store open somewhere) keeps every write past the end instead: a
+/// hole might still be a live reader's bytes.
 struct CheckpointWriter {
     file: std::fs::File,
     cursor: u64,
     free: Vec<(u64, u64)>,
+    reuse: bool,
 }
 
 impl CheckpointWriter {
@@ -5157,7 +5185,9 @@ impl CheckpointWriter {
     /// old logical file, so an append never reuses a superseded range in the
     /// same pass (those become free for the next checkpoint).
     fn alloc(&mut self, len: u64) -> u64 {
-        if let Some(at) = first_fit(&mut self.free, len, 0) {
+        if self.reuse
+            && let Some(at) = first_fit(&mut self.free, len, 0)
+        {
             return at;
         }
         let at = self.cursor;
@@ -5293,6 +5323,7 @@ fn alloc_footer(
     len: u64,
     min_offset: u64,
 ) -> (u64, Vec<(u64, u64)>) {
+    let free: &[(u64, u64)] = if writer.reuse { free } else { &[] };
     for (i, &(offset, available)) in free.iter().enumerate() {
         if offset >= min_offset && available >= len {
             // Everything at or after the footer is outside the data region;

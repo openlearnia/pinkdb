@@ -52,6 +52,17 @@
 //! mutation boundary) re-checks that the locked fd is still the file named at
 //! the lock path and fails closed otherwise (see [`Lease`]).
 //!
+//! **Open handles (wave 136w6).** Every durable open also holds a shared
+//! `flock` on `<path>.pink.open` for as long as it holds the store, so a
+//! checkpoint can see handles that hold no lease (readers in other processes).
+//! Before an in-place checkpoint allocates anything it tries `LOCK_EX|LOCK_NB`
+//! on its own sidecar fd: only if no other handle has the store open anywhere
+//! may the pass reuse ranges an earlier checkpoint freed; otherwise it appends
+//! (the footer still lists those ranges, and the more-than-50 %-free rewrite
+//! still bounds the file). The conversion is not atomic, so the shared lock is
+//! re-taken on every path, error paths included (see [`HoleProbe`]). Like the
+//! lock file the sidecar is never deleted or replaced.
+//!
 //! Every process keeps a full in-memory store with an applied position
 //! (`wal_id`, generation, WAL file identity, byte/record offsets, checkpoint
 //! identity). Refresh (design section 4) replays only the frames past the
@@ -497,6 +508,132 @@ fn file_identity(path: &Path) -> Option<(u64, u64)> {
     std::fs::metadata(path).ok().map(|m| identity_of(&m))
 }
 
+// ---------- the open-handle sidecar ----------
+
+/// `<checkpoint>.pink.open`: one shared lock per open handle, so an in-place
+/// checkpoint can tell whether *any* other handle (in another process too) has
+/// the store open before it overwrites a range one of them may still read.
+///
+/// Like the lease file it is never deleted or replaced while the store may be
+/// open: `flock` protects the inode, and a fresh file would let two processes
+/// each believe they are the only one. Two durable opens of one path in one
+/// process are two fds and hold two shared locks, which is the intent (each
+/// has its own handles).
+#[cfg(unix)]
+#[derive(Debug)]
+struct Sidecar {
+    file: File,
+    path: PathBuf,
+}
+
+/// See [`Sidecar`]: only Unix has a shared file lock to put on one, so every
+/// other target has no sidecar and the store is never exclusive.
+#[cfg(not(unix))]
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug)]
+struct Sidecar;
+
+#[cfg(unix)]
+impl Sidecar {
+    fn open(checkpoint: &Path) -> Result<Sidecar> {
+        let path = open_sidecar_path(checkpoint);
+        // M-5: owner-only, like the lease file.
+        crate::fsutil::tighten(&path);
+        let file = crate::fsutil::open_rw_private(&path, false)?;
+        // Blocking: the exclusive lock is held for one checkpoint's allocation
+        // only, so an opener waits at most that long.
+        flock(&file, libc::LOCK_SH).map_err(PinkDbError::Io)?;
+        Ok(Sidecar { file, path })
+    }
+
+    /// Try to become the store's only open handle. Conversion is not atomic
+    /// (see [`HoleProbe`]), so the caller disposes of the returned probe to
+    /// get the shared lock back.
+    fn probe(&self) -> HoleProbe<'_> {
+        let exclusive = flock(&self.file, libc::LOCK_EX | libc::LOCK_NB).is_ok()
+            // A deleted or replaced sidecar locks nothing: read that as "some
+            // other handle may be open" and append.
+            && self.identity_current();
+        HoleProbe {
+            exclusive,
+            sidecar: Some(self),
+        }
+    }
+
+    fn identity_current(&self) -> bool {
+        let Ok(fd_meta) = self.file.metadata() else {
+            return false;
+        };
+        match std::fs::metadata(&self.path) {
+            Ok(path_meta) => identity_of(&fd_meta) == identity_of(&path_meta),
+            Err(_) => false,
+        }
+    }
+}
+
+// `UnsafeSingleProcess` promises a filesystem without usable locks; there is no
+// shared lock to take, so such a store never checkpoints exclusively.
+#[cfg(unix)]
+fn new_sidecar(checkpoint: &Path, mode: LockMode) -> Result<Option<Sidecar>> {
+    Ok(match mode {
+        LockMode::Required => Some(Sidecar::open(checkpoint)?),
+        LockMode::UnsafeSingleProcess => None,
+    })
+}
+
+#[cfg(not(unix))]
+fn new_sidecar(_checkpoint: &Path, _mode: LockMode) -> Result<Option<Sidecar>> {
+    Ok(None)
+}
+
+/// Convert `file`'s flock to `how`, retrying an interrupted wait.
+#[cfg(unix)]
+fn flock(file: &File, how: i32) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        // SAFETY: `file` owns the fd for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), how) } == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+/// One checkpoint's claim on the store: `exclusive` means no other handle has
+/// it open anywhere, so freed ranges may be reused; otherwise the checkpoint
+/// appends only.
+///
+/// An exclusive probe holds `LOCK_EX` on the sidecar while it lives. Dropping it
+/// always re-takes `LOCK_SH` (blocking) — on the append-only path, on success
+/// and on every error path — because the `flock` conversion may have dropped
+/// the shared lock first, and a handle that quietly lost it would let the next
+/// checkpoint overwrite ranges a reader of this handle is still on.
+pub(crate) struct HoleProbe<'a> {
+    exclusive: bool,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    sidecar: Option<&'a Sidecar>,
+}
+
+impl HoleProbe<'_> {
+    pub(crate) fn exclusive(&self) -> bool {
+        self.exclusive
+    }
+}
+
+impl Drop for HoleProbe<'_> {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(sidecar) = self.sidecar {
+            // Blocking: an opener that queued for the shared lock while this
+            // checkpoint held it must hold it before the next checkpoint probes.
+            let _ = flock(&sidecar.file, libc::LOCK_SH);
+        }
+    }
+}
+
 // ---------- the write lease ----------
 
 /// How durable opens coordinate with other processes.
@@ -603,6 +740,9 @@ impl Gate {
 #[derive(Debug)]
 pub(crate) struct Lease {
     file: File,
+    /// The open-handle sidecar (`<checkpoint>.pink.open`) this handle holds
+    /// `LOCK_SH` on; `None` where there is no usable shared lock.
+    sidecar: Option<Sidecar>,
     /// `<checkpoint>.pink.lock`: compared with the fd's identity by
     /// [`Lease::verify_lock_identity`].
     lock_path: PathBuf,
@@ -656,9 +796,14 @@ impl Lease {
         // M-5: owner-only, and narrow a pre-existing 0644 lock file.
         crate::fsutil::tighten(&lock_path);
         let file = crate::fsutil::open_rw_private(&lock_path, false)?;
+        // Stream C's readers read chunk bytes from the file on demand, so
+        // another handle anywhere may still be sitting on an older iteration:
+        // the sidecar is what makes that visible at checkpoint time.
+        let sidecar = new_sidecar(checkpoint, mode)?;
         let ms = busy_timeout.as_millis().min(u64::MAX as u128) as u64;
         Ok(Arc::new(Lease {
             file,
+            sidecar,
             lock_path,
             checkpoint_path: checkpoint.to_path_buf(),
             gate: Gate::default(),
@@ -674,6 +819,22 @@ impl Lease {
             #[cfg(test)]
             refresh_passes: AtomicU64::new(0),
         }))
+    }
+
+    /// Attempt to become the store's only open handle for one in-place
+    /// checkpoint; the result must be held until the checkpoint's new slot is
+    /// durable and the WAL is rolled. Without a sidecar (non-Unix, or
+    /// `UnsafeSingleProcess`) the store is never exclusive, so checkpoints
+    /// append only.
+    pub(crate) fn probe_holes(&self) -> HoleProbe<'_> {
+        #[cfg(unix)]
+        if let Some(sidecar) = &self.sidecar {
+            return sidecar.probe();
+        }
+        HoleProbe {
+            exclusive: false,
+            sidecar: None,
+        }
     }
 
     pub(crate) fn set_busy_timeout(&self, timeout: Duration) {
@@ -2521,7 +2682,13 @@ impl Wal {
     pub(crate) fn checkpoint(
         &mut self,
         guard: &LeaseGuard,
-        save: impl FnOnce(&Path, &Path, u64, u64) -> Result<super::persist::CheckpointSave>,
+        save: impl FnOnce(
+            &Path,
+            &Path,
+            u64,
+            u64,
+            &HoleProbe<'_>,
+        ) -> Result<super::persist::CheckpointSave>,
     ) -> Result<()> {
         self.absorb_sync_failure();
         if self.poisoned.is_some() {
@@ -2554,7 +2721,17 @@ impl Wal {
             .ok_or_else(|| PinkDbError::Execution("WAL generation counter overflow".to_string()))?;
         // 1. Full state to `.tmp`, fsynced by the writer, or an in-place
         //    checkpoint that already wrote its data, footer, and new slot.
-        let kind = save(&tmp, &self.checkpoint_path, self.generation, fresh_gen)?;
+        //    Holes are reused only while this probe holds the store exclusively
+        //    (no other handle anywhere); dropping it, after the WAL is rolled,
+        //    puts the shared lock back.
+        let probe = self.lease.probe_holes();
+        let kind = save(
+            &tmp,
+            &self.checkpoint_path,
+            self.generation,
+            fresh_gen,
+            &probe,
+        )?;
         if kind == super::persist::CheckpointSave::Full {
             sync_parent_dir(&tmp);
         }
@@ -4035,6 +4212,12 @@ fn wal_path(checkpoint: &Path) -> PathBuf {
 fn lock_path(checkpoint: &Path) -> PathBuf {
     let mut s = checkpoint.as_os_str().to_os_string();
     s.push(".lock");
+    PathBuf::from(s)
+}
+
+fn open_sidecar_path(checkpoint: &Path) -> PathBuf {
+    let mut s = checkpoint.as_os_str().to_os_string();
+    s.push(".open");
     PathBuf::from(s)
 }
 
@@ -5708,12 +5891,12 @@ impl PinkDb {
                 ));
             }
             match key {
-                Some(k) => guard_wal.checkpoint(guard, |tmp, _, _, _| {
+                Some(k) => guard_wal.checkpoint(guard, |tmp, _, _, _, _| {
                     self.save_sync_with_key(tmp, &k)?;
                     Ok(crate::persist::CheckpointSave::Full)
                 })?,
-                None => guard_wal.checkpoint(guard, |tmp, target, generation, next| {
-                    self.save_checkpoint_sync(tmp, target, generation, next)
+                None => guard_wal.checkpoint(guard, |tmp, target, generation, next, probe| {
+                    self.save_checkpoint_sync(tmp, target, generation, next, probe)
                 })?,
             }
         }
@@ -5722,8 +5905,8 @@ impl PinkDb {
             if self.encryption_key.is_some() {
                 return Err(crate::crypto::unavailable());
             }
-            guard_wal.checkpoint(guard, |tmp, target, generation, next| {
-                self.save_checkpoint_sync(tmp, target, generation, next)
+            guard_wal.checkpoint(guard, |tmp, target, generation, next, probe| {
+                self.save_checkpoint_sync(tmp, target, generation, next, probe)
             })?;
         }
         // A fresh WAL generation replays from the checkpoint's session
@@ -6160,6 +6343,8 @@ mod tests {
             let _ = std::fs::remove_file(&r.path);
         }
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.roll", wal.display())));
+        // Test teardown only: the store never deletes its open sidecar.
+        let _ = std::fs::remove_file(open_sidecar_path(ckpt));
     }
 
     /// The legacy (v2/v3) payload layout, for hand-built fixtures.
@@ -11274,5 +11459,194 @@ mod tests {
                 "a refused value leaves the setting unchanged"
             );
         }
+    }
+
+    /// Is `offset..offset+len` inside one of `ranges`?
+    #[cfg(unix)]
+    fn hole_covers(ranges: &[(u64, u64)], offset: u64, len: u64) -> bool {
+        ranges
+            .iter()
+            .any(|&(o, l)| o <= offset && offset + len <= o + l)
+    }
+
+    /// A store big enough that one re-encoded row group stays far below the
+    /// 50 % free-space compaction trigger, plus a one-row table to dirty; an
+    /// append-only pass must not turn into a full rewrite here.
+    #[cfg(unix)]
+    fn open_holes_store(tag: &str) -> TempCkpt {
+        let p = tmp_ckpt(tag);
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE big (a INTEGER);").unwrap();
+        db.execute("CREATE TABLE dirty (a INTEGER, v VARCHAR);")
+            .unwrap();
+        let values = (1..=20_000)
+            .map(|i| format!("({i})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        db.execute(&format!("INSERT INTO big VALUES {values};"))
+            .unwrap();
+        db.execute("INSERT INTO dirty VALUES (1, 'v1');").unwrap();
+        db.checkpoint().unwrap();
+        p
+    }
+
+    /// 136w6: an in-place checkpoint reuses freed ranges only while no other
+    /// handle has the store open. While a second open exists it appends and
+    /// keeps the superseded ranges free; once that handle closes, holes are
+    /// reusable again.
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_appends_while_another_handle_has_the_store_open() {
+        let p = open_holes_store("open_holes");
+        let mut db = durable(&p);
+        let inode = file_identity(&p);
+        let before = std::fs::metadata(&p).unwrap().len();
+        let dirty_before = image_layout(&p)
+            .into_iter()
+            .find(|(name, _)| name.ends_with(".dirty"))
+            .unwrap()
+            .1;
+
+        let other = durable(&p);
+        db.execute("UPDATE dirty SET v = 'x' WHERE a = 1;").unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(
+            crate::persist::last_checkpoint_reused_holes(),
+            Some(false),
+            "another open handle anywhere must force the append-only pass"
+        );
+        let appended = std::fs::metadata(&p).unwrap().len();
+        assert!(appended > before, "append-only must grow the file");
+        assert_eq!(file_identity(&p), inode, "still an in-place pass");
+        let dirty_appended = image_layout(&p)
+            .into_iter()
+            .find(|(name, _)| name.ends_with(".dirty"))
+            .unwrap()
+            .1;
+        assert!(
+            dirty_appended[0].0 >= before,
+            "the re-encoded group must go past the old end of file: {dirty_appended:?} < {before}"
+        );
+        let free = crate::persist::footer_free_ranges_for_test(&p).unwrap();
+        for &(offset, len) in &dirty_before {
+            assert!(
+                hole_covers(&free, offset, len),
+                "the superseded range {offset}+{len} must stay free, free={free:?}"
+            );
+        }
+
+        drop(other);
+        db.execute("UPDATE dirty SET v = 'y' WHERE a = 1;").unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(
+            crate::persist::last_checkpoint_reused_holes(),
+            Some(true),
+            "with no other handle open, holes are reusable again"
+        );
+        let dirty_reused = image_layout(&p)
+            .into_iter()
+            .find(|(name, _)| name.ends_with(".dirty"))
+            .unwrap()
+            .1;
+        assert_eq!(
+            dirty_reused.first().map(|span| span.0),
+            dirty_before.first().map(|span| span.0),
+            "the freed range must be reused: {dirty_reused:?} vs {dirty_before:?}"
+        );
+        drop(db);
+
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM big;"), vec![20_000]);
+        assert_eq!(
+            ints(&mut back, "SELECT count(*) FROM dirty WHERE v = 'y';"),
+            vec![1]
+        );
+        cleanup(&p);
+    }
+
+    /// 136w6: the `flock` conversion is not atomic, so a failed upgrade must
+    /// leave the store's shared lock held — otherwise the next checkpoint could
+    /// overwrite ranges this handle is still reading.
+    #[cfg(unix)]
+    #[test]
+    fn failed_probe_keeps_the_shared_lock() {
+        let p = open_holes_store("probe_shared");
+        let mut db = durable(&p);
+        let other = durable(&p);
+        db.execute("UPDATE dirty SET v = 'a' WHERE a = 1;").unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(crate::persist::last_checkpoint_reused_holes(), Some(false));
+        drop(other);
+        // Only `db` is open now. A fresh fd would win `LOCK_EX` if the failed
+        // upgrade had dropped `db`'s shared lock instead of restoring it.
+        let probe = std::fs::File::open(open_sidecar_path(&p)).unwrap();
+        assert!(
+            flock(&probe, libc::LOCK_EX | libc::LOCK_NB).is_err(),
+            "the store must still be held shared after a failed upgrade"
+        );
+        drop(probe);
+
+        // A third opener still opens and coexists, and the store still
+        // checkpoints (append only) around it.
+        let mut third = durable(&p);
+        assert_eq!(ints(&mut third, "SELECT count(*) FROM big;"), vec![20_000]);
+        db.execute("UPDATE dirty SET v = 'b' WHERE a = 1;").unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(crate::persist::last_checkpoint_reused_holes(), Some(false));
+        drop(third);
+
+        db.execute("UPDATE dirty SET v = 'c' WHERE a = 1;").unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(
+            crate::persist::last_checkpoint_reused_holes(),
+            Some(true),
+            "the surviving handle got its shared lock back"
+        );
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(
+            ints(&mut back, "SELECT count(*) FROM dirty WHERE v = 'c';"),
+            vec![1]
+        );
+        cleanup(&p);
+    }
+
+    /// 136w6: the open sidecar is owner-only, is never replaced, and a leftover
+    /// one (a crashed process) blocks neither opening nor checkpointing.
+    #[cfg(unix)]
+    #[test]
+    fn open_sidecar_is_kept_and_never_blocks() {
+        let p = open_holes_store("sidecar");
+        let side = open_sidecar_path(&p);
+        assert!(side.exists(), "a durable open creates its sidecar");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&side).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "the sidecar must be owner-only");
+        }
+        let inode = file_identity(&side);
+        let mut back = durable(&p);
+        assert_eq!(
+            file_identity(&side),
+            inode,
+            "a reopen must reuse the sidecar, never replace it"
+        );
+        back.execute("UPDATE dirty SET v = 'z' WHERE a = 1;")
+            .unwrap();
+        back.checkpoint().unwrap();
+        assert_eq!(
+            crate::persist::last_checkpoint_reused_holes(),
+            Some(true),
+            "a leftover, unlocked sidecar must not look like another open handle"
+        );
+        drop(back);
+        assert_eq!(file_identity(&side), inode);
+        let mut again = durable(&p);
+        assert_eq!(
+            ints(&mut again, "SELECT count(*) FROM dirty WHERE v = 'z';"),
+            vec![1]
+        );
+        drop(again);
+        cleanup(&p);
     }
 }
