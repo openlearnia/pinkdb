@@ -159,18 +159,29 @@ fn text_to_hugeint_matches_duckdb() {
         err(&mut db, "SELECT 'abc'::HUGEINT;"),
         "Conversion Error: Could not convert string 'abc' to INT128"
     );
-    // Beyond 38 fractional digits DuckDB gives up instead of rounding
-    // (corpus `test_hugeint_exponent`).
-    for v in [
-        format!("0.{}1e5", "0".repeat(300)),
-        format!("1.{}1e5", "0".repeat(300)),
-        format!("1.1{}1e5", "0".repeat(300)),
-    ] {
-        assert_eq!(
-            err(&mut db, &format!("SELECT '{v}'::HUGEINT;")),
-            format!("Conversion Error: Could not convert string '{v}' to INT128")
-        );
-    }
+    // A long *zero* fraction is still fine: the release flushes it only when
+    // the exponent scales it. A non-zero fraction that outgrows the 128-bit
+    // decimal fails (the local corpus file
+    // `types/hugeint/test_hugeint_exponent.test` still expects the alpha rule
+    // for the first two).
+    let zeros = "0".repeat(300);
+    assert_eq!(
+        text(
+            &mut db,
+            &format!("SELECT '0.{zeros}1e5'::HUGEINT, '1.{zeros}1e5'::HUGEINT;")
+        ),
+        ["0", "100000"]
+    );
+    let v = format!("1.1{zeros}1e5");
+    assert_eq!(
+        err(&mut db, &format!("SELECT '{v}'::HUGEINT;")),
+        format!("Conversion Error: Could not convert string '{v}' to INT128")
+    );
+    // A zero integer rounds by sign, not by the (signless) zero result.
+    assert_eq!(
+        text(&mut db, "SELECT '-0.5'::HUGEINT, '-0.4'::HUGEINT;"),
+        ["-1", "0"]
+    );
     assert_eq!(
         err(&mut db, "SELECT '1e39'::HUGEINT;"),
         "Conversion Error: Could not convert string '1e39' to INT128"
