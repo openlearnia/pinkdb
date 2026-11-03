@@ -7,7 +7,7 @@
 const native = require('./build/pinkdb.node');
 
 // 1.1: (major << 16) | minor. The addon still exposes the v1 cell API.
-const ABI_VERSION = (1 << 16) | 1;
+const ABI_VERSION = (1 << 16) | 2;
 
 /**
  * Error raised by pinkdb. `class` is the stable C ABI error class:

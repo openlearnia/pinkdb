@@ -1,5 +1,5 @@
 /*
- * pinkdb C ABI v1.1 — https://github.com/openlearnia/pinkdb
+ * pinkdb C ABI v1.2 — https://github.com/openlearnia/pinkdb
  *
  * Built as `libpinkdb_ffi.dylib` (cdylib) and `libpinkdb_ffi.a` (staticlib)
  * from the `pinkdb-ffi` crate. Link with `-lpinkdb_ffi`.
@@ -24,7 +24,8 @@
  *   borrow from their owning result/handle/thread and stay valid only until
  *   that owner is freed or the next FFI call on the same thread. Copy them if
  *   you need them longer. `text_ptr` is followed by a NUL byte but may contain
- *   embedded NULs — always trust `text_len`.
+ *   embedded NULs — always trust `text_len`. `pinkdb_string_t.ptr` borrows
+ *   from its chunk and is valid until `pinkdb_destroy_chunk`.
  * - v1 handles are NOT thread-safe: never call into one handle from two
  *   threads at once. A durable file may be opened by several processes;
  *   writes are serialized by a per-file write lease, and concurrent
@@ -56,7 +57,7 @@
 #include <stdint.h>
 
 #define PINKDB_ABI_VERSION_MAJOR 1
-#define PINKDB_ABI_VERSION_MINOR 1
+#define PINKDB_ABI_VERSION_MINOR 2
 #define PINKDB_ABI_VERSION ((PINKDB_ABI_VERSION_MAJOR << 16) | PINKDB_ABI_VERSION_MINOR)
 
 /* Library (not ABI) version, from the Cargo package version. */
@@ -76,6 +77,36 @@ typedef struct pinkdb_prepared pinkdb_prepared;
 typedef struct pinkdb_database pinkdb_database;
 typedef struct pinkdb_connection pinkdb_connection;
 typedef struct pinkdb_config pinkdb_config;
+typedef struct pinkdb_data_chunk pinkdb_data_chunk;
+typedef struct pinkdb_vector pinkdb_vector;
+
+/* A VARCHAR/BLOB/VARIANT element in a chunk: `len` bytes at `ptr`, never
+ * NUL-terminated. `ptr` is NULL and `len` 0 when the row is NULL. */
+typedef struct pinkdb_string_t {
+    const char *ptr;
+    uint64_t len;
+} pinkdb_string_t;
+
+/* INTERVAL payload: months, days and microseconds, each added independently. */
+typedef struct pinkdb_interval {
+    int32_t months;
+    int32_t days;
+    int64_t micros;
+} pinkdb_interval;
+
+/* HUGEINT and DECIMAL: a signed 128-bit integer, two's complement. */
+typedef struct pinkdb_hugeint {
+    uint64_t lower;
+    int64_t upper;
+} pinkdb_hugeint;
+
+/* UHUGEINT and UUID: an unsigned 128-bit integer, low limb first. A UUID is
+ * the engine's 128-bit value; the v1 cell and the bindings render the
+ * canonical text form. */
+typedef struct pinkdb_uhugeint {
+    uint64_t lower;
+    uint64_t upper;
+} pinkdb_uhugeint;
 
 /* Statement kind tags (pinkdb_result_kind). */
 enum {
@@ -145,10 +176,13 @@ enum {
        string; `i`/`d` are zero. Every SUM over an integer column now yields
        HUGEINT, so a host that predates these tags sees them as unknown. */
     PINKDB_TYPE_HUGEINT = 13,
-    PINKDB_TYPE_UHUGEINT = 14
-    /* UUID columns report PINKDB_TYPE_VARCHAR and carry the canonical
-       lowercase text form: the ABI has no 128-bit cell, so it is not a tag of
-       its own. */
+    PINKDB_TYPE_UHUGEINT = 14,
+    /* v1.2: UUID. The chunk API exposes 16 bytes; the v1 cell API still
+       renders the canonical lowercase text. */
+    PINKDB_TYPE_UUID = 15,
+    /* v1.2: FLOAT, an array element type only (never a column's own tag). It
+       is reported by pinkdb_result_column_array_element_type. */
+    PINKDB_TYPE_FLOAT = 16
 };
 
 /* An ARRAY's type tag: the type in the low byte, the element count above it.
@@ -182,8 +216,8 @@ typedef struct pink_value {
     size_t text_len;
 } pink_value;
 
-/* ABI version of the linked library, `major << 16 | minor` (1.1 is
- * 0x00010001). Compare it with PINKDB_ABI_VERSION; a same-major version is
+/* ABI version of the linked library, `major << 16 | minor` (1.2 is
+ * 0x00010002). Compare it with PINKDB_ABI_VERSION; a same-major version is
  * forward compatible. */
 uint32_t pinkdb_abi_version(void);
 
@@ -295,6 +329,111 @@ size_t pinkdb_result_row_count(const pinkdb_result *result, size_t statement);
  * range or when the statement is not a SELECT. */
 pink_value pinkdb_result_value(const pinkdb_result *result, size_t statement,
                                size_t row, size_t column);
+
+/*
+ * Chunk API (ABI 1.2)
+ * -------------------
+ * A SELECT's rows are produced as columnar chunks of at most 2048 rows. The
+ * chunk API exposes those chunks without converting them to cells:
+ *
+ *     pinkdb_data_chunk *chunk;
+ *     while ((chunk = pinkdb_result_fetch_chunk(result, statement))) {
+ *         size_t rows = pinkdb_chunk_size(chunk);
+ *         const uint64_t *valid = pinkdb_vector_validity(
+ *             pinkdb_chunk_column(chunk, 0));
+ *         const int32_t *data = pinkdb_vector_data(
+ *             pinkdb_chunk_column(chunk, 0));
+ *         ...
+ *         pinkdb_destroy_chunk(chunk);
+ *     }
+ *
+ * Fetch order is statement-local: each call returns the next chunk and NULL
+ * once the end is reached. Fetching from a failed result, a non-SELECT
+ * statement, or a statement index out of range returns NULL. A fetch after
+ * the end keeps returning NULL (it does not restart).
+ *
+ * Ownership: the caller owns each chunk and frees it with
+ * pinkdb_destroy_chunk. A chunk holds its own reference to the underlying
+ * column data, so it stays valid after pinkdb_result_free: a chunk may be
+ * destroyed before or after its result. Vectors are borrowed from their
+ * chunk and are invalid after pinkdb_destroy_chunk. A result may be freed
+ * while chunks from it are still alive.
+ */
+
+/* DECIMAL precision, or -1 when the column is not DECIMAL. */
+int32_t pinkdb_result_column_decimal_width(const pinkdb_result *result,
+                                           size_t statement, size_t column);
+
+/* DECIMAL scale (digits after the point), or -1 when the column is not
+ * DECIMAL. */
+int32_t pinkdb_result_column_decimal_scale(const pinkdb_result *result,
+                                           size_t statement, size_t column);
+
+/* ARRAY element count, or 0 when the column is not an ARRAY. */
+uint64_t pinkdb_result_column_array_length(const pinkdb_result *result,
+                                           size_t statement, size_t column);
+
+/* An ARRAY's element type (PINKDB_TYPE_DOUBLE or PINKDB_TYPE_FLOAT), or -1
+ * when the column is not an ARRAY. */
+int32_t pinkdb_result_column_array_element_type(const pinkdb_result *result,
+                                                size_t statement, size_t column);
+
+/* The next chunk of a SELECT result, or NULL at the end / for a failed or
+ * non-SELECT result. The caller frees it with pinkdb_destroy_chunk. */
+pinkdb_data_chunk *pinkdb_result_fetch_chunk(pinkdb_result *result,
+                                             size_t statement);
+
+/* Free a chunk. NULL-safe. */
+void pinkdb_destroy_chunk(pinkdb_data_chunk *chunk);
+
+/* Rows in a chunk (0 for NULL). */
+size_t pinkdb_chunk_size(const pinkdb_data_chunk *chunk);
+
+/* A vector borrowed from `chunk`, or NULL when the column is out of range.
+ * Valid until pinkdb_destroy_chunk(chunk). */
+pinkdb_vector *pinkdb_chunk_column(const pinkdb_data_chunk *chunk,
+                                   size_t column);
+
+/* The vector's payload in its native layout:
+ *
+ *   PINKDB_TYPE_BOOLEAN      const uint8_t *   (0 or 1, one byte per row)
+ *   PINKDB_TYPE_INTEGER      const int32_t *
+ *   PINKDB_TYPE_BIGINT       const int64_t *
+ *   PINKDB_TYPE_DOUBLE       const double *
+ *   PINKDB_TYPE_DATE         const int32_t *   (days since 1970-01-01)
+ *   PINKDB_TYPE_TIMESTAMP    const int64_t *   (microseconds since epoch, UTC)
+ *   PINKDB_TYPE_INTERVAL     const pinkdb_interval *
+ *   PINKDB_TYPE_HUGEINT      const pinkdb_hugeint *
+ *   PINKDB_TYPE_DECIMAL      const pinkdb_hugeint * (unscaled; use
+ *                                                  decimal_scale for the point)
+ *   PINKDB_TYPE_UHUGEINT     const pinkdb_uhugeint *
+ *   PINKDB_TYPE_UUID         const pinkdb_uhugeint * (the 128-bit value;
+ *                                                    canonical text is upper
+ *                                                    then lower, in hex)
+ *   PINKDB_TYPE_VARCHAR      const pinkdb_string_t *
+ *   PINKDB_TYPE_VARIANT      const pinkdb_string_t * (provisional: the JSON
+ *                                                    text of each value)
+ *
+ * BOOLEAN, INTEGER, BIGINT, DOUBLE, DATE, TIMESTAMP, INTERVAL, HUGEINT,
+ * UHUGEINT, UUID and DECIMAL are zero-copy on little-endian hosts: the
+ * pointer is the engine's own column buffer. VARCHAR and VARIANT build one
+ * string-element array per chunk without copying the bytes (VARIANT builds
+ * its JSON text once per chunk). On a big-endian host the 128-bit types are
+ * copied into a {lower, upper} array per chunk.
+ *
+ * Provisional: ARRAY has no data pointer in 1.2 (returns NULL); use the v1
+ * cell API for ARRAY columns. 112c's Arrow export is the full nested path.
+ * A NULL row's payload bytes are unspecified; check validity first. */
+const void *pinkdb_vector_data(const pinkdb_vector *vector);
+
+/* The vector's validity mask: u64 words, bit i set means row i is valid.
+ * NULL when every row is valid. Bits at or beyond pinkdb_chunk_size are
+ * unspecified. */
+const uint64_t *pinkdb_vector_validity(const pinkdb_vector *vector);
+
+/* 1 when `row` is valid, 0 otherwise. A NULL mask means every row is valid,
+ * so this returns 1. */
+int32_t pinkdb_validity_row_is_valid(const uint64_t *validity, size_t row);
 
 /* INSERT/UPDATE/DELETE results: affected row count, else 0. */
 size_t pinkdb_result_affected(const pinkdb_result *result, size_t statement);

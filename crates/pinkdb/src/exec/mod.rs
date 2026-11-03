@@ -535,6 +535,50 @@ pub enum QueryResult {
     },
 }
 
+/// A statement outcome whose SELECT rows are still the executor's columnar
+/// chunks: [`crate::db::Connection::execute_chunked`] returns these without
+/// converting to rows. Every other caller sees [`QueryResult`].
+pub enum ChunkedResult {
+    Selected {
+        names: Vec<String>,
+        types: Vec<DataType>,
+        chunks: Vec<DataChunk>,
+    },
+    /// A non-SELECT outcome, or a SELECT that only exists as rows (inside a
+    /// transaction, a write path's `RETURNING`, `CALL`, `COPY`, a profile).
+    Other(QueryResult),
+}
+
+impl ChunkedResult {
+    /// The row-shaped view, when this is not a chunked SELECT.
+    pub fn as_query_result(&self) -> Option<&QueryResult> {
+        match self {
+            ChunkedResult::Other(result) => Some(result),
+            ChunkedResult::Selected { .. } => None,
+        }
+    }
+
+    /// Convert to the row-shaped [`QueryResult`].
+    pub fn into_query_result(self) -> QueryResult {
+        match self {
+            ChunkedResult::Selected {
+                names,
+                types,
+                chunks,
+            } => {
+                let mut rows = Vec::with_capacity(chunks.iter().map(|c| c.num_rows).sum());
+                for chunk in &chunks {
+                    for i in 0..chunk.num_rows {
+                        rows.push(chunk.columns.iter().map(|c| c.get(i)).collect());
+                    }
+                }
+                QueryResult::Selected { names, types, rows }
+            }
+            ChunkedResult::Other(result) => result,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Output {
     chunks: Vec<DataChunk>,
@@ -2941,28 +2985,50 @@ pub(crate) fn run_read_with_budget(
     run_read_with(&cx, plan)
 }
 
+/// [`run_read_with_budget`] keeping the executor's chunks instead of
+/// materializing rows (the C API's chunk fetch).
+pub(crate) fn run_read_chunks_with_budget(
+    db: &PinkDb,
+    plan: &LogicalPlan,
+    budget: std::sync::Arc<ExecBudget>,
+    session: crate::storage::Session,
+) -> Result<ChunkedResult> {
+    debug_assert!(
+        crate::plan::is_read_only(plan),
+        "run_read_chunks needs a query plan"
+    );
+    let cx = Cx::with_budget(db, budget)
+        .with_session(session)
+        .with_projections(plan);
+    run_read_chunks_with(&cx, plan, true)
+}
+
 fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
+    run_read_chunks_with(cx, plan, false).map(ChunkedResult::into_query_result)
+}
+
+fn run_read_chunks_with(cx: &Cx, plan: &LogicalPlan, keep_chunks: bool) -> Result<ChunkedResult> {
     // `USE` is read-only for locking but is not a row-producing plan: it
     // returns the target database for the session layer to apply.
     if let LogicalPlan::Use { ns } = plan {
-        return use_result(cx.db, ns);
+        return use_result(cx.db, ns).map(ChunkedResult::Other);
     }
     // `SET VARIABLE` writes session state only: it is read-only for the store
     // (no lock upgrade, nothing logged) but must still run on the read path.
     if let LogicalPlan::SetVariable { name, value } = plan {
-        return set_variable(cx, name, value);
+        return set_variable(cx, name, value).map(ChunkedResult::Other);
     }
     if let LogicalPlan::SetSetting { name, value } = plan {
-        return set_setting(cx, name, Some(value));
+        return set_setting(cx, name, Some(value)).map(ChunkedResult::Other);
     }
     if let LogicalPlan::ResetSetting { name } = plan {
-        return set_setting(cx, name.as_deref().unwrap_or("*"), None);
+        return set_setting(cx, name.as_deref().unwrap_or("*"), None).map(ChunkedResult::Other);
     }
     // `COPY … TO …` (wave 71) is read-only for the store (only an external
     // file is written) but produces DuckDB's `Count` result, not a row set —
     // handle it before the row evaluator.
     if let LogicalPlan::CopyTo { .. } = plan {
-        return execute_copy_to(cx.db, plan);
+        return execute_copy_to(cx.db, plan).map(ChunkedResult::Other);
     }
     let out = eval(cx, plan)?;
     let mut rows = Vec::new();
@@ -2979,22 +3045,33 @@ fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
                 )));
             }
         }
-        let mut bytes = 0usize;
-        for i in 0..chunk.num_rows() {
-            let row: Vec<Value> = chunk.columns.iter().map(|c| c.get(i)).collect();
-            bytes += row_approx_bytes(&row);
-            rows.push(row);
+        if keep_chunks {
+            cx.add_result(chunk.num_rows(), chunk_approx_bytes(chunk))?;
+        } else {
+            let mut bytes = 0usize;
+            for i in 0..chunk.num_rows() {
+                let row: Vec<Value> = chunk.columns.iter().map(|c| c.get(i)).collect();
+                bytes += row_approx_bytes(&row);
+                rows.push(row);
+            }
+            // Charge the complete chunk against the final-result cap. Join
+            // builders charge their own output separately, so a CROSS JOIN
+            // cannot grow without bound even before this final materialization.
+            cx.add_result(chunk.num_rows(), bytes)?;
         }
-        // Charge the complete chunk against the final-result cap. Join
-        // builders charge their own output separately, so a CROSS JOIN
-        // cannot grow without bound even before this final materialization.
-        cx.add_result(chunk.num_rows(), bytes)?;
     }
-    Ok(QueryResult::Selected {
+    if keep_chunks {
+        return Ok(ChunkedResult::Selected {
+            names: out.names,
+            types: out.types,
+            chunks: out.chunks,
+        });
+    }
+    Ok(ChunkedResult::Other(QueryResult::Selected {
         names: out.names,
         types: out.types,
         rows,
-    })
+    }))
 }
 
 /// Execute `COPY <table> TO '<path>' [(FORMAT <name>)]` (wave 71): materialize

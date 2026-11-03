@@ -558,7 +558,21 @@ impl Connection {
     /// Parse and run every statement, returning one result each.
     /// Multi-statement strings mix freely (each statement locks as needed).
     pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
-        self.execute_inner(sql, None)
+        Ok(self
+            .execute_inner(sql, None, false)?
+            .into_iter()
+            .map(crate::exec::ChunkedResult::into_query_result)
+            .collect())
+    }
+
+    /// Like [`Connection::execute`], but a SELECT's rows stay in the
+    /// executor's columnar [`crate::exec::ChunkedResult::Selected`] chunks
+    /// instead of being materialized as rows. Inside an open transaction, and
+    /// for write-path SELECTs (`RETURNING`, `CALL`, `COPY`), the outcome is
+    /// still row-shaped and returned as
+    /// [`crate::exec::ChunkedResult::Other`].
+    pub fn execute_chunked(&mut self, sql: &str) -> Result<Vec<crate::exec::ChunkedResult>> {
+        self.execute_inner(sql, None, true)
     }
 
     /// Run every statement like [`Connection::execute`], also returning one
@@ -573,8 +587,12 @@ impl Connection {
     /// [`QueryProfile::optimize`] is always zero here.
     pub fn execute_profiled(&mut self, sql: &str) -> Result<Vec<(QueryResult, QueryProfile)>> {
         let mut profiles = Vec::new();
-        let results = self.execute_inner(sql, Some(&mut profiles))?;
-        Ok(results.into_iter().zip(profiles).collect())
+        let results = self.execute_inner(sql, Some(&mut profiles), false)?;
+        Ok(results
+            .into_iter()
+            .map(crate::exec::ChunkedResult::into_query_result)
+            .zip(profiles)
+            .collect())
     }
 
     /// The one runner behind [`Connection::execute`] and
@@ -584,7 +602,8 @@ impl Connection {
         &mut self,
         sql: &str,
         mut profiles: Option<&mut Vec<QueryProfile>>,
-    ) -> Result<Vec<QueryResult>> {
+        keep_chunks: bool,
+    ) -> Result<Vec<crate::exec::ChunkedResult>> {
         let profiling = profiles.is_some();
         read_lock(&self.db.shared).ensure_wal_healthy()?;
         let parse_start = profiling.then(Instant::now);
@@ -609,9 +628,16 @@ impl Connection {
                 let in_transaction = self.txn.is_some();
                 let stmt_start = Instant::now();
                 let mut draft = ProfileDraft::default();
-                let result = self.execute_one(stmt, text, Some(&mut draft))?;
+                let result = self.execute_one(stmt, text, Some(&mut draft), keep_chunks)?;
                 let total = stmt_start.elapsed() + if i == 0 { parse } else { Duration::ZERO };
-                let (rows, columns, kind) = crate::result_facts(&result);
+                let (rows, columns, kind) = match &result {
+                    crate::exec::ChunkedResult::Selected { names, chunks, .. } => (
+                        chunks.iter().map(|c| c.num_rows as u64).sum(),
+                        names.len() as u32,
+                        "selected",
+                    ),
+                    crate::exec::ChunkedResult::Other(result) => crate::result_facts(result),
+                };
                 if let Some(sink) = profiles.as_deref_mut() {
                     sink.push(QueryProfile {
                         parse,
@@ -631,7 +657,7 @@ impl Connection {
                 }
                 out.push(result);
             } else {
-                out.push(self.execute_one(stmt, text, None)?);
+                out.push(self.execute_one(stmt, text, None, keep_chunks)?);
             }
         }
         Ok(out)
@@ -891,6 +917,18 @@ impl Connection {
         })
     }
 
+    /// [`Connection::execute_chunked`] for one prepared statement.
+    pub fn execute_bound_chunked(
+        &mut self,
+        bound: &crate::prepared::BoundStatement,
+    ) -> Result<crate::exec::ChunkedResult> {
+        let mut results = self.execute_chunked(bound.sql())?;
+        debug_assert_eq!(results.len(), 1, "a bound statement is one statement");
+        results.pop().ok_or_else(|| {
+            PinkDbError::Execution("internal error: bound statement produced no result".to_string())
+        })
+    }
+
     /// Run `f` against the store a statement of this connection binds
     /// against: the open transaction's private snapshot when one is open
     /// (so a prepared statement sees uncommitted tables/rows), else the
@@ -907,11 +945,12 @@ impl Connection {
         stmt: &crate::sql::ast::Statement,
         sql_text: Option<&str>,
         profile: Option<&mut ProfileDraft>,
-    ) -> Result<QueryResult> {
+        keep_chunks: bool,
+    ) -> Result<crate::exec::ChunkedResult> {
         // The previous statement's scan log is what `pinkdb_scan_io()`
         // reports; this statement records into a fresh one (wave 133b).
         self.with_bind_store(|db| db.finish_scan_records());
-        self.execute_statement(stmt, sql_text, profile)
+        self.execute_statement(stmt, sql_text, profile, keep_chunks)
     }
 
     fn execute_statement(
@@ -919,7 +958,8 @@ impl Connection {
         stmt: &crate::sql::ast::Statement,
         sql_text: Option<&str>,
         mut profile: Option<&mut ProfileDraft>,
-    ) -> Result<QueryResult> {
+        keep_chunks: bool,
+    ) -> Result<crate::exec::ChunkedResult> {
         // One budget per statement: the deadline starts here (before bind)
         // and is shared by every evaluation context of this statement. No
         // limits (the embedded default) is a zero-cost `None` budget.
@@ -928,7 +968,8 @@ impl Connection {
                 .with_external_services(self.external_services)
                 .with_cancel(self.cancel.clone()),
         );
-        let result = self.execute_one_with(stmt, sql_text, profile.as_deref_mut(), &budget);
+        let result =
+            self.execute_one_with(stmt, sql_text, profile.as_deref_mut(), &budget, keep_chunks);
         if let Some(p) = profile {
             p.memory_limit = crate::memory::limit() as u64;
             p.memory_peak = budget.memory_peak() as u64;
@@ -942,7 +983,8 @@ impl Connection {
         sql_text: Option<&str>,
         mut profile: Option<&mut ProfileDraft>,
         budget: &Arc<crate::exec::ExecBudget>,
-    ) -> Result<QueryResult> {
+        keep_chunks: bool,
+    ) -> Result<crate::exec::ChunkedResult> {
         // Network authentication gate: evaluated before *every* statement of
         // a batch with the store's current user catalog, so the first
         // `CREATE USER` of an unauthenticated batch is allowed and the very
@@ -958,7 +1000,7 @@ impl Connection {
                 if let Some(p) = profile.as_deref_mut() {
                     p.execute += start.map(|s| s.elapsed()).unwrap_or_default();
                 }
-                return result;
+                return result.map(crate::exec::ChunkedResult::Other);
             }
             crate::sql::ast::Statement::Commit => {
                 let start = profile.as_ref().map(|_| Instant::now());
@@ -966,7 +1008,7 @@ impl Connection {
                 if let Some(p) = profile.as_deref_mut() {
                     p.execute += start.map(|s| s.elapsed()).unwrap_or_default();
                 }
-                return result;
+                return result.map(crate::exec::ChunkedResult::Other);
             }
             crate::sql::ast::Statement::Rollback => {
                 let start = profile.as_ref().map(|_| Instant::now());
@@ -974,7 +1016,7 @@ impl Connection {
                 if let Some(p) = profile.as_deref_mut() {
                     p.execute += start.map(|s| s.elapsed()).unwrap_or_default();
                 }
-                return result;
+                return result.map(crate::exec::ChunkedResult::Other);
             }
             _ => {}
         }
@@ -1135,7 +1177,7 @@ impl Connection {
                 }
                 self.current_db = after.db().to_string();
                 self.current_schema = after.schema().to_string();
-                Ok(result)
+                Ok(crate::exec::ChunkedResult::Other(result))
             }
             None => {
                 let pre = self.current_db.clone();
@@ -1162,12 +1204,22 @@ impl Connection {
                 enforce(self.gate(), &shared, &plan, &pre_ns)?;
                 let result = if is_read_only(&plan) {
                     let exec_start = profile.as_ref().map(|_| Instant::now());
-                    let result = crate::exec::run_read_with_budget(
-                        &shared,
-                        &plan,
-                        budget.clone(),
-                        self.session.clone(),
-                    );
+                    let result = if keep_chunks {
+                        crate::exec::run_read_chunks_with_budget(
+                            &shared,
+                            &plan,
+                            budget.clone(),
+                            self.session.clone(),
+                        )
+                    } else {
+                        crate::exec::run_read_with_budget(
+                            &shared,
+                            &plan,
+                            budget.clone(),
+                            self.session.clone(),
+                        )
+                        .map(crate::exec::ChunkedResult::Other)
+                    };
                     // Release before the `USE` logging below re-locks.
                     drop(shared);
                     if let Some(p) = profile.as_deref_mut() {
@@ -1176,13 +1228,13 @@ impl Connection {
                     result?
                 } else {
                     drop(shared);
-                    self.autocommit_write(
+                    crate::exec::ChunkedResult::Other(self.autocommit_write(
                         stmt,
                         sql_text,
                         &pre,
                         budget.clone(),
                         profile.as_deref_mut(),
-                    )?
+                    )?)
                 };
                 // `USE` is read-only for locking but still WAL-logged: replay
                 // must switch sessions exactly like this connection did.
@@ -1191,7 +1243,7 @@ impl Connection {
                 // connection could have dropped the database in between — a
                 // logged `USE` for a dead database could never replay.
                 if is_read_only(&plan)
-                    && let QueryResult::Used { .. } = &result
+                    && let Some(QueryResult::Used { .. }) = result.as_query_result()
                 {
                     let log_start = profile.as_ref().map(|_| Instant::now());
                     let lease = self.db.acquire_lease()?;
@@ -1202,7 +1254,10 @@ impl Connection {
                         shared.refresh_under_lease(g)?;
                     }
                     let shared = read_lock(&self.db.shared);
-                    let after = session_after(&result, &pre, &self.current_schema, &shared);
+                    let after = result
+                        .as_query_result()
+                        .map(|result| session_after(result, &pre, &self.current_schema, &shared))
+                        .unwrap_or_else(|| pre_ns.clone());
                     if !shared.schema_exists(&after) {
                         return Err(PinkDbError::Catalog(format!(
                             "database \"{after}\" not found"
@@ -1237,12 +1292,17 @@ impl Connection {
                     }
                 }
                 // Apply the session transition.
-                let after = session_after(
-                    &result,
-                    &pre,
-                    &self.current_schema,
-                    &read_lock(&self.db.shared),
-                );
+                let after = result
+                    .as_query_result()
+                    .map(|result| {
+                        session_after(
+                            result,
+                            &pre,
+                            &self.current_schema,
+                            &read_lock(&self.db.shared),
+                        )
+                    })
+                    .unwrap_or_else(|| pre_ns.clone());
                 self.current_db = after.db().to_string();
                 self.current_schema = after.schema().to_string();
                 Ok(result)

@@ -106,7 +106,7 @@ func nilAt(t *testing.T, row []any, i int) {
 // ----- tests -----
 
 func TestABIVersion(t *testing.T) {
-	if SupportedABI != (1<<16)|1 {
+	if SupportedABI != (1<<16)|2 {
 		t.Fatalf("SupportedABI = %d, want 1.1", SupportedABI)
 	}
 	db := mustOpenMemory(t)

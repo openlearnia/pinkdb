@@ -40,6 +40,8 @@ package pinkdb
 typedef struct pinkdb_handle pinkdb_handle;
 typedef struct pinkdb_result pinkdb_result;
 typedef struct pinkdb_prepared pinkdb_prepared;
+typedef struct pinkdb_data_chunk pinkdb_data_chunk;
+typedef struct pinkdb_vector pinkdb_vector;
 
 // pink_value is passed by value; text_ptr/text_len is the VARCHAR,
 // DECIMAL and INTERVAL payload and is not NUL-terminated.
@@ -77,6 +79,38 @@ int32_t pinkdb_result_column_type(
 size_t pinkdb_result_row_count(const pinkdb_result *result, size_t statement);
 pink_value pinkdb_result_value(
 	const pinkdb_result *result, size_t statement, size_t row, size_t column);
+int32_t pinkdb_result_column_decimal_scale(
+	const pinkdb_result *result, size_t statement, size_t column);
+pinkdb_data_chunk *pinkdb_result_fetch_chunk(
+	pinkdb_result *result, size_t statement);
+void pinkdb_destroy_chunk(pinkdb_data_chunk *chunk);
+size_t pinkdb_chunk_size(const pinkdb_data_chunk *chunk);
+const pinkdb_vector *pinkdb_chunk_column(
+	const pinkdb_data_chunk *chunk, size_t column);
+const void *pinkdb_vector_data(const pinkdb_vector *vector);
+const uint64_t *pinkdb_vector_validity(const pinkdb_vector *vector);
+int32_t pinkdb_validity_row_is_valid(const uint64_t *validity, size_t row);
+
+typedef struct pinkdb_string {
+	const char *ptr;
+	uint64_t len;
+} pinkdb_string;
+
+typedef struct pinkdb_hugeint {
+	uint64_t lower;
+	int64_t upper;
+} pinkdb_hugeint;
+
+typedef struct pinkdb_uhugeint {
+	uint64_t lower;
+	uint64_t upper;
+} pinkdb_uhugeint;
+
+typedef struct pinkdb_interval {
+	int32_t months;
+	int32_t days;
+	int64_t micros;
+} pinkdb_interval;
 size_t pinkdb_result_affected(const pinkdb_result *result, size_t statement);
 const char *pinkdb_result_name(const pinkdb_result *result, size_t statement);
 */
@@ -87,6 +121,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"runtime"
 	"strings"
 	"sync"
@@ -96,7 +131,7 @@ import (
 
 // SupportedABI is the C ABI version this binding speaks. Open and OpenMemory
 // refuse a linked library that reports a different version.
-const SupportedABI = (1 << 16) | 1
+const SupportedABI = (1 << 16) | 2
 
 // Errors returned by this package in addition to the native error messages
 // from pinkdb_last_error.
@@ -210,6 +245,7 @@ const (
 	// one, and the text is what the engine prints).
 	typeHugeint  int32 = 13
 	typeUhugeint int32 = 14
+	typeUuid     int32 = 15
 )
 
 var typeNames = map[int32]string{
@@ -225,6 +261,7 @@ var typeNames = map[int32]string{
 	typeHugeint:   "hugeint",
 	typeUhugeint:  "uhugeint",
 	typeInterval:  "interval",
+	typeUuid:      "uuid",
 }
 
 // typeName is the pinkdb type name for a column type tag.
@@ -762,17 +799,36 @@ func materialize(result *C.pinkdb_result) ([]Result, error) {
 			}
 			rows := int(C.pinkdb_result_row_count(result, C.size_t(stmt)))
 			r.Rows = make([][]any, 0, rows)
-			for row := 0; row < rows; row++ {
-				cells := make([]any, 0, columns)
+			chunk := C.pinkdb_result_fetch_chunk(result, C.size_t(stmt))
+			for chunk != nil {
+				size := int(C.pinkdb_chunk_size(chunk))
+				vectors := make([]*C.pinkdb_vector, columns)
+				tags := make([]int32, columns)
+				scales := make([]int32, columns)
 				for col := 0; col < columns; col++ {
-					v := C.pinkdb_result_value(result, C.size_t(stmt), C.size_t(row), C.size_t(col))
-					value, err := valueToGo(v)
-					if err != nil {
-						return nil, fmt.Errorf("pinkdb: statement %d row %d column %d: %w", stmt, row, col, err)
-					}
-					cells = append(cells, value)
+					vectors[col] = C.pinkdb_chunk_column(chunk, C.size_t(col))
+					tags[col] = int32(C.pinkdb_result_column_type(result, C.size_t(stmt), C.size_t(col)))
+					scales[col] = int32(C.pinkdb_result_column_decimal_scale(result, C.size_t(stmt), C.size_t(col)))
 				}
-				r.Rows = append(r.Rows, cells)
+				err := func() error {
+					defer C.pinkdb_destroy_chunk(chunk)
+					for row := 0; row < size; row++ {
+						cells := make([]any, 0, columns)
+						for col := 0; col < columns; col++ {
+							value, err := vectorToGo(result, stmt, row, col, vectors[col], tags[col], scales[col])
+							if err != nil {
+								return fmt.Errorf("pinkdb: statement %d row %d column %d: %w", stmt, row, col, err)
+							}
+							cells = append(cells, value)
+						}
+						r.Rows = append(r.Rows, cells)
+					}
+					return nil
+				}()
+				if err != nil {
+					return nil, err
+				}
+				chunk = C.pinkdb_result_fetch_chunk(result, C.size_t(stmt))
 			}
 		}
 		r.Affected = int64(C.pinkdb_result_affected(result, C.size_t(stmt)))
@@ -782,6 +838,92 @@ func materialize(result *C.pinkdb_result) ([]Result, error) {
 		results = append(results, r)
 	}
 	return results, nil
+}
+
+// vectorToGo reads one row of a 1.2 vector. INTERVAL and ARRAY have no Go
+// native shape here, so they fall back to the result's canonical cell.
+func vectorToGo(
+	result *C.pinkdb_result,
+	stmt, row, col int,
+	vector *C.pinkdb_vector,
+	tag int32,
+	scale int32,
+) (any, error) {
+	if C.pinkdb_validity_row_is_valid(C.pinkdb_vector_validity(vector), C.size_t(row)) == 0 {
+		return nil, nil
+	}
+	data := C.pinkdb_vector_data(vector)
+	if data == nil {
+		return valueToGo(C.pinkdb_result_value(result, C.size_t(stmt), C.size_t(row), C.size_t(col)))
+	}
+	switch tag {
+	case typeBoolean:
+		return unsafe.Slice((*uint8)(data), row+1)[row] != 0, nil
+	case typeInteger:
+		return int64(unsafe.Slice((*int32)(data), row+1)[row]), nil
+	case typeBigint:
+		return unsafe.Slice((*int64)(data), row+1)[row], nil
+	case typeDouble:
+		return unsafe.Slice((*float64)(data), row+1)[row], nil
+	case typeVarchar, 10: // 10 is VARIANT's JSON string element
+		value := unsafe.Slice((*C.pinkdb_string)(data), row+1)[row]
+		if value.ptr == nil || value.len == 0 {
+			return "", nil
+		}
+		return C.GoStringN(value.ptr, C.int(value.len)), nil
+	case typeDate:
+		days := int64(unsafe.Slice((*int32)(data), row+1)[row])
+		return dateFromDays(days)
+	case typeTimestamp:
+		return timestampFromMicros(unsafe.Slice((*int64)(data), row+1)[row])
+	case typeDecimal:
+		value := unsafe.Slice((*C.pinkdb_hugeint)(data), row+1)[row]
+		return formatDecimal(hugeintValue(value), scale), nil
+	case typeHugeint:
+		value := unsafe.Slice((*C.pinkdb_hugeint)(data), row+1)[row]
+		return hugeintValue(value).String(), nil
+	case typeUhugeint:
+		value := unsafe.Slice((*C.pinkdb_uhugeint)(data), row+1)[row]
+		return uhugeintValue(value).String(), nil
+	case typeUuid:
+		value := unsafe.Slice((*C.pinkdb_uhugeint)(data), row+1)[row]
+		text := fmt.Sprintf("%016x%016x", value.upper, value.lower)
+		return fmt.Sprintf("%s-%s-%s-%s-%s", text[0:8], text[8:12], text[12:16], text[16:20], text[20:32]), nil
+	default:
+		// INTERVAL and ARRAY: keep the canonical cell until 112c gives them
+		// a native Go shape.
+		return valueToGo(C.pinkdb_result_value(result, C.size_t(stmt), C.size_t(row), C.size_t(col)))
+	}
+}
+
+func hugeintValue(value C.pinkdb_hugeint) *big.Int {
+	bits := new(big.Int).SetUint64(uint64(value.lower))
+	upper := new(big.Int).SetInt64(int64(value.upper))
+	upper.Lsh(upper, 64)
+	return bits.Add(bits, upper)
+}
+
+func uhugeintValue(value C.pinkdb_uhugeint) *big.Int {
+	bits := new(big.Int).SetUint64(uint64(value.lower))
+	upper := new(big.Int).SetUint64(uint64(value.upper))
+	upper.Lsh(upper, 64)
+	return bits.Add(bits, upper)
+}
+
+func formatDecimal(value *big.Int, scale int32) string {
+	negative := value.Sign() < 0
+	digits := new(big.Int).Abs(value).String()
+	if scale > 0 {
+		for len(digits) <= int(scale) {
+			digits = "0" + digits
+		}
+		point := len(digits) - int(scale)
+		digits = digits[:point] + "." + digits[point:]
+	}
+	if negative {
+		digits = "-" + digits
+	}
+	return digits
 }
 
 // valueToGo maps one pink_value to a Go native: NULL to nil, BOOLEAN to bool,

@@ -1,4 +1,4 @@
-//! pinkdb C ABI v1.1 — `pinkdb-ffi`.
+//! pinkdb C ABI v1.2 — `pinkdb-ffi`.
 //!
 //! Exposes the `pinkdb` embedding API over a C ABI (`cdylib` + `staticlib`)
 //! for foreign bindings (Python `cffi`, Go `cgo`, ...). This crate is the
@@ -41,13 +41,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use pinkdb::db::{Connection, Database};
+use pinkdb::exec::ChunkedResult;
 use pinkdb::wal::WalSyncMethod;
-use pinkdb::{CancelFlag, DataType, EncryptionKey, PinkDbError, QueryProfile, QueryResult, Value};
+use pinkdb::{
+    CancelFlag, DataChunk, DataType, EncryptionKey, PinkDbError, QueryProfile, QueryResult, Value,
+    Vector, VectorData,
+};
 
 /// ABI version reported by [`pinkdb_abi_version`]: `major << 16 | minor`.
 ///
 /// Additions bump the minor; removals or layout changes bump the major.
-pub const PINKDB_ABI_VERSION: u32 = (1 << 16) | 1;
+pub const PINKDB_ABI_VERSION: u32 = (1 << 16) | 2;
 
 // ----- statement kind tags (`pinkdb_result_kind`) -----
 pub const PINKDB_STMT_SELECTED: i32 = 0;
@@ -128,6 +132,12 @@ pub const PINKDB_TYPE_ARRAY_FLOAT: i32 = 12;
 /// `text`/`text_len` carry the exact digits and `i`/`d` stay zero.
 pub const PINKDB_TYPE_HUGEINT: i32 = 13;
 pub const PINKDB_TYPE_UHUGEINT: i32 = 14;
+/// A UUID: 16 bytes in the chunk API (`pinkdb_uhugeint` layout); the v1 cell
+/// API still renders it as canonical VARCHAR text.
+pub const PINKDB_TYPE_UUID: i32 = 15;
+/// A FLOAT array element, not a standalone column type. Appears only through
+/// `pinkdb_result_column_array_element_type`.
+pub const PINKDB_TYPE_FLOAT: i32 = 16;
 
 // ----- thread-local error -----
 
@@ -516,7 +526,7 @@ fn dtype_tag(t: DataType) -> i32 {
         DataType::Decimal { .. } => PINKDB_TYPE_DECIMAL,
         DataType::Interval => PINKDB_TYPE_INTERVAL,
         DataType::Variant => PINKDB_TYPE_VARIANT,
-        DataType::Uuid => PINKDB_TYPE_VARCHAR,
+        DataType::Uuid => PINKDB_TYPE_UUID,
         DataType::Hugeint => PINKDB_TYPE_HUGEINT,
         DataType::Uhugeint => PINKDB_TYPE_UHUGEINT,
     }
@@ -528,10 +538,252 @@ fn nul_terminated(s: &str) -> Vec<u8> {
     b
 }
 
+/// A SELECT result: the schema, the executor's chunks, and (lazily) the v1
+/// cell rows. Bindings on ABI 1.2 read the chunks; `pinkdb_result_value` still
+/// answers the older cell API from the same data.
 struct SelStmt {
     names: Vec<Vec<u8>>,
     types: Vec<i32>,
-    rows: Vec<Vec<Cell>>,
+    dtypes: Vec<DataType>,
+    chunks: Vec<DataChunk>,
+    row_count: usize,
+    /// The next chunk `pinkdb_result_fetch_chunk` hands out.
+    next_chunk: usize,
+    /// Built on the first v1 cell access; NULL-cell conversion is eager for
+    /// the types that can fail (ARRAY), so this never loses an error.
+    rows: RefCell<Option<Vec<Vec<Cell>>>>,
+}
+
+impl SelStmt {
+    fn from_chunks(
+        names: Vec<String>,
+        dtypes: Vec<DataType>,
+        chunks: Vec<DataChunk>,
+    ) -> std::result::Result<SelStmt, String> {
+        let row_count = chunks.iter().map(|c| c.num_rows).sum();
+        let types = dtypes.iter().copied().map(dtype_tag).collect();
+        // Array cells are the only cell conversion that can fail; validate
+        // them now so a v1 caller sees the same error the row path produced.
+        let rows = if dtypes.iter().any(|t| matches!(t, DataType::Array { .. })) {
+            Some(cells_from_chunks(&chunks)?)
+        } else {
+            None
+        };
+        Ok(SelStmt {
+            names: names.iter().map(|n| nul_terminated(n)).collect(),
+            types,
+            dtypes,
+            chunks,
+            row_count,
+            next_chunk: 0,
+            rows: RefCell::new(rows),
+        })
+    }
+
+    fn from_rows(
+        names: Vec<String>,
+        dtypes: Vec<DataType>,
+        rows: Vec<Vec<Value>>,
+    ) -> std::result::Result<SelStmt, String> {
+        let chunks = chunks_from_rows(&dtypes, &rows)?;
+        SelStmt::from_chunks(names, dtypes, chunks)
+    }
+
+    fn rows(&self) -> std::cell::Ref<'_, Vec<Vec<Cell>>> {
+        if self.rows.borrow().is_none() {
+            // `from_chunks` already validated the only failing conversion.
+            let rows = cells_from_chunks(&self.chunks).unwrap_or_default();
+            *self.rows.borrow_mut() = Some(rows);
+        }
+        std::cell::Ref::map(self.rows.borrow(), |r| {
+            r.as_ref().expect("rows were just initialized")
+        })
+    }
+}
+
+fn cells_from_chunks(chunks: &[DataChunk]) -> std::result::Result<Vec<Vec<Cell>>, String> {
+    let mut rows = Vec::with_capacity(chunks.iter().map(|c| c.num_rows).sum());
+    for chunk in chunks {
+        for i in 0..chunk.num_rows {
+            rows.push(
+                chunk
+                    .columns
+                    .iter()
+                    .map(|c| Cell::from_value(&c.get(i)))
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            );
+        }
+    }
+    Ok(rows)
+}
+
+/// The row-shaped result paths (`RETURNING`, `CALL`, transactions) still hand
+/// the C API rows; rebuild chunks so every SELECT serves chunk fetch.
+fn chunks_from_rows(
+    dtypes: &[DataType],
+    rows: &[Vec<Value>],
+) -> std::result::Result<Vec<DataChunk>, String> {
+    let mut chunks = Vec::with_capacity(rows.len().div_ceil(pinkdb::CHUNK_SIZE));
+    for window in rows.chunks(pinkdb::CHUNK_SIZE) {
+        let mut columns = Vec::with_capacity(dtypes.len());
+        for (i, dtype) in dtypes.iter().enumerate() {
+            let mut vector = Vector::with_capacity(*dtype, window.len());
+            for row in window {
+                vector
+                    .push_value(row.get(i).cloned().unwrap_or(Value::Null))
+                    .map_err(|e| e.to_string())?;
+            }
+            columns.push(vector);
+        }
+        chunks.push(DataChunk::new(columns).map_err(|e| e.to_string())?);
+    }
+    Ok(chunks)
+}
+
+/// A `{const char *ptr; uint64_t len}` string element in a VARCHAR, BLOB or
+/// VARIANT vector. `ptr` is NULL for a NULL row and is never NUL-terminated.
+#[repr(C)]
+pub struct PinkString {
+    pub ptr: *const c_char,
+    pub len: u64,
+}
+
+/// The little-endian `{lower, upper}` words C sees for a 128-bit value. On a
+/// big-endian host the chunk builder fills one of these per row instead of
+/// exposing the engine's native words.
+#[repr(C)]
+pub struct PinkU128 {
+    pub lower: u64,
+    pub upper: u64,
+}
+
+/// One vector's C view: a typed data pointer, an optional validity mask, and
+/// the owned payloads those pointers borrow from.
+pub struct PinkVector {
+    data: *const c_void,
+    validity: *const u64,
+    len: usize,
+    /// Owned string-element array (VARCHAR/BLOB/VARIANT).
+    _strings: Vec<PinkString>,
+    /// Owned JSON text backing `_strings` for VARIANT.
+    _text: Vec<Vec<u8>>,
+    /// Big-endian hosts only: owned `{lower, upper}` words for 128-bit types.
+    _ints: Vec<PinkU128>,
+}
+
+fn wide_data<T>(
+    values: &[T],
+    ints: &mut Vec<PinkU128>,
+    to_u128: impl Fn(&T) -> u128,
+) -> *const c_void {
+    if cfg!(target_endian = "little") {
+        return values.as_ptr().cast();
+    }
+    ints.extend(values.iter().map(|v| {
+        let x = to_u128(v);
+        PinkU128 {
+            lower: x as u64,
+            upper: (x >> 64) as u64,
+        }
+    }));
+    ints.as_ptr().cast()
+}
+
+impl PinkVector {
+    fn new(vector: &Vector) -> PinkVector {
+        let len = vector.len();
+        let mut strings = Vec::new();
+        let mut text = Vec::new();
+        let mut ints = Vec::new();
+        let data: *const c_void = match vector.data() {
+            VectorData::Boolean(v) => v.as_ptr().cast(),
+            VectorData::Int32(v) => v.as_ptr().cast(),
+            VectorData::Int64(v) => v.as_ptr().cast(),
+            VectorData::Float64(v) => v.as_ptr().cast(),
+            VectorData::Date32(v) => v.as_ptr().cast(),
+            VectorData::TimestampMicros(v) => v.as_ptr().cast(),
+            VectorData::Decimal { values, .. } => wide_data(values, &mut ints, |v| *v as u128),
+            VectorData::Interval(v) => v.as_ptr().cast(),
+            VectorData::Int128(v) => wide_data(v, &mut ints, |v| *v as u128),
+            VectorData::UInt128(v) => wide_data(v, &mut ints, |v| *v),
+            VectorData::Uuid(v) => wide_data(v, &mut ints, |v| *v),
+            VectorData::VarChar(v) => {
+                strings.reserve(len);
+                for i in 0..len {
+                    if vector.is_valid(i) {
+                        let s = v.get(i);
+                        strings.push(PinkString {
+                            ptr: s.as_ptr() as *const c_char,
+                            len: s.len() as u64,
+                        });
+                    } else {
+                        strings.push(PinkString {
+                            ptr: ptr::null(),
+                            len: 0,
+                        });
+                    }
+                }
+                strings.as_ptr().cast()
+            }
+            // Provisional: VARIANT crosses as its JSON text, not a nested
+            // value. 112c's Arrow export is the full nested path.
+            VectorData::Variant(v) => {
+                text.reserve(len);
+                strings.reserve(len);
+                for (i, value) in v.iter().enumerate().take(len) {
+                    if vector.is_valid(i) {
+                        let bytes = value.to_json().into_bytes();
+                        strings.push(PinkString {
+                            ptr: bytes.as_ptr() as *const c_char,
+                            len: bytes.len() as u64,
+                        });
+                        text.push(bytes);
+                    } else {
+                        strings.push(PinkString {
+                            ptr: ptr::null(),
+                            len: 0,
+                        });
+                    }
+                }
+                strings.as_ptr().cast()
+            }
+            // Provisional: ARRAY has no C child vector in 1.2; the data
+            // pointer is NULL and callers use the v1 cell API.
+            VectorData::Array { .. } => ptr::null(),
+        };
+        let validity = if vector.has_nulls() {
+            vector.validity_words().as_ptr()
+        } else {
+            ptr::null()
+        };
+        PinkVector {
+            data,
+            validity,
+            len,
+            _strings: strings,
+            _text: text,
+            _ints: ints,
+        }
+    }
+}
+
+/// One chunk handed to C by [`pinkdb_result_fetch_chunk`]. It owns its
+/// `DataChunk` (shared with the result's chunk list) and every C payload, so
+/// it outlives the result.
+pub struct PinkChunk {
+    /// Keeps the `Arc<Vector>`s the typed pointers point into alive.
+    _chunk: DataChunk,
+    columns: Vec<PinkVector>,
+}
+
+impl PinkChunk {
+    fn new(chunk: DataChunk) -> PinkChunk {
+        let columns = chunk.columns.iter().map(|c| PinkVector::new(c)).collect();
+        PinkChunk {
+            _chunk: chunk,
+            columns,
+        }
+    }
 }
 
 enum StmtData {
@@ -647,46 +899,43 @@ fn kind_of(r: &QueryResult) -> i32 {
     }
 }
 
-fn build_result(results: Vec<QueryResult>) -> std::result::Result<PinkResult, String> {
+fn build_result(results: Vec<ChunkedResult>) -> std::result::Result<PinkResult, String> {
     let stmts = results
         .into_iter()
         .map(|r| {
             Ok(match r {
-                QueryResult::Selected { names, types, rows } => StmtData::Sel(SelStmt {
-                    names: names.iter().map(|n| nul_terminated(n)).collect(),
-                    types: types.into_iter().map(dtype_tag).collect(),
-                    rows: rows
-                        .iter()
-                        .map(|row| row.iter().map(Cell::from_value).collect())
-                        .collect::<std::result::Result<Vec<_>, _>>()?,
-                }),
+                ChunkedResult::Selected {
+                    names,
+                    types,
+                    chunks,
+                } => StmtData::Sel(SelStmt::from_chunks(names, types, chunks)?),
+                // The row-shaped paths (a transaction, `RETURNING`, `CALL`)
+                // still arrive as rows; rebuild chunks so fetch works there too.
+                ChunkedResult::Other(QueryResult::Selected { names, types, rows }) => {
+                    StmtData::Sel(SelStmt::from_rows(names, types, rows)?)
+                }
                 // `CALL` (wave 44): a call whose own result is a result set is
                 // presented as that row set (the statement stream needs no new
                 // C-ABI entry); any other call outcome is a simple statement whose
                 // count is the number of body statements it ran.
                 // A JavaScript body's `print` lines are not carried over the
                 // C ABI yet (wave 81 follow-up).
-                QueryResult::Called {
+                ChunkedResult::Other(QueryResult::Called {
                     name,
                     statements,
                     result: Some(inner),
                     ..
-                } => match *inner {
-                    QueryResult::Selected { names, types, rows } => StmtData::Sel(SelStmt {
-                        names: names.into_iter().map(|n| nul_terminated(&n)).collect(),
-                        types: types.into_iter().map(dtype_tag).collect(),
-                        rows: rows
-                            .iter()
-                            .map(|row| row.iter().map(Cell::from_value).collect())
-                            .collect::<std::result::Result<Vec<_>, _>>()?,
-                    }),
+                }) => match *inner {
+                    QueryResult::Selected { names, types, rows } => {
+                        StmtData::Sel(SelStmt::from_rows(names, types, rows)?)
+                    }
                     _ => StmtData::Simple {
                         kind: PINKDB_STMT_CREATED,
                         count: statements,
                         name: Some(nul_terminated(&name)),
                     },
                 },
-                other => {
+                ChunkedResult::Other(other) => {
                     let kind = kind_of(&other);
                     let (count, name) = match &other {
                         QueryResult::Inserted { count }
@@ -745,7 +994,7 @@ fn build_profiled_result(
     pairs: Vec<(QueryResult, QueryProfile)>,
 ) -> std::result::Result<PinkResult, String> {
     let (results, profiles): (Vec<QueryResult>, Vec<QueryProfile>) = pairs.into_iter().unzip();
-    let mut result = build_result(results)?;
+    let mut result = build_result(results.into_iter().map(ChunkedResult::Other).collect())?;
     result.profiles = profiles.iter().map(ProfileData::from_profile).collect();
     Ok(result)
 }
@@ -971,7 +1220,7 @@ fn executed(conn: &PinkConnection, text: &str) -> *mut PinkResult {
                 Err(e) => Err(QueryFailure::Engine(e)),
             }
         } else {
-            match state.conn.execute(text) {
+            match state.conn.execute_chunked(text) {
                 Ok(results) => build_result(results).map_err(QueryFailure::Build),
                 Err(e) => Err(QueryFailure::Engine(e)),
             }
@@ -1088,7 +1337,7 @@ fn executed_prepared(
                 Err(e) => Err(QueryFailure::Engine(e)),
             }
         } else {
-            match state.conn.execute_bound(&bound_stmt) {
+            match state.conn.execute_bound_chunked(&bound_stmt) {
                 Ok(result) => build_result(vec![result]).map_err(QueryFailure::Build),
                 Err(e) => Err(QueryFailure::Engine(e)),
             }
@@ -2002,6 +2251,15 @@ pub extern "C" fn pinkdb_result_free(result: *mut PinkResult) {
     drop(unsafe { Box::from_raw(result) });
 }
 
+fn stmt_at_mut<'a>(result: *mut PinkResult, statement: usize) -> Option<&'a mut StmtData> {
+    if result.is_null() {
+        return None;
+    }
+    // SAFETY: non-null, owned by the caller, exclusive access for the fetch.
+    let r = unsafe { &mut *result };
+    r.stmts.get_mut(statement)
+}
+
 fn stmt_at<'a>(result: *const PinkResult, statement: usize) -> Option<&'a StmtData> {
     if result.is_null() {
         return None;
@@ -2074,7 +2332,7 @@ pub extern "C" fn pinkdb_result_column_type(
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_result_row_count(result: *const PinkResult, statement: usize) -> usize {
     match stmt_at(result, statement) {
-        Some(StmtData::Sel(s)) => s.rows.len(),
+        Some(StmtData::Sel(s)) => s.row_count,
         _ => 0,
     }
 }
@@ -2090,13 +2348,168 @@ pub extern "C" fn pinkdb_result_value(
 ) -> PinkValue {
     match stmt_at(result, statement) {
         Some(StmtData::Sel(s)) => s
-            .rows
+            .rows()
             .get(row)
             .and_then(|r| r.get(column))
             .map(Cell::value)
             .unwrap_or_else(PinkValue::null),
         _ => PinkValue::null(),
     }
+}
+
+/// DECIMAL precision, or -1 when the column is not DECIMAL.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_column_decimal_width(
+    result: *const PinkResult,
+    statement: usize,
+    column: usize,
+) -> i32 {
+    match stmt_at(result, statement).and_then(|s| match s {
+        StmtData::Sel(s) => s.dtypes.get(column),
+        _ => None,
+    }) {
+        Some(DataType::Decimal { precision, .. }) => i32::from(*precision),
+        _ => -1,
+    }
+}
+
+/// DECIMAL scale, or -1 when the column is not DECIMAL.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_column_decimal_scale(
+    result: *const PinkResult,
+    statement: usize,
+    column: usize,
+) -> i32 {
+    match stmt_at(result, statement).and_then(|s| match s {
+        StmtData::Sel(s) => s.dtypes.get(column),
+        _ => None,
+    }) {
+        Some(DataType::Decimal { scale, .. }) => i32::from(*scale),
+        _ => -1,
+    }
+}
+
+/// ARRAY element count, or 0 when the column is not an ARRAY.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_column_array_length(
+    result: *const PinkResult,
+    statement: usize,
+    column: usize,
+) -> u64 {
+    match stmt_at(result, statement).and_then(|s| match s {
+        StmtData::Sel(s) => s.dtypes.get(column),
+        _ => None,
+    }) {
+        Some(DataType::Array { len, .. }) => u64::from(*len),
+        _ => 0,
+    }
+}
+
+/// An ARRAY's element type ([`PINKDB_TYPE_DOUBLE`] or
+/// [`PINKDB_TYPE_FLOAT`]), or -1 when the column is not an ARRAY.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_column_array_element_type(
+    result: *const PinkResult,
+    statement: usize,
+    column: usize,
+) -> i32 {
+    match stmt_at(result, statement).and_then(|s| match s {
+        StmtData::Sel(s) => s.dtypes.get(column),
+        _ => None,
+    }) {
+        Some(DataType::Array { elem, .. }) if *elem == pinkdb::ArrayElem::Float => {
+            PINKDB_TYPE_FLOAT
+        }
+        Some(DataType::Array { .. }) => PINKDB_TYPE_DOUBLE,
+        _ => -1,
+    }
+}
+
+/// The next chunk of a SELECT result, or NULL at the end, for a failed result,
+/// or for a non-SELECT statement. The caller owns the chunk and frees it with
+/// [`pinkdb_destroy_chunk`]; a chunk stays valid after its result is freed.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_fetch_chunk(
+    result: *mut PinkResult,
+    statement: usize,
+) -> *mut PinkChunk {
+    let Some(StmtData::Sel(s)) = stmt_at_mut(result, statement) else {
+        return ptr::null_mut();
+    };
+    let Some(chunk) = s.chunks.get(s.next_chunk).cloned() else {
+        return ptr::null_mut();
+    };
+    s.next_chunk += 1;
+    Box::into_raw(Box::new(PinkChunk::new(chunk)))
+}
+
+/// Free a chunk from [`pinkdb_result_fetch_chunk`]. NULL-safe.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_destroy_chunk(chunk: *mut PinkChunk) {
+    if chunk.is_null() {
+        return;
+    }
+    // SAFETY: produced by Box::into_raw in `pinkdb_result_fetch_chunk`,
+    // freed once by its owner.
+    drop(unsafe { Box::from_raw(chunk) });
+}
+
+/// Rows in a chunk.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_chunk_size(chunk: *const PinkChunk) -> usize {
+    if chunk.is_null() {
+        return 0;
+    }
+    // SAFETY: non-null, valid for the call.
+    unsafe { &*chunk }.columns.first().map_or(0, |c| c.len)
+}
+
+/// A vector borrowed from `chunk`; NULL when the column is out of range.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_chunk_column(chunk: *const PinkChunk, column: usize) -> *const PinkVector {
+    if chunk.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: non-null, valid for the call; the vector lives as long as the
+    // chunk.
+    unsafe { &*chunk }
+        .columns
+        .get(column)
+        .map_or(ptr::null(), |v| v as *const PinkVector)
+}
+
+/// The vector's typed payload (see the header for each type's layout), or
+/// NULL for a type with no 1.2 payload (ARRAY).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_vector_data(vector: *const PinkVector) -> *const c_void {
+    if vector.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: non-null, valid while its chunk lives.
+    unsafe { &*vector }.data
+}
+
+/// The vector's validity words (bit i set = row i valid), or NULL when every
+/// row is valid.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_vector_validity(vector: *const PinkVector) -> *const u64 {
+    if vector.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: non-null, valid while its chunk lives.
+    unsafe { &*vector }.validity
+}
+
+/// 1 when `row` is valid (or `validity` is NULL, meaning all rows are),
+/// 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_validity_row_is_valid(validity: *const u64, row: usize) -> i32 {
+    if validity.is_null() {
+        return 1;
+    }
+    // SAFETY: the caller passes a mask covering `row`; bit i of word i/64.
+    let word = unsafe { *validity.add(row / 64) };
+    ((word >> (row % 64)) & 1) as i32
 }
 
 /// Affected-row count for INSERT/UPDATE/DELETE results (0 otherwise).
@@ -2269,8 +2682,8 @@ mod tests {
     }
 
     #[test]
-    fn abi_version_is_one_one() {
-        assert_eq!(pinkdb_abi_version(), (1 << 16) | 1);
+    fn abi_version_is_one_two() {
+        assert_eq!(pinkdb_abi_version(), (1 << 16) | 2);
     }
 
     #[test]

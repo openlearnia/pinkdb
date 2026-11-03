@@ -106,7 +106,7 @@ fn durable_roundtrip_through_the_c_abi() {
 }
 
 #[test]
-fn uuid_columns_cross_the_abi_as_text() {
+fn uuid_columns_report_the_uuid_tag() {
     let h = pinkdb_open_memory();
     let r = exec(
         h,
@@ -114,10 +114,10 @@ fn uuid_columns_cross_the_abi_as_text() {
          INSERT INTO u VALUES ('550E8400-E29B-41D4-A716-446655440000', 1), (NULL, 2);
          SELECT id FROM u ORDER BY b;",
     );
-    // The ABI has no 128-bit cell: a UUID column reports VARCHAR and carries
-    // the lowercase text form.
+    // 1.2 reports a real UUID tag; the v1 cell still carries the lowercase
+    // text form for callers that have not moved to chunk fetch.
     // Statements: 0 CREATE, 1 INSERT, 2 SELECT.
-    assert_eq!(pinkdb_result_column_type(r, 2, 0), PINKDB_TYPE_VARCHAR);
+    assert_eq!(pinkdb_result_column_type(r, 2, 0), PINKDB_TYPE_UUID);
     assert_eq!(
         text(&pinkdb_result_value(r, 2, 0, 0)),
         "550e8400-e29b-41d4-a716-446655440000"

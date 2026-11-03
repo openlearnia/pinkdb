@@ -1465,6 +1465,7 @@ pub fn parse_u128_str(s: &str) -> Option<u128> {
 /// One calendar interval (`months`, `days`, `micros`), the payload layout of
 /// an INTERVAL vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+#[repr(C)]
 pub struct Interval {
     pub months: i32,
     pub days: i32,

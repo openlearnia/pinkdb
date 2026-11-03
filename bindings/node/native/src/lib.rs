@@ -8,7 +8,7 @@
 //!
 //! Type mapping (documented in `bindings/node/README.md`):
 //! BOOLEAN → boolean, INTEGER → number, BIGINT → BigInt, DOUBLE → number,
-//! VARCHAR/DECIMAL/INTERVAL/HUGEINT/UHUGEINT → string, DATE/TIMESTAMP → string
+//! VARCHAR/DECIMAL/INTERVAL/HUGEINT/UHUGEINT/UUID → string, DATE/TIMESTAMP → string
 //! in the engine's
 //! canonical form (a JS `Date` cannot carry a µs timestamp or a calendar date
 //! without a timezone assumption), DOUBLE-based ARRAY → `Float64Array`,
@@ -29,8 +29,8 @@ use pinkdb_ffi::{
     PINKDB_TYPE_DATE,
     PINKDB_TYPE_DECIMAL, PINKDB_TYPE_DOUBLE, PINKDB_TYPE_HUGEINT, PINKDB_TYPE_INTEGER,
     PINKDB_TYPE_INTERVAL, PINKDB_TYPE_NULL, PINKDB_TYPE_TIMESTAMP, PINKDB_TYPE_UHUGEINT,
-    PINKDB_TYPE_VARCHAR, PinkHandle,
-    PinkPrepared, PinkResult, PinkValue, array_tag_len,
+    PINKDB_TYPE_UUID, PINKDB_TYPE_VARIANT, PINKDB_TYPE_VARCHAR, PinkChunk, PinkHandle,
+    PinkPrepared, PinkResult, PinkString, PinkU128, PinkValue, PinkVector, array_tag_len,
 };
 
 const KIND_NAMES: [&str; 27] = [
@@ -66,7 +66,7 @@ const KIND_NAMES: [&str; 27] = [
 // Indices follow the C ABI's PINKDB_TYPE_* tags; 10 is VARIANT, 11 and 12 are
 // the ARRAY kinds (named from their tag's upper bits before this table is
 // consulted), 13 and 14 are the 128-bit integers.
-const TYPE_NAMES: [&str; 15] = [
+const TYPE_NAMES: [&str; 17] = [
     "null",
     "boolean",
     "integer",
@@ -82,6 +82,8 @@ const TYPE_NAMES: [&str; 15] = [
     "float[]",
     "hugeint",
     "uhugeint",
+    "uuid",
+    "float",
 ];
 
 fn kind_name(kind: i32) -> &'static str {
@@ -226,6 +228,176 @@ fn value_to_js(env: &Env, value: &PinkValue) -> Result<JsUnknown> {
     Ok(js)
 }
 
+/// UTF-8 text behind one `pinkdb_string_t` element.
+fn string_element(string: &PinkString) -> Result<String> {
+    if string.ptr.is_null() || string.len == 0 {
+        return Ok(String::new());
+    }
+    // SAFETY: the ABI guarantees `len` readable bytes at `ptr` while the chunk lives.
+    let bytes = unsafe { slice::from_raw_parts(string.ptr as *const u8, string.len as usize) };
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| local_error("internal", "non-UTF-8 text from the pinkdb ABI"))
+}
+
+/// One 128-bit row as `{lower, upper}` little-endian words.
+fn wide(bits: &PinkU128) -> u128 {
+    (bits.lower as u128) | ((bits.upper as u128) << 64)
+}
+
+/// The JS value of one row of a 1.2 vector. ARRAY columns have no 1.2 payload
+/// (112c adds one), so they fall back to the result's cell.
+fn value_from_vector(
+    env: &Env,
+    result: *const PinkResult,
+    statement: usize,
+    column: usize,
+    vector: *const PinkVector,
+    tag: i32,
+    scale: i32,
+    row: usize,
+) -> Result<JsUnknown> {
+    if ffi::pinkdb_validity_row_is_valid(ffi::pinkdb_vector_validity(vector), row) == 0 {
+        return Ok(env.get_null()?.into_unknown());
+    }
+    let data = ffi::pinkdb_vector_data(vector);
+    if data.is_null() {
+        let value = ffi::pinkdb_result_value(result, statement, row, column);
+        return value_to_js(env, &value);
+    }
+    let js = match tag & 0xff {
+        PINKDB_TYPE_BOOLEAN => {
+            let value = unsafe { *(data as *const u8).add(row) != 0 };
+            env.get_boolean(value)?.into_unknown()
+        }
+        PINKDB_TYPE_INTEGER => {
+            let value = unsafe { *(data as *const i32).add(row) };
+            env.create_int32(value)?.into_unknown()
+        }
+        PINKDB_TYPE_BIGINT => {
+            let value = unsafe { *(data as *const i64).add(row) };
+            env.create_bigint_from_i64(value)?.into_unknown()?
+        }
+        PINKDB_TYPE_DOUBLE => {
+            let value = unsafe { *(data as *const f64).add(row) };
+            env.create_double(value)?.into_unknown()
+        }
+        PINKDB_TYPE_VARCHAR | PINKDB_TYPE_VARIANT => {
+            let string = unsafe { &*(data as *const PinkString).add(row) };
+            env.create_string_from_std(string_element(string)?)?.into_unknown()
+        }
+        PINKDB_TYPE_DATE => {
+            let days = unsafe { *(data as *const i32).add(row) };
+            env.create_string_from_std(pinkdb::types::format_date(days))?
+                .into_unknown()
+        }
+        PINKDB_TYPE_TIMESTAMP => {
+            let micros = unsafe { *(data as *const i64).add(row) };
+            env.create_string_from_std(pinkdb::types::format_timestamp(micros))?
+                .into_unknown()
+        }
+        PINKDB_TYPE_DECIMAL => {
+            let bits = unsafe { &*(data as *const PinkU128).add(row) };
+            let text = pinkdb::types::format_decimal(wide(bits) as i128, scale as u8);
+            env.create_string_from_std(text)?.into_unknown()
+        }
+        PINKDB_TYPE_INTERVAL => {
+            let interval = unsafe { &*(data as *const pinkdb::types::Interval).add(row) };
+            let text = pinkdb::types::format_interval(
+                interval.months,
+                interval.days,
+                interval.micros,
+            );
+            env.create_string_from_std(text)?.into_unknown()
+        }
+        PINKDB_TYPE_HUGEINT => {
+            let bits = unsafe { &*(data as *const PinkU128).add(row) };
+            env.create_string_from_std((wide(bits) as i128).to_string())?
+                .into_unknown()
+        }
+        PINKDB_TYPE_UHUGEINT => {
+            let bits = unsafe { &*(data as *const PinkU128).add(row) };
+            env.create_string_from_std(wide(bits).to_string())?
+                .into_unknown()
+        }
+        PINKDB_TYPE_UUID => {
+            let bits = unsafe { &*(data as *const PinkU128).add(row) };
+            env.create_string_from_std(pinkdb::uuid::format(wide(bits)))?
+                .into_unknown()
+        }
+        other => {
+            return Err(local_error(
+                "internal",
+                format!("no 1.2 vector reader for pinkdb type tag {other}"),
+            ));
+        }
+    };
+    Ok(js)
+}
+
+/// One chunk's borrowed vectors and the schema bits their values need.
+struct ChunkColumns {
+    chunk: *mut PinkChunk,
+    columns: Vec<*const PinkVector>,
+    tags: Vec<i32>,
+    scales: Vec<i32>,
+}
+
+impl ChunkColumns {
+    fn fetch(result: *mut PinkResult, statement: usize) -> Option<ChunkColumns> {
+        let chunk = unsafe { ffi::pinkdb_result_fetch_chunk(result, statement) };
+        if chunk.is_null() {
+            return None;
+        }
+        let count = ffi::pinkdb_result_column_count(result, statement);
+        let mut columns = Vec::with_capacity(count);
+        let mut tags = Vec::with_capacity(count);
+        let mut scales = Vec::with_capacity(count);
+        for column in 0..count {
+            columns.push(unsafe { ffi::pinkdb_chunk_column(chunk, column) });
+            tags.push(ffi::pinkdb_result_column_type(result, statement, column));
+            scales.push(ffi::pinkdb_result_column_decimal_scale(
+                result, statement, column,
+            ));
+        }
+        Some(ChunkColumns {
+            chunk,
+            columns,
+            tags,
+            scales,
+        })
+    }
+
+    fn len(&self) -> usize {
+        unsafe { ffi::pinkdb_chunk_size(self.chunk) }
+    }
+
+    fn value(
+        &self,
+        env: &Env,
+        result: *const PinkResult,
+        statement: usize,
+        row: usize,
+        column: usize,
+    ) -> Result<JsUnknown> {
+        value_from_vector(
+            env,
+            result,
+            statement,
+            column,
+            self.columns[column],
+            self.tags[column],
+            self.scales[column],
+            row,
+        )
+    }
+}
+
+impl Drop for ChunkColumns {
+    fn drop(&mut self) {
+        unsafe { ffi::pinkdb_destroy_chunk(self.chunk) };
+    }
+}
+
 fn column_names(result: *const PinkResult, statement: usize) -> Result<Vec<String>> {
     let count = ffi::pinkdb_result_column_count(result, statement);
     let mut names = Vec::with_capacity(count);
@@ -250,19 +422,20 @@ fn column_types(result: *const PinkResult, statement: usize) -> Vec<String> {
 
 fn rows_to_js(
     env: &Env,
-    result: *const PinkResult,
+    result: *mut PinkResult,
     statement: usize,
     names: &[String],
 ) -> Result<Vec<JsUnknown>> {
     let rows = ffi::pinkdb_result_row_count(result, statement);
     let mut out = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let mut object = env.create_object()?;
-        for (column, name) in names.iter().enumerate() {
-            let value = ffi::pinkdb_result_value(result, statement, row, column);
-            object.set_named_property(name, value_to_js(env, &value)?)?;
+    while let Some(chunk) = ChunkColumns::fetch(result, statement) {
+        for row in 0..chunk.len() {
+            let mut object = env.create_object()?;
+            for (column, name) in names.iter().enumerate() {
+                object.set_named_property(name, chunk.value(env, result, statement, row, column)?)?;
+            }
+            out.push(object.into_unknown());
         }
-        out.push(object.into_unknown());
     }
     Ok(out)
 }
@@ -272,7 +445,7 @@ fn rows_to_js(
 /// when `include_rows` is set.
 fn result_to_js(
     env: &Env,
-    result: *const PinkResult,
+    result: *mut PinkResult,
     statement: usize,
     include_rows: bool,
 ) -> Result<JsUnknown> {
@@ -645,8 +818,8 @@ impl Drop for NativePrepared {
 pub struct NativeRowStream {
     result: *mut PinkResult,
     names: Vec<String>,
-    row: usize,
-    total: usize,
+    chunk: Option<ChunkColumns>,
+    chunk_row: usize,
 }
 
 unsafe impl Send for NativeRowStream {}
@@ -654,12 +827,11 @@ unsafe impl Send for NativeRowStream {}
 impl NativeRowStream {
     fn new(result: *mut PinkResult) -> Result<Self> {
         let names = column_names(result, 0)?;
-        let total = ffi::pinkdb_result_row_count(result, 0);
         Ok(Self {
             result,
             names,
-            row: 0,
-            total,
+            chunk: None,
+            chunk_row: 0,
         })
     }
 }
@@ -668,21 +840,36 @@ impl NativeRowStream {
 impl NativeRowStream {
     #[napi]
     pub fn next(&mut self, env: Env) -> Result<Option<JsUnknown>> {
-        if self.result.is_null() || self.row >= self.total {
-            self.close();
+        if self.result.is_null() {
             return Ok(None);
         }
-        let mut object = env.create_object()?;
-        for (column, name) in self.names.iter().enumerate() {
-            let value = ffi::pinkdb_result_value(self.result, 0, self.row, column);
-            object.set_named_property(name, value_to_js(&env, &value)?)?;
+        loop {
+            if self.chunk.is_none() {
+                self.chunk = ChunkColumns::fetch(self.result, 0);
+                self.chunk_row = 0;
+                if self.chunk.is_none() {
+                    self.close();
+                    return Ok(None);
+                }
+            }
+            let chunk = self.chunk.as_ref().expect("chunk just fetched");
+            if self.chunk_row >= chunk.len() {
+                self.chunk = None;
+                continue;
+            }
+            let row = self.chunk_row;
+            let mut object = env.create_object()?;
+            for (column, name) in self.names.iter().enumerate() {
+                object.set_named_property(name, chunk.value(&env, self.result, 0, row, column)?)?;
+            }
+            self.chunk_row += 1;
+            return Ok(Some(object.into_unknown()));
         }
-        self.row += 1;
-        Ok(Some(object.into_unknown()))
     }
 
     #[napi]
     pub fn close(&mut self) {
+        self.chunk = None;
         if !self.result.is_null() {
             ffi::pinkdb_result_free(self.result);
             self.result = ptr::null_mut();
