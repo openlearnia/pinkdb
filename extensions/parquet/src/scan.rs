@@ -154,6 +154,10 @@ fn scan_into(
             continue;
         }
         out.files += 1;
+        // A footer's counts size every buffer below, so they are checked
+        // before anything is allocated from them: a corrupt file is an error,
+        // never an abort (see `FileMeta::validate`).
+        file.meta.validate()?;
         // A scan that references no file column (COUNT(*), COUNT(filename),
         // a hive-only projection) is answered from the footer's row counts
         // and virtual columns; no reader is opened and no page is fetched.
@@ -254,17 +258,54 @@ fn decoded_columns<'a>(
 /// chunk-aligned batches and its append shares them instead of copying them
 /// into a ragged tail. A row-group boundary is invisible to the chunking; a
 /// chunk never exceeds `CHUNK_SIZE` rows, which is all a vector may hold.
-fn chunk_lens(rows: usize, offset: usize) -> Vec<usize> {
-    let mut lens = Vec::with_capacity(rows.div_ceil(CHUNK_SIZE) + 1);
-    let mut left = rows;
-    let mut at = offset;
-    while left > 0 {
-        let n = (CHUNK_SIZE - at % CHUNK_SIZE).min(left);
-        lens.push(n);
-        left -= n;
-        at += n;
+///
+/// The lengths are iterated, never collected: they are sized from a footer's
+/// row count, which is untrusted (a file that claims 2^63 rows must not size
+/// a 36 PB buffer before its first page is even read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChunkLens {
+    left: usize,
+    at: usize,
+    total: usize,
+}
+
+impl ChunkLens {
+    /// The rows these chunks cover in all.
+    pub(crate) fn rows(self) -> usize {
+        self.total
     }
-    lens
+
+    /// How many chunks there are. Only used to bound a hint, never to size
+    /// a buffer on its own (see the callers' `min(CHUNK_SIZE)`).
+    pub(crate) fn chunks(self) -> usize {
+        if self.left == 0 {
+            return 0;
+        }
+        let first = (CHUNK_SIZE - self.at % CHUNK_SIZE).min(self.left);
+        1 + (self.left - first).div_ceil(CHUNK_SIZE)
+    }
+}
+
+impl Iterator for ChunkLens {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        if self.left == 0 {
+            return None;
+        }
+        let n = (CHUNK_SIZE - self.at % CHUNK_SIZE).min(self.left);
+        self.left -= n;
+        self.at += n;
+        Some(n)
+    }
+}
+
+fn chunk_lens(rows: usize, offset: usize) -> ChunkLens {
+    ChunkLens {
+        left: rows,
+        at: offset,
+        total: rows,
+    }
 }
 
 /// Decode one opened file serially (local `File`, or a remote `RemoteFile`
@@ -287,14 +328,14 @@ fn scan_reader<R: ChunkReader + 'static>(
         out.row_groups += 1;
         let rows = rg.rows as usize;
         let lens = chunk_lens(rows, offset);
-        offset += rows;
+        offset = offset.saturating_add(rows);
         if decoded.is_empty() {
-            assemble_row_group(file, plan, &lens, &decoded, Vec::new(), sink)?;
+            assemble_row_group(file, plan, lens, &decoded, Vec::new(), sink)?;
             continue;
         }
-        let pieces = decode_row_group(reader, rg_index, &decoded, &lens, &file.meta.path)?;
+        let pieces = decode_row_group(reader, rg_index, &decoded, lens, &file.meta.path)?;
         out.columns_decoded += decoded.len() as u64;
-        assemble_row_group(file, plan, &lens, &decoded, pieces, sink)?;
+        assemble_row_group(file, plan, lens, &decoded, pieces, sink)?;
     }
     Ok(())
 }
@@ -317,8 +358,8 @@ fn scan_metadata_only(
         out.row_groups += 1;
         let rows = rg.rows as usize;
         let lens = chunk_lens(rows, offset);
-        offset += rows;
-        assemble_row_group(file, plan, &lens, &[], Vec::new(), sink)?;
+        offset = offset.saturating_add(rows);
+        assemble_row_group(file, plan, lens, &[], Vec::new(), sink)?;
     }
     Ok(())
 }
@@ -355,7 +396,7 @@ fn scan_local_parallel(
         out.row_groups += 1;
         let rows = rg.rows as usize;
         surviving.push((rg_index, rows, offset));
-        offset += rows;
+        offset = offset.saturating_add(rows);
     }
     let workers = rayon::current_num_threads().max(1);
     let open = || -> Result<SerializedFileReader<std::fs::File>> {
@@ -384,11 +425,11 @@ fn scan_local_parallel(
             end += 1;
         }
         let window = &surviving[at..end];
-        let tasks: Vec<(usize, usize, Vec<usize>)> = window
+        let tasks: Vec<(usize, usize, ChunkLens)> = window
             .iter()
             .flat_map(|&(rg_index, rows, start)| {
                 let lens = chunk_lens(rows, start);
-                (0..decoded.len()).map(move |slot| (rg_index, slot, lens.clone()))
+                (0..decoded.len()).map(move |slot| (rg_index, slot, lens))
             })
             .collect();
         let results: Vec<Result<Vec<Vector>>> = tasks
@@ -405,7 +446,7 @@ fn scan_local_parallel(
                     &reader,
                     *rg_index,
                     decoded[*slot].2,
-                    lens,
+                    *lens,
                     &file.meta.path,
                 );
                 // A failed decode hands its reader back for the tasks after it.
@@ -424,7 +465,7 @@ fn scan_local_parallel(
             }
             out.columns_decoded += decoded.len() as u64;
             let lens = chunk_lens(rows, start);
-            assemble_row_group(file, plan, &lens, &decoded, pieces, sink)?;
+            assemble_row_group(file, plan, lens, &decoded, pieces, sink)?;
         }
         at = end;
     }
@@ -436,7 +477,7 @@ fn decode_in_row_group<R: ChunkReader + 'static>(
     reader: &SerializedFileReader<R>,
     rg_index: usize,
     column: &FileColumn,
-    lens: &[usize],
+    lens: ChunkLens,
     path: &str,
 ) -> Result<Vec<Vector>> {
     let row_group_reader = reader.get_row_group(rg_index).map_err(|e| {
@@ -452,7 +493,7 @@ fn decode_row_group<R: ChunkReader + 'static>(
     reader: &SerializedFileReader<R>,
     rg_index: usize,
     decoded: &[(usize, usize, &FileColumn)],
-    lens: &[usize],
+    lens: ChunkLens,
     path: &str,
 ) -> Result<Vec<Vec<Vector>>> {
     let row_group_reader = reader.get_row_group(rg_index).map_err(|e| {
@@ -468,7 +509,7 @@ fn decode_row_group<R: ChunkReader + 'static>(
 fn decode_row_group_reader(
     row_group_reader: &dyn RowGroupReader,
     decoded: &[(usize, usize, &FileColumn)],
-    lens: &[usize],
+    lens: ChunkLens,
     path: &str,
 ) -> Result<Vec<Vec<Vector>>> {
     // One column at a time: each needed file column decodes into the pieces
@@ -488,7 +529,7 @@ fn decode_row_group_reader(
 fn assemble_row_group(
     file: &FileResolved,
     plan: &DecodePlan<'_>,
-    lens: &[usize],
+    lens: ChunkLens,
     decoded: &[(usize, usize, &FileColumn)],
     mut pieces: Vec<Vec<Vector>>,
     sink: &mut dyn FnMut(DataChunk) -> Result<()>,
@@ -497,7 +538,7 @@ fn assemble_row_group(
     let placeholders = &plan.placeholders;
     let width = resolved.schema.len();
     let mut start = 0usize;
-    for (chunk_index, &n) in lens.iter().enumerate() {
+    for (chunk_index, n) in lens.enumerate() {
         let mut cols: Vec<Arc<Vector>> = Vec::with_capacity(width);
         for (out_index, placeholder) in placeholders.iter().enumerate() {
             if let Some(placeholder) = placeholder {
@@ -622,7 +663,7 @@ fn scan_remote_parallel(
             .collect();
         let rows = rg.rows as usize;
         surviving.push((rg_index, rows, offset, crate::ranged::coalesce_spans(spans)));
-        offset += rows;
+        offset = offset.saturating_add(rows);
     }
 
     let mut at = 0;
@@ -663,7 +704,7 @@ fn scan_remote_parallel(
 
         // Decode row groups concurrently when the window has more than one;
         // assembly below still runs in row-group order.
-        let indexes: Vec<(usize, Vec<usize>)> = window
+        let indexes: Vec<(usize, ChunkLens)> = window
             .iter()
             .map(|(rg_index, rows, start, _)| (*rg_index, chunk_lens(*rows, *start)))
             .collect();
@@ -672,7 +713,7 @@ fn scan_remote_parallel(
                 let mut handles = Vec::with_capacity(indexes.len());
                 for (rg_index, lens) in &indexes {
                     handles.push(scope.spawn(move || {
-                        decode_row_group(reader, *rg_index, decoded, lens, &file.meta.path)
+                        decode_row_group(reader, *rg_index, decoded, *lens, &file.meta.path)
                     }));
                 }
                 handles
@@ -684,7 +725,7 @@ fn scan_remote_parallel(
             indexes
                 .iter()
                 .map(|(rg_index, lens)| {
-                    decode_row_group(reader, *rg_index, decoded, lens, &file.meta.path)
+                    decode_row_group(reader, *rg_index, decoded, *lens, &file.meta.path)
                 })
                 .collect()
         };
@@ -692,7 +733,7 @@ fn scan_remote_parallel(
         for ((_, lens), result) in indexes.iter().zip(results) {
             let pieces = result?;
             out.columns_decoded += decoded.len() as u64;
-            assemble_row_group(file, plan, lens, decoded, pieces, sink)?;
+            assemble_row_group(file, plan, *lens, decoded, pieces, sink)?;
         }
 
         let starts: Vec<u64> = spans.iter().map(|span| span.start).collect();
@@ -1008,7 +1049,7 @@ fn stats_keeps(
 fn decode_column(
     row_group: &dyn RowGroupReader,
     column: &FileColumn,
-    lens: &[usize],
+    lens: ChunkLens,
 ) -> Result<Vec<Vector>> {
     if let Some(shred) = &column.shred {
         return crate::variant_read::read_column(row_group, column.leaf, shred, lens, &column.name);
@@ -1211,7 +1252,7 @@ fn decode_column(
 fn read_array_column(
     row_group: &dyn RowGroupReader,
     column: &FileColumn,
-    lens: &[usize],
+    lens: ChunkLens,
 ) -> Result<Vec<Vector>> {
     let leaf = column.leaf;
     let ty = column.ty;
@@ -1248,7 +1289,7 @@ fn read_array_column(
 /// other width is a variable-length LIST, refused rather than misread.
 fn read_array_chunks<T>(
     reader: &mut parquet::column::reader::ColumnReaderImpl<T>,
-    lens: &[usize],
+    lens: ChunkLens,
     dtype: DataType,
     column: &str,
     convert: impl Fn(&T::T) -> Value,
@@ -1260,8 +1301,8 @@ where
         unreachable!("read_array_chunks is called for ARRAY columns only")
     };
     let len = len as usize;
-    let rows: usize = lens.iter().sum();
-    let mut out: Vec<Vector> = Vec::with_capacity(lens.len());
+    let rows = lens.rows();
+    let mut out: Vec<Vector> = Vec::with_capacity(lens.chunks().min(CHUNK_SIZE));
     let mut vector = Vector::with_capacity(dtype, CHUNK_SIZE.min(rows));
     let mut in_chunk = 0usize;
     let mut done = 0usize;
@@ -1269,11 +1310,13 @@ where
     let mut levels: Vec<i16> = Vec::new();
     let mut reps: Vec<i16> = Vec::new();
     // The row being assembled, one slot per element (`Value::Null` for a NULL
-    // element) and `null_row` for a NULL array. A batch can end mid-row.
-    let mut row: Vec<Value> = Vec::with_capacity(len);
+    // element) and `null_row` for a NULL array. A batch can end mid-row. The
+    // ARRAY length comes from the footer's key-value metadata, so the row's
+    // buffer is hinted, not sized: a hostile length must not allocate it.
+    let mut row: Vec<Value> = Vec::with_capacity(len.min(CHUNK_SIZE));
     let mut null_row = false;
-    for &n in lens {
-        let want = n * len;
+    for n in lens {
+        let want = n.saturating_mul(len);
         values.clear();
         levels.clear();
         reps.clear();
@@ -1398,7 +1441,7 @@ fn decode_error(column: &str, why: impl std::fmt::Display) -> PinkDbError {
 /// (duckdb/extension/parquet/column_reader.cpp, `ColumnReader::Read`).
 fn read_flat_chunks<T>(
     reader: &mut parquet::column::reader::ColumnReaderImpl<T>,
-    lens: &[usize],
+    lens: ChunkLens,
     optional: bool,
     column: &str,
     mut finish: impl FnMut(&mut Vec<T::T>, &[i16], usize, &str) -> Result<Vector>,
@@ -1406,12 +1449,12 @@ fn read_flat_chunks<T>(
 where
     T: parquet::data_type::DataType,
 {
-    let rows: usize = lens.iter().sum();
-    let mut out = Vec::with_capacity(lens.len());
+    let rows = lens.rows();
+    let mut out = Vec::with_capacity(lens.chunks().min(CHUNK_SIZE));
     let mut done = 0usize;
     let mut values: Vec<T::T> = Vec::new();
     let mut levels: Vec<i16> = Vec::new();
-    for &n in lens {
+    for n in lens {
         values.clear();
         levels.clear();
         let mut filled = 0usize;
@@ -1649,21 +1692,28 @@ mod tests {
     fn chunk_lens_fills_vectors_and_keeps_the_file_aligned() {
         // A row group that starts mid-chunk emits a short first piece; every
         // later piece is full, so the next row group starts aligned again.
-        let lens = chunk_lens(5000, 1000);
+        let lens: Vec<usize> = chunk_lens(5000, 1000).collect();
         assert_eq!(lens[0], CHUNK_SIZE - 1000);
         assert_eq!(&lens[1..], &[CHUNK_SIZE, 1904]);
         assert_eq!(lens.iter().sum::<usize>(), 5000);
         // Aligned starts keep the start aligned, and a ragged tail is last.
-        assert_eq!(chunk_lens(3000, 0), vec![CHUNK_SIZE, 952]);
-        assert_eq!(chunk_lens(0, 7), Vec::<usize>::new());
+        assert_eq!(
+            chunk_lens(3000, 0).collect::<Vec<usize>>(),
+            vec![CHUNK_SIZE, 952]
+        );
+        assert_eq!(
+            chunk_lens(0, 7).collect::<Vec<usize>>(),
+            Vec::<usize>::new()
+        );
         for (rows, offset) in [(1, 0), (2048, 0), (2049, 5), (9000, 2047), (77, 3)] {
             let lens = chunk_lens(rows, offset);
-            assert_eq!(lens.iter().sum::<usize>(), rows);
-            assert!(lens.iter().all(|&n| n > 0 && n <= CHUNK_SIZE));
+            assert_eq!(lens.rows(), rows);
+            assert_eq!(lens.chunks(), lens.collect::<Vec<usize>>().len());
+            assert!(lens.into_iter().all(|n| n > 0 && n <= CHUNK_SIZE));
             // Only the first piece of a row group may be short: it ends on the
             // boundary the previous row group left open.
             let mut at = offset;
-            for (i, &n) in lens.iter().enumerate() {
+            for (i, n) in lens.enumerate() {
                 if i > 0 {
                     assert!(
                         at.is_multiple_of(CHUNK_SIZE),
@@ -1673,6 +1723,45 @@ mod tests {
                 at += n;
             }
         }
+    }
+
+    #[test]
+    fn chunk_lens_counts_without_allocating_for_a_hostile_row_count() {
+        // A footer can claim any row count; lengths must be arithmetic, not a
+        // 4.5e15-element vector (the `huge_rg_num_rows.parquet` abort).
+        let lens = chunk_lens(usize::MAX / 2, 0);
+        assert_eq!(lens.chunks(), (usize::MAX / 2).div_ceil(CHUNK_SIZE));
+        assert_eq!(lens.into_iter().next(), Some(CHUNK_SIZE));
+    }
+
+    #[test]
+    fn page_locations_outside_the_file_are_refused() {
+        let page = |offset, size: i32, row: i64| PageLocation {
+            offset,
+            compressed_page_size: size,
+            first_row_index: row,
+        };
+        assert!(page_locations_fit(
+            &[page(4, 10, 0), page(14, 10, 5)],
+            10,
+            24
+        ));
+        // A size or offset past the end of the file (or an i32::MAX page).
+        assert!(!page_locations_fit(&[page(4, i32::MAX, 0)], 10, 24));
+        assert!(!page_locations_fit(&[page(20, 10, 0)], 10, 24));
+        assert!(!page_locations_fit(&[page(-1, 10, 0)], 10, 24));
+        // Row indexes must start at 0, increase, and stay below the rows.
+        assert!(!page_locations_fit(&[page(4, 10, 1)], 10, 24));
+        assert!(!page_locations_fit(
+            &[page(4, 10, 0), page(14, 10, 0)],
+            10,
+            24
+        ));
+        assert!(!page_locations_fit(
+            &[page(4, 10, 0), page(14, 10, 10)],
+            10,
+            24
+        ));
     }
 
     /// Every row of the file behind `resolved`, read either on the pool or on
@@ -1999,7 +2088,7 @@ impl RowGroupMorsels {
         let decoded = decoded_columns(file, &plan);
         let lens = chunk_lens(group.rows, group.offset);
         if decoded.is_empty() {
-            return assemble_row_group(file, &plan, &lens, &decoded, Vec::new(), sink);
+            return assemble_row_group(file, &plan, lens, &decoded, Vec::new(), sink);
         }
         let pieces = match (&self.reader, &self.remote) {
             (FileSource::Remote(chunk), Some(spec)) => {
@@ -2027,13 +2116,13 @@ impl RowGroupMorsels {
                             props: Arc::clone(&self.props),
                             locations: selection.locations.clone(),
                         };
-                        decode_row_group_reader(&filtered, &decoded, &lens, &self.path)?
+                        decode_row_group_reader(&filtered, &decoded, lens, &self.path)?
                     }
-                    None => decode_row_group_reader(&row_group, &decoded, &lens, &self.path)?,
+                    None => decode_row_group_reader(&row_group, &decoded, lens, &self.path)?,
                 }
             }
             (FileSource::Local(reader), _) => {
-                decode_row_group(reader, group.index, &decoded, &lens, &self.path)?
+                decode_row_group(reader, group.index, &decoded, lens, &self.path)?
             }
             (FileSource::Remote(_), None) => {
                 return Err(PinkDbError::Execution(format!(
@@ -2042,7 +2131,7 @@ impl RowGroupMorsels {
                 )));
             }
         };
-        assemble_row_group(file, &plan, &lens, &decoded, pieces, sink)
+        assemble_row_group(file, &plan, lens, &decoded, pieces, sink)
     }
 
     fn decode_plan(&self) -> DecodePlan<'_> {
@@ -2117,6 +2206,12 @@ pub fn plan_row_groups(
         .map(|i| (!needed[i]).then(|| Arc::new(Vector::new_empty(resolved.schema[i].1))))
         .collect();
     let mut resolved = resolved;
+    // The morsel plan sizes buffers from the footer's counts, and a lake data
+    // file's footer is as untrusted as any other: check it once here, before
+    // any decode (the scan entry points do the same, see `scan_into`).
+    for file in &resolved.files {
+        file.meta.validate()?;
+    }
     let path = resolved
         .files
         .first()
@@ -2211,7 +2306,7 @@ pub fn plan_row_groups(
                 spans,
                 selection,
             });
-            kept_offset += kept_rows;
+            kept_offset = kept_offset.saturating_add(kept_rows);
         }
     }
     Ok(RowGroupMorsels {
@@ -2306,6 +2401,16 @@ fn page_selection(
         return None;
     }
     let page_count = first.len();
+    // A page index is untrusted footer bytes too: an offset or size outside
+    // the file would size a read, so an implausible index is ignored and the
+    // row group is read whole (parquet then checks each page against the
+    // chunk's remaining bytes).
+    if decoded_pages
+        .iter()
+        .any(|locations| !page_locations_fit(locations, rows, file.meta.file_size))
+    {
+        return None;
+    }
     let mut bounds: Vec<usize> = first
         .iter()
         .map(|page| page.first_row_index as usize)
@@ -2408,6 +2513,32 @@ fn page_selection(
         locations,
         spans,
     })
+}
+
+/// Whether a column's page index describes pages of a row group of `rows`
+/// rows that all lie inside a `file_size`-byte file: page 0 starts the row
+/// group, row indexes strictly increase, and every page's byte range is
+/// inside the file. Anything else is corrupt metadata and must not size a
+/// read.
+fn page_locations_fit(locations: &[PageLocation], rows: usize, file_size: u64) -> bool {
+    let inside = |location: &PageLocation| {
+        location.compressed_page_size > 0
+            && location.offset >= 0
+            && (location.offset as u64)
+                .checked_add(location.compressed_page_size as u64)
+                .is_some_and(|end| end <= file_size)
+    };
+    let rows = rows as u64;
+    locations
+        .first()
+        .is_some_and(|first| first.first_row_index == 0)
+        && locations.iter().all(inside)
+        && locations.iter().all(|location| {
+            location.first_row_index >= 0 && (location.first_row_index as u64) < rows
+        })
+        && locations
+            .windows(2)
+            .all(|pair| pair[0].first_row_index < pair[1].first_row_index)
 }
 
 fn chunk_start(chunk: &crate::file_meta::ChunkInfo) -> u64 {
