@@ -57,39 +57,107 @@ pub struct Column {
     /// without a caller knowing. Read them through [`Column::chunk`],
     /// [`Column::chunk_mut`] and [`Column::chunk_rows`].
     ///
+    /// Ranges a handle stopped naming (an update replaced the chunk, or a
+    /// save moved it) wait here until the next checkpoint drains them: the
+    /// checkpoint keeps such a range free for one pass so a snapshot that
+    /// still reads it sees its bytes (see [`crate::storage::PinkDb`]).
+    ///
     /// Each handle is its own `Arc` so the cache can hold a `Weak` to it and
     /// drop its payload under memory pressure; a snapshot clones the handles
     /// (sharing the payloads), never the `Arc`s.
     chunks: Vec<Arc<ChunkHandle>>,
+    superseded: Mutex<Vec<SupersededRange>>,
 }
 
-/// The bytes of a `.pink` file a lazily opened store decodes from.
+/// The bytes of a `.pink` file a lazily opened store decodes from: the file
+/// itself, or an in-memory image.
 ///
-/// Every chunk handle of the store holds an `Arc` of it, so the image lives
-/// exactly as long as some chunk may still need it (a store whose every chunk
-/// was decoded or dropped releases it early). An encrypted store's image is
-/// the decrypted plaintext: the last reference overwrites it before the buffer
-/// is freed.
-pub(crate) struct StoreImage {
-    bytes: Box<[u8]>,
+/// Every chunk handle of the store holds an `Arc` of it, so the source lives
+/// exactly as long as some chunk may still need it. A file source keeps no
+/// copy: a chunk's bytes are read with a positioned read when the chunk is
+/// decoded, and the operating system's page cache holds the compressed bytes
+/// between scans. The in-memory form is what `from_pink_bytes`, the wasm
+/// build and an encrypted store use — a `PINKENC1` container is decrypted
+/// whole, so it cannot be read page by page, and the last reference overwrites
+/// its plaintext before the buffer is freed.
+pub(crate) struct StoreSource {
+    data: SourceData,
     secret: bool,
 }
 
-impl StoreImage {
-    pub(crate) fn new(bytes: Vec<u8>, secret: bool) -> Arc<Self> {
+enum SourceData {
+    Memory(Box<[u8]>),
+    File { file: Arc<std::fs::File>, len: u64 },
+}
+
+impl StoreSource {
+    pub(crate) fn memory(bytes: Vec<u8>, secret: bool) -> Arc<Self> {
         Arc::new(Self {
-            bytes: bytes.into_boxed_slice(),
+            data: SourceData::Memory(bytes.into_boxed_slice()),
             secret,
         })
     }
 
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
+    /// A store read from `file` in place. `len` is the length the open saw;
+    /// a file that grows or shrinks behind the store is a corrupt file.
+    pub(crate) fn file(file: Arc<std::fs::File>, len: u64) -> Arc<Self> {
+        Arc::new(Self {
+            data: SourceData::File { file, len },
+            secret: false,
+        })
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        match &self.data {
+            SourceData::Memory(bytes) => bytes.len() as u64,
+            SourceData::File { len, .. } => *len,
+        }
+    }
+
+    /// A borrow of `len` bytes at `offset`, when the source is in memory. The
+    /// decoders take this when they can: a memory image needs no copy at all.
+    pub(crate) fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        let SourceData::Memory(bytes) = &self.data else {
+            return None;
+        };
+        let start = usize::try_from(offset).ok()?;
+        bytes.get(start..start.checked_add(len)?)
+    }
+
+    /// Fill `buf` from `offset`. The one place the store's bytes enter the
+    /// process, for both forms of the source.
+    pub(crate) fn read(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .filter(|&end| end <= self.len())
+            .ok_or_else(|| {
+                PinkDbError::Execution("corrupt file: a chunk is outside the file".to_string())
+            })?;
+        match &self.data {
+            SourceData::Memory(bytes) => {
+                buf.copy_from_slice(&bytes[offset as usize..end as usize]);
+            }
+            SourceData::File { file, .. } => {
+                pread_exact(file, offset, buf)?;
+                #[cfg(test)]
+                SOURCE_READ_BYTES.with(|bytes| bytes.set(bytes.get() + buf.len() as u64));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_vec(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        self.read(offset, &mut buf)?;
+        Ok(buf)
     }
 }
 
-impl Drop for StoreImage {
+impl Drop for StoreSource {
     fn drop(&mut self) {
+        let SourceData::Memory(bytes) = &mut self.data else {
+            return;
+        };
         if !self.secret {
             return;
         }
@@ -97,53 +165,267 @@ impl Drop for StoreImage {
         // freed right after may be dropped as dead, and `write_volatile` needs
         // an aligned pointer, which a `u8` buffer does not guarantee for wider
         // words. This runs once, when an encrypted session ends.
-        for byte in self.bytes.iter_mut() {
+        for byte in bytes.iter_mut() {
             unsafe { std::ptr::write_volatile(byte, 0) };
         }
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-impl std::fmt::Debug for StoreImage {
+impl std::fmt::Debug for StoreSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StoreImage")
-            .field("bytes", &self.bytes.len())
+        f.debug_struct("StoreSource")
+            .field("len", &self.len())
+            .field("file", &matches!(self.data, SourceData::File { .. }))
             .field("secret", &self.secret)
             .finish()
     }
 }
 
-/// One chunk's bytes in the retained store image.
+// What a `File` source has read on this thread. A test hook: an open must
+// leave the data region alone until a statement reads a chunk.
+#[cfg(test)]
+thread_local! {
+    static SOURCE_READ_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn source_read_bytes() -> u64 {
+    SOURCE_READ_BYTES.with(|bytes| bytes.get())
+}
+
+/// Fill `buf` from `offset` with a positioned read, so concurrent workers do
+/// not move a shared file cursor.
+pub(crate) fn pread_exact(file: &std::fs::File, mut offset: u64, mut buf: &mut [u8]) -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        #[cfg(unix)]
+        let read = file.read_at(buf, offset);
+        #[cfg(windows)]
+        let read = file.seek_read(buf, offset);
+        #[cfg(not(any(unix, windows)))]
+        let read: std::io::Result<usize> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "positioned reads are not supported on this platform",
+        ));
+        let n = read?;
+        if n == 0 {
+            return Err(PinkDbError::Execution(
+                "corrupt file: the file ended before its footer".to_string(),
+            ));
+        }
+        offset += n as u64;
+        buf = &mut buf[n..];
+    }
+    Ok(())
+}
+
+/// A decode's scratch bytes: one page, and the blocks a chunk's checksum is
+/// streamed in. Bounded and uncharged — it is not cached state.
+const CRC_BLOCK: usize = 128 * 1024;
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_scratch<R>(f: impl FnOnce(&mut Vec<u8>) -> Result<R>) -> Result<R> {
+    SCRATCH.with(|cell| f(&mut cell.borrow_mut()))
+}
+
+fn checksum_error() -> PinkDbError {
+    PinkDbError::Execution(
+        "corrupt file: a column chunk fails its checksum (the file is damaged)".to_string(),
+    )
+}
+
+fn page_outside() -> PinkDbError {
+    PinkDbError::Execution("corrupt file: the page index does not hold this page".to_string())
+}
+
+/// One column chunk's bytes in the store source, shared by every handle over
+/// its pages.
 ///
-/// The open-time sweep verified the enclosing column chunk's CRC32C over
-/// exactly these bytes, so a decode validates the page structure only.
+/// The CRC32C and the page index are checked on first read rather than at open
+/// (wave 136c): a damaged chunk fails the statement that reads it, with the
+/// same text a damaged open used to fail with. Both results are cached here,
+/// so a chunk is verified and parsed once however many pages and scans touch
+/// it.
+pub(crate) struct EncodedColumnChunk {
+    source: Arc<StoreSource>,
+    /// Absolute offset of the page index; the index is followed by the pages.
+    offset: u64,
+    /// The page index and every page: also the CRC32C's granule.
+    length: u64,
+    crc32c: u32,
+    page_count: u32,
+    state: Mutex<BytesState>,
+}
+
+#[derive(Default)]
+struct BytesState {
+    /// `(rel, len)` per page, relative to the chunk's offset.
+    pages: Option<Arc<[(u32, u32)]>>,
+    verified: bool,
+}
+
+impl EncodedColumnChunk {
+    pub(crate) fn new(
+        source: Arc<StoreSource>,
+        offset: u64,
+        length: u64,
+        crc32c: u32,
+        page_count: u32,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            source,
+            offset,
+            length,
+            crc32c,
+            page_count,
+            state: Mutex::new(BytesState::default()),
+        })
+    }
+
+    pub(crate) fn source(&self) -> &Arc<StoreSource> {
+        &self.source
+    }
+
+    pub(crate) fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub(crate) fn length(&self) -> u64 {
+        self.length
+    }
+
+    pub(crate) fn page_count(&self) -> u32 {
+        self.page_count
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BytesState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The chunk's CRC32C, once. A memory source checksums its slice directly;
+    /// a file source streams it in [`CRC_BLOCK`] blocks, so a large column
+    /// chunk never needs a large buffer.
+    fn verify(&self) -> Result<()> {
+        if self.lock().verified {
+            return Ok(());
+        }
+        let crc = match self.source.slice(self.offset, self.length as usize) {
+            Some(bytes) => crate::persist::crc32c(bytes),
+            None => with_scratch(|scratch| {
+                let mut acc = !0u32;
+                let mut at = 0u64;
+                while at < self.length {
+                    let n = (self.length - at).min(CRC_BLOCK as u64) as usize;
+                    scratch.resize(n, 0);
+                    self.source.read(self.offset + at, &mut scratch[..n])?;
+                    acc = crate::persist::crc32c_update(acc, &scratch[..n]);
+                    at += n as u64;
+                }
+                Ok(!acc)
+            })?,
+        };
+        if crc != self.crc32c {
+            return Err(checksum_error());
+        }
+        self.lock().verified = true;
+        Ok(())
+    }
+
+    /// The page index, verified and parsed once. Every structural use of a
+    /// chunk goes through here, so a corrupt chunk always reports its checksum
+    /// first — the order the open-time sweep checked them in.
+    pub(crate) fn pages(&self) -> Result<Arc<[(u32, u32)]>> {
+        self.verify()?;
+        if let Some(pages) = self.lock().pages.clone() {
+            return Ok(pages);
+        }
+        let index_len = 4 + self.page_count as usize * 8;
+        let bytes = self.source.read_vec(self.offset, index_len)?;
+        let count = u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes")) as usize;
+        if count != self.page_count as usize {
+            return Err(PinkDbError::Execution(
+                "corrupt file: the column chunk's page count disagrees with the footer".to_string(),
+            ));
+        }
+        let mut pages = Vec::with_capacity(count);
+        for i in 0..count {
+            let at = u32::from_le_bytes(bytes[4 + i * 8..8 + i * 8].try_into().expect("four"));
+            let len = u32::from_le_bytes(bytes[8 + i * 8..12 + i * 8].try_into().expect("four"));
+            let end = u64::from(at).checked_add(u64::from(len));
+            if end.is_none_or(|end| end > self.length) {
+                return Err(PinkDbError::Execution(
+                    "corrupt file: a page is outside the column chunk".to_string(),
+                ));
+            }
+            pages.push((at, len));
+        }
+        let pages: Arc<[(u32, u32)]> = pages.into();
+        self.lock().pages = Some(Arc::clone(&pages));
+        Ok(pages)
+    }
+
+    /// Read one page and decode it. A memory source decodes its slice in
+    /// place; a file source reads the page into the thread's scratch first.
+    fn decode_page(&self, page: u32, dtype: DataType) -> Result<Vector> {
+        let pages = self.pages()?;
+        let &(rel, len) = pages.get(page as usize).ok_or_else(page_outside)?;
+        let offset = self.offset + u64::from(rel);
+        if let Some(bytes) = self.source.slice(offset, len as usize) {
+            return crate::persist::decode_page(bytes, dtype);
+        }
+        with_scratch(|scratch| {
+            scratch.resize(len as usize, 0);
+            self.source.read(offset, &mut scratch[..len as usize])?;
+            crate::persist::decode_page(&scratch[..len as usize], dtype)
+        })
+    }
+}
+
+impl std::fmt::Debug for EncodedColumnChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncodedColumnChunk")
+            .field("offset", &self.offset)
+            .field("length", &self.length)
+            .field("page_count", &self.page_count)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// One chunk's place in its column chunk: the shared descriptor plus the page
+/// number. 24 bytes, of which the descriptor is shared by up to
+/// `CHUNKS_PER_ROW_GROUP` handles.
 #[derive(Debug, Clone)]
 pub(crate) struct EncodedChunk {
-    pub(crate) image: Arc<StoreImage>,
-    /// The page's byte range in the image.
-    pub(crate) offset: u64,
-    pub(crate) length: u64,
+    pub(crate) chunk: Arc<EncodedColumnChunk>,
+    /// Which page of the column chunk this chunk is.
+    pub(crate) page: u32,
     /// Rows the footer recorded for this chunk.
     pub(crate) rows: usize,
 }
 
 impl EncodedChunk {
-    pub(crate) fn new(image: Arc<StoreImage>, offset: u64, length: u64, rows: usize) -> Self {
-        Self {
-            image,
-            offset,
-            length,
-            rows,
-        }
+    pub(crate) fn new(chunk: Arc<EncodedColumnChunk>, page: u32, rows: usize) -> Self {
+        Self { chunk, page, rows }
     }
 
     fn decode(&self, dtype: DataType) -> Result<Vector> {
-        let start = self.offset as usize;
-        let end = start + self.length as usize;
-        let bytes = self.image.bytes().get(start..end).ok_or_else(|| {
-            PinkDbError::Execution("corrupt file: a chunk is outside the file".to_string())
-        })?;
-        crate::persist::decode_page(bytes, dtype)
+        self.chunk.decode_page(self.page, dtype)
+    }
+
+    /// The pool bytes a decode of this page needs, before the vector exists:
+    /// the decoded width per row, over the page's encoded length.
+    fn decoded_bound(&self, dtype: DataType) -> Result<usize> {
+        let pages = self.chunk.pages()?;
+        let &(_, len) = pages.get(self.page as usize).ok_or_else(page_outside)?;
+        Ok(decoded_bound(dtype, self.rows, len as usize))
     }
 }
 
@@ -231,17 +513,12 @@ impl ChunkHandle {
         }
     }
 
-    /// A handle over a chunk still in the store image: the `.pink` loader
-    /// builds these from the footer, and the first read decodes it.
-    pub(crate) fn new_encoded(
-        image: Arc<StoreImage>,
-        offset: u64,
-        length: u64,
-        rows: usize,
-    ) -> Self {
+    /// A handle over a chunk still in the store: the `.pink` loader builds
+    /// these from the footer, and the first read verifies and decodes it.
+    pub(crate) fn new_encoded(chunk: Arc<EncodedColumnChunk>, page: u32, rows: usize) -> Self {
         Self {
             state: Mutex::new(ChunkState {
-                encoded: Some(EncodedChunk::new(image, offset, length, rows)),
+                encoded: Some(EncodedChunk::new(chunk, page, rows)),
                 ..ChunkState::default()
             }),
         }
@@ -275,11 +552,14 @@ impl ChunkHandle {
         if let Some(vector) = handle.decoded(dirty) {
             return Ok(vector);
         }
-        let (rows, length) = match handle.lock().encoded.as_ref() {
-            Some(encoded) => (encoded.rows, encoded.length),
+        // The chunk's descriptor is cloned out of the handle before the bound
+        // is computed: reading the page index can touch the file, and no
+        // handle lock is held across that read.
+        let encoded = match handle.lock().encoded.clone() {
+            Some(encoded) => encoded,
             None => return Err(missing_payload()),
         };
-        let mut charge = crate::memory::reserve(decoded_bound(dtype, rows, length as usize))?;
+        let mut charge = crate::memory::reserve(encoded.decoded_bound(dtype)?)?;
         let mut state = handle.lock();
         // Another thread may have decoded the chunk while this one reserved.
         if let Some(payload) = state.payload.as_ref() {
@@ -407,15 +687,15 @@ impl ChunkHandle {
         state.encoded.clone()
     }
 
-    /// Point the chunk at the image a save just wrote, at bytes that are its
-    /// stored form. Returns whether the chunk was dirty: a saved write is
-    /// stored now, so the cache may evict it.
+    /// Point the chunk at the bytes a save just wrote, at its own page of a
+    /// shared column-chunk descriptor. Returns whether the chunk was dirty: a
+    /// saved write is stored now, so the cache may evict it.
     ///
-    /// The payload is untouched and nothing is decoded: the image's bytes are
+    /// The payload is untouched and nothing is decoded: the stored bytes are
     /// what this chunk holds, which is what makes the handle clean again.
-    fn repoint(&self, image: &Arc<StoreImage>, offset: u64, length: u64, rows: usize) -> bool {
+    fn repoint(&self, chunk: &Arc<EncodedColumnChunk>, page: u32, rows: usize) -> bool {
         let mut state = self.lock();
-        state.encoded = Some(EncodedChunk::new(Arc::clone(image), offset, length, rows));
+        state.encoded = Some(EncodedChunk::new(Arc::clone(chunk), page, rows));
         std::mem::replace(&mut state.dirty, false)
     }
 }
@@ -441,7 +721,10 @@ impl std::fmt::Debug for ChunkHandle {
             )
             .field(
                 "encoded",
-                &state.encoded.as_ref().map(|e| (e.offset, e.length)),
+                &state
+                    .encoded
+                    .as_ref()
+                    .map(|e| (e.chunk.offset(), e.chunk.length(), e.page)),
             )
             .field("dirty", &state.dirty)
             .field("charged", &state.payload.as_ref().map(|p| p.charge.bytes()))
@@ -577,6 +860,7 @@ impl Clone for Column {
                 .iter()
                 .map(|handle| Arc::new(handle.duplicate()))
                 .collect(),
+            superseded: Mutex::new(Vec::new()),
         }
     }
 }
@@ -610,6 +894,7 @@ impl Column {
             dtype,
             default: None,
             chunks: vec![Arc::new(ChunkHandle::empty(dtype))],
+            superseded: Mutex::new(Vec::new()),
         }
     }
 
@@ -630,6 +915,7 @@ impl Column {
             dtype,
             default,
             chunks,
+            superseded: Mutex::new(Vec::new()),
         })
     }
 
@@ -710,8 +996,32 @@ impl Column {
     /// Replace chunk `i`'s payload in place (the loader reuses the empty tail,
     /// a delete rewrites a chunk as its gathered survivor rows).
     fn set_chunk(&mut self, i: usize, chunk: Arc<Vector>) -> Result<()> {
+        self.supersede(i);
         self.chunks[i] = Arc::new(ChunkHandle::new(chunk)?);
         Ok(())
+    }
+
+    /// Note chunk `i`'s file range as superseded when the handle still names
+    /// stored bytes: a snapshot or a running scan may read them after this
+    /// column has moved on.
+    fn supersede(&self, i: usize) {
+        let Some(old) = self.chunks[i].stored() else {
+            return;
+        };
+        self.superseded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(SupersededRange {
+                offset: old.chunk.offset(),
+                len: old.chunk.length(),
+                chunk: Arc::downgrade(&old.chunk),
+            });
+    }
+
+    /// Take the ranges this column's handles have stopped naming: the
+    /// checkpoint drains them once their last reader is gone.
+    pub(crate) fn take_superseded(&self) -> Vec<SupersededRange> {
+        std::mem::take(&mut *self.superseded.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Install the chunk list a lazily opened table read from the footer: still
@@ -748,41 +1058,56 @@ impl Column {
 
     /// The stored form of chunks `first..last`, when a save may copy the
     /// group's bytes through instead of decoding and re-encoding them: every
-    /// chunk is clean and they still sit next to each other in one image, so
-    /// the group's encoded column chunk is those bytes. `None` falls back to
-    /// the encoder.
-    pub(crate) fn stored_group(
+    /// chunk is clean, they are the whole of one column chunk, and they still
+    /// name it. `None` falls back to the encoder.
+    pub(crate) fn stored_chunk(
         &self,
         first: usize,
         last: usize,
-    ) -> Option<(Arc<StoreImage>, Vec<EncodedChunk>)> {
+    ) -> Option<Arc<EncodedColumnChunk>> {
         let chunks = self.chunks.get(first..last)?;
-        let image = chunks.first()?.stored()?.image;
-        let mut encoded = Vec::with_capacity(chunks.len());
-        for handle in chunks {
+        let mut shared: Option<Arc<EncodedColumnChunk>> = None;
+        for (i, handle) in chunks.iter().enumerate() {
             let chunk = handle.stored()?;
-            if !Arc::ptr_eq(&chunk.image, &image) {
+            if chunk.page != i as u32 {
                 return None;
             }
-            encoded.push(chunk);
+            match &shared {
+                None => shared = Some(Arc::clone(&chunk.chunk)),
+                Some(prev) => {
+                    if !Arc::ptr_eq(prev, &chunk.chunk) {
+                        return None;
+                    }
+                }
+            }
         }
-        Some((image, encoded))
+        let shared = shared?;
+        // A checkpoint moves a whole column chunk; part of one is re-encoded.
+        if shared.page_count() as usize != chunks.len() {
+            return None;
+        }
+        Some(shared)
     }
 
-    /// Point one chunk at the image a save wrote: `offset` and `length` are
-    /// its page there. A dirty chunk is stored now, so it becomes an eviction
-    /// candidate.
+    /// Point one chunk at the bytes a save wrote: its page of a shared
+    /// column-chunk descriptor. A dirty chunk is stored now, so it becomes an
+    /// eviction candidate.
     pub(crate) fn repoint_chunk(
         &self,
         i: usize,
-        image: &Arc<StoreImage>,
-        offset: u64,
-        length: u64,
+        chunk: &Arc<EncodedColumnChunk>,
+        page: u32,
         rows: usize,
     ) {
         install_evictor();
+        // A move leaves the old range for whatever still reads it.
+        if self.chunks[i].stored().is_some_and(|old| {
+            old.chunk.offset() != chunk.offset() || old.chunk.length() != chunk.length()
+        }) {
+            self.supersede(i);
+        }
         let handle = &self.chunks[i];
-        if handle.repoint(image, offset, length, rows) {
+        if handle.repoint(chunk, page, rows) {
             register(&Arc::downgrade(handle));
         }
     }
@@ -3286,6 +3611,39 @@ pub struct PinkDb {
     /// The log the last finished statement left: what `EXPLAIN ANALYZE` and
     /// `pinkdb_scan_io()` report until the running statement replaces it.
     pub(crate) finished_scans: std::sync::Mutex<Vec<crate::morsel::ScanRecord>>,
+    /// Ranges a checkpoint retired while a live handle could still read them
+    /// (wave 136c). A range is reusable only once its handle is gone: the
+    /// allocator skips these, and the next checkpoint drops the released ones
+    /// (see [`PinkDb::sweep_superseded`]). In-memory stores, which have no
+    /// file to overwrite, leave this empty.
+    pub(crate) superseded: Mutex<Vec<SupersededRange>>,
+}
+
+/// A file range that a checkpoint superseded but whose bytes a live handle may
+/// still read: the range is free in the footer, but nothing may be written
+/// over it until the handle is gone.
+#[derive(Clone, Debug)]
+pub(crate) struct SupersededRange {
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+    pub(crate) chunk: std::sync::Weak<EncodedColumnChunk>,
+}
+
+impl PinkDb {
+    /// Drain the wait list, keeping only the ranges a live handle still
+    /// names, and return them for this checkpoint to reserve. A range whose
+    /// handle has dropped is free at once: from here on nothing writes its
+    /// bytes.
+    pub(crate) fn sweep_superseded(&self) -> Vec<SupersededRange> {
+        let mut list = self.superseded.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held = Vec::with_capacity(list.len());
+        for range in list.drain(..) {
+            if range.chunk.strong_count() > 0 {
+                held.push(range);
+            }
+        }
+        held
+    }
 }
 
 impl Default for PinkDb {
@@ -3403,6 +3761,9 @@ impl Clone for PinkDb {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
             ),
+            // A snapshot's chunks hold their own references; the wait list is
+            // the store's (the store that takes the checkpoint).
+            superseded: Mutex::new(Vec::new()),
         }
     }
 }
@@ -3499,6 +3860,7 @@ impl PinkDb {
             stream_folded_rows: std::sync::atomic::AtomicU64::new(0),
             scan_records: std::sync::Mutex::new(Vec::new()),
             finished_scans: std::sync::Mutex::new(Vec::new()),
+            superseded: Mutex::new(Vec::new()),
         }
     }
 

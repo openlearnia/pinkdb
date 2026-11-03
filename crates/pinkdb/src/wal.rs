@@ -7446,6 +7446,62 @@ mod tests {
         cleanup(&p);
     }
 
+    /// A checkpoint must not write over a range a snapshot still reads: the
+    /// superseded range waits until the snapshot's descriptor is gone
+    /// (wave 136c).
+    #[test]
+    fn a_checkpoint_never_reuses_a_live_snapshots_range() {
+        let p = tmp_ckpt("snapshot_grace");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER, v VARCHAR);")
+            .unwrap();
+        let values = (0..130_000)
+            .map(|i| format!("({i}, 'v{i}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        db.execute(&format!("INSERT INTO t VALUES {values};"))
+            .unwrap();
+        db.checkpoint().unwrap();
+        // Two row groups; the snapshot shares their chunk descriptors.
+        let mut snapshot = db.clone();
+        let rows = ints(&mut snapshot, "SELECT count(*) FROM t;");
+        let texts = strings(&mut snapshot, "SELECT v FROM t WHERE a < 3 ORDER BY a;");
+        // Supersede group 1's chunks: the snapshot still reads the old bytes.
+        let fits = crate::persist::first_fits();
+        db.execute("UPDATE t SET v = 'x' WHERE a = 123000;")
+            .unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(
+            crate::persist::first_fits(),
+            fits,
+            "a live snapshot's range must not be reused"
+        );
+        assert_eq!(ints(&mut snapshot, "SELECT count(*) FROM t;"), rows);
+        assert_eq!(
+            strings(&mut snapshot, "SELECT v FROM t WHERE a < 3 ORDER BY a;"),
+            texts
+        );
+        drop(snapshot);
+        // The range is free once nothing references it, and the next write of
+        // the same size reuses it instead of growing the file.
+        let fits = crate::persist::first_fits();
+        db.execute("UPDATE t SET v = 'y' WHERE a = 123000;")
+            .unwrap();
+        db.checkpoint().unwrap();
+        assert!(
+            crate::persist::first_fits() > fits,
+            "the released range must be reused"
+        );
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM t;"), vec![130_000]);
+        assert_eq!(
+            strings(&mut back, "SELECT v FROM t WHERE a < 3 ORDER BY a;"),
+            vec!["v0".to_string(), "v1".to_string(), "v2".to_string()]
+        );
+        cleanup(&p);
+    }
+
     fn image_layout(p: &Path) -> Vec<(String, Vec<(u64, u64)>)> {
         let data = std::fs::read(p).unwrap();
         let (offset, len, _) = crate::persist::footer_location(&data, data.len() as u64).unwrap();
@@ -9954,6 +10010,17 @@ mod tests {
             assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
         }
 
+        /// `Some(rows)` of `t ORDER BY a` (an empty vec when `t` is missing),
+        /// `None` when the statement refuses a damaged chunk — the documented
+        /// lazy-CRC contract (wave 136c).
+        fn rows_or_refused(db: &mut PinkDb) -> Option<Vec<i64>> {
+            match db.execute("SELECT a FROM t ORDER BY a;") {
+                Ok(_) => Some(rows_or_missing(db)),
+                Err(e) if e.to_string().contains("corrupt file:") => None,
+                Err(e) => panic!("unexpected query error: {e}"),
+            }
+        }
+
         /// Rows of `t ORDER BY a`, or an empty vec when `t` does not exist.
         fn rows_or_missing(db: &mut PinkDb) -> Vec<i64> {
             match db.execute("SELECT a FROM t ORDER BY a;") {
@@ -10295,10 +10362,9 @@ mod tests {
                 reset_state_b(&ckpt_bytes[..len]);
                 match PinkDb::open_durable(p.to_str().unwrap()) {
                     Ok(mut db) => {
-                        assert_eq!(
-                            rows_or_missing(&mut db),
-                            vec![1, 2, 3],
-                            "a published .tmp must hold the full state"
+                        assert!(
+                            rows_or_refused(&mut db).is_none_or(|rows| rows == vec![1, 2, 3]),
+                            "a published .tmp must hold the full state, or refuse the read"
                         );
                     }
                     Err(e) => assert!(
@@ -10312,13 +10378,10 @@ mod tests {
                 corrupt[off] ^= 0x5A;
                 reset_state_b(&corrupt);
                 match PinkDb::open_durable(p.to_str().unwrap()) {
-                    Ok(mut db) => {
-                        assert_eq!(
-                            rows_or_missing(&mut db),
-                            vec![1, 2, 3],
-                            "a published .tmp must hold the full state"
-                        );
-                    }
+                    Ok(mut db) => assert!(
+                        rows_or_refused(&mut db).is_none_or(|rows| rows == vec![1, 2, 3]),
+                        "a published .tmp must hold the full state, or refuse the read"
+                    ),
                     Err(e) => assert!(!e.to_string().is_empty()),
                 }
             }
