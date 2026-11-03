@@ -3444,15 +3444,24 @@ peg::parser! {
             / word("grouping") word("sets") lparen() s:grouping_sets() rparen() { GroupItem::Set(GroupSet::Sets(s)) }
             / e:expr() { GroupItem::Plain(e) }
 
-        rule grouping_sets() -> Vec<Vec<Expr>>
+        rule grouping_sets() -> Vec<GroupSet>
             = first:grouping_set() rest:(comma() s:grouping_set() { s })* {
                   let mut out = vec![first];
                   out.extend(rest);
                   out
               }
 
-        /// One parenthesized grouping set; `()` is the grand total.
-        rule grouping_set() -> Vec<Expr> = lparen() l:expr_list()? rparen() { l.unwrap_or_default() }
+        /// One element of a `GROUPING SETS` list. Unlike a top-level item it
+        /// can itself be `CUBE`, `ROLLUP` or another `GROUPING SETS`; a plain
+        /// `(a, b)` or `()` is an explicit set.
+        rule grouping_set() -> GroupSet
+            = word("cube") lparen() l:expr_list() rparen() { GroupSet::Cube(l) }
+            / word("rollup") lparen() l:expr_list() rparen() { GroupSet::Rollup(l) }
+            / word("grouping") word("sets") lparen() s:grouping_sets() rparen() { GroupSet::Sets(s) }
+            / l:grouping_set_exprs() { GroupSet::Exprs(l) }
+
+        rule grouping_set_exprs() -> Vec<Expr>
+            = lparen() l:expr_list()? rparen() { l.unwrap_or_default() }
 
         /// `QUALIFY <cond>` filters over window results, after `WINDOW`.
         rule qualify_clause() -> Expr = word("qualify") e:expr() { e }

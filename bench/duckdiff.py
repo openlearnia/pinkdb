@@ -2844,10 +2844,66 @@ def run_mart():
         run_case(label, sql, ordered, expect_error, MART_SETUP, MART_SETUP)
 
 
+GROUPING_SETS_SETUP = """
+CREATE TABLE gs AS SELECT i % 2 c0, i % 3 c1, i % 4 c2, i % 5 c3, i % 6 c4,
+ i % 7 c5, i % 8 c6, i % 9 c7, i % 10 c8, i % 11 c9, i % 12 c10, i % 13 c11, i
+ FROM range(100) r(i);
+CREATE TABLE gs3 AS SELECT i % 3 a, i % 4 b, i FROM range(100) r(i);
+"""
+
+
+# DuckDB v2.0.0 keeps insertion order through many hash tables and runs out of
+# memory on the 4096-set case with its default thread count; one thread with
+# order preservation off is the build's supported way to run it.
+GROUPING_SETS_DUCK_SETUP = "SET threads=1; SET preserve_insertion_order=false;\n" + GROUPING_SETS_SETUP
+
+
+GROUPING_SETS_QUERIES = [
+    # one scan, 4096 hash tables: the corpus' many-sets case
+    ("grouping-sets-cube12-sum",
+     "SELECT sum(s) FROM (SELECT sum(i) s FROM gs "
+     "GROUP BY CUBE (c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11));", False, False),
+    ("grouping-sets-cube12-masks",
+     "SELECT count(DISTINCT g) FROM (SELECT "
+     "grouping(c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11) g FROM gs "
+     "GROUP BY CUBE (c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11));", False, False),
+    ("grouping-sets-rollup",
+     "SELECT c0, c1, sum(i), grouping(c0), grouping(c1), grouping(c0,c1) "
+     "FROM gs GROUP BY ROLLUP (c0,c1) ORDER BY 1,2,3;", True, False),
+    ("grouping-sets-cross-product",
+     "SELECT a, b, sum(i), grouping(a), grouping(b) FROM gs3 "
+     "GROUP BY GROUPING SETS ((a),()), GROUPING SETS ((b),()) ORDER BY 1,2,3;",
+     True, False),
+    ("grouping-sets-three",
+     "SELECT a, b, sum(i), grouping(a), grouping(b), grouping(a,b) FROM gs3 "
+     "GROUP BY GROUPING SETS ((a,b),(a),()) ORDER BY 1,2,3;", True, False),
+    ("grouping-sets-nested-cube",
+     "SELECT count(*) FROM (SELECT a, b, sum(i) FROM gs3 "
+     "GROUP BY GROUPING SETS (CUBE(a,b), ROLLUP(a,b)));", False, False),
+    # 16 * CUBE(12) is 65,536 sets, one past DuckDB's cap.
+    ("grouping-sets-limit",
+     "SELECT count(*) FROM gs GROUP BY GROUPING SETS (" +
+     ",".join(["CUBE(c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11)"] * 16) + ");",
+     False, True),
+]
+
+
+def run_grouping_sets():
+    print("== grouping sets battery (single scan, many sets) ==")
+    for label, sql, ordered, expect_error in GROUPING_SETS_QUERIES:
+        run_case(label, sql, ordered, expect_error, GROUPING_SETS_SETUP, GROUPING_SETS_DUCK_SETUP)
+    got = pink_query(GROUPING_SETS_SETUP, GROUPING_SETS_QUERIES[-1][1])
+    check("grouping-sets-limit-message",
+          got[0] == "error" and
+          "Maximum grouping set count of 65535 exceeded" in got[1],
+          f"pink={got}")
+
+
 def main():
     import sys
     run_small()
     run_mart()
+    run_grouping_sets()
 
     run_literals()
     run_expression_names()

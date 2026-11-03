@@ -629,7 +629,12 @@ fn substitute_group_set(
     Ok(match set {
         GroupSet::Rollup(items) => GroupSet::Rollup(map(items)?),
         GroupSet::Cube(items) => GroupSet::Cube(map(items)?),
-        GroupSet::Sets(sets) => GroupSet::Sets(sets.iter().map(map).collect::<Result<Vec<_>>>()?),
+        GroupSet::Sets(sets) => GroupSet::Sets(
+            sets.iter()
+                .map(|s| substitute_group_set(s, args, used))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        GroupSet::Exprs(items) => GroupSet::Exprs(map(items)?),
         // No expressions of its own: the select list supplies them.
         GroupSet::All => GroupSet::All,
     })

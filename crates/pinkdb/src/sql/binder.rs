@@ -5920,11 +5920,59 @@ fn default_name(expr: &Expr) -> String {
 /// it with a constant key column, so it never denotes a real input column.
 const GROUPING_SENTINEL: usize = usize::MAX / 2;
 
+/// DuckDB's hard cap on the number of sets one query may expand to.
+const MAX_GROUPING_SETS: usize = 65_535;
+
+/// Every expression a grouping item names, including inside nested sets.
+fn collect_group_set_exprs<'a>(item: &'a GroupSet, out: &mut Vec<&'a Expr>) {
+    match item {
+        GroupSet::Rollup(list) | GroupSet::Cube(list) | GroupSet::Exprs(list) => {
+            out.extend(list.iter())
+        }
+        GroupSet::Sets(children) => {
+            for child in children {
+                collect_group_set_exprs(child, out);
+            }
+        }
+        // `GROUP BY ALL` picks the select list, which is not bound yet.
+        GroupSet::All => {}
+    }
+}
+
+fn check_grouping_set_count(count: usize) -> Result<()> {
+    if count > MAX_GROUPING_SETS {
+        return Err(PinkDbError::Execution(
+            "Maximum grouping set count of 65535 exceeded".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// How many sets one grouping item expands to. Counted before anything is
+/// built so an oversized cross product or nested cube fails cheaply.
+fn group_set_count(item: &GroupSet) -> Result<usize> {
+    let count = match item {
+        GroupSet::All => 0,
+        GroupSet::Exprs(_) => 1,
+        GroupSet::Rollup(exprs) => exprs.len() + 1,
+        GroupSet::Cube(exprs) => 1usize.checked_shl(exprs.len() as u32).unwrap_or(usize::MAX),
+        GroupSet::Sets(children) => {
+            let mut total = 0usize;
+            for child in children {
+                total = total.saturating_add(group_set_count(child)?);
+            }
+            total
+        }
+    };
+    check_grouping_set_count(count)?;
+    Ok(count)
+}
+
 /// The subsets one `GROUP BY` item contributes, as indices into `master`.
 ///
 /// `ROLLUP(a, b)` yields the prefixes longest first (`{a,b}`, `{a}`, `{}`),
 /// `CUBE(a, b)` every subset from all-keys down to none, `GROUPING SETS (...)`
-/// exactly as written — DuckDB's row order for each.
+/// the concatenation of its items in written order — DuckDB's row order.
 fn group_set_indices(master: &[Expr], item: &GroupSet) -> Result<Vec<Vec<usize>>> {
     let resolve = |e: &Expr| -> Result<usize> {
         master.iter().position(|m| m == e).ok_or_else(|| {
@@ -5934,14 +5982,18 @@ fn group_set_indices(master: &[Expr], item: &GroupSet) -> Result<Vec<Vec<usize>>
             ))
         })
     };
-    Ok(match item {
+    let mut out = match item {
         // Expanded into plain keys before this runs (see `GROUP BY ALL` in
         // `bind_select_with`): an `All` here would name itself.
         GroupSet::All => Vec::new(),
-        GroupSet::Sets(list) => list
-            .iter()
-            .map(|set| set.iter().map(&resolve).collect::<Result<Vec<_>>>())
-            .collect::<Result<Vec<_>>>()?,
+        GroupSet::Exprs(list) => vec![list.iter().map(&resolve).collect::<Result<Vec<_>>>()?],
+        GroupSet::Sets(children) => {
+            let mut sets = Vec::new();
+            for child in children {
+                sets.extend(group_set_indices(master, child)?);
+            }
+            sets
+        }
         GroupSet::Rollup(exprs) => {
             let mut idx = exprs.iter().map(&resolve).collect::<Result<Vec<_>>>()?;
             let mut out = Vec::with_capacity(idx.len() + 1);
@@ -5952,27 +6004,31 @@ fn group_set_indices(master: &[Expr], item: &GroupSet) -> Result<Vec<Vec<usize>>
             out
         }
         GroupSet::Cube(exprs) => {
-            // A cube over n expressions is 2^n aggregates; refuse the sizes
-            // whose plan could never run rather than allocating it.
-            if exprs.len() > 12 {
-                return Err(PinkDbError::Execution(
-                    "CUBE over more than 12 expressions is not supported".to_string(),
-                ));
-            }
             let idx = exprs.iter().map(&resolve).collect::<Result<Vec<_>>>()?;
-            let mut out = Vec::with_capacity(1 << idx.len());
-            for mask in (0..(1u32 << idx.len())).rev() {
+            let total = 1usize.checked_shl(idx.len() as u32).unwrap_or(usize::MAX);
+            check_grouping_set_count(total)?;
+            let mut out = Vec::with_capacity(total);
+            for mask in (0..total).rev() {
                 out.push(
                     idx.iter()
                         .enumerate()
-                        .filter(|(i, _): &(usize, &usize)| mask & (1 << (idx.len() - 1 - i)) != 0)
+                        .filter(|(i, _): &(usize, &usize)| {
+                            mask & (1usize << (idx.len() - 1 - i)) != 0
+                        })
                         .map(|(_, &k)| k)
                         .collect(),
                 );
             }
             out
         }
-    })
+    };
+    // A key listed twice in one set is one key, and group keys are encoded in
+    // master order regardless of how the set was written.
+    for set in &mut out {
+        set.sort_unstable();
+        set.dedup();
+    }
+    Ok(out)
 }
 
 /// Expand a `GROUP BY` list into the ordered key-index sets the aggregate
@@ -5983,6 +6039,13 @@ fn expand_grouping_sets(
     plain: usize,
     items: &[GroupSet],
 ) -> Result<Vec<Vec<usize>>> {
+    // Check the final product first: a 3x CUBE(15) must fail before the
+    // 32,768-set children are allocated.
+    let mut total = 1usize;
+    for item in items {
+        total = total.saturating_mul(group_set_count(item)?);
+        check_grouping_set_count(total)?;
+    }
     let mut sets: Vec<Vec<usize>> = vec![(0..plain).collect()];
     for item in items {
         let own = group_set_indices(master, item)?;
@@ -5991,6 +6054,8 @@ fn expand_grouping_sets(
             for extra in &own {
                 let mut set = base.clone();
                 set.extend(extra.iter().copied());
+                set.sort_unstable();
+                set.dedup();
                 next.push(set);
             }
         }
@@ -6015,15 +6080,6 @@ fn sync_grouping_keys(keys: &mut Vec<BoundExpr>, binder: &Binder) {
     }
 }
 
-/// A typed NULL: an omitted grouping-set key still needs the key column's type
-/// so every branch of the union has one output schema.
-fn typed_null(dtype: DataType) -> BoundExpr {
-    BoundExpr::Cast {
-        expr: Box::new(BoundExpr::Literal(Value::Null)),
-        dtype,
-    }
-}
-
 /// Big-endian mask for one `GROUPING(...)` argument list in one set: 1 for
 /// every argument the set omits, the first argument being the high bit.
 /// A zero-argument `GROUPING()` is 1 for the grand total only.
@@ -6040,11 +6096,10 @@ fn grouping_mask(args: &[usize], set: &[usize]) -> i64 {
     mask
 }
 
-/// The aggregate stage for GROUPING SETS / ROLLUP / CUBE: one plain
-/// [`LogicalPlan::Aggregate`] per set, unioned with `UNION ALL`. Omitted keys
-/// become typed NULLs and each mask slot a constant, so every branch emits the
-/// same `[keys..., aggs...]` columns and the clauses above see one ordinary
-/// aggregate output.
+/// The aggregate stage for GROUPING SETS / ROLLUP / CUBE: one aggregate over
+/// the input, with the expanded sets attached. Omitted keys become NULLs and
+/// each mask slot a constant in the executor, so the clauses above see one
+/// ordinary `[keys..., aggs...]` output.
 fn grouping_set_plan(
     input: LogicalPlan,
     keys: &[BoundExpr],
@@ -6052,40 +6107,26 @@ fn grouping_set_plan(
     sets: &[Vec<usize>],
     group_masks: &[Vec<usize>],
 ) -> LogicalPlan {
-    let real = keys.len() - group_masks.len();
-    // Branch output is `[keys..., aggs...]`: the union needs every column's
-    // type, not just the keys'.
-    let mut types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
-    types.extend(aggs.iter().map(|a| a.dtype));
-    let mut out: Option<LogicalPlan> = None;
-    for set in sets {
-        let mut branch_keys = Vec::with_capacity(keys.len());
-        for (i, k) in keys.iter().enumerate().take(real) {
-            branch_keys.push(if set.contains(&i) {
-                k.clone()
-            } else {
-                typed_null(k.dtype())
-            });
-        }
-        for args in group_masks {
-            branch_keys.push(BoundExpr::Literal(Value::Bigint(grouping_mask(args, set))));
-        }
-        let agg = LogicalPlan::Aggregate {
-            input: Box::new(input.clone()),
-            keys: branch_keys,
-            aggs: aggs.to_vec(),
-        };
-        out = Some(match out {
-            None => agg,
-            Some(left) => LogicalPlan::SetOp {
-                op: SetOp::UnionAll,
-                left: Box::new(left),
-                right: Box::new(agg),
-                types: types.clone(),
-            },
-        });
+    let key_count = keys.len() - group_masks.len();
+    let masks = sets
+        .iter()
+        .map(|set| {
+            group_masks
+                .iter()
+                .map(|args| grouping_mask(args, set))
+                .collect()
+        })
+        .collect();
+    LogicalPlan::Aggregate {
+        input: Box::new(input),
+        keys: keys.to_vec(),
+        aggs: aggs.to_vec(),
+        grouping_sets: Some(crate::plan::GroupingSetPlan {
+            key_count,
+            sets: sets.to_vec(),
+            masks,
+        }),
     }
-    out.expect("GROUP BY expands to at least one set")
 }
 
 fn validate_grouped(expr: &BoundExpr, keys: &[BoundExpr]) -> Result<()> {
@@ -6551,7 +6592,9 @@ fn plan_reads_enclosing_row(plan: &LogicalPlan) -> bool {
                 || plan_reads_enclosing_row(right)
                 || on.as_ref().is_some_and(expr)
         }
-        LogicalPlan::Aggregate { input, keys, aggs } => {
+        LogicalPlan::Aggregate {
+            input, keys, aggs, ..
+        } => {
             plan_reads_enclosing_row(input)
                 || keys.iter().any(&expr)
                 || aggs
@@ -6809,8 +6852,16 @@ fn lift_correlation(plan: &LogicalPlan) -> Result<Option<Lifted>> {
         // Grouping emits one row per group: a conjunct over plain group keys
         // describes that row, anything else (an aggregate's value, an
         // ungrouped aggregate's single row) does not.
-        LogicalPlan::Aggregate { input, keys, aggs } => {
-            if keys.is_empty()
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+            grouping_sets,
+        } => {
+            // A set's omitted key is NULL above the aggregate, so a predicate
+            // over an input row does not describe that row here.
+            if grouping_sets.is_some()
+                || keys.is_empty()
                 || keys.iter().any(reads_enclosing_row)
                 || aggs
                     .iter()
@@ -6843,6 +6894,7 @@ fn lift_correlation(plan: &LogicalPlan) -> Result<Option<Lifted>> {
                     input: Box::new(inner.base),
                     keys: keys.clone(),
                     aggs: aggs.clone(),
+                    grouping_sets: None,
                 },
                 conjuncts,
             }))
@@ -7101,6 +7153,7 @@ impl Binder<'_> {
             input: Box::new(dep.plan),
             keys: keys.clone(),
             aggs,
+            grouping_sets: None,
         };
         // The aggregate emits its group keys first, so the right keys are the
         // leading columns of its output.
@@ -7324,6 +7377,7 @@ impl Binder<'_> {
                         keys,
                         aggs: body_aggs,
                         input,
+                        ..
                     } if keys.is_empty() => {
                         output = Some(exprs[0].clone());
                         counts = body_aggs
@@ -16024,17 +16078,13 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     // must exist before the select list binds.
     let mut master_ast: Vec<Expr> = sel.group_by.clone();
     if !sel.group_sets.is_empty() {
+        let mut names = Vec::new();
         for item in &sel.group_sets {
-            let exprs: Vec<&Expr> = match item {
-                GroupSet::Rollup(list) | GroupSet::Cube(list) => list.iter().collect(),
-                GroupSet::Sets(sets) => sets.iter().flatten().collect(),
-                // `GROUP BY ALL` picks the select list, which is not bound yet.
-                GroupSet::All => continue,
-            };
-            for e in exprs {
-                if !master_ast.contains(e) {
-                    master_ast.push(e.clone());
-                }
+            collect_group_set_exprs(item, &mut names);
+        }
+        for e in names {
+            if !master_ast.contains(e) {
+                master_ast.push(e.clone());
             }
         }
         binder.grouping_keys = Some(master_ast.clone());
@@ -16422,6 +16472,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                 input: Box::new(plan),
                 keys,
                 aggs,
+                grouping_sets: None,
             },
         };
         if let Some(h) = having {
@@ -17105,6 +17156,69 @@ mod tests {
         assert!(bind_one(&db, "SELECT region, SUM(total) FROM sales GROUP BY region;").is_ok());
         assert!(bind_one(&db, "SELECT id, SUM(total) FROM sales GROUP BY region;").is_err());
         assert!(bind_one(&db, "SELECT SUM(total) FROM sales;").is_ok());
+    }
+
+    fn grouping_set_count(plan: &LogicalPlan) -> Option<usize> {
+        match plan {
+            LogicalPlan::Aggregate { grouping_sets, .. } => {
+                grouping_sets.as_ref().map(|s| s.sets.len())
+            }
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Sort { input, .. } => grouping_set_count(input),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn many_grouping_sets_plan_on_a_small_stack() {
+        // Expansion used to recurse once per set; 4096 sets overflowed the
+        // runner's 2 MiB worker stack. Planning here runs on the same size.
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let mut db = PinkDb::new();
+                db.create_table(
+                    "cube12",
+                    (0..12)
+                        .map(|i| (format!("c{i}"), DataType::Integer))
+                        .collect(),
+                )
+                .unwrap();
+                let plan = bind_one(
+                    &db,
+                    "SELECT COUNT(*) FROM cube12 GROUP BY CUBE \
+                     (c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11);",
+                )
+                .unwrap();
+                assert_eq!(grouping_set_count(&plan), Some(4096));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn grouping_set_limit_is_duckdb_message() {
+        let mut db = PinkDb::new();
+        db.create_table(
+            "cube12",
+            (0..12)
+                .map(|i| (format!("c{i}"), DataType::Integer))
+                .collect(),
+        )
+        .unwrap();
+        // 2^16 sets, one past the cap.
+        let err = bind_one(
+            &db,
+            "SELECT COUNT(*) FROM cube12 GROUP BY CUBE \
+             (c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c0+1,c1+1,c2+1,c3+1);",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Maximum grouping set count of 65535 exceeded"
+        );
     }
 
     #[test]
