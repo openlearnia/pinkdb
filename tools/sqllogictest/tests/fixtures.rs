@@ -11,6 +11,10 @@ fn fixtures() -> PathBuf {
 }
 
 fn run(directory: &Path, filter: &str, out: &Path) -> Report {
+    run_with(directory, filter, out, &[])
+}
+
+fn run_with(directory: &Path, filter: &str, out: &Path, extra: &[&str]) -> Report {
     let output = Command::new(env!("CARGO_BIN_EXE_pinkdb-slt"))
         .arg("--corpus")
         .arg(directory)
@@ -22,6 +26,7 @@ fn run(directory: &Path, filter: &str, out: &Path) -> Report {
         .arg("300")
         .arg("--out")
         .arg(out)
+        .args(extra)
         .env("PINKDB_SLT_TEST_HOOK", "1")
         .output()
         .expect("run pinkdb-slt");
@@ -52,6 +57,9 @@ fn fixtures_cover_every_status() {
     let config = Config {
         statement_timeout: std::time::Duration::from_secs(10),
         file_timeout: std::time::Duration::from_millis(300),
+        // What `main` gives the in-process worker: the file deadline plus the
+        // grace period before the worker is abandoned.
+        hard_timeout: std::time::Duration::from_millis(2_300),
         temp_root: temp.clone(),
         duckdb_root: directory
             .parent()
@@ -123,7 +131,7 @@ fn cli_report_and_baseline_check() {
     let temp = std::env::temp_dir().join(format!("pinkdb-slt-cli-{}", std::process::id()));
     let all = temp.join("all.json");
     let report = run(&directory, "*.test", &all);
-    assert_eq!(report.files.len(), 6);
+    assert_eq!(report.files.len(), 9);
     assert_eq!(file(&report, "pass.test").status, FileStatus::Pass);
 
     // Flip one file's status to exercise both directions of `check` with an
@@ -167,6 +175,57 @@ fn cli_report_and_baseline_check() {
     let improved = check(&all, &failed_baseline);
     assert_eq!(improved.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&improved.stdout).contains("newly passing: pass.test"));
+
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+/// A stack overflow and an abort end their child process, not the run: the
+/// file is a `crash` with the child's status and stderr, its neighbours are
+/// unaffected, and `--in-process` still runs a file here.
+#[test]
+fn isolated_child_crashes_are_contained() {
+    let directory = fixtures();
+    let temp = std::env::temp_dir().join(format!("pinkdb-slt-isolated-{}", std::process::id()));
+    let all = temp.join("all.json");
+    let report = run(&directory, "*.test", &all);
+
+    let overflow = file(&report, "stack_overflow.test");
+    assert_eq!(overflow.status, FileStatus::Crash);
+    let reason = overflow.reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("stack overflow"),
+        "the child's stderr tail is missing from the reason: {reason}"
+    );
+
+    let abort = file(&report, "abort.test");
+    assert_eq!(abort.status, FileStatus::Crash);
+    let reason = abort.reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("SIGABRT"),
+        "the child's exit status is missing from the reason: {reason}"
+    );
+
+    // The hook sleeps for an hour, so only the parent's kill can end this file.
+    let hang = file(&report, "hang.test");
+    assert_eq!(hang.status, FileStatus::Timeout);
+    assert!(
+        hang.notes.iter().any(|note| note.contains("killed")),
+        "the timeout does not say the child was killed: {:?}",
+        hang.notes
+    );
+    assert!(
+        (300..5_000).contains(&hang.duration_ms),
+        "hang.test ended after {} ms, not after the file deadline",
+        hang.duration_ms
+    );
+
+    assert_eq!(file(&report, "pass.test").status, FileStatus::Pass);
+    assert_eq!(file(&report, "fail.test").status, FileStatus::Fail);
+
+    let in_process = temp.join("in-process.json");
+    let report = run_with(&directory, "pass.test", &in_process, &["--in-process"]);
+    assert_eq!(report.files.len(), 1);
+    assert_eq!(file(&report, "pass.test").status, FileStatus::Pass);
 
     let _ = std::fs::remove_dir_all(&temp);
 }
