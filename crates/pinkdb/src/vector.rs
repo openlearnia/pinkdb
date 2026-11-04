@@ -787,6 +787,26 @@ impl Vector {
         Ok(())
     }
 
+    pub(crate) fn push_date(&mut self, days: i32) -> Result<()> {
+        self.check_room()?;
+        match &mut self.data {
+            VectorData::Date32(v) => v.push(days),
+            data => return Err(typed_push_error("a date", data.dtype())),
+        }
+        self.finish_typed_push();
+        Ok(())
+    }
+
+    pub(crate) fn push_timestamp(&mut self, micros: i64) -> Result<()> {
+        self.check_room()?;
+        match &mut self.data {
+            VectorData::TimestampMicros(v) => v.push(micros),
+            data => return Err(typed_push_error("a timestamp", data.dtype())),
+        }
+        self.finish_typed_push();
+        Ok(())
+    }
+
     pub(crate) fn push_float64(&mut self, x: f64) -> Result<()> {
         self.check_room()?;
         match &mut self.data {

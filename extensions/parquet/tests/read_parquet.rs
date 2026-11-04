@@ -1119,3 +1119,101 @@ fn the_reader_agrees_with_duckdb_on_the_committed_people_fixture() {
         ]
     );
 }
+
+/// A `CREATE TABLE AS` load folds each chunk's statistics while it is decoded;
+/// an `INSERT ... SELECT` of the same file folds them after the fact. Both must
+/// leave exactly the same column statistics.
+#[test]
+fn ctas_load_statistics_match_the_append_path() {
+    let dir = temp_dir("load_stats");
+    let path = dir.join("t.parquet");
+    let n = 5000i64;
+    let columns = vec![
+        Column::Int32(
+            "i",
+            (0..n)
+                .map(|x| if x % 7 == 0 { None } else { Some(x as i32) })
+                .collect(),
+        ),
+        Column::Int64(
+            "b",
+            (0..n)
+                .map(|x| if x % 11 == 0 { None } else { Some(-x * 3) })
+                .collect(),
+        ),
+        Column::Double(
+            "x",
+            (0..n)
+                .map(|x| {
+                    if x % 17 == 0 {
+                        None
+                    } else {
+                        Some(x as f64 / 4.0)
+                    }
+                })
+                .collect(),
+        ),
+        Column::Str(
+            "s",
+            (0..n)
+                .map(|x| {
+                    if x % 5 == 0 {
+                        None
+                    } else {
+                        Some(if x % 2 == 0 { "even" } else { "odd" })
+                    }
+                })
+                .collect(),
+        ),
+        Column::Date("dt", (0..n).map(|x| Some(19_000 + x as i32)).collect()),
+        Column::TimestampMicros("ts", (0..n).map(|x| Some(x * 1_000_000)).collect()),
+        Column::Int32Decimal {
+            name: "d",
+            precision: 9,
+            scale: 2,
+            values: (0..n)
+                .map(|x| {
+                    if x % 13 == 0 {
+                        None
+                    } else {
+                        Some(x as i32 * 100)
+                    }
+                })
+                .collect(),
+        },
+    ];
+    write_file(
+        path.to_str().unwrap(),
+        &columns,
+        500,
+        Compression::SNAPPY,
+        vec![],
+    );
+    let mut db = store();
+    db.execute(&format!(
+        "CREATE TABLE fused AS SELECT * FROM read_parquet('{}')",
+        path.display()
+    ))
+    .expect("CTAS");
+    db.execute(
+        "CREATE TABLE folded (i INTEGER, b BIGINT, x DOUBLE, s VARCHAR, dt DATE, \
+         ts TIMESTAMP, d DECIMAL(9,2))",
+    )
+    .expect("create");
+    db.execute(&format!(
+        "INSERT INTO folded SELECT * FROM read_parquet('{}')",
+        path.display()
+    ))
+    .expect("insert");
+    let mut fused = select(&mut db, "SELECT * FROM pinkdb_column_stats('fused')");
+    let mut folded = select(&mut db, "SELECT * FROM pinkdb_column_stats('folded')");
+    // The table name (column 1) is the only expected difference.
+    for rows in [&mut fused, &mut folded] {
+        for row in rows.iter_mut() {
+            row[1] = Value::Null;
+        }
+    }
+    assert_eq!(fused.len(), 7);
+    assert_eq!(fused, folded, "a CTAS load kept different statistics");
+    let _ = std::fs::remove_dir_all(&dir);
+}

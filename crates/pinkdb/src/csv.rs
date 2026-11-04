@@ -1289,7 +1289,72 @@ fn push_field(col: &mut Vector, field: &str, dtype: DataType) -> Result<()> {
     if c.is_empty() {
         return col.push_null();
     }
-    col.push_valid(field_value(c, dtype)?)
+    push_cell(col, c, dtype)
+}
+
+/// Parse one non-NULL cell straight into its column with the typed push
+/// helpers, sharing `field_value`'s parsers and messages (no `Value` per
+/// field). ARRAY and VARIANT keep the value path: they allocate anyway.
+fn push_cell(col: &mut Vector, text: &str, dtype: DataType) -> Result<()> {
+    let text = match dtype {
+        DataType::Varchar => text,
+        _ => trim_cell(text),
+    };
+    match dtype {
+        DataType::Boolean => {
+            if text.eq_ignore_ascii_case("true") {
+                col.push_bool(true)
+            } else if text.eq_ignore_ascii_case("false") {
+                col.push_bool(false)
+            } else {
+                Err(PinkDbError::Type(format!(
+                    "cannot parse \"{text}\" as BOOLEAN"
+                )))
+            }
+        }
+        DataType::Uuid => col.push_uuid(
+            crate::uuid::parse(text)
+                .ok_or_else(|| PinkDbError::Type(format!("cannot parse \"{text}\" as UUID")))?,
+        ),
+        DataType::Decimal { precision, scale } => {
+            let v = crate::types::parse_decimal_str(text, precision, scale)
+                .map_err(PinkDbError::Type)?;
+            col.push_decimal(v, scale)
+        }
+        DataType::Interval => match crate::types::parse_interval(text) {
+            Some(iv) => col.push_interval(iv),
+            None => Err(PinkDbError::Type(format!(
+                "cannot parse \"{text}\" as INTERVAL"
+            ))),
+        },
+        DataType::Integer => col.push_int32(
+            text.parse::<i32>()
+                .map_err(|_| PinkDbError::Type(format!("cannot parse \"{text}\" as INTEGER")))?,
+        ),
+        DataType::Bigint => col.push_int64(
+            text.parse::<i64>()
+                .map_err(|_| PinkDbError::Type(format!("cannot parse \"{text}\" as BIGINT")))?,
+        ),
+        DataType::Hugeint | DataType::Uhugeint => Err(PinkDbError::Execution(format!(
+            "{} is not yet supported in CSV",
+            dtype.name()
+        ))),
+        DataType::Double => col.push_float64(
+            text.parse::<f64>()
+                .map_err(|_| PinkDbError::Type(format!("cannot parse \"{text}\" as DOUBLE")))?,
+        ),
+        DataType::Varchar => col.push_str(text),
+        DataType::Date => col.push_date(
+            parse_date(text)
+                .ok_or_else(|| PinkDbError::Type(format!("cannot parse \"{text}\" as DATE")))?,
+        ),
+        DataType::Timestamp => {
+            col.push_timestamp(parse_timestamp(text).ok_or_else(|| {
+                PinkDbError::Type(format!("cannot parse \"{text}\" as TIMESTAMP"))
+            })?)
+        }
+        DataType::Array { .. } | DataType::Variant => col.push_valid(field_value(text, dtype)?),
+    }
 }
 
 /// Default table name = file stem (e.g. `sales.csv` → `sales`; a URL's
@@ -1908,7 +1973,7 @@ enum CleanError {
 /// reader's dialect). Missing fields read as NULL; extra fields error.
 fn push_line(
     chunk: &mut [Vector],
-    line: &[u8],
+    line: &str,
     types: &[DataType],
     offset: usize,
 ) -> std::result::Result<(), BatchError> {
@@ -1918,21 +1983,15 @@ fn push_line(
     let mut fields = Fields::new(line);
     let mut seen = 0usize;
     for (col, dtype) in chunk.iter_mut().zip(types) {
-        let (raw, quoted) = fields.next().unwrap_or((&[], false));
+        let (s, quoted) = fields.next().unwrap_or(("", false));
         seen += 1;
-        let s = std::str::from_utf8(raw).map_err(|_| {
-            BatchError::Db(PinkDbError::Execution(
-                "CSV contains invalid UTF-8".to_string(),
-            ))
-        })?;
         if quoted {
             // A quoted empty is NULL here because `fast_eligible` keeps
             // `allow_quoted_nulls := false` off the batch path.
             if s.is_empty() {
                 col.push_null().map_err(BatchError::Db)?;
             } else {
-                col.push_valid(field_value(s, *dtype).map_err(BatchError::Db)?)
-                    .map_err(BatchError::Db)?;
+                push_cell(col, s, *dtype).map_err(BatchError::Db)?;
             }
         } else {
             push_field(col, s, *dtype).map_err(BatchError::Db)?;
@@ -1951,58 +2010,65 @@ fn push_line(
 /// One record's fields, RFC 4180 quoting included: a quoted field keeps its
 /// bytes verbatim (`""` becomes `"`, nothing is trimmed), an unquoted field
 /// is `push_field`'s business. Only files [`record_ends`] accepted come here,
-/// so the quoting scan cannot fail.
+/// so the quoting scan cannot fail, and [`parse_batch`] validated the batch's
+/// UTF-8 once.
 struct Fields<'a> {
-    line: &'a [u8],
+    line: &'a str,
     /// One past the delimiter that ended the field last returned;
     /// `line.len() + 1` once the last field is out.
     pos: usize,
     /// Holds a quoted field that needed `""` unescaping.
-    unescaped: Vec<u8>,
+    unescaped: String,
 }
 
 impl<'a> Fields<'a> {
-    fn new(line: &'a [u8]) -> Self {
+    fn new(line: &'a str) -> Self {
         Self {
             line,
             pos: 0,
-            unescaped: Vec::new(),
+            unescaped: String::new(),
         }
     }
 
     /// The next field, and whether it was quoted.
-    fn next(&mut self) -> Option<(&[u8], bool)> {
+    fn next(&mut self) -> Option<(&str, bool)> {
         if self.pos > self.line.len() {
             return None;
         }
-        if self.line.get(self.pos) == Some(&b'"') {
-            // Find the closing quote; a doubled quote is content.
-            let mut i = self.pos + 1;
+        let rest = self.line.get(self.pos..)?;
+        if rest.starts_with('"') {
+            // Find the closing quote; a doubled quote is content. ASCII
+            // boundaries, so every slice below is valid UTF-8.
+            let bytes = rest.as_bytes();
+            let mut i = 1;
             loop {
-                let q = i + self.line[i..].iter().position(|&b| b == b'"')?;
-                if q + 1 < self.line.len() && self.line[q + 1] == b'"' {
+                let q = i + bytes[i..].iter().position(|&b| b == b'"')?;
+                if q + 1 < bytes.len() && bytes[q + 1] == b'"' {
                     i = q + 2;
                     continue;
                 }
-                let content = &self.line[self.pos + 1..q];
-                self.unescaped.clear();
-                let mut at = 0;
-                while let Some(off) = content[at..].iter().position(|&b| b == b'"') {
-                    self.unescaped.extend_from_slice(&content[at..=at + off]);
-                    at += off + 2; // the second quote of the pair
-                }
-                self.unescaped.extend_from_slice(&content[at..]);
-                self.pos = q + 1;
-                if self.line.get(self.pos) == Some(&b',') || self.pos == self.line.len() {
+                let content = &rest[1..q];
+                self.pos += q + 1;
+                if self.line.as_bytes().get(self.pos) == Some(&b',') || self.pos == self.line.len()
+                {
                     self.pos += 1;
                 }
+                if !content.contains("\"\"") {
+                    return Some((content, true));
+                }
+                self.unescaped.clear();
+                let mut at = 0;
+                while let Some(off) = content[at..].find("\"\"") {
+                    self.unescaped.push_str(&content[at..at + off]);
+                    self.unescaped.push('"');
+                    at += off + 2;
+                }
+                self.unescaped.push_str(&content[at..]);
                 return Some((&self.unescaped, true));
             }
         }
-        let rest = self.line.get(self.pos..)?;
         let end = rest
-            .iter()
-            .position(|&b| b == b',')
+            .find(',')
             .map(|off| self.pos + off)
             .unwrap_or(self.line.len());
         let field = &self.line[self.pos..end];
@@ -2018,22 +2084,28 @@ fn parse_batch(
     end: usize,
     types: &[DataType],
 ) -> std::result::Result<Vec<Vector>, BatchError> {
+    // One UTF-8 check per batch (and per worker), not per field.
+    let text = std::str::from_utf8(&data[start..end]).map_err(|_| {
+        BatchError::Db(PinkDbError::Execution(
+            "CSV contains invalid UTF-8".to_string(),
+        ))
+    })?;
     let mut chunk = new_chunk(types);
-    let mut line_start = start;
+    let mut line_start = 0usize;
     let mut in_quotes = false;
-    for i in start..end {
-        match data[i] {
+    for (i, &b) in text.as_bytes().iter().enumerate() {
+        match b {
             b'"' => in_quotes = !in_quotes,
             b'\n' if !in_quotes => {
-                push_line(&mut chunk, &data[line_start..i], types, line_start)?;
+                push_line(&mut chunk, &text[line_start..i], types, start + line_start)?;
                 line_start = i + 1;
             }
             _ => {}
         }
     }
-    if line_start < end {
+    if line_start < text.len() {
         // Final line without a trailing newline (last batch of the file).
-        push_line(&mut chunk, &data[line_start..end], types, line_start)?;
+        push_line(&mut chunk, &text[line_start..], types, start + line_start)?;
     }
     Ok(chunk)
 }
@@ -4032,5 +4104,83 @@ mod tests {
         .unwrap();
         assert_eq!(rows, 0);
         assert!(flatten(streamed).is_empty());
+    }
+
+    /// The batch path's typed builders must produce exactly what the per-row
+    /// `Value` path (`field_value`) produces, for every type they cover.
+    #[test]
+    fn typed_builders_agree_with_field_value() {
+        let cases = [
+            ("true", DataType::Boolean),
+            (" 12 ", DataType::Integer),
+            ("-9000000000", DataType::Bigint),
+            ("1.25", DataType::Double),
+            ("2024-02-29", DataType::Date),
+            ("2024-02-29 12:34:56.5", DataType::Timestamp),
+            (
+                "-123.45",
+                DataType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+            ),
+        ];
+        for (text, dtype) in cases {
+            let mut v = Vector::new_empty(dtype);
+            push_field(&mut v, text, dtype).unwrap();
+            assert_eq!(
+                v.get(0),
+                field_value(trim_cell(text), dtype).unwrap(),
+                "{text} as {dtype:?}"
+            );
+            let mut quoted = Vector::new_empty(dtype);
+            push_line(
+                std::slice::from_mut(&mut quoted),
+                &format!("\"{text}\""),
+                &[dtype],
+                0,
+            )
+            .unwrap();
+            assert_eq!(quoted.get(0), v.get(0), "quoted {text}");
+        }
+        // Varchar: unquoted cells trim, quoted cells keep their spaces and
+        // decode `""`, and quoted empty is NULL like the record reader.
+        let mut v = Vector::new_empty(DataType::Varchar);
+        push_field(&mut v, "  abc  ", DataType::Varchar).unwrap();
+        assert_eq!(v.get(0), Value::Varchar("abc".to_string()));
+        let mut q = Vector::new_empty(DataType::Varchar);
+        push_line(
+            std::slice::from_mut(&mut q),
+            "\" a,b\"\"c \"",
+            &[DataType::Varchar],
+            0,
+        )
+        .unwrap();
+        assert_eq!(q.get(0), Value::Varchar(" a,b\"c ".to_string()));
+        let mut n = [
+            Vector::new_empty(DataType::Integer),
+            Vector::new_empty(DataType::Integer),
+        ];
+        push_line(&mut n, ",", &[DataType::Integer; 2], 0).unwrap();
+        assert_eq!(n[0].get(0), Value::Null);
+        assert_eq!(n[1].get(0), Value::Null);
+        let mut n = Vector::new_empty(DataType::Integer);
+        push_line(
+            std::slice::from_mut(&mut n),
+            "\"\"",
+            &[DataType::Integer],
+            0,
+        )
+        .unwrap();
+        assert_eq!(n.get(0), Value::Null);
+    }
+
+    #[test]
+    fn batch_utf8_is_checked_once_with_the_record_readers_error() {
+        let err = parse_batch(b"a\n\xff\n", 0, 4, &[DataType::Varchar]).unwrap_err();
+        let BatchError::Db(err) = err else {
+            panic!("wrong batch error: {err:?}")
+        };
+        assert_eq!(err.to_string(), "CSV contains invalid UTF-8");
     }
 }

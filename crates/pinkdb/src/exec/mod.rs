@@ -35,6 +35,7 @@ use crate::plan::{
 };
 use crate::sql::ast::{BinaryOp, JoinKind, SortSpec};
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr, common_numeric};
+use crate::stats::ChunkStats;
 use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};
@@ -1696,8 +1697,19 @@ pub(crate) fn run_plain(
             }
             db.create_table_in(&target, name, schema)?;
             let t = db.table_mut_in(&target, name)?;
-            for batch in &staged {
-                t.append_shared_chunk(batch)?;
+            // Fold statistics on the pool, then hand them to the table: the
+            // append path would otherwise rescan every column it just
+            // received. Statistics describe one batch, so at most 64 batches
+            // (≈4 MB of sketches for 16 columns) are in flight.
+            const STATS_GROUP: usize = 64;
+            for group in staged.chunks(STATS_GROUP) {
+                let stats: Vec<ChunkStats> = group
+                    .par_iter()
+                    .map(|batch| ChunkStats::of(batch))
+                    .collect();
+                for (batch, stats) in group.iter().zip(&stats) {
+                    t.append_shared_chunk_with_stats(batch, Some(stats))?;
+                }
             }
             Ok(QueryResult::Created)
         }

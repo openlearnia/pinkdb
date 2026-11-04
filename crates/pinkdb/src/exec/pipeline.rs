@@ -488,7 +488,7 @@ pub(crate) fn collect(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Output>> {
     let Some(compiled) = compile(cx, plan)? else {
         return Ok(None);
     };
-    let Some(chunks) = run(cx, &compiled, &CollectSink::default())? else {
+    let Some(chunks) = run(cx, &compiled, &CollectSink::new())? else {
         return Err(PinkDbError::Execution(
             "internal: the pipeline's collect sink declined a chunk".to_string(),
         ));
@@ -503,10 +503,20 @@ pub(crate) fn collect(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Output>> {
 /// The collect sink: the morsels' chunks themselves, in morsel order — what the
 /// materialized path's intermediate result holds, chunk for chunk. The chunks
 /// accumulate, so they are charged to the statement's pool as they arrive
-/// (wave 136a) and released when the sink finishes.
-#[derive(Default)]
+/// (wave 136a) and released when the sink finishes. Each worker charges its own
+/// slot: chunks from the pool's threads never contend on one shared lock.
 struct CollectSink {
-    held: std::sync::Mutex<crate::memory::Reservation>,
+    held: Vec<std::sync::Mutex<crate::memory::Reservation>>,
+}
+
+impl CollectSink {
+    fn new() -> Self {
+        Self {
+            held: (0..rayon::current_num_threads().max(1))
+                .map(|_| std::sync::Mutex::new(crate::memory::Reservation::empty()))
+                .collect(),
+        }
+    }
 }
 
 impl Default for crate::memory::Reservation {
@@ -528,14 +538,15 @@ impl Sink for CollectSink {
             None => chunk.clone(),
             Some(sel) => chunk.take(sel),
         };
-        let mut held = self
-            .held
+        let bytes = chunk_approx_bytes(&out);
+        let slot = rayon::current_thread_index().unwrap_or(0) % self.held.len();
+        let mut held = self.held[slot]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if held.bytes() == 0 {
             *held = cx.budget.memory().empty_reservation();
         }
-        held.grow(chunk_approx_bytes(&out))?;
+        held.grow(bytes)?;
         Ok(Some(out))
     }
 
@@ -1397,4 +1408,37 @@ where
         }
     }
     Ok(Some(partials))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::ExecBudget;
+
+    /// The collect sink must return every chunk exactly once, in source order,
+    /// no matter which worker folded it or which reservation slot it took.
+    #[test]
+    fn collect_sink_keeps_every_chunk_in_order_across_workers() {
+        let db = crate::storage::PinkDb::new();
+        let cx = Cx::with_budget(&db, std::sync::Arc::new(ExecBudget::unbounded()));
+        let chunks: Vec<DataChunk> = (0..4096)
+            .map(|i| {
+                let mut v = crate::vector::Vector::new_empty(crate::types::DataType::Integer);
+                v.push_int32(i).expect("push");
+                DataChunk::new(vec![v]).expect("chunk")
+            })
+            .collect();
+        let steps = steps(&cx, &[], &[]).expect("steps");
+        let got = run_chunks(&cx, &steps, &CollectSink::new(), &chunks)
+            .expect("run")
+            .expect("sink collected");
+        assert_eq!(got.len(), chunks.len());
+        for (i, chunk) in got.iter().enumerate() {
+            assert_eq!(chunk.num_rows(), 1);
+            assert_eq!(
+                chunk.columns[0].get(0),
+                crate::types::Value::Integer(i as i32)
+            );
+        }
+    }
 }
