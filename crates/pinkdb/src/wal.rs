@@ -8182,6 +8182,90 @@ mod tests {
         cleanup(&p);
     }
 
+    /// Load `src`'s rows as a new table `name` the way a streamed load does:
+    /// a table off the catalog, its row groups written ahead of the
+    /// checkpoint, then its commit record.
+    fn stream_copy(db: &PinkDb, p: &Path, src: &str, name: &str) -> crate::persist::StreamedTable {
+        let ns = crate::storage::SchemaPath::new("main", "main");
+        let mut t = db.table_in(&ns, src).unwrap().clone();
+        t.name = name.to_string();
+        let per = crate::persist::CHUNKS_PER_ROW_GROUP;
+        let n = t.num_chunks();
+        for first in (0..n).step_by(per) {
+            db.write_pending_group_of(p, &ns, name, &t, first, (first + per).min(n))
+                .unwrap();
+        }
+        db.sync_pending_load().unwrap();
+        let record = db.streamed_table_record(&ns, name, false, &t).unwrap();
+        crate::persist::StreamedTable::decode(&record.encode()).unwrap()
+    }
+
+    /// S0: another handle (a replay) attaches a streamed table from its
+    /// commit record alone, with identical results, and its own checkpoint
+    /// references the groups where the load wrote them.
+    #[test]
+    fn a_streamed_table_record_attaches_on_another_handle() {
+        let p = tmp_ckpt("attach_record");
+        let mut a = durable(&p);
+        fill(&mut a, "src", 300_000);
+        a.checkpoint().unwrap();
+        let record = stream_copy(&a, &p, "src", "t");
+        assert_eq!(record.table(), ("main", "main", "t"));
+        let mut b = durable(&p);
+        b.attach_streamed_table(&p, &record).unwrap();
+        assert_eq!(ints(&mut b, "SELECT sum(a) FROM t;"), vec![44_999_850_000]);
+        assert_eq!(
+            strings(&mut b, "SELECT v FROM t WHERE a = 123456;"),
+            vec![format!("v{}", 123_456 % 977)]
+        );
+        assert_eq!(crate::persist::pending_load_state(&b), Some(false));
+        drop(a);
+        b.checkpoint().unwrap();
+        assert_eq!(crate::persist::pending_load_state(&b), None);
+        drop(b);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM t;"), vec![300_000]);
+        assert_eq!(
+            ints(&mut back, "SELECT sum(a) FROM src;"),
+            vec![44_999_850_000]
+        );
+        drop(back);
+        cleanup(&p);
+    }
+
+    /// S0: a commit record over damaged bytes is refused with the table and
+    /// the range named, never attached as empty or wrong data.
+    #[test]
+    fn a_streamed_table_record_over_damaged_bytes_is_refused() {
+        let p = tmp_ckpt("attach_damaged");
+        let mut a = durable(&p);
+        fill(&mut a, "src", 150_000);
+        a.checkpoint().unwrap();
+        let record = stream_copy(&a, &p, "src", "t");
+        // Flip one byte inside the last written row group.
+        // The copy's groups are the last bytes of the file.
+        let offset = std::fs::metadata(&*p).unwrap().len() - 1000;
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(&*p).unwrap();
+            let mut byte = [0u8; 1];
+            let r = std::fs::File::open(&*p).unwrap();
+            r.read_exact_at(&mut byte, offset).unwrap();
+            byte[0] ^= 0xFF;
+            f.write_all_at(&byte, offset).unwrap();
+        }
+        let mut b = durable(&p);
+        let err = b
+            .attach_streamed_table(&p, &record)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"t\"") && err.contains("checksum"), "{err}");
+        assert!(b.execute("SELECT * FROM t;").is_err(), "nothing attached");
+        drop(b);
+        drop(a);
+        cleanup(&p);
+    }
+
     /// The image witness across two handles (two leases, as two processes):
     /// a foreign in-place checkpoint changes it, a `.save` replacing the file
     /// changes it, and a streaming load's appends past the logical end do
