@@ -36,6 +36,11 @@ repo = [
 [dependencies]
 peg = "0.8"
 rayon = "1.12.0"
+# Dictionary building hashes every string of every chunk: SipHash was 4.6k
+# profile samples of an ingest checkpoint. Fixed-seed (dictionary order is
+# first-occurrence, so the hasher never decides bytes) and already in the
+# lockfile through hashbrown.
+foldhash = "0.2"
 # The second compression stage of a `.pink` chunk frame (wave 102): the
 # pure-Rust LZ4 block format. No C code, so a default build stays free of C
 # dependencies (the measurement that picked it over the hand-rolled LZ77 is
