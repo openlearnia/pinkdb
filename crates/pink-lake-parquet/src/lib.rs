@@ -116,6 +116,10 @@ impl pink_lake::format::FileMorsels for ParquetMorsels {
         self.plan.decode(index, sink)
     }
 
+    fn stats(&self, index: usize, column: usize) -> Option<(pinkdb::ColumnStats, u64)> {
+        self.plan.stats(index, column)
+    }
+
     fn counters(&self) -> pink_lake::format::ScanCounters {
         let counters = self.plan.counters();
         pink_lake::format::ScanCounters {

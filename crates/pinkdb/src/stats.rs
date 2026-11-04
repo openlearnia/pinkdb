@@ -1308,6 +1308,27 @@ impl TopNThreshold {
         }
     }
 
+    /// [`may_qualify`](Self::may_qualify) over a source's morsel statistics
+    /// (see `MorselSource::morsel_stats`). An unknown NULL count keeps the
+    /// morsel; a DOUBLE column always does, since file bounds leave out NaN.
+    pub(crate) fn may_qualify_stats(
+        &self,
+        stats: &crate::attached::ColumnStats,
+        rows: u64,
+        float: bool,
+    ) -> bool {
+        let Some(null_count) = stats.null_count else {
+            return true;
+        };
+        let zone = Zone {
+            null_count,
+            min: stats.min.clone(),
+            max: stats.max.clone(),
+            nan_count: u64::from(float),
+        };
+        self.may_qualify(&zone, rows)
+    }
+
     /// Offer a worker's n-th best key; the tighter cut-off is kept. A NULL
     /// key proves nothing about non-NULL rows and is ignored.
     pub(crate) fn offer(&self, key: &Value) {
