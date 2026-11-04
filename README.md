@@ -2483,7 +2483,7 @@ cargo build --release -p pinkdb-ffi
 make -C crates/pinkdb-ffi hello   # compiles and runs the C example
 ```
 
-- Header: `crates/pinkdb-ffi/include/pinkdb.h` (ABI v1; `pinkdb_abi_version()`).
+- Header: `crates/pinkdb-ffi/include/pinkdb.h` (ABI 1.3; `pinkdb_abi_version()` returns `major << 16 | minor`, and a newer minor only adds calls).
 - Handles (`pinkdb_open` for durable files, `pinkdb_open_memory`) are not
   thread-safe — use one per thread. Errors are thread-local
   (`pinkdb_last_error`), with a stable class in `pinkdb_last_error_class`.

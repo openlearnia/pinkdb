@@ -82,6 +82,7 @@ __all__ = [
     "Result",
     "Statement",
     "abi_version",
+    "abi_version_info",
     "connect",
     "connect_memory",
     "library_path",
@@ -457,8 +458,16 @@ if (_loaded_abi_version >> 16 != _ABI_VERSION >> 16
 
 
 def abi_version() -> int:
-    """ABI version reported by the loaded library (currently 1)."""
+    """C ABI version of the loaded library, encoded ``major << 16 | minor``
+    (``65539`` is 1.3). Compare :func:`abi_version_info` instead: a newer
+    minor only adds calls."""
     return int(_LIB.pinkdb_abi_version())
+
+
+def abi_version_info() -> "tuple[int, int]":
+    """The loaded library's C ABI version as ``(major, minor)``."""
+    version = abi_version()
+    return (version >> 16, version & 0xFFFF)
 
 
 def _last_error(lib: ctypes.CDLL) -> str:

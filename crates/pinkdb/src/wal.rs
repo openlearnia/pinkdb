@@ -1453,6 +1453,14 @@ struct SyncState {
     /// Test hook: fail this many syncs without calling the syscall.
     #[cfg(test)]
     fail_next: usize,
+    /// Test hook: the next sync waits until this many committers are blocked
+    /// behind it, so a test sees a group form instead of hoping threads
+    /// overlap.
+    #[cfg(test)]
+    hold_for: usize,
+    /// Committers blocked on `ready` behind an in-flight sync.
+    #[cfg(test)]
+    waiters: usize,
 }
 
 impl SyncGroup {
@@ -1474,6 +1482,10 @@ impl SyncGroup {
                 last_method: WalSyncMethod::Full,
                 #[cfg(test)]
                 fail_next: 0,
+                #[cfg(test)]
+                hold_for: 0,
+                #[cfg(test)]
+                waiters: 0,
             }),
             ready: Condvar::new(),
         }))
@@ -1516,7 +1528,16 @@ impl SyncGroup {
                 return Ok(());
             }
             if st.in_flight {
+                #[cfg(test)]
+                {
+                    st.waiters += 1;
+                    self.ready.notify_all();
+                }
                 st = self.ready.wait(st).unwrap_or_else(|p| p.into_inner());
+                #[cfg(test)]
+                {
+                    st.waiters -= 1;
+                }
                 continue;
             }
             st.in_flight = true;
@@ -1585,6 +1606,23 @@ impl SyncGroup {
                 st.fail_next -= 1;
                 return Err(std::io::Error::other("injected WAL sync failure"));
             }
+            if st.hold_for > 0 {
+                // Bounded, so a regression that keeps committers out of the
+                // group fails the test's assertion instead of hanging it.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while st.waiters < st.hold_for {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    st = self
+                        .ready
+                        .wait_timeout(st, left)
+                        .unwrap_or_else(|p| p.into_inner())
+                        .0;
+                }
+                st.hold_for = 0;
+            }
         }
         sync_file(method, &self.file)
     }
@@ -1598,6 +1636,11 @@ impl SyncGroup {
     #[cfg(test)]
     fn fail_next_syncs(&self, count: usize) {
         self.lock().fail_next = count;
+    }
+
+    #[cfg(test)]
+    fn hold_next_sync_for(&self, waiters: usize) {
+        self.lock().hold_for = waiters;
     }
 }
 
@@ -11684,9 +11727,17 @@ mod tests {
         let db = crate::Database::from_store(store);
         let threads = 16;
         let per = 4;
-        // All threads enter the commit path together, which is the shape
-        // group commit is for: one writer's sync is in flight while the
-        // others append.
+        // The first sync waits until every other committer is blocked behind
+        // it, the shape group commit is for: one writer's sync is in flight
+        // while the others append. They then share one more sync, so the
+        // group forms deterministically however the threads are scheduled.
+        observer
+            .durable_handle()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .sync
+            .hold_next_sync_for(threads - 1);
         let start = std::sync::Arc::new(Barrier::new(threads));
         let mut joined = Vec::new();
         for t in 0..threads {
