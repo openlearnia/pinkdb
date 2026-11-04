@@ -1238,6 +1238,24 @@ fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
             name: name.to_string(),
         });
     }
+    // The decoded cache's cap (wave 136c-2): process-wide like the pool's
+    // limit, and `NULL` restores the free room under `memory_limit`.
+    if crate::memory::is_cache_limit_setting(name) {
+        match v.get(0) {
+            Value::Null => crate::memory::reset_cache_limit(),
+            Value::Varchar(text) => {
+                crate::memory::set_cache_limit(crate::memory::parse_limit(&text)?)
+            }
+            other => {
+                return Err(PinkDbError::Type(format!(
+                    "decoded_cache_limit takes a string like '64MB' or '0', not {other}"
+                )));
+            }
+        }
+        return Ok(QueryResult::SetVariable {
+            name: name.to_string(),
+        });
+    }
     cx.session.set(name, v.get(0));
     Ok(QueryResult::SetVariable {
         name: name.to_string(),
@@ -1305,6 +1323,35 @@ fn set_setting(cx: &Cx, name: &str, value: Option<&BoundExpr>) -> Result<QueryRe
                 }
             }
             None => crate::memory::reset_limit(),
+        }
+        return Ok(QueryResult::SetVariable {
+            name: name.to_string(),
+        });
+    }
+    // `decoded_cache_limit` (wave 136c-2) caps the room the decoded cache may
+    // take under `memory_limit`; unset, it may take whatever is free.
+    if crate::memory::is_cache_limit_setting(name) {
+        match value {
+            Some(value) => {
+                let single = DataChunk {
+                    columns: Vec::new(),
+                    num_rows: 1,
+                    ordinal: 0,
+                };
+                let v = eval_expr(value, &single, cx)?;
+                match v.get(0) {
+                    Value::Null => crate::memory::reset_cache_limit(),
+                    Value::Varchar(text) => {
+                        crate::memory::set_cache_limit(crate::memory::parse_limit(&text)?)
+                    }
+                    other => {
+                        return Err(PinkDbError::Type(format!(
+                            "decoded_cache_limit takes a string like '64MB' or '0', not {other}"
+                        )));
+                    }
+                }
+            }
+            None => crate::memory::reset_cache_limit(),
         }
         return Ok(QueryResult::SetVariable {
             name: name.to_string(),
@@ -3191,22 +3238,35 @@ fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
 /// A store table's chunks, read one at a time (wave 136b-4): `keep` is the
 /// chunks the zone maps left, `cols` the projection, and every consumer decodes
 /// a chunk when it starts on it instead of pinning the whole table first.
+///
+/// `cache` says where a freshly decoded chunk belongs: a streaming scan drops
+/// it when its morsel's flow returns (`false`), while a consumer that holds the
+/// chunks it reads — a materialized result, the lake's whole-file loader — keeps
+/// it in the decoded cache (`true`), under that cache's own budget
+/// (wave 136c-2).
 #[derive(Clone, Debug)]
 pub(crate) struct StoreScan<'a> {
     table: &'a DataTable,
     keep: Option<Vec<usize>>,
     present: Option<Vec<bool>>,
+    cache: bool,
     /// Top-N cut-offs (T3) checked against each chunk's zone map before the
     /// chunk is decoded.
     thresholds: Vec<(usize, std::sync::Arc<crate::stats::TopNThreshold>)>,
 }
 
 impl<'a> StoreScan<'a> {
-    pub(crate) fn new(t: &'a DataTable, cols: Option<&[usize]>, keep: Option<Vec<usize>>) -> Self {
+    pub(crate) fn new(
+        t: &'a DataTable,
+        cols: Option<&[usize]>,
+        keep: Option<Vec<usize>>,
+        cache: bool,
+    ) -> Self {
         StoreScan {
             table: t,
             keep,
             present: cols.and_then(|cols| present_columns(t, cols)),
+            cache,
             thresholds: Vec::new(),
         }
     }
@@ -3257,9 +3317,11 @@ impl<'a> StoreScan<'a> {
                 return Ok(None);
             }
         }
-        match &self.present {
-            Some(present) => self.table.scan_chunk_projected(index, present),
-            None => self.table.scan_chunk(index),
+        match (&self.present, self.cache) {
+            (Some(present), true) => self.table.scan_chunk_projected(index, present),
+            (Some(present), false) => self.table.scan_chunk_projected_uncached(index, present),
+            (None, true) => self.table.scan_chunk(index),
+            (None, false) => self.table.scan_chunk_uncached(index),
         }
     }
 
@@ -3358,14 +3420,19 @@ pub(crate) fn store_scan<'a>(cx: &'a Cx, plan: &LogicalPlan) -> Result<Option<St
     }
     let t = cx.db.table_in(&lookup, table)?;
     let keep = scan_candidates(t, cx.prunes.for_scan(plan), &cx.dynamic.for_scan(plan));
+    // §10's measured rule: an uncached streaming scan costs the TPC-H SF1
+    // warm A/B 1.62x (a query re-decodes every chunk it reads), so a streaming
+    // scan admits into the decoded cache, which has its own budget and evicts
+    // clean chunks under pressure. The uncached decode stays available for a
+    // caller that must charge nothing (`Column::chunk_uncached`).
     Ok(Some(
-        StoreScan::new(t, cx.projections.for_scan(plan), keep)
+        StoreScan::new(t, cx.projections.for_scan(plan), keep, true)
             .with_thresholds(cx.dynamic.thresholds_for_scan(plan)),
     ))
 }
 
 fn scan_chunks_of(t: &DataTable, keep: Option<&[usize]>) -> Result<Vec<DataChunk>> {
-    StoreScan::new(t, None, keep.map(<[usize]>::to_vec)).materialize()
+    StoreScan::new(t, None, keep.map(<[usize]>::to_vec), true).materialize()
 }
 
 /// The chunks of `t` whose stored zone maps leave every simple predicate
@@ -3900,7 +3967,7 @@ fn project_scan_chunks_of(
     cols: &[usize],
     keep: Option<&[usize]>,
 ) -> Result<Vec<DataChunk>> {
-    StoreScan::new(t, Some(cols), keep.map(<[usize]>::to_vec)).materialize()
+    StoreScan::new(t, Some(cols), keep.map(<[usize]>::to_vec), true).materialize()
 }
 
 /// Exact aggregate answers from an attached lake table's stored statistics
