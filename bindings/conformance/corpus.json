@@ -1,6 +1,6 @@
 {
   "corpus_version": 1,
-  "abi_version": 65539,
+  "abi_version": 65540,
   "description": "Language-neutral pinkdb binding conformance corpus. See README.md for the schema and the value encoding.",
   "cases": [
     {

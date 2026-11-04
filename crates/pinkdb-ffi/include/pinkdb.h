@@ -1,5 +1,5 @@
 /*
- * pinkdb C ABI v1.3 — https://github.com/openlearnia/pinkdb
+ * pinkdb C ABI v1.4 — https://github.com/openlearnia/pinkdb
  *
  * Built as `libpinkdb_ffi.dylib` (cdylib) and `libpinkdb_ffi.a` (staticlib)
  * from the `pinkdb-ffi` crate. Link with `-lpinkdb_ffi`.
@@ -53,6 +53,7 @@
 #ifndef PINKDB_H
 #define PINKDB_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -100,7 +101,7 @@ struct ArrowArray {
 #endif /* ARROW_C_DATA_INTERFACE */
 
 #define PINKDB_ABI_VERSION_MAJOR 1
-#define PINKDB_ABI_VERSION_MINOR 3
+#define PINKDB_ABI_VERSION_MINOR 4
 #define PINKDB_ABI_VERSION ((PINKDB_ABI_VERSION_MAJOR << 16) | PINKDB_ABI_VERSION_MINOR)
 
 /* Library (not ABI) version, from the Cargo package version. */
@@ -117,6 +118,7 @@ extern "C" {
 typedef struct pinkdb_handle pinkdb_handle;
 typedef struct pinkdb_result pinkdb_result;
 typedef struct pinkdb_prepared pinkdb_prepared;
+typedef struct pinkdb_appender pinkdb_appender;
 typedef struct pinkdb_database pinkdb_database;
 typedef struct pinkdb_connection pinkdb_connection;
 typedef struct pinkdb_config pinkdb_config;
@@ -273,6 +275,11 @@ pinkdb_handle *pinkdb_open_memory(void);
 
 /* Close a handle. NULL-safe. */
 void pinkdb_close(pinkdb_handle *handle);
+
+/* The connection behind a v1 handle, for bindings that open with pinkdb_open
+ * but use connection-level calls such as typed binding. Borrowed: valid until
+ * pinkdb_close(handle). */
+pinkdb_connection *pinkdb_handle_connection(pinkdb_handle *handle);
 
 /* Execute one or more `;`-separated SQL statements.
  * Returns NULL on error (see pinkdb_last_error); free with
@@ -719,6 +726,162 @@ int32_t pinkdb_query_prepared(pinkdb_connection *connection,
                               const pinkdb_prepared *prepared,
                               const pink_value *values, size_t value_count,
                               pinkdb_result **out_result);
+
+/*
+ * Typed parameter binding (ABI 1.4)
+ * ---------------------------------
+ * Bind one value per `?` placeholder, then execute with
+ * `pinkdb_execute_bound`. Indices are 1-based; an index outside
+ * 1..pinkdb_prepared_parameter_count is an error. `pinkdb_clear_bindings`
+ * clears them all. Bindings persist after execution, so a statement can be
+ * executed again and only changed parameters rebound. The v1
+ * `pink_value` array path (`pinkdb_query_prepared`) is unchanged and does not
+ * read or change typed bindings.
+ *
+ * A missing binding at execute time is a "parameter" error on the result.
+ * `pinkdb_bind_blob` is present for ABI symmetry but reports an error: the
+ * engine has no BLOB scalar type. `pinkdb_bind_null` binds SQL NULL, which is
+ * distinct from leaving a parameter unbound. DECIMAL takes the unscaled
+ * 128-bit value plus precision (width) and scale; the engine accepts width
+ * 1..=38 and scale 0..=width. UUID is the engine's 128-bit value.
+ */
+
+int32_t pinkdb_bind_bool(pinkdb_prepared *prepared, size_t index, bool value);
+int32_t pinkdb_bind_int32(pinkdb_prepared *prepared, size_t index, int32_t value);
+int32_t pinkdb_bind_int64(pinkdb_prepared *prepared, size_t index, int64_t value);
+int32_t pinkdb_bind_double(pinkdb_prepared *prepared, size_t index, double value);
+/* `ptr` is read only for this call and may be NULL only when `len` is 0. */
+int32_t pinkdb_bind_varchar(pinkdb_prepared *prepared, size_t index,
+                            const char *ptr, size_t len);
+/* Always returns 0 with a clear "no BLOB type" error. */
+int32_t pinkdb_bind_blob(pinkdb_prepared *prepared, size_t index,
+                         const char *ptr, size_t len);
+int32_t pinkdb_bind_date(pinkdb_prepared *prepared, size_t index,
+                         int32_t days);
+int32_t pinkdb_bind_timestamp(pinkdb_prepared *prepared, size_t index,
+                              int64_t micros);
+int32_t pinkdb_bind_interval(pinkdb_prepared *prepared, size_t index,
+                             pinkdb_interval value);
+int32_t pinkdb_bind_hugeint(pinkdb_prepared *prepared, size_t index,
+                            pinkdb_hugeint value);
+int32_t pinkdb_bind_uhugeint(pinkdb_prepared *prepared, size_t index,
+                             pinkdb_uhugeint value);
+int32_t pinkdb_bind_decimal(pinkdb_prepared *prepared, size_t index,
+                            pinkdb_hugeint value, int32_t width, int32_t scale);
+int32_t pinkdb_bind_uuid(pinkdb_prepared *prepared, size_t index,
+                         pinkdb_uhugeint value);
+int32_t pinkdb_bind_null(pinkdb_prepared *prepared, size_t index);
+
+/* Clear every typed binding. Returns 1, or 0 for a NULL handle. */
+int32_t pinkdb_clear_bindings(pinkdb_prepared *prepared);
+
+/* Execute using the current typed bindings. Returns and reports exactly like
+ * pinkdb_query_prepared; *out_result is always set on a non-NULL out pointer.
+ * A missing binding is a "parameter" error on the result. */
+int32_t pinkdb_execute_bound(pinkdb_connection *connection,
+                             const pinkdb_prepared *prepared,
+                             pinkdb_result **out_result);
+
+/*
+ * Appender (ABI 1.4)
+ * ------------------
+ * An appender buffers rows and flushes them through the normal INSERT path,
+ * so coercion, PRIMARY KEY/UNIQUE checks, indexes, triggers, the write lease
+ * and transaction visibility behave exactly as for INSERT. A flush is one
+ * statement and therefore one commit unit: if any row in it violates a
+ * constraint, none of that flush's rows are written and the statement fails.
+ * Rows already written by earlier automatic flushes stay written (in an open
+ * transaction they still disappear on ROLLBACK).
+ *
+ * Every column must be supplied; DEFAULT/omitted columns are not supported
+ * (a flush names all columns implicitly by position). The engine does not
+ * currently enforce non-PRIMARY KEY NOT NULL declarations or support CHECK
+ * constraints, so the appender cannot enforce them either; PRIMARY KEY
+ * non-NULL is enforced.
+ *
+ * An appender belongs to its connection's thread and is single-threaded.
+ * Appends may be interleaved with other calls on the same connection; a
+ * query sees only rows flushed before it, never unflushed buffered rows.
+ * An appender keeps its session alive after pinkdb_disconnect: disconnecting
+ * flushes every still-buffered appender and detaches it. A detached appender's
+ * later calls fail with "connection is closed"; pinkdb_appender_destroy still
+ * frees it. Destroy appenders before disconnecting when the flush error
+ * matters.
+ *
+ * Auto-flush runs after every N ended rows (default 204800, 100 chunks) so a
+ * long append does not grow one enormous statement. Explicit flush and close also flush.
+ * After any flush or append-chunk error the appender is invalid: flush,
+ * append and end_row return 0 with the stored error, and destroy frees it
+ * without retrying a rejected batch. A wrong end_row column count names the
+ * row and leaves the appender usable.
+ */
+
+/* Create an appender for schema.table. schema NULL means the connection's
+ * current schema. The table's column types are resolved here. Returns 1, or 0
+ * with *out_appender NULL and *errmsg a string
+ * to free with pinkdb_free. Both out parameters must be non-NULL. */
+int32_t pinkdb_appender_create(pinkdb_connection *connection,
+                               const char *schema, size_t schema_len,
+                               const char *table, size_t table_len,
+                               pinkdb_appender **out_appender, char **errmsg);
+
+/* Rows buffered before an automatic flush; 0 selects 1. NULL-safe. */
+void pinkdb_appender_set_auto_flush(pinkdb_appender *appender,
+                                    uint64_t rows);
+
+/* Append one value to the current row. Returns 1, or 0 on a NULL/closed/
+ * failed appender, an invalid payload or a BLOB (unsupported). */
+int32_t pinkdb_append_bool(pinkdb_appender *appender, bool value);
+int32_t pinkdb_append_int32(pinkdb_appender *appender, int32_t value);
+int32_t pinkdb_append_int64(pinkdb_appender *appender, int64_t value);
+int32_t pinkdb_append_double(pinkdb_appender *appender, double value);
+int32_t pinkdb_append_varchar(pinkdb_appender *appender, const char *ptr,
+                              size_t len);
+/* Always returns 0 with a clear "no BLOB type" error. */
+int32_t pinkdb_append_blob(pinkdb_appender *appender, const char *ptr,
+                           size_t len);
+int32_t pinkdb_append_date(pinkdb_appender *appender, int32_t days);
+int32_t pinkdb_append_timestamp(pinkdb_appender *appender, int64_t micros);
+int32_t pinkdb_append_interval(pinkdb_appender *appender,
+                               pinkdb_interval value);
+int32_t pinkdb_append_hugeint(pinkdb_appender *appender,
+                              pinkdb_hugeint value);
+int32_t pinkdb_append_uhugeint(pinkdb_appender *appender,
+                               pinkdb_uhugeint value);
+int32_t pinkdb_append_decimal(pinkdb_appender *appender, pinkdb_hugeint value,
+                              int32_t width, int32_t scale);
+int32_t pinkdb_append_uuid(pinkdb_appender *appender, pinkdb_uhugeint value);
+int32_t pinkdb_append_null(pinkdb_appender *appender);
+
+/* End the current row. Returns 1, or 0 on a NULL/closed/failed appender or a
+ * wrong column count (the error names the row and discards the pending
+ * values). */
+int32_t pinkdb_appender_end_row(pinkdb_appender *appender);
+
+/* Append every row of a chunk, for example one fetched from another result.
+ * An error invalidates the appender because earlier automatic flushes may
+ * already have committed. */
+int32_t pinkdb_appender_append_chunk(pinkdb_appender *appender,
+                                     const pinkdb_data_chunk *chunk);
+
+/* Flush buffered rows as one statement. Returns 1, or 0 with the error in
+ * pinkdb_last_error and pinkdb_appender_error; a failed flush invalidates
+ * the appender. */
+int32_t pinkdb_appender_flush(pinkdb_appender *appender);
+
+/* Flush and mark closed. Returns like pinkdb_appender_flush. The handle is
+ * still freed with pinkdb_appender_destroy. */
+int32_t pinkdb_appender_close(pinkdb_appender *appender);
+
+/* Flush (unless already closed or failed) and free. Returns 1 when destroyed
+ * cleanly. A final flush error returns 0 and is copied to pinkdb_last_error;
+ * the handle is still freed. A previously failed appender is freed without
+ * retrying and returns 0 with its stored error. NULL-safe. */
+int32_t pinkdb_appender_destroy(pinkdb_appender *appender);
+
+/* Stored error, or NULL. Owned by the appender; valid until its next call or
+ * destroy. */
+const char *pinkdb_appender_error(const pinkdb_appender *appender);
 
 /* Error carried by a result, or NULL when it succeeded. Owned by the result;
  * valid until pinkdb_result_free. */

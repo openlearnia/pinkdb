@@ -51,7 +51,7 @@ inside SQL, which every binding supports.
 ```json
 {
   "corpus_version": 1,
-  "abi_version": 65539,
+  "abi_version": 65540,
   "cases": [
     {
       "name": "types_roundtrip",

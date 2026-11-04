@@ -38,6 +38,7 @@
 #![cfg_attr(target_arch = "wasm32", allow(clippy::drop_non_drop))]
 
 pub mod agent;
+pub mod appender;
 pub mod array;
 pub mod attached;
 pub mod catalog_image;
@@ -115,6 +116,7 @@ pub mod vector;
 pub mod vector_index;
 pub mod wal;
 
+pub use appender::Appender;
 pub use attached::{
     AtSpec, AttachedLake, AttachedScan, AttachedTable, ColumnStats, PathStats, PruneOp,
     PrunePredicate,

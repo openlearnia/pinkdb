@@ -424,6 +424,7 @@ impl PinkDb {
             &report.stmts,
             &[],
             &[],
+            &[],
             Some(&report.sets),
             None,
             &memo,

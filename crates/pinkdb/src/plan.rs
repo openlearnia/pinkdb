@@ -9,6 +9,7 @@ use crate::sql::ast::{JoinKind, MergeMatch, Select, SetOp, SortSpec};
 use crate::sql::binder::{BoundAgg, BoundExpr, BoundWindow};
 use crate::storage::SchemaPath;
 use crate::types::{DataType, Value};
+use crate::vector::DataChunk;
 
 /// The rows a DML statement returns (`RETURNING`, wave 95b): the final row
 /// images, after BEFORE triggers ran.
@@ -638,6 +639,13 @@ pub enum LogicalPlan {
         /// here so every read check sees what the statement touched.
         sources: Vec<(String, String)>,
     },
+    /// Materialized chunks handed straight to the executor by an internal
+    /// caller (the table appender's flush): the rows are already typed like
+    /// the target, so no bound expression or SQL text round-trip is needed.
+    /// Only `InsertSelect` sources it; the binder never produces it.
+    Chunks {
+        chunks: Vec<DataChunk>,
+    },
     /// Window functions: output is input columns ++ one column per window.
     /// Partition/order/arg expressions address the input (scan-relative, or
     /// Aggregate-output after rebasing — same rules as select items).
@@ -830,6 +838,7 @@ pub fn is_read_only(plan: &LogicalPlan) -> bool {
                 | LogicalPlan::Project { .. }
                 | LogicalPlan::Distinct { .. }
                 | LogicalPlan::Values { .. }
+                | LogicalPlan::Chunks { .. }
                 | LogicalPlan::Sort { .. }
                 | LogicalPlan::Limit { .. }
                 | LogicalPlan::Offset { .. }
@@ -1331,6 +1340,8 @@ pub(crate) fn collect_tables_read(
                 expr_tables_read(e, default_ns, out);
             }
         }
+        // Materialized chunks name no catalog source.
+        LogicalPlan::Chunks { .. } => {}
         LogicalPlan::Insert { .. } | LogicalPlan::InsertSelect { .. } => {
             let (exprs, plans) = dml_payload(plan);
             for p in plans {
@@ -1668,6 +1679,7 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
                     .any(expr_contains_table_function)
         }
         LogicalPlan::Values { rows, .. } => rows.iter().flatten().any(expr_contains_table_function),
+        LogicalPlan::Chunks { .. } => false,
         LogicalPlan::Project { input, exprs, .. } => {
             contains_table_function(input) || exprs.iter().any(expr_contains_table_function)
         }
@@ -1959,6 +1971,7 @@ fn walk_scan_filters(
         // holds no child plan to analyze.
         | LogicalPlan::SingleRow
         | LogicalPlan::Values { .. }
+        | LogicalPlan::Chunks { .. }
         | LogicalPlan::Begin
         | LogicalPlan::Commit
         | LogicalPlan::Rollback
@@ -2616,6 +2629,7 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut Vec<String>) {
             );
         }
         LogicalPlan::Values { rows, .. } => exprs.extend(rows.iter().flatten()),
+        LogicalPlan::Chunks { .. } => {}
         LogicalPlan::Project {
             input, exprs: es, ..
         } => {
@@ -2732,7 +2746,9 @@ fn walk_scan_projections(
         }
         // Unqualified scans name CTE outputs (binder-resolved), not tables;
         // the CTE's own query is walked through `LogicalPlan::Cte`.
-        LogicalPlan::Scan { ns: None, .. } | LogicalPlan::SingleRow => {}
+        LogicalPlan::Scan { ns: None, .. }
+        | LogicalPlan::SingleRow
+        | LogicalPlan::Chunks { .. } => {}
         // Constant rows hold no scan: their expressions are the whole input.
         LogicalPlan::Values { rows, .. } => {
             for e in rows.iter().flatten() {

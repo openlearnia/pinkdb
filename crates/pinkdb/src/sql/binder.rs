@@ -13030,6 +13030,18 @@ pub(crate) fn plan_schema(
             .cloned()
             .zip(types.iter().copied())
             .collect()),
+        // Internal materialized chunks carry their columns, not a name list.
+        LogicalPlan::Chunks { chunks } => Ok(chunks
+            .first()
+            .map(|chunk| {
+                chunk
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, column)| (format!("column{i}"), column.dtype()))
+                    .collect()
+            })
+            .unwrap_or_default()),
         // A file source's schema is the schema the binder read from the
         // file at bind time — carried in the plan, so no second read.
         LogicalPlan::Filter { input, .. }

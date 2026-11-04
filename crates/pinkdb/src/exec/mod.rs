@@ -4666,6 +4666,24 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 types: vec![DataType::Varchar],
             })
         }
+        // Materialized chunks (an appender's flush): already typed, so they
+        // pass through without evaluating an expression per cell.
+        LogicalPlan::Chunks { chunks } => {
+            let (names, types) = match chunks.first() {
+                Some(chunk) => chunk
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, column)| (format!("column{i}"), column.dtype()))
+                    .unzip(),
+                None => (Vec::new(), Vec::new()),
+            };
+            Ok(Output {
+                chunks: chunks.clone(),
+                names,
+                types,
+            })
+        }
         LogicalPlan::Values {
             rows, names, types, ..
         } => {
@@ -6752,6 +6770,13 @@ fn estimate_rows(cx: &Cx, plan: &LogicalPlan) -> Option<u64> {
         }
         LogicalPlan::Cte { body, .. } => estimate_rows(cx, body),
         LogicalPlan::Values { rows, .. } => Some(rows.len().max(1) as u64),
+        LogicalPlan::Chunks { chunks } => Some(
+            chunks
+                .iter()
+                .map(|chunk| chunk.num_rows as u64)
+                .sum::<u64>()
+                .max(1),
+        ),
         // A key join keeps about its smaller input: a foreign key join yields
         // the fact rows its (filtered) dimension still matches, which the
         // dimension side bounds. Only a hint for the build side — without it
@@ -9380,6 +9405,10 @@ fn explain_into(
         }
         LogicalPlan::SingleRow => "SingleRow".to_string(),
         LogicalPlan::Values { rows, .. } => format!("Values ({} rows)", rows.len()),
+        LogicalPlan::Chunks { chunks } => {
+            let rows: usize = chunks.iter().map(|chunk| chunk.num_rows).sum();
+            format!("Chunks ({rows} rows)")
+        }
         LogicalPlan::Filter { input, predicate } => {
             children.push(input);
             format!("Filter {}", expr_text(predicate))
@@ -9673,7 +9702,7 @@ impl<'p> Stream<'p> {
             }
             LogicalPlan::SingleRow => (StreamKind::SingleRow(false), Vec::new(), Vec::new()),
             // Constant rows are cheap to materialize: no streaming form.
-            LogicalPlan::Values { .. } => return Ok(None),
+            LogicalPlan::Values { .. } | LogicalPlan::Chunks { .. } => return Ok(None),
             LogicalPlan::Filter { input, predicate } => {
                 let Some(input) = Stream::build(cx, input)? else {
                     return Ok(None);

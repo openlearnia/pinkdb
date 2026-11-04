@@ -26,6 +26,7 @@ package pinkdb
 #include <stdlib.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 // The subset of the pinkdb C ABI v1 this package uses, declared here instead
 // of including crates/pinkdb-ffi/include/pinkdb.h: that header lives outside
@@ -40,6 +41,7 @@ package pinkdb
 typedef struct pinkdb_handle pinkdb_handle;
 typedef struct pinkdb_result pinkdb_result;
 typedef struct pinkdb_prepared pinkdb_prepared;
+typedef struct pinkdb_connection pinkdb_connection;
 typedef struct pinkdb_data_chunk pinkdb_data_chunk;
 typedef struct pinkdb_vector pinkdb_vector;
 
@@ -58,6 +60,7 @@ uint32_t pinkdb_abi_version(void);
 pinkdb_handle *pinkdb_open(const char *path);
 pinkdb_handle *pinkdb_open_memory(void);
 void pinkdb_close(pinkdb_handle *handle);
+pinkdb_connection *pinkdb_handle_connection(pinkdb_handle *handle);
 const char *pinkdb_last_error(void);
 const char *pinkdb_last_error_class(void);
 int32_t pinkdb_set_allow_sql_load_extension(pinkdb_handle *handle, int32_t allow);
@@ -69,6 +72,8 @@ pinkdb_result *pinkdb_execute_prepared(
 	pinkdb_handle *handle, const pinkdb_prepared *prepared,
 	const pink_value *values, size_t value_count);
 void pinkdb_result_free(pinkdb_result *result);
+const char *pinkdb_result_error(const pinkdb_result *result);
+const char *pinkdb_result_error_class(const pinkdb_result *result);
 size_t pinkdb_result_statement_count(const pinkdb_result *result);
 int32_t pinkdb_result_kind(const pinkdb_result *result, size_t statement);
 size_t pinkdb_result_column_count(const pinkdb_result *result, size_t statement);
@@ -111,6 +116,32 @@ typedef struct pinkdb_interval {
 	int32_t days;
 	int64_t micros;
 } pinkdb_interval;
+int32_t pinkdb_bind_bool(pinkdb_prepared *prepared, size_t index, bool value);
+int32_t pinkdb_bind_int32(pinkdb_prepared *prepared, size_t index, int32_t value);
+int32_t pinkdb_bind_int64(pinkdb_prepared *prepared, size_t index, int64_t value);
+int32_t pinkdb_bind_double(pinkdb_prepared *prepared, size_t index, double value);
+int32_t pinkdb_bind_varchar(pinkdb_prepared *prepared, size_t index,
+	const char *ptr, size_t len);
+int32_t pinkdb_bind_blob(pinkdb_prepared *prepared, size_t index,
+	const char *ptr, size_t len);
+int32_t pinkdb_bind_date(pinkdb_prepared *prepared, size_t index,
+	int32_t days);
+int32_t pinkdb_bind_timestamp(pinkdb_prepared *prepared, size_t index,
+	int64_t micros);
+int32_t pinkdb_bind_interval(pinkdb_prepared *prepared, size_t index,
+	pinkdb_interval value);
+int32_t pinkdb_bind_hugeint(pinkdb_prepared *prepared, size_t index,
+	pinkdb_hugeint value);
+int32_t pinkdb_bind_uhugeint(pinkdb_prepared *prepared, size_t index,
+	pinkdb_uhugeint value);
+int32_t pinkdb_bind_decimal(pinkdb_prepared *prepared, size_t index,
+	pinkdb_hugeint value, int32_t width, int32_t scale);
+int32_t pinkdb_bind_uuid(pinkdb_prepared *prepared, size_t index,
+	pinkdb_uhugeint value);
+int32_t pinkdb_bind_null(pinkdb_prepared *prepared, size_t index);
+int32_t pinkdb_clear_bindings(pinkdb_prepared *prepared);
+int32_t pinkdb_execute_bound(pinkdb_connection *connection,
+	const pinkdb_prepared *prepared, pinkdb_result **out_result);
 size_t pinkdb_result_affected(const pinkdb_result *result, size_t statement);
 const char *pinkdb_result_name(const pinkdb_result *result, size_t statement);
 */
@@ -131,7 +162,7 @@ import (
 
 // SupportedABI is the C ABI version this binding speaks. Open and OpenMemory
 // refuse a linked library that reports a different version.
-const SupportedABI = (1 << 16) | 3
+const SupportedABI = (1 << 16) | 4
 
 // Errors returned by this package in addition to the native error messages
 // from pinkdb_last_error.
@@ -563,26 +594,41 @@ func (stmt *Stmt) Execute(args ...any) (Result, error) {
 	if stmt.closed {
 		return Result{}, ErrStmtClosed
 	}
+	if len(args) < stmt.nparams {
+		return Result{}, &Error{Class: "parameter", Message: fmt.Sprintf(
+			"values were not provided for prepared statement parameters: %d", stmt.nparams)}
+	}
+	if len(args) > stmt.nparams {
+		return Result{}, &Error{Class: "parameter", Message: fmt.Sprintf(
+			"parameter count mismatch: the prepared statement takes %d, but values were provided for: %d",
+			stmt.nparams, len(args))}
+	}
 
-	values, buffers, err := bindValues(args)
-	if err != nil {
-		return Result{}, err
+	// Bindings and the execute that consumes them both report errors through
+	// the thread-local last error, so keep them on one OS thread.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if C.pinkdb_clear_bindings(stmt.prepared) == 0 {
+		return Result{}, nativeError()
 	}
-	defer func() {
-		// The native call copies every VARCHAR payload before returning.
-		for _, buffer := range buffers {
-			C.free(buffer)
+	for i, arg := range args {
+		if err := bindTyped(stmt.prepared, C.size_t(i+1), arg); err != nil {
+			return Result{}, err
 		}
-	}()
-	var valuesPtr *C.pink_value
-	if len(values) > 0 {
-		valuesPtr = &values[0]
 	}
-	result, err := stmt.executeNative(valuesPtr, C.size_t(len(values)))
-	if err != nil {
-		return Result{}, err
+	connection := C.pinkdb_handle_connection(stmt.db.handle)
+	if connection == nil {
+		return Result{}, nativeError()
+	}
+	var result *C.pinkdb_result
+	C.pinkdb_execute_bound(connection, stmt.prepared, &result)
+	if result == nil {
+		return Result{}, nativeError()
 	}
 	defer C.pinkdb_result_free(result)
+	if err := resultError(result); err != nil {
+		return Result{}, err
+	}
 	results, err := materialize(result)
 	if err != nil {
 		return Result{}, err
@@ -592,19 +638,6 @@ func (stmt *Stmt) Execute(args ...any) (Result, error) {
 			"pinkdb: prepared statement produced %d results, want 1", len(results))
 	}
 	return results[0], nil
-}
-
-// executeNative runs pinkdb_execute_prepared and, when it fails, reads the
-// thread-local pinkdb_last_error on the same OS thread. The caller must hold
-// the DB mutex and owns the returned result (freed with pinkdb_result_free).
-func (stmt *Stmt) executeNative(values *C.pink_value, count C.size_t) (*C.pinkdb_result, error) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	result := C.pinkdb_execute_prepared(stmt.db.handle, stmt.prepared, values, count)
-	if result == nil {
-		return nil, nativeError()
-	}
-	return result, nil
 }
 
 // Close frees the native prepared statement. It is idempotent: after the
@@ -623,103 +656,102 @@ func (stmt *Stmt) Close() {
 	}
 }
 
-// bindValues converts Go parameters to pink_value structs. VARCHAR payloads
-// are copied into C memory and returned as buffers; the caller frees them
-// after the native call. On error every buffer allocated so far is freed.
-func bindValues(args []any) ([]C.pink_value, []unsafe.Pointer, error) {
-	values := make([]C.pink_value, len(args))
-	buffers := make([]unsafe.Pointer, 0, len(args))
-	fail := func(err error) ([]C.pink_value, []unsafe.Pointer, error) {
-		for _, buffer := range buffers {
-			C.free(buffer)
+// bindTyped binds one 1-based parameter through the typed ABI. Client-side
+// rejections (an integer outside BIGINT, an unsupported Go type, a DATE
+// outside i32) are returned directly; a rejected native call reads the
+// thread-local last error, so the caller must hold the OS thread.
+func bindTyped(prepared *C.pinkdb_prepared, index C.size_t, arg any) error {
+	ok := C.int32_t(0)
+	switch value := arg.(type) {
+	case nil:
+		ok = C.pinkdb_bind_null(prepared, index)
+	case bool:
+		ok = C.pinkdb_bind_bool(prepared, index, C.bool(value))
+	case int:
+		return bindSigned(prepared, index, int64(value))
+	case int8:
+		return bindSigned(prepared, index, int64(value))
+	case int16:
+		return bindSigned(prepared, index, int64(value))
+	case int32:
+		return bindSigned(prepared, index, int64(value))
+	case int64:
+		return bindSigned(prepared, index, value)
+	case uint:
+		if uint64(value) > math.MaxInt64 {
+			return integerRangeError(int(index)-1, uint64(value))
 		}
-		return nil, nil, err
-	}
-	for i, arg := range args {
-		v := &values[i]
-		switch value := arg.(type) {
-		case nil:
-			v.is_null = 1
-		case bool:
-			v.type_tag = C.int32_t(typeBoolean)
-			if value {
-				v.int64 = 1
-			}
-		case int:
-			bindInt(v, int64(value))
-		case int8:
-			bindInt(v, int64(value))
-		case int16:
-			bindInt(v, int64(value))
-		case int32:
-			bindInt(v, int64(value))
-		case int64:
-			bindInt(v, value)
-		case uint:
-			if uint64(value) > math.MaxInt64 {
-				return fail(integerRangeError(i, uint64(value)))
-			}
-			bindInt(v, int64(value))
-		case uint8:
-			bindInt(v, int64(value))
-		case uint16:
-			bindInt(v, int64(value))
-		case uint32:
-			bindInt(v, int64(value))
-		case uint64:
-			if value > math.MaxInt64 {
-				return fail(integerRangeError(i, value))
-			}
-			bindInt(v, int64(value))
-		case float32:
-			v.type_tag = C.int32_t(typeDouble)
-			v.double_ = C.double(value)
-		case float64:
-			v.type_tag = C.int32_t(typeDouble)
-			v.double_ = C.double(value)
-		case string:
-			v.type_tag = C.int32_t(typeVarchar)
-			if len(value) > 0 {
-				buffer := C.CBytes([]byte(value))
-				buffers = append(buffers, buffer)
-				v.text_ptr = (*C.char)(buffer)
-				v.text_len = C.size_t(len(value))
-			}
-		case []byte:
-			return fail(fmt.Errorf(
-				"pinkdb: parameter %d: []byte is not bindable; ABI v1 has no BLOB type "+
-					"(decode it to a string or embed it in SQL)", i+1))
-		case time.Time:
-			v.type_tag = C.int32_t(typeTimestamp)
-			v.int64 = C.int64_t(value.UnixMicro())
-		case Date:
-			// Floor-divide UTC seconds into days so pre-epoch instants keep
-			// their calendar day.
-			sec := time.Time(value).UTC().Unix()
-			days := sec / secondsPerDay
-			if sec%secondsPerDay < 0 {
-				days--
-			}
-			v.type_tag = C.int32_t(typeDate)
-			v.int64 = C.int64_t(days)
-		default:
-			return fail(fmt.Errorf(
-				"pinkdb: parameter %d: unsupported Go type %T; bind nil, bool, an integer, "+
-					"float32/float64, string, time.Time or pinkdb.Date", i+1, arg))
+		return bindSigned(prepared, index, int64(value))
+	case uint8:
+		return bindSigned(prepared, index, int64(value))
+	case uint16:
+		return bindSigned(prepared, index, int64(value))
+	case uint32:
+		return bindSigned(prepared, index, int64(value))
+	case uint64:
+		if value > math.MaxInt64 {
+			return integerRangeError(int(index)-1, value)
 		}
+		return bindSigned(prepared, index, int64(value))
+	case float32:
+		ok = C.pinkdb_bind_double(prepared, index, C.double(value))
+	case float64:
+		ok = C.pinkdb_bind_double(prepared, index, C.double(value))
+	case string:
+		var ptr *C.char
+		if len(value) > 0 {
+			buffer := C.CBytes([]byte(value))
+			defer C.free(buffer)
+			ptr = (*C.char)(buffer)
+		}
+		ok = C.pinkdb_bind_varchar(prepared, index, ptr, C.size_t(len(value)))
+	case []byte:
+		var ptr *C.char
+		if len(value) > 0 {
+			buffer := C.CBytes(value)
+			defer C.free(buffer)
+			ptr = (*C.char)(buffer)
+		}
+		ok = C.pinkdb_bind_blob(prepared, index, ptr, C.size_t(len(value)))
+	case time.Time:
+		ok = C.pinkdb_bind_timestamp(prepared, index, C.int64_t(value.UnixMicro()))
+	case Date:
+		// Floor-divide UTC seconds into days so pre-epoch instants keep
+		// their calendar day.
+		sec := time.Time(value).UTC().Unix()
+		days := sec / secondsPerDay
+		if sec%secondsPerDay < 0 {
+			days--
+		}
+		if days < math.MinInt32 || days > math.MaxInt32 {
+			return fmt.Errorf(
+				"pinkdb: parameter %d: DATE day %d does not fit in i32", index, days)
+		}
+		ok = C.pinkdb_bind_date(prepared, index, C.int32_t(days))
+	default:
+		return fmt.Errorf(
+			"pinkdb: parameter %d: unsupported Go type %T; bind nil, bool, an integer, "+
+				"float32/float64, string, time.Time or pinkdb.Date", index, arg)
 	}
-	return values, buffers, nil
+	if ok != 1 {
+		return nativeError()
+	}
+	return nil
 }
 
-// bindInt tags n as INTEGER when it fits int32 and BIGINT otherwise. Every
+// bindSigned tags n as INTEGER when it fits int32 and BIGINT otherwise. Every
 // int64 is representable, so no range error is possible here.
-func bindInt(v *C.pink_value, n int64) {
+func bindSigned(prepared *C.pinkdb_prepared, index C.size_t, n int64) error {
+	var ok C.int32_t
 	if n >= math.MinInt32 && n <= math.MaxInt32 {
-		v.type_tag = C.int32_t(typeInteger)
+		ok = C.pinkdb_bind_int32(prepared, index, C.int32_t(n))
 	} else {
-		v.type_tag = C.int32_t(typeBigint)
+		ok = C.pinkdb_bind_int64(prepared, index, C.int64_t(n))
 	}
-	v.int64 = C.int64_t(n)
+	if ok != 1 {
+		return nativeError()
+	}
+	return nil
 }
 
 func integerRangeError(index int, value uint64) error {
@@ -763,6 +795,20 @@ func nativeError() error {
 	}
 	class := "internal"
 	if cls := C.pinkdb_last_error_class(); cls != nil {
+		class = C.GoString(cls)
+	}
+	return &Error{Class: class, Message: C.GoString(msg)}
+}
+
+// resultError returns the error carried by a failed result, if any. Unlike the
+// thread-local last error, it survives a result that encodes the failure.
+func resultError(result *C.pinkdb_result) error {
+	msg := C.pinkdb_result_error(result)
+	if msg == nil {
+		return nil
+	}
+	class := "internal"
+	if cls := C.pinkdb_result_error_class(result); cls != nil {
 		class = C.GoString(cls)
 	}
 	return &Error{Class: class, Message: C.GoString(msg)}
