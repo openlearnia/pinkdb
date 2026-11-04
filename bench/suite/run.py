@@ -1037,12 +1037,16 @@ class Suite:
             # The fastest warm run is compared, not the median: these queries
             # take 1-3 ms, and on shared runners a median moved 3 -> 8 ms for
             # the same plan (corr_not_in, 2026-11-03). A real regression slows
-            # every run, so it still shows in the fastest one.
+            # every run, so it still shows in the fastest one. Even the fastest
+            # run reached 8 ms on one runner (2026-11-04, 16bb4b8) while two
+            # builds measured 2.0 ms in all 5 rounds on a quiet machine, so the
+            # absolute allowance is 10 ms: this guard catches large regressions,
+            # and the interleaved TPC-H comparisons catch small ones.
             for key, _ in queries:
                 base = baseline.get(key, {}).get("median_ms")
                 warm = out[key]["runs_ms"][1:]
                 got = min(warm) if warm else None
-                if base and got and got > max(2 * base, base + 5):
+                if base and got and got > max(2 * base, base + 10):
                     regressions.append(f"{key}: fastest {got:.1f}ms vs baseline {base:.1f}ms")
             # Binary sizes differ by platform (Mach-O vs ELF, linkers), so the
             # baseline keeps one per sys.platform; a platform without one is
