@@ -9,6 +9,12 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-11-04
+### Wave 141b — join build sides are freed in parallel ✅
+
+The chunks a hash join built are freed by every worker instead of one thread
+at the end of the statement: TPC-H geomean 0.945 at SF1 and 0.93 at SF10
+against 141a (Q10 1.3× faster, Q7 and Q5 1.2×).
+
 ### Wave 141a — joins gather their build columns without per-row dispatch ✅
 
 A hash join's output reads each build-side column through slices resolved once per join, not by

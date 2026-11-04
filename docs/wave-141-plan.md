@@ -27,7 +27,13 @@ build outputs (~240 samples), `FlatSink::merge` (~145) and `pipeline::steps` (~1
   to the number of build chunks. One rejected attempt is worth recording: building the typed slices
   per call was O(build chunks) per output chunk, and made Q7 2.9× slower. The slices must be built
   once per join.
-- **141b — buffer reuse in `ProbeChunk::new` and `Vector::take`** (next).
+- **141b — the build outputs are freed by every worker.** The 141a profile showed no allocation
+  cost worth reusing buffers for: `ProbeChunk::new` is the hash-table head lookup, not malloc. What
+  the workers did wait on was the main thread freeing the join build outputs serially: 12 % of Q7
+  and Q10, while every worker slept. `Compiled`'s drop now frees the build chunks with
+  `into_par_iter`, before the statement returns. The first try freed them on a background rayon
+  task. That only moved the work into the next statement (Q22 1.12–1.28 in interleaved runs), so it
+  was replaced.
 - **141c — a row-layout build side** (design: `docs/wave-141c-design.md`).
 - Later, from the profile: a parallel or deferred drop of the build outputs, and a parallel
   `FlatSink::merge`.
@@ -51,3 +57,22 @@ against DuckDB went from 5.96× to 5.16× even under that load.
 
 Gates: `cargo test -p pinkdb` (0 failures), `cargo clippy --workspace --all-targets -D warnings`
 clean, `cargo fmt`.
+
+## 141b results
+
+The re-profile after 141a, main thread's serial share while the workers idle: Q7 had the serial hash
+build at about 16 % (`MatchTable::build`) and build-output drops at 12 %; Q10 had drops at 12 %, the
+build at 6 % and `FlatSink::merge` at 6 %.
+
+Interleaved A/B against 141a:
+
+| | geomean | notable |
+|---|---|---|
+| SF1, 5 rounds, load 8 | **0.945** | Q22 0.80, Q20 0.82, Q4/Q8 0.88 |
+| SF10, 3 rounds, load 11–24 | **0.930** | Q7 0.86, Q5 0.90; per-query swings from load (Q21 0.33, Q22 2.05) |
+| SF10, 6 rounds, selected queries | — | Q10 0.78, Q7 0.85, Q5 0.80, Q22 0.99 |
+
+The SF10 Q22 outlier, rechecked at 8 rounds: 1.015. The SF1 Q11 outlier: 1.00.
+
+Next by measured share: a parallel `MatchTable::build` (up to 16 % of Q7), then a parallel
+aggregate merge, then 141c.
