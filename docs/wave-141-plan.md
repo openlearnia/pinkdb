@@ -89,3 +89,27 @@ That was at load 11–23. A re-profile showed why: the build's serial share is s
 linking. Once linking ran in parallel, Q7's main thread spent its remaining build time in
 `chunk_approx_bytes` (the build's byte estimate), about 48 samples, and in concatenating per-chunk
 key arrays, about 30. Neither is worth a wave alone. Not landed: no change without a measured gain.
+
+## Tried and not landed: one string buffer list per join build column (2026-11-04)
+
+After 141a, 141b and 142, Q10's output assembly is still about 48 % of worker time. Strings
+dominate it: `StrVec::gather` is 23 %, of which `SharedList::push` is 10 %, because every output
+chunk re-registers the buffers of the roughly 280 build chunks it touches. The attempt:
+- concatenate each VARCHAR build column once per join into one `StrVec` whose shared list holds
+  every build chunk's buffer;
+- gather by view copy plus one list clone.
+
+The bench-mode A/B against main:
+- Q10 at SF10: 3.2× slower;
+- Q5 at SF1: 50× slower;
+- Q5 at SF10: failed.
+
+The cause is accounting, not the gather. `StrVec::memory_size` charges every buffer a vector
+references, in full, by design (the pool errs high). With the whole build column's list attached,
+each output chunk was charged, and walked, the entire build side's string bytes. Reverted.
+
+What this means for 141c: a row layout or a shared build heap only works if a gathered string's
+buffer is charged once per join, not once per output chunk. DuckDB does that: a result vector holds
+a reference to the build's heap block, and the buffer manager accounts by block, not by vector.
+That needs a change to how `StrVec` reports shared bytes (count a join's build heap once, for
+example as a handle the join owns) before string gathering can be made cheaper.
