@@ -6,7 +6,8 @@
 
 const native = require('./build/pinkdb.node');
 
-const ABI_VERSION = 1;
+// 1.3: (major << 16) | minor. The addon still exposes the v1 cell API.
+const ABI_VERSION = (1 << 16) | 3;
 
 /**
  * Error raised by pinkdb. `class` is the stable C ABI error class:
@@ -161,9 +162,11 @@ function abiVersion() {
 }
 
 const actualAbi = guard(() => native.abiVersion());
-if (actualAbi !== ABI_VERSION) {
+// Same major, at least this minor: a newer minor only adds calls.
+if (actualAbi >>> 16 !== ABI_VERSION >>> 16 || (actualAbi & 0xffff) < (ABI_VERSION & 0xffff)) {
   throw new Error(
-    `pinkdb: the native addon speaks C ABI v${actualAbi}, this package expects v${ABI_VERSION}; ` +
+    `pinkdb: the native addon speaks C ABI v${actualAbi >>> 16}.${actualAbi & 0xffff}, ` +
+      `this package expects v${ABI_VERSION >>> 16}.${ABI_VERSION & 0xffff} or a later minor; ` +
       'rebuild with `npm run build` against a matching libpinkdb_ffi',
   );
 }

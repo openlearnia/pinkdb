@@ -22,7 +22,7 @@ function tempDatabase(name = 'test.pinkdb') {
 
 test('abiVersion matches the package constant', () => {
   assert.equal(abiVersion(), ABI_VERSION);
-  assert.equal(abiVersion(), 1);
+  assert.equal(abiVersion(), (1 << 16) | 3);
 });
 
 test('a file database survives close and reopen', () => {

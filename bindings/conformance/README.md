@@ -51,7 +51,7 @@ inside SQL, which every binding supports.
 ```json
 {
   "corpus_version": 1,
-  "abi_version": 1,
+  "abi_version": 65539,
   "cases": [
     {
       "name": "types_roundtrip",
@@ -63,7 +63,7 @@ inside SQL, which every binding supports.
 }
 ```
 
-`abi_version` is the C ABI version the expectations were produced with; a binding
+`abi_version` is the C ABI version (`major << 16 | minor`) the expectations were produced with; a binding
 whose `pinkdb_abi_version()` differs fails the whole corpus instead of guessing.
 
 `setup` statements run once per case, in order, on a fresh database (in-memory where

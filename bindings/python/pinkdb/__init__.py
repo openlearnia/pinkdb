@@ -138,6 +138,7 @@ _TYPE_ARRAY = 11
 _TYPE_ARRAY_FLOAT = 12
 _TYPE_HUGEINT = 13
 _TYPE_UHUGEINT = 14
+_TYPE_UUID = 15
 
 _TYPE_NAMES = {
     _TYPE_NULL: "null",
@@ -152,6 +153,7 @@ _TYPE_NAMES = {
     _TYPE_INTERVAL: "interval",
     _TYPE_HUGEINT: "hugeint",
     _TYPE_UHUGEINT: "uhugeint",
+    _TYPE_UUID: "uuid",
 }
 
 def _type_name(tag: int) -> str:
@@ -170,7 +172,7 @@ _EPOCH_DATE = _datetime.date(1970, 1, 1)
 _EPOCH_DATETIME = _datetime.datetime(1970, 1, 1)
 
 #: ABI version this binding targets (``pinkdb_abi_version``).
-_ABI_VERSION = 1
+_ABI_VERSION = (1 << 16) | 3
 
 
 class Warning(Exception):  # noqa: A001 - the name PEP 249 requires
@@ -240,6 +242,24 @@ _EXCEPTIONS_BY_CLASS = {
     "csv": DataError,
     "internal": InternalError,
 }
+
+
+class _PinkString(ctypes.Structure):
+    """C mirror of ``pinkdb_string_t`` (``{const char *ptr; uint64_t len}``)."""
+
+    _fields_ = [
+        ("ptr", ctypes.c_void_p),
+        ("len", ctypes.c_uint64),
+    ]
+
+
+class _PinkU128(ctypes.Structure):
+    """C mirror of ``pinkdb_hugeint`` (low word first, little-endian)."""
+
+    _fields_ = [
+        ("lower", ctypes.c_uint64),
+        ("upper", ctypes.c_uint64),
+    ]
 
 
 class _PinkValue(ctypes.Structure):
@@ -378,6 +398,35 @@ def _bind(lib: ctypes.CDLL, path: str) -> None:
         _PinkValue,
     )
     declare(
+        "pinkdb_result_column_decimal_width",
+        [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t],
+        ctypes.c_int32,
+    )
+    declare(
+        "pinkdb_result_column_decimal_scale",
+        [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t],
+        ctypes.c_int32,
+    )
+    declare(
+        "pinkdb_result_fetch_chunk",
+        [ctypes.c_void_p, ctypes.c_size_t],
+        ctypes.c_void_p,
+    )
+    declare("pinkdb_destroy_chunk", [ctypes.c_void_p], None)
+    declare("pinkdb_chunk_size", [ctypes.c_void_p], ctypes.c_size_t)
+    declare(
+        "pinkdb_chunk_column",
+        [ctypes.c_void_p, ctypes.c_size_t],
+        ctypes.c_void_p,
+    )
+    declare("pinkdb_vector_data", [ctypes.c_void_p], ctypes.c_void_p)
+    declare("pinkdb_vector_validity", [ctypes.c_void_p], ctypes.c_void_p)
+    declare(
+        "pinkdb_validity_row_is_valid",
+        [ctypes.c_void_p, ctypes.c_size_t],
+        ctypes.c_int32,
+    )
+    declare(
         "pinkdb_result_affected",
         [ctypes.c_void_p, ctypes.c_size_t],
         ctypes.c_size_t,
@@ -397,10 +446,13 @@ except OSError as exc:  # wrong architecture, not a shared library, ...
 _bind(_LIB, library_path)
 
 _loaded_abi_version = int(_LIB.pinkdb_abi_version())
-if _loaded_abi_version != _ABI_VERSION:
+# Same major, at least this minor: a newer minor only adds calls.
+if (_loaded_abi_version >> 16 != _ABI_VERSION >> 16
+        or (_loaded_abi_version & 0xFFFF) < (_ABI_VERSION & 0xFFFF)):
     raise Error(
         f"pinkdb-ffi ABI version mismatch: {library_path!r} reports version "
-        f"{_loaded_abi_version}, this binding requires version {_ABI_VERSION}"
+        f"{_loaded_abi_version >> 16}.{_loaded_abi_version & 0xFFFF}, this binding "
+        f"requires {_ABI_VERSION >> 16}.{_ABI_VERSION & 0xFFFF} or a later minor"
     )
 
 
@@ -497,6 +549,108 @@ def _value_to_python(v: _PinkValue):
         return _decimal.Decimal(text) if tag == _TYPE_DECIMAL else text
     raise Error(f"unknown value type tag {tag} from the native library")
 
+
+def _format_uuid(bits: int) -> str:
+    """The engine's canonical lowercase UUID text from its 128 bits."""
+    text = f"{bits:032x}"
+    return f"{text[:8]}-{text[8:12]}-{text[12:16]}-{text[16:20]}-{text[20:]}"
+
+
+def _chunk_value(
+    lib: ctypes.CDLL,
+    result_ptr,
+    statement: int,
+    row: int,
+    column: int,
+    tag: int,
+    data,
+    validity,
+    scale: int,
+):
+    """One row of a 1.2 vector, in the same Python type as ``_value_to_python``.
+
+    INTERVAL and ARRAY have no Python-native form here, so they fall back to
+    the result's canonical cell; VARIANT's JSON text is read from the chunk.
+    """
+    if not lib.pinkdb_validity_row_is_valid(validity, row):
+        return None
+    if not data:
+        return _value_to_python(lib.pinkdb_result_value(result_ptr, statement, row, column))
+    if tag == _TYPE_BOOLEAN:
+        return bool(ctypes.cast(data, ctypes.POINTER(ctypes.c_uint8))[row])
+    if tag == _TYPE_INTEGER:
+        return int(ctypes.cast(data, ctypes.POINTER(ctypes.c_int32))[row])
+    if tag == _TYPE_BIGINT:
+        return int(ctypes.cast(data, ctypes.POINTER(ctypes.c_int64))[row])
+    if tag == _TYPE_DOUBLE:
+        return float(ctypes.cast(data, ctypes.POINTER(ctypes.c_double))[row])
+    if tag in (_TYPE_VARCHAR, 10):  # 10 is VARIANT's JSON string element
+        string = ctypes.cast(data, ctypes.POINTER(_PinkString))[row]
+        if not string.ptr or string.len == 0:
+            return ""
+        return ctypes.string_at(string.ptr, string.len).decode("utf-8")
+    if tag == _TYPE_DATE:
+        days = int(ctypes.cast(data, ctypes.POINTER(ctypes.c_int32))[row])
+        try:
+            return _EPOCH_DATE + _datetime.timedelta(days=days)
+        except OverflowError as exc:
+            raise Error(
+                f"DATE value {days} (days since epoch) is outside "
+                "Python's datetime range"
+            ) from exc
+    if tag == _TYPE_TIMESTAMP:
+        micros = int(ctypes.cast(data, ctypes.POINTER(ctypes.c_int64))[row])
+        try:
+            return _EPOCH_DATETIME + _datetime.timedelta(microseconds=micros)
+        except OverflowError as exc:
+            raise Error(
+                f"TIMESTAMP value {micros} (microseconds since epoch) is "
+                "outside Python's datetime range"
+            ) from exc
+    if tag in (_TYPE_DECIMAL, _TYPE_HUGEINT, _TYPE_UHUGEINT, _TYPE_UUID):
+        words = ctypes.cast(data, ctypes.POINTER(_PinkU128))[row]
+        bits = (words.upper << 64) | words.lower
+        if tag == _TYPE_DECIMAL:
+            signed = bits - (1 << 128) if bits >> 127 else bits
+            return _decimal.Decimal(signed).scaleb(-scale)
+        if tag == _TYPE_HUGEINT:
+            return str(bits - (1 << 128) if bits >> 127 else bits)
+        if tag == _TYPE_UHUGEINT:
+            return str(bits)
+        return _format_uuid(bits)
+    # INTERVAL and ARRAY: keep the canonical cell until 112c gives them a
+    # native Python shape.
+    return _value_to_python(lib.pinkdb_result_value(result_ptr, statement, row, column))
+
+
+def _chunk_rows(lib: ctypes.CDLL, result_ptr, statement: int, ncols: int):
+    """Yield every row of a SELECT from the result's chunks, then free them."""
+    chunk = lib.pinkdb_result_fetch_chunk(result_ptr, statement)
+    try:
+        while chunk:
+            size = lib.pinkdb_chunk_size(chunk)
+            columns = []
+            for col in range(ncols):
+                tag = lib.pinkdb_result_column_type(result_ptr, statement, col)
+                vector = lib.pinkdb_chunk_column(chunk, col)
+                columns.append(
+                    (
+                        tag,
+                        lib.pinkdb_vector_data(vector),
+                        lib.pinkdb_vector_validity(vector),
+                        lib.pinkdb_result_column_decimal_scale(result_ptr, statement, col),
+                    )
+                )
+            for row in range(size):
+                yield [
+                    _chunk_value(lib, result_ptr, statement, row, col, *columns[col])
+                    for col in range(ncols)
+                ]
+            lib.pinkdb_destroy_chunk(chunk)
+            chunk = lib.pinkdb_result_fetch_chunk(result_ptr, statement)
+    finally:
+        if chunk:
+            lib.pinkdb_destroy_chunk(chunk)
 
 #: Python types that bind by value to a ``?`` placeholder, for error messages.
 _BINDABLE_TYPES = (
@@ -682,16 +836,7 @@ def _snapshot(lib: ctypes.CDLL, result_ptr) -> list:
                         lib.pinkdb_result_column_type(result_ptr, stmt, col),
                     )
                 )
-            nrows = lib.pinkdb_result_row_count(result_ptr, stmt)
-            rows = [
-                [
-                    _value_to_python(
-                        lib.pinkdb_result_value(result_ptr, stmt, row, col)
-                    )
-                    for col in range(ncols)
-                ]
-                for row in range(nrows)
-            ]
+            rows = list(_chunk_rows(lib, result_ptr, stmt, ncols))
             results.append(Result(kind, columns, column_types, rows, 0, None))
         else:
             affected = lib.pinkdb_result_affected(result_ptr, stmt)
@@ -1090,6 +1235,7 @@ class Cursor:
         self._kind = None
         self._row_count = 0
         self._row_index = 0
+        self._rows = iter(())
         self._affected = 0
         self._closed = False
         #: Rows ``fetchmany()`` returns when called without a size.
@@ -1193,12 +1339,7 @@ class Cursor:
         result = self._require_result()
         if self._row_index >= self._row_count:
             return None
-        row = tuple(
-            _value_to_python(
-                self._lib.pinkdb_result_value(result, 0, self._row_index, col)
-            )
-            for col in range(len(self._columns))
-        )
+        row = tuple(next(self._rows, ()))
         self._row_index += 1
         return row
 
@@ -1287,6 +1428,7 @@ class Cursor:
         self._kind = None
         self._row_count = 0
         self._row_index = 0
+        self._rows = iter(())
         self._affected = 0
 
     def _adopt(self, result) -> None:
@@ -1311,6 +1453,7 @@ class Cursor:
             self._affected = int(self._lib.pinkdb_result_affected(result, 0))
         self._result = result
         self._row_index = 0
+        self._rows = _chunk_rows(self._lib, result, 0, len(self._columns)) if kind_tag == 0 else iter(())
 
 
 class Connection(Database):

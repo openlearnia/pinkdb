@@ -1,35 +1,53 @@
 /*
- * pinkdb C ABI v1 — https://github.com/openlearnia/pinkdb
+ * pinkdb C ABI v1.3 — https://github.com/openlearnia/pinkdb
  *
  * Built as `libpinkdb_ffi.dylib` (cdylib) and `libpinkdb_ffi.a` (staticlib)
  * from the `pinkdb-ffi` crate. Link with `-lpinkdb_ffi`.
  *
+ * Versioning: `PINKDB_ABI_VERSION` is `major << 16 | minor`. Adding a
+ * function, a type tag or a struct field at the end bumps the minor; removing
+ * or renaming a function, or changing an existing layout, bumps the major.
+ * A caller may accept a newer library with the same major. Structs that cross
+ * the boundary by value carry a `struct_size` field when a later minor may
+ * grow them (`pink_value` predates that rule and keeps its v1 layout).
+ *
  * Contract
  * --------
  * - Every pointer returned by this library is freed with the matching
- *   `pinkdb_*_free` function (`pinkdb_result_free`, `pinkdb_prepared_free`
- *   and `pinkdb_close`). Never free the same pointer twice.
+ *   `pinkdb_*_free` function (`pinkdb_result_free`, `pinkdb_prepared_free`,
+ *   `pinkdb_disconnect`, `pinkdb_close_database`, `pinkdb_destroy_config`
+ *   and `pinkdb_close`). `errmsg` strings use `pinkdb_free`. Never free the
+ *   same pointer twice.
  * - Text pointers (`pinkdb_result_column_name`, `pinkdb_result_name`,
  *   `pinkdb_result_profile_kind`, `pink_value.text_ptr`, `pinkdb_last_error`,
  *   `pinkdb_last_error_class`)
  *   borrow from their owning result/handle/thread and stay valid only until
  *   that owner is freed or the next FFI call on the same thread. Copy them if
  *   you need them longer. `text_ptr` is followed by a NUL byte but may contain
- *   embedded NULs — always trust `text_len`.
- * - Handles are NOT thread-safe: never call into one handle from two threads
- *   at once (serialize calls, e.g. with a mutex — the Go and Python bindings
- *   do). A durable file may be opened by several handles/processes; writes are
- *   serialized by a per-file write lease, and concurrent transactions use
- *   optimistic COMMIT validation (a conflict is a retryable error, never a
- *   silent lost update). In-memory handles are independent. Errors are
- *   thread-local; `pinkdb_last_error` returns NULL
- *   when the last call on the calling thread succeeded.
+ *   embedded NULs — always trust `text_len`. `pinkdb_string_t.ptr` borrows
+ *   from its chunk and is valid until `pinkdb_destroy_chunk`.
+ * - v1 handles are NOT thread-safe: never call into one handle from two
+ *   threads at once. A durable file may be opened by several processes;
+ *   writes are serialized by a per-file write lease, and concurrent
+ *   transactions use optimistic COMMIT validation (a conflict is a retryable
+ *   error, never a silent lost update). In-memory stores are independent.
+ *   The v1 errors are thread-local; `pinkdb_last_error` returns NULL when the
+ *   last v1 call on the calling thread succeeded.
+ * - Databases may be opened and shared across threads. A connection belongs
+ *   to one thread at a time (create it on any thread, then hand it over), with
+ *   one exception: `pinkdb_interrupt` may be called from another thread while
+ *   a statement runs on that connection.
  * - SQL is passed as (pointer, length) and must be valid UTF-8. Passing a
  *   NULL pointer with a non-zero length, or invalid UTF-8, is an error.
- * - Error reporting: functions that return a pointer return NULL on failure;
- *   index/kind accessors return 0/-1 for out-of-range indices; call
+ * - v1 error reporting: functions that return a pointer return NULL on
+ *   failure; index/kind accessors return 0/-1 for out-of-range indices; call
  *   `pinkdb_last_error` for the message and `pinkdb_last_error_class` for its
  *   class.
+ * - New API error reporting: `pinkdb_query` and `pinkdb_query_prepared`
+ *   always return a result, successful or failed; read its error with
+ *   `pinkdb_result_error`/`pinkdb_result_error_class` until
+ *   `pinkdb_result_free`. Functions with an `errmsg` out-parameter set it to
+ *   a string (free with `pinkdb_free`) on failure and NULL on success.
  */
 
 #ifndef PINKDB_H
@@ -37,6 +55,59 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+/*
+ * Arrow C Data Interface
+ * ----------------------
+ * These are the standard ABI-stable structs from the Arrow C Data Interface
+ * specification. The include guard is the specification's own, so this header
+ * can be included next to arrow/c/abi.h (or arrow's Rust/Python headers)
+ * without redefining the structs. The plugin-interface structs are not
+ * declared here.
+ */
+#ifndef ARROW_C_DATA_INTERFACE
+#define ARROW_C_DATA_INTERFACE
+
+#define ARROW_FLAG_DICTIONARY_ORDERED 1
+#define ARROW_FLAG_NULLABLE 2
+#define ARROW_FLAG_MAP_KEYS_SORTED 4
+
+struct ArrowSchema {
+    const char *format;
+    const char *name;
+    const char *metadata;
+    int64_t flags;
+    int64_t n_children;
+    struct ArrowSchema **children;
+    struct ArrowSchema *dictionary;
+    void (*release)(struct ArrowSchema *);
+    void *private_data;
+};
+
+struct ArrowArray {
+    int64_t length;
+    int64_t null_count;
+    int64_t offset;
+    int64_t n_buffers;
+    int64_t n_children;
+    const void **buffers;
+    struct ArrowArray **children;
+    struct ArrowArray *dictionary;
+    void (*release)(struct ArrowArray *);
+    void *private_data;
+};
+
+#endif /* ARROW_C_DATA_INTERFACE */
+
+#define PINKDB_ABI_VERSION_MAJOR 1
+#define PINKDB_ABI_VERSION_MINOR 3
+#define PINKDB_ABI_VERSION ((PINKDB_ABI_VERSION_MAJOR << 16) | PINKDB_ABI_VERSION_MINOR)
+
+/* Library (not ABI) version, from the Cargo package version. */
+#define PINKDB_VERSION_MAJOR 0
+#define PINKDB_VERSION_MINOR 1
+#define PINKDB_VERSION_PATCH 0
+#define PINKDB_VERSION "0.1.0"
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,6 +117,39 @@ extern "C" {
 typedef struct pinkdb_handle pinkdb_handle;
 typedef struct pinkdb_result pinkdb_result;
 typedef struct pinkdb_prepared pinkdb_prepared;
+typedef struct pinkdb_database pinkdb_database;
+typedef struct pinkdb_connection pinkdb_connection;
+typedef struct pinkdb_config pinkdb_config;
+typedef struct pinkdb_data_chunk pinkdb_data_chunk;
+typedef struct pinkdb_vector pinkdb_vector;
+
+/* A VARCHAR/BLOB/VARIANT element in a chunk: `len` bytes at `ptr`, never
+ * NUL-terminated. `ptr` is NULL and `len` 0 when the row is NULL. */
+typedef struct pinkdb_string_t {
+    const char *ptr;
+    uint64_t len;
+} pinkdb_string_t;
+
+/* INTERVAL payload: months, days and microseconds, each added independently. */
+typedef struct pinkdb_interval {
+    int32_t months;
+    int32_t days;
+    int64_t micros;
+} pinkdb_interval;
+
+/* HUGEINT and DECIMAL: a signed 128-bit integer, two's complement. */
+typedef struct pinkdb_hugeint {
+    uint64_t lower;
+    int64_t upper;
+} pinkdb_hugeint;
+
+/* UHUGEINT and UUID: an unsigned 128-bit integer, low limb first. A UUID is
+ * the engine's 128-bit value; the v1 cell and the bindings render the
+ * canonical text form. */
+typedef struct pinkdb_uhugeint {
+    uint64_t lower;
+    uint64_t upper;
+} pinkdb_uhugeint;
 
 /* Statement kind tags (pinkdb_result_kind). */
 enum {
@@ -115,10 +219,13 @@ enum {
        string; `i`/`d` are zero. Every SUM over an integer column now yields
        HUGEINT, so a host that predates these tags sees them as unknown. */
     PINKDB_TYPE_HUGEINT = 13,
-    PINKDB_TYPE_UHUGEINT = 14
-    /* UUID columns report PINKDB_TYPE_VARCHAR and carry the canonical
-       lowercase text form: the ABI has no 128-bit cell, so it is not a tag of
-       its own. */
+    PINKDB_TYPE_UHUGEINT = 14,
+    /* v1.2: UUID. The chunk API exposes 16 bytes; the v1 cell API still
+       renders the canonical lowercase text. */
+    PINKDB_TYPE_UUID = 15,
+    /* v1.2: FLOAT, an array element type only (never a column's own tag). It
+       is reported by pinkdb_result_column_array_element_type. */
+    PINKDB_TYPE_FLOAT = 16
 };
 
 /* An ARRAY's type tag: the type in the low byte, the element count above it.
@@ -152,7 +259,9 @@ typedef struct pink_value {
     size_t text_len;
 } pink_value;
 
-/* ABI version of the linked library (currently 1). */
+/* ABI version of the linked library, `major << 16 | minor` (1.3 is
+ * 0x00010003). Compare it with PINKDB_ABI_VERSION; a same-major version is
+ * forward compatible. */
 uint32_t pinkdb_abi_version(void);
 
 /* Open a durable database (checkpoint + WAL) at a filesystem path.
@@ -264,6 +373,184 @@ size_t pinkdb_result_row_count(const pinkdb_result *result, size_t statement);
 pink_value pinkdb_result_value(const pinkdb_result *result, size_t statement,
                                size_t row, size_t column);
 
+/*
+ * Chunk API (ABI 1.2)
+ * -------------------
+ * A SELECT's rows are produced as columnar chunks of at most 2048 rows. The
+ * chunk API exposes those chunks without converting them to cells:
+ *
+ *     pinkdb_data_chunk *chunk;
+ *     while ((chunk = pinkdb_result_fetch_chunk(result, statement))) {
+ *         size_t rows = pinkdb_chunk_size(chunk);
+ *         const uint64_t *valid = pinkdb_vector_validity(
+ *             pinkdb_chunk_column(chunk, 0));
+ *         const int32_t *data = pinkdb_vector_data(
+ *             pinkdb_chunk_column(chunk, 0));
+ *         ...
+ *         pinkdb_destroy_chunk(chunk);
+ *     }
+ *
+ * Fetch order is statement-local: each call returns the next chunk and NULL
+ * once the end is reached. Fetching from a failed result, a non-SELECT
+ * statement, or a statement index out of range returns NULL. A fetch after
+ * the end keeps returning NULL (it does not restart).
+ *
+ * Ownership: the caller owns each chunk and frees it with
+ * pinkdb_destroy_chunk. A chunk holds its own reference to the underlying
+ * column data, so it stays valid after pinkdb_result_free: a chunk may be
+ * destroyed before or after its result. Vectors are borrowed from their
+ * chunk and are invalid after pinkdb_destroy_chunk. A result may be freed
+ * while chunks from it are still alive.
+ */
+
+/* DECIMAL precision, or -1 when the column is not DECIMAL. */
+int32_t pinkdb_result_column_decimal_width(const pinkdb_result *result,
+                                           size_t statement, size_t column);
+
+/* DECIMAL scale (digits after the point), or -1 when the column is not
+ * DECIMAL. */
+int32_t pinkdb_result_column_decimal_scale(const pinkdb_result *result,
+                                           size_t statement, size_t column);
+
+/* ARRAY element count, or 0 when the column is not an ARRAY. */
+uint64_t pinkdb_result_column_array_length(const pinkdb_result *result,
+                                           size_t statement, size_t column);
+
+/* An ARRAY's element type (PINKDB_TYPE_DOUBLE or PINKDB_TYPE_FLOAT), or -1
+ * when the column is not an ARRAY. */
+int32_t pinkdb_result_column_array_element_type(const pinkdb_result *result,
+                                                size_t statement, size_t column);
+
+/* The next chunk of a SELECT result, or NULL at the end / for a failed or
+ * non-SELECT result. The caller frees it with pinkdb_destroy_chunk. */
+pinkdb_data_chunk *pinkdb_result_fetch_chunk(pinkdb_result *result,
+                                             size_t statement);
+
+/* Free a chunk. NULL-safe. */
+void pinkdb_destroy_chunk(pinkdb_data_chunk *chunk);
+
+/* Rows in a chunk (0 for NULL). */
+size_t pinkdb_chunk_size(const pinkdb_data_chunk *chunk);
+
+/* A vector borrowed from `chunk`, or NULL when the column is out of range.
+ * Valid until pinkdb_destroy_chunk(chunk). */
+pinkdb_vector *pinkdb_chunk_column(const pinkdb_data_chunk *chunk,
+                                   size_t column);
+
+/* The vector's payload in its native layout:
+ *
+ *   PINKDB_TYPE_BOOLEAN      const uint8_t *   (0 or 1, one byte per row)
+ *   PINKDB_TYPE_INTEGER      const int32_t *
+ *   PINKDB_TYPE_BIGINT       const int64_t *
+ *   PINKDB_TYPE_DOUBLE       const double *
+ *   PINKDB_TYPE_DATE         const int32_t *   (days since 1970-01-01)
+ *   PINKDB_TYPE_TIMESTAMP    const int64_t *   (microseconds since epoch, UTC)
+ *   PINKDB_TYPE_INTERVAL     const pinkdb_interval *
+ *   PINKDB_TYPE_HUGEINT      const pinkdb_hugeint *
+ *   PINKDB_TYPE_DECIMAL      const pinkdb_hugeint * (unscaled; use
+ *                                                  decimal_scale for the point)
+ *   PINKDB_TYPE_UHUGEINT     const pinkdb_uhugeint *
+ *   PINKDB_TYPE_UUID         const pinkdb_uhugeint * (the 128-bit value;
+ *                                                    canonical text is upper
+ *                                                    then lower, in hex)
+ *   PINKDB_TYPE_VARCHAR      const pinkdb_string_t *
+ *   PINKDB_TYPE_VARIANT      const pinkdb_string_t * (provisional: the JSON
+ *                                                    text of each value)
+ *
+ * BOOLEAN, INTEGER, BIGINT, DOUBLE, DATE, TIMESTAMP, INTERVAL, HUGEINT,
+ * UHUGEINT, UUID and DECIMAL are zero-copy on little-endian hosts: the
+ * pointer is the engine's own column buffer. VARCHAR and VARIANT build one
+ * string-element array per chunk without copying the bytes (VARIANT builds
+ * its JSON text once per chunk). On a big-endian host the 128-bit types are
+ * copied into a {lower, upper} array per chunk.
+ *
+ * Provisional: ARRAY has no data pointer in 1.2 (returns NULL); use the v1
+ * cell API for ARRAY columns. 112c's Arrow export is the full nested path.
+ * A NULL row's payload bytes are unspecified; check validity first. */
+const void *pinkdb_vector_data(const pinkdb_vector *vector);
+
+/* The vector's validity mask: u64 words, bit i set means row i is valid.
+ * NULL when every row is valid. Bits at or beyond pinkdb_chunk_size are
+ * unspecified. */
+const uint64_t *pinkdb_vector_validity(const pinkdb_vector *vector);
+
+/* 1 when `row` is valid, 0 otherwise. A NULL mask means every row is valid,
+ * so this returns 1. */
+int32_t pinkdb_validity_row_is_valid(const uint64_t *validity, size_t row);
+
+/*
+ * Arrow export (ABI 1.3)
+ * ----------------------
+ * A result exports as one struct-typed Arrow schema/array: the root format is
+ * "+s" and each child is one result column, in result-column order. Use
+ * pinkdb_result_arrow_schema once, then pinkdb_result_fetch_arrow for each
+ * chunk. At the end of the result pinkdb_result_fetch_arrow leaves
+ * out->release NULL and returns 1, so a normal loop is:
+ *
+ *     struct ArrowSchema schema;
+ *     struct ArrowArray array;
+ *     pinkdb_result_arrow_schema(result, statement, &schema);
+ *     while (pinkdb_result_fetch_arrow(result, statement, &array)) {
+ *         if (array.release == NULL) break;
+ *         ... consume array ...
+ *         array.release(&array);
+ *     }
+ *     schema.release(&schema);
+ *
+ * pinkdb_chunk_to_arrow exports a chunk already fetched with
+ * pinkdb_result_fetch_chunk; it does not consume the chunk.
+ *
+ * All three calls return 1 on success and 0 on error. A failed result reports
+ * through pinkdb_result_error/pinkdb_result_error_class; other errors go to
+ * pinkdb_last_error/pinkdb_last_error_class. A NULL output pointer or NULL
+ * input is an error, except that fetching at the end of a result is success.
+ *
+ * Formats and copies (validity is shared in every case):
+ *
+ *   BOOLEAN       b       data is a bit-packed copy
+ *   INTEGER       i       zero-copy int32 payload
+ *   BIGINT        l       zero-copy int64 payload
+ *   DOUBLE        g       zero-copy f64 payload
+ *   DATE          tdD     zero-copy int32 days
+ *   TIMESTAMP     tsu:    zero-copy int64 microseconds (no time zone)
+ *   DECIMAL(p,s)  d:p,s   zero-copy int128 decimal128
+ *   INTERVAL      tin     copy: months, days, micros * 1000 as nanoseconds
+ *   VARCHAR       u       copy: int32 offsets + UTF-8 bytes
+ *   VARIANT       u       copy: JSON text; provisional extension name
+ *                         "pinkdb.variant"
+ *   HUGEINT       d:38,0  zero-copy int128 decimal128; a value with more
+ *                         than 38 digits fails the export
+ *   UHUGEINT      d:38,0  zero-copy; same 38-digit limit
+ *   UUID          w:16    copy: 16 big-endian bytes; extension name
+ *                         "arrow.uuid"
+ *   ARRAY         +w:N    parent shares row validity; fixed-size-list child
+ *                         is i/l/f/g. BIGINT/FLOAT/DOUBLE child payloads are
+ *                         zero-copy; INTEGER children are copied to int32.
+ *
+ * A NULL validity buffer means every row is valid. NULL rows still occupy
+ * their slot in fixed-width and text payloads; only validity says they are
+ * NULL. VARCHAR text is UTF-8. HUGEINT/UHUGEINT export as
+ * decimal128(38,0) so integer SUMs stay numeric; the few values at or beyond
+ * 10^38 make that chunk's export fail with a type error naming the row.
+ *
+ * Ownership: a schema/array owns everything reachable through private_data.
+ * Call its release callback exactly once; release sets release to NULL, so a
+ * second release call is not needed and must not be made. An exported array
+ * holds its own references to the chunk's vectors and stays valid after the
+ * result and chunk are freed. Each child has its own release callback; to move
+ * a child out, copy its struct and set the original child's release to NULL
+ * before releasing the parent, per the Arrow specification.
+ */
+int32_t pinkdb_result_arrow_schema(const pinkdb_result *result,
+                                   size_t statement,
+                                   struct ArrowSchema *out);
+
+int32_t pinkdb_chunk_to_arrow(const pinkdb_data_chunk *chunk,
+                              struct ArrowArray *out);
+
+int32_t pinkdb_result_fetch_arrow(pinkdb_result *result, size_t statement,
+                                  struct ArrowArray *out);
+
 /* INSERT/UPDATE/DELETE results: affected row count, else 0. */
 size_t pinkdb_result_affected(const pinkdb_result *result, size_t statement);
 
@@ -329,6 +616,124 @@ uint32_t pinkdb_result_profile_columns(const pinkdb_result *result,
 const char *pinkdb_result_profile_kind(const pinkdb_result *result,
                                        size_t statement);
 
+/*
+ * Database / connection API (ABI 1.1)
+ * -----------------------------------
+ * A database owns the store; connections own independent sessions. Open one
+ * database, connect once per thread, and disconnect every connection before
+ * closing the database.
+ */
+
+/* Create an empty configuration. Free with pinkdb_destroy_config. Never
+ * returns NULL in practice; NULL on allocation failure. */
+pinkdb_config *pinkdb_create_config(void);
+
+/* Set one option, returning 1 on success and 0 on an unknown name or invalid
+ * value. `name` and `value` are NUL-terminated UTF-8 and are read only for
+ * this call. Names are case-insensitive:
+ *
+ *   read_only                 "true"/"false" (default false)
+ *   access_mode               "automatic", "read_only", "read_write"
+ *   memory_limit              DuckDB-style size ("1GB", "512MB", "-1" = none)
+ *   threads                   positive integer
+ *   wal_sync_method           "full", "fsync", "fdatasync"
+ *   allow_sql_load_extension  "true"/"false" (default false)
+ *
+ * memory_limit is process-wide and applies when the database is opened.
+ * read_only/access_mode refuse every non-query statement; they are enforced
+ * by this library, not by file permissions.
+ * On failure, pinkdb_config_error holds the message naming the option. */
+int32_t pinkdb_config_set(pinkdb_config *config, const char *name,
+                          const char *value);
+
+/* Copy a 32-byte raw key into the configuration. The key is never logged or
+ * echoed. Returns 1, or 0 for a NULL pointer or a length other than 32.
+ * Keyed stores require a build with the `encryption` feature; opening one
+ * without it fails with a clear error. In-memory stores cannot be keyed. */
+int32_t pinkdb_config_set_encryption_key(pinkdb_config *config,
+                                         const unsigned char *key,
+                                         size_t key_len);
+
+/* Last configuration failure, or NULL. Borrowed from the configuration and
+ * valid until the next set call or pinkdb_destroy_config. */
+const char *pinkdb_config_error(const pinkdb_config *config);
+
+/* Destroy a configuration. NULL-safe. Databases opened with it keep their
+ * copies of every setting. */
+void pinkdb_destroy_config(pinkdb_config *config);
+
+/* Open a database. `path` NULL or ":memory:" is in-memory; otherwise durable.
+ * `config` may be NULL for defaults. Returns 1 on success, 0 on failure.
+ * On failure *out_database is NULL and *errmsg is a string to free with
+ * pinkdb_free; on success *errmsg is NULL. Both out parameters must be
+ * non-NULL. The database may be used from several threads. */
+int32_t pinkdb_open_ext(const char *path, const pinkdb_config *config,
+                        pinkdb_database **out_database, char **errmsg);
+
+/* Close the database. NULL-safe. Existing connections keep the store alive
+ * until disconnected, but later queries on them fail with "invalid_argument".
+ * Free with this call (not pinkdb_free). Do not call this concurrently with
+ * any other function that uses the same database handle. */
+void pinkdb_close_database(pinkdb_database *database);
+
+/* Create an independent connection (session) on an open database. May be
+ * called from any thread. Returns 1 and stores the connection, or 0 on a
+ * NULL/closed database or allocation failure. Free with
+ * pinkdb_disconnect. */
+int32_t pinkdb_connect(pinkdb_database *database,
+                       pinkdb_connection **out_connection);
+
+/* Disconnect. NULL-safe. Do not use the pointer afterwards. */
+void pinkdb_disconnect(pinkdb_connection *connection);
+
+/* Stop the statement currently running on `connection`. Call from another
+ * thread while that statement runs. The statement stops at the executor's
+ * next cancellation checkpoint with the "interrupted" error class. A flag set
+ * before the next query starts is cleared by that query. NULL-safe; no other
+ * call on the connection may run concurrently. */
+void pinkdb_interrupt(pinkdb_connection *connection);
+
+/* Execute one or more SQL statements on a connection. Returns 1 when they
+ * all ran, 0 when one failed; either way *out_result is a result owned by the
+ * caller (free with pinkdb_result_free). Inspect a failed result with
+ * pinkdb_result_error/class. *out_result must be non-NULL.
+ *
+ * SECURITY: the LOAD EXTENSION policy is fixed when the database is opened;
+ * see allow_sql_load_extension above. */
+int32_t pinkdb_query(pinkdb_connection *connection, const char *sql,
+                     size_t sql_len, pinkdb_result **out_result);
+
+/* Prepare one statement with `?` placeholders on a connection. Returns 1, or
+ * 0 with *out_prepared NULL and *errmsg a string to free with pinkdb_free;
+ * on success *errmsg is NULL. Both out parameters must be non-NULL. The
+ * prepared statement may be executed on any connection of the same database
+ * and is freed with pinkdb_prepared_free. */
+int32_t pinkdb_prepare_ext(pinkdb_connection *connection, const char *sql,
+                           size_t sql_len, pinkdb_prepared **out_prepared,
+                           char **errmsg);
+
+/* Execute a prepared statement with one pink_value per placeholder in
+ * textual order. Returns and reports exactly like pinkdb_query. Values are
+ * read only for the call (VARCHAR payloads are copied). */
+int32_t pinkdb_query_prepared(pinkdb_connection *connection,
+                              const pinkdb_prepared *prepared,
+                              const pink_value *values, size_t value_count,
+                              pinkdb_result **out_result);
+
+/* Error carried by a result, or NULL when it succeeded. Owned by the result;
+ * valid until pinkdb_result_free. */
+const char *pinkdb_result_error(const pinkdb_result *result);
+
+/* Stable error class of pinkdb_result_error, or NULL when the result
+ * succeeded. Static string: never free. Same class names as
+ * pinkdb_last_error_class, plus "permission" (read-only refusal) and
+ * "interrupted" (pinkdb_interrupt). */
+const char *pinkdb_result_error_class(const pinkdb_result *result);
+
+/* Free an errmsg string from pinkdb_open_ext/pinkdb_prepare_ext. NULL-safe.
+ * Not a general-purpose free: only pass strings this library returned. */
+void pinkdb_free(void *ptr);
+
 /* Last error on the calling thread (NUL-terminated), or NULL when the last
  * call on this thread succeeded. Valid until the next FFI call on this
  * thread. */
@@ -347,6 +752,8 @@ const char *pinkdb_last_error(void);
  *   "csv"              a CSV import/export error
  *   "invalid_argument" the caller passed a bad argument (NULL handle, invalid
  *                      UTF-8, a value that cannot be bound, ...)
+ *   "permission"       the database is read-only and the statement writes
+ *   "interrupted"      pinkdb_interrupt stopped the statement
  *   "internal"         a caught panic; the handle is still usable
  *
  * The string is static: never free it, and it stays valid across later calls

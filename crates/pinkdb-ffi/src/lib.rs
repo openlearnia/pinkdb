@@ -1,4 +1,4 @@
-//! pinkdb C ABI v1 — `pinkdb-ffi`.
+//! pinkdb C ABI v1.3 — `pinkdb-ffi`.
 //!
 //! Exposes the `pinkdb` embedding API over a C ABI (`cdylib` + `staticlib`)
 //! for foreign bindings (Python `cffi`, Go `cgo`, ...). This crate is the
@@ -33,15 +33,28 @@
 // `unsafe fn` here does not apply to this crate.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::cell::RefCell;
-use std::ffi::{CStr, CString, c_char};
+use std::cell::{RefCell, UnsafeCell};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use pinkdb::{DataType, PinkDb, PinkDbError, QueryProfile, QueryResult, Value};
+use pinkdb::db::{Connection, Database};
+use pinkdb::exec::ChunkedResult;
+use pinkdb::wal::WalSyncMethod;
+use pinkdb::{
+    CancelFlag, DataChunk, DataType, EncryptionKey, PinkDbError, QueryProfile, QueryResult, Value,
+    Vector, VectorData,
+};
 
-/// ABI version reported by [`pinkdb_abi_version`].
-pub const PINKDB_ABI_VERSION: u32 = 1;
+mod arrow;
+pub use arrow::{ArrowArray, ArrowSchema};
+
+/// ABI version reported by [`pinkdb_abi_version`]: `major << 16 | minor`.
+///
+/// Additions bump the minor; removals or layout changes bump the major.
+pub const PINKDB_ABI_VERSION: u32 = (1 << 16) | 3;
 
 // ----- statement kind tags (`pinkdb_result_kind`) -----
 pub const PINKDB_STMT_SELECTED: i32 = 0;
@@ -122,6 +135,12 @@ pub const PINKDB_TYPE_ARRAY_FLOAT: i32 = 12;
 /// `text`/`text_len` carry the exact digits and `i`/`d` stay zero.
 pub const PINKDB_TYPE_HUGEINT: i32 = 13;
 pub const PINKDB_TYPE_UHUGEINT: i32 = 14;
+/// A UUID: 16 bytes in the chunk API (`pinkdb_uhugeint` layout); the v1 cell
+/// API still renders it as canonical VARCHAR text.
+pub const PINKDB_TYPE_UUID: i32 = 15;
+/// A FLOAT array element, not a standalone column type. Appears only through
+/// `pinkdb_result_column_array_element_type`.
+pub const PINKDB_TYPE_FLOAT: i32 = 16;
 
 // ----- thread-local error -----
 
@@ -143,6 +162,8 @@ const CLASS_IO: &CStr = c"io";
 const CLASS_CSV: &CStr = c"csv";
 const CLASS_INVALID_ARGUMENT: &CStr = c"invalid_argument";
 const CLASS_INTERNAL: &CStr = c"internal";
+const CLASS_PERMISSION: &CStr = c"permission";
+const CLASS_INTERRUPTED: &CStr = c"interrupted";
 
 fn set_error(class: &'static CStr, msg: &str) {
     // Interior NULs cannot live in a CString; escape them for display.
@@ -155,11 +176,18 @@ fn set_error(class: &'static CStr, msg: &str) {
 /// The one enforced constraint (a NOT NULL column added to a non-empty table
 /// without a default) is an `Execution` error with a fixed prefix; give it
 /// its own class so drivers can raise an integrity error.
-fn set_engine_error(e: &PinkDbError) {
+fn engine_error_class(e: &PinkDbError) -> &'static CStr {
     // Same stable kinds the CLI's JSON contract uses (`pinkdb::agent`), plus
-    // "constraint" for the one enforced constraint. Drivers map these onto
-    // their own exception hierarchies.
-    let class = if matches!(e, PinkDbError::Execution(msg)
+    // "constraint" for the one enforced constraint and "interrupted" for the
+    // cancellation flag's fixed message. Drivers map these onto their own
+    // exception hierarchies.
+    if matches!(e, PinkDbError::Permission(_)) {
+        CLASS_PERMISSION
+    } else if matches!(e, PinkDbError::Execution(msg)
+        if msg == pinkdb::STATEMENT_CANCELLED)
+    {
+        CLASS_INTERRUPTED
+    } else if matches!(e, PinkDbError::Execution(msg)
         if msg.starts_with("NOT NULL constraint failed"))
     {
         CLASS_CONSTRAINT
@@ -174,8 +202,11 @@ fn set_engine_error(e: &PinkDbError) {
             "csv" => CLASS_CSV,
             _ => CLASS_INTERNAL,
         }
-    };
-    set_error(class, &e.to_string());
+    }
+}
+
+fn set_engine_error(e: &PinkDbError) {
+    set_error(engine_error_class(e), &e.to_string());
 }
 
 fn clear_error() {
@@ -498,7 +529,7 @@ fn dtype_tag(t: DataType) -> i32 {
         DataType::Decimal { .. } => PINKDB_TYPE_DECIMAL,
         DataType::Interval => PINKDB_TYPE_INTERVAL,
         DataType::Variant => PINKDB_TYPE_VARIANT,
-        DataType::Uuid => PINKDB_TYPE_VARCHAR,
+        DataType::Uuid => PINKDB_TYPE_UUID,
         DataType::Hugeint => PINKDB_TYPE_HUGEINT,
         DataType::Uhugeint => PINKDB_TYPE_UHUGEINT,
     }
@@ -510,10 +541,252 @@ fn nul_terminated(s: &str) -> Vec<u8> {
     b
 }
 
+/// A SELECT result: the schema, the executor's chunks, and (lazily) the v1
+/// cell rows. Bindings on ABI 1.2 read the chunks; `pinkdb_result_value` still
+/// answers the older cell API from the same data.
 struct SelStmt {
     names: Vec<Vec<u8>>,
     types: Vec<i32>,
-    rows: Vec<Vec<Cell>>,
+    dtypes: Vec<DataType>,
+    chunks: Vec<DataChunk>,
+    row_count: usize,
+    /// The next chunk `pinkdb_result_fetch_chunk` hands out.
+    next_chunk: usize,
+    /// Built on the first v1 cell access; NULL-cell conversion is eager for
+    /// the types that can fail (ARRAY), so this never loses an error.
+    rows: RefCell<Option<Vec<Vec<Cell>>>>,
+}
+
+impl SelStmt {
+    fn from_chunks(
+        names: Vec<String>,
+        dtypes: Vec<DataType>,
+        chunks: Vec<DataChunk>,
+    ) -> std::result::Result<SelStmt, String> {
+        let row_count = chunks.iter().map(|c| c.num_rows).sum();
+        let types = dtypes.iter().copied().map(dtype_tag).collect();
+        // Array cells are the only cell conversion that can fail; validate
+        // them now so a v1 caller sees the same error the row path produced.
+        let rows = if dtypes.iter().any(|t| matches!(t, DataType::Array { .. })) {
+            Some(cells_from_chunks(&chunks)?)
+        } else {
+            None
+        };
+        Ok(SelStmt {
+            names: names.iter().map(|n| nul_terminated(n)).collect(),
+            types,
+            dtypes,
+            chunks,
+            row_count,
+            next_chunk: 0,
+            rows: RefCell::new(rows),
+        })
+    }
+
+    fn from_rows(
+        names: Vec<String>,
+        dtypes: Vec<DataType>,
+        rows: Vec<Vec<Value>>,
+    ) -> std::result::Result<SelStmt, String> {
+        let chunks = chunks_from_rows(&dtypes, &rows)?;
+        SelStmt::from_chunks(names, dtypes, chunks)
+    }
+
+    fn rows(&self) -> std::cell::Ref<'_, Vec<Vec<Cell>>> {
+        if self.rows.borrow().is_none() {
+            // `from_chunks` already validated the only failing conversion.
+            let rows = cells_from_chunks(&self.chunks).unwrap_or_default();
+            *self.rows.borrow_mut() = Some(rows);
+        }
+        std::cell::Ref::map(self.rows.borrow(), |r| {
+            r.as_ref().expect("rows were just initialized")
+        })
+    }
+}
+
+fn cells_from_chunks(chunks: &[DataChunk]) -> std::result::Result<Vec<Vec<Cell>>, String> {
+    let mut rows = Vec::with_capacity(chunks.iter().map(|c| c.num_rows).sum());
+    for chunk in chunks {
+        for i in 0..chunk.num_rows {
+            rows.push(
+                chunk
+                    .columns
+                    .iter()
+                    .map(|c| Cell::from_value(&c.get(i)))
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            );
+        }
+    }
+    Ok(rows)
+}
+
+/// The row-shaped result paths (`RETURNING`, `CALL`, transactions) still hand
+/// the C API rows; rebuild chunks so every SELECT serves chunk fetch.
+fn chunks_from_rows(
+    dtypes: &[DataType],
+    rows: &[Vec<Value>],
+) -> std::result::Result<Vec<DataChunk>, String> {
+    let mut chunks = Vec::with_capacity(rows.len().div_ceil(pinkdb::CHUNK_SIZE));
+    for window in rows.chunks(pinkdb::CHUNK_SIZE) {
+        let mut columns = Vec::with_capacity(dtypes.len());
+        for (i, dtype) in dtypes.iter().enumerate() {
+            let mut vector = Vector::with_capacity(*dtype, window.len());
+            for row in window {
+                vector
+                    .push_value(row.get(i).cloned().unwrap_or(Value::Null))
+                    .map_err(|e| e.to_string())?;
+            }
+            columns.push(vector);
+        }
+        chunks.push(DataChunk::new(columns).map_err(|e| e.to_string())?);
+    }
+    Ok(chunks)
+}
+
+/// A `{const char *ptr; uint64_t len}` string element in a VARCHAR, BLOB or
+/// VARIANT vector. `ptr` is NULL for a NULL row and is never NUL-terminated.
+#[repr(C)]
+pub struct PinkString {
+    pub ptr: *const c_char,
+    pub len: u64,
+}
+
+/// The little-endian `{lower, upper}` words C sees for a 128-bit value. On a
+/// big-endian host the chunk builder fills one of these per row instead of
+/// exposing the engine's native words.
+#[repr(C)]
+pub struct PinkU128 {
+    pub lower: u64,
+    pub upper: u64,
+}
+
+/// One vector's C view: a typed data pointer, an optional validity mask, and
+/// the owned payloads those pointers borrow from.
+pub struct PinkVector {
+    data: *const c_void,
+    validity: *const u64,
+    len: usize,
+    /// Owned string-element array (VARCHAR/BLOB/VARIANT).
+    _strings: Vec<PinkString>,
+    /// Owned JSON text backing `_strings` for VARIANT.
+    _text: Vec<Vec<u8>>,
+    /// Big-endian hosts only: owned `{lower, upper}` words for 128-bit types.
+    _ints: Vec<PinkU128>,
+}
+
+fn wide_data<T>(
+    values: &[T],
+    ints: &mut Vec<PinkU128>,
+    to_u128: impl Fn(&T) -> u128,
+) -> *const c_void {
+    if cfg!(target_endian = "little") {
+        return values.as_ptr().cast();
+    }
+    ints.extend(values.iter().map(|v| {
+        let x = to_u128(v);
+        PinkU128 {
+            lower: x as u64,
+            upper: (x >> 64) as u64,
+        }
+    }));
+    ints.as_ptr().cast()
+}
+
+impl PinkVector {
+    fn new(vector: &Vector) -> PinkVector {
+        let len = vector.len();
+        let mut strings = Vec::new();
+        let mut text = Vec::new();
+        let mut ints = Vec::new();
+        let data: *const c_void = match vector.data() {
+            VectorData::Boolean(v) => v.as_ptr().cast(),
+            VectorData::Int32(v) => v.as_ptr().cast(),
+            VectorData::Int64(v) => v.as_ptr().cast(),
+            VectorData::Float64(v) => v.as_ptr().cast(),
+            VectorData::Date32(v) => v.as_ptr().cast(),
+            VectorData::TimestampMicros(v) => v.as_ptr().cast(),
+            VectorData::Decimal { values, .. } => wide_data(values, &mut ints, |v| *v as u128),
+            VectorData::Interval(v) => v.as_ptr().cast(),
+            VectorData::Int128(v) => wide_data(v, &mut ints, |v| *v as u128),
+            VectorData::UInt128(v) => wide_data(v, &mut ints, |v| *v),
+            VectorData::Uuid(v) => wide_data(v, &mut ints, |v| *v),
+            VectorData::VarChar(v) => {
+                strings.reserve(len);
+                for i in 0..len {
+                    if vector.is_valid(i) {
+                        let s = v.get(i);
+                        strings.push(PinkString {
+                            ptr: s.as_ptr() as *const c_char,
+                            len: s.len() as u64,
+                        });
+                    } else {
+                        strings.push(PinkString {
+                            ptr: ptr::null(),
+                            len: 0,
+                        });
+                    }
+                }
+                strings.as_ptr().cast()
+            }
+            // Provisional: VARIANT crosses as its JSON text, not a nested
+            // value. 112c's Arrow export is the full nested path.
+            VectorData::Variant(v) => {
+                text.reserve(len);
+                strings.reserve(len);
+                for (i, value) in v.iter().enumerate().take(len) {
+                    if vector.is_valid(i) {
+                        let bytes = value.to_json().into_bytes();
+                        strings.push(PinkString {
+                            ptr: bytes.as_ptr() as *const c_char,
+                            len: bytes.len() as u64,
+                        });
+                        text.push(bytes);
+                    } else {
+                        strings.push(PinkString {
+                            ptr: ptr::null(),
+                            len: 0,
+                        });
+                    }
+                }
+                strings.as_ptr().cast()
+            }
+            // Provisional: ARRAY has no C child vector in 1.2; the data
+            // pointer is NULL and callers use the v1 cell API.
+            VectorData::Array { .. } => ptr::null(),
+        };
+        let validity = if vector.has_nulls() {
+            vector.validity_words().as_ptr()
+        } else {
+            ptr::null()
+        };
+        PinkVector {
+            data,
+            validity,
+            len,
+            _strings: strings,
+            _text: text,
+            _ints: ints,
+        }
+    }
+}
+
+/// One chunk handed to C by [`pinkdb_result_fetch_chunk`]. It owns its
+/// `DataChunk` (shared with the result's chunk list) and every C payload, so
+/// it outlives the result.
+pub struct PinkChunk {
+    /// Keeps the `Arc<Vector>`s the typed pointers point into alive.
+    _chunk: DataChunk,
+    columns: Vec<PinkVector>,
+}
+
+impl PinkChunk {
+    fn new(chunk: DataChunk) -> PinkChunk {
+        let columns = chunk.columns.iter().map(|c| PinkVector::new(c)).collect();
+        PinkChunk {
+            _chunk: chunk,
+            columns,
+        }
+    }
 }
 
 enum StmtData {
@@ -563,6 +836,25 @@ pub struct PinkResult {
     /// One per statement, in the same order, when profiling was enabled for
     /// the execution that produced this result; empty otherwise.
     profiles: Vec<ProfileData>,
+    /// The error this result carries, if any. Failed queries still return a
+    /// result so callers read the error from it instead of a thread-local.
+    error: Option<CString>,
+    error_class: Option<&'static CStr>,
+}
+
+impl PinkResult {
+    fn failed(class: &'static CStr, message: &str) -> PinkResult {
+        PinkResult {
+            stmts: Vec::new(),
+            profiles: Vec::new(),
+            error: CString::new(message.replace('\0', "\\0")).ok(),
+            error_class: Some(class),
+        }
+    }
+}
+
+fn failed_result(class: &'static CStr, message: &str) -> *mut PinkResult {
+    Box::into_raw(Box::new(PinkResult::failed(class, message)))
 }
 
 fn kind_of(r: &QueryResult) -> i32 {
@@ -610,46 +902,43 @@ fn kind_of(r: &QueryResult) -> i32 {
     }
 }
 
-fn build_result(results: Vec<QueryResult>) -> std::result::Result<PinkResult, String> {
+fn build_result(results: Vec<ChunkedResult>) -> std::result::Result<PinkResult, String> {
     let stmts = results
         .into_iter()
         .map(|r| {
             Ok(match r {
-                QueryResult::Selected { names, types, rows } => StmtData::Sel(SelStmt {
-                    names: names.iter().map(|n| nul_terminated(n)).collect(),
-                    types: types.into_iter().map(dtype_tag).collect(),
-                    rows: rows
-                        .iter()
-                        .map(|row| row.iter().map(Cell::from_value).collect())
-                        .collect::<std::result::Result<Vec<_>, _>>()?,
-                }),
+                ChunkedResult::Selected {
+                    names,
+                    types,
+                    chunks,
+                } => StmtData::Sel(SelStmt::from_chunks(names, types, chunks)?),
+                // The row-shaped paths (a transaction, `RETURNING`, `CALL`)
+                // still arrive as rows; rebuild chunks so fetch works there too.
+                ChunkedResult::Other(QueryResult::Selected { names, types, rows }) => {
+                    StmtData::Sel(SelStmt::from_rows(names, types, rows)?)
+                }
                 // `CALL` (wave 44): a call whose own result is a result set is
                 // presented as that row set (the statement stream needs no new
                 // C-ABI entry); any other call outcome is a simple statement whose
                 // count is the number of body statements it ran.
                 // A JavaScript body's `print` lines are not carried over the
                 // C ABI yet (wave 81 follow-up).
-                QueryResult::Called {
+                ChunkedResult::Other(QueryResult::Called {
                     name,
                     statements,
                     result: Some(inner),
                     ..
-                } => match *inner {
-                    QueryResult::Selected { names, types, rows } => StmtData::Sel(SelStmt {
-                        names: names.into_iter().map(|n| nul_terminated(&n)).collect(),
-                        types: types.into_iter().map(dtype_tag).collect(),
-                        rows: rows
-                            .iter()
-                            .map(|row| row.iter().map(Cell::from_value).collect())
-                            .collect::<std::result::Result<Vec<_>, _>>()?,
-                    }),
+                }) => match *inner {
+                    QueryResult::Selected { names, types, rows } => {
+                        StmtData::Sel(SelStmt::from_rows(names, types, rows)?)
+                    }
                     _ => StmtData::Simple {
                         kind: PINKDB_STMT_CREATED,
                         count: statements,
                         name: Some(nul_terminated(&name)),
                     },
                 },
-                other => {
+                ChunkedResult::Other(other) => {
                     let kind = kind_of(&other);
                     let (count, name) = match &other {
                         QueryResult::Inserted { count }
@@ -696,6 +985,8 @@ fn build_result(results: Vec<QueryResult>) -> std::result::Result<PinkResult, St
     Ok(PinkResult {
         stmts,
         profiles: Vec::new(),
+        error: None,
+        error_class: None,
     })
 }
 
@@ -706,51 +997,859 @@ fn build_profiled_result(
     pairs: Vec<(QueryResult, QueryProfile)>,
 ) -> std::result::Result<PinkResult, String> {
     let (results, profiles): (Vec<QueryResult>, Vec<QueryProfile>) = pairs.into_iter().unzip();
-    let mut result = build_result(results)?;
+    let mut result = build_result(results.into_iter().map(ChunkedResult::Other).collect())?;
     result.profiles = profiles.iter().map(ProfileData::from_profile).collect();
     Ok(result)
 }
 
-// ----- handles -----
+// ----- database, connection and config objects -----
 
-/// Opaque database handle. Not thread-safe: use one handle per thread.
-pub struct PinkHandle {
-    db: PinkDb,
-    /// Per-handle session setting (`pinkdb_set_profiling`), off by default.
+/// The store and the policy fixed when it was opened. Connections hold an
+/// `Arc`, so closing the database handle stops new queries but does not pull
+/// the store out from under a running connection.
+struct DbInner {
+    db: Database,
+    read_only: bool,
+    closed: AtomicBool,
+    /// Applied to every new session. `threads` is a session setting; the WAL
+    /// sync method is process-wide and only meaningful for durable stores.
+    threads: Option<i64>,
+    wal_sync_method: Option<&'static str>,
+}
+
+/// Opaque database handle (a store plus its open-time policy). May be created
+/// on any thread and shared between threads; only connections are
+/// single-threaded.
+pub struct PinkDatabase {
+    inner: Arc<DbInner>,
+}
+
+/// One connection's mutable engine session. `pinkdb_interrupt` reads only the
+/// cancel flag next to this cell, never the session, so a shared reference is
+/// enough there.
+struct ConnState {
+    conn: Connection,
+    /// Per-connection session setting (`pinkdb_set_profiling`).
     profiling: bool,
 }
 
-fn c_path(path: *const c_char) -> Option<String> {
+/// Opaque connection handle. A connection is created from any thread but must
+/// not be used from two threads at once, except for `pinkdb_interrupt`.
+pub struct PinkConnection {
+    inner: Arc<DbInner>,
+    cancel: CancelFlag,
+    state: UnsafeCell<ConnState>,
+}
+
+/// Builder for `pinkdb_open_ext`. Fields are validated by
+/// `pinkdb_config_set`, so opening cannot fail on a bad setting.
+#[derive(Default)]
+pub struct PinkConfig {
+    read_only: bool,
+    memory_limit: Option<usize>,
+    threads: Option<i64>,
+    wal_sync_method: Option<WalSyncMethod>,
+    encryption_key: Option<[u8; 32]>,
+    allow_sql_load_extension: bool,
+    /// Last `pinkdb_config_set` failure; borrowed until the next set/destroy.
+    error: Option<CString>,
+}
+
+/// Opaque v1 handle: one database with one session, kept only so the existing
+/// bindings compile until 112b moves them to the connection API.
+pub struct PinkHandle {
+    conn: Box<PinkConnection>,
+}
+
+fn parse_bool(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn c_text<'a>(value: *const c_char, what: &str) -> Result<&'a str, String> {
+    if value.is_null() {
+        return Err(format!("null {what}"));
+    }
+    // SAFETY: non-null and required by the API contract to be a NUL-terminated
+    // C string.
+    unsafe { CStr::from_ptr(value) }
+        .to_str()
+        .map_err(|_| format!("{what} is not valid UTF-8"))
+}
+
+fn config_set(config: &mut PinkConfig, name: &str, value: &str) -> Result<(), String> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "read_only" => {
+            config.read_only =
+                parse_bool(value).ok_or_else(|| format!("invalid boolean '{value}'"))?;
+        }
+        "memory_limit" => {
+            config.memory_limit =
+                Some(pinkdb::memory::parse_limit(value).map_err(|e| format!("memory_limit: {e}"))?);
+        }
+        "threads" => {
+            let n: i64 = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("threads: '{value}' is not an integer"))?;
+            if n <= 0 {
+                return Err(format!("threads: {n} is not positive"));
+            }
+            config.threads = Some(n);
+        }
+        "wal_sync_method" => {
+            config.wal_sync_method = Some(
+                WalSyncMethod::parse(value)
+                    .ok_or_else(|| format!("wal_sync_method: unknown method '{value}'"))?,
+            );
+        }
+        "access_mode" => match value.trim().to_ascii_lowercase().as_str() {
+            "automatic" | "read_write" => config.read_only = false,
+            "read_only" => config.read_only = true,
+            _ => return Err(format!("access_mode: unknown mode '{value}'")),
+        },
+        "allow_sql_load_extension" => {
+            config.allow_sql_load_extension =
+                parse_bool(value).ok_or_else(|| format!("invalid boolean '{value}'"))?;
+        }
+        _ => return Err(format!("unknown configuration option '{name}'")),
+    }
+    Ok(())
+}
+
+fn open_from_config(path: Option<&str>, config: &PinkConfig) -> Result<Database, String> {
+    if config.encryption_key.is_some() && path.is_none() {
+        return Err("an encryption key requires a durable path".to_string());
+    }
+    let db = match path {
+        Some(path) => match config.encryption_key {
+            // SAFETY: the 32-byte array is a valid raw key; the copy stays in
+            // this stack frame and `EncryptionKey` zeroizes its own copy.
+            Some(key) => Database::open_with_key(path, &EncryptionKey::from_raw(key))
+                .map_err(|e| e.to_string())?,
+            None => Database::open(path).map_err(|e| e.to_string())?,
+        },
+        None => Database::new(),
+    };
+    db.set_allow_sql_load_extension(config.allow_sql_load_extension);
+    if let Some(bytes) = config.memory_limit {
+        // The engine's limit is process-wide, like DuckDB's max_memory.
+        pinkdb::memory::set_limit(bytes);
+    }
+    Ok(db)
+}
+
+fn new_connection(inner: Arc<DbInner>) -> Result<PinkConnection, String> {
+    let mut conn = inner.db.connect();
+    if let Some(n) = inner.threads {
+        conn.execute(&format!("SET threads = {n}"))
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(method) = inner.wal_sync_method
+        && inner.db.is_durable()
+    {
+        conn.execute(&format!("SET wal_sync_method = '{method}'"))
+            .map_err(|e| e.to_string())?;
+    }
+    let cancel = CancelFlag::new();
+    conn.set_cancel_flag(Some(cancel.clone()));
+    Ok(PinkConnection {
+        cancel,
+        state: UnsafeCell::new(ConnState {
+            conn,
+            profiling: false,
+        }),
+        inner,
+    })
+}
+
+/// A query failure before a `PinkResult` exists.
+enum QueryFailure {
+    Engine(PinkDbError),
+    Build(String),
+}
+
+fn failure_result(failure: QueryFailure) -> *mut PinkResult {
+    match failure {
+        QueryFailure::Engine(e) => Box::into_raw(Box::new(PinkResult::failed(
+            engine_error_class(&e),
+            &e.to_string(),
+        ))),
+        QueryFailure::Build(message) => failed_result(CLASS_TYPE, &message),
+    }
+}
+
+fn read_only_violation(sql: &str) -> bool {
+    let Ok(statements) = pinkdb::sql::parse_statements(sql) else {
+        // The executor reports the parse error with its usual class.
+        return false;
+    };
+    statements
+        .iter()
+        .any(|statement| !pinkdb::serve::statement_allowed(statement, false))
+}
+
+fn check_read_only(sql: &str) -> Option<*mut PinkResult> {
+    if read_only_violation(sql) {
+        return Some(failed_result(
+            CLASS_PERMISSION,
+            "read-only database: only queries are allowed",
+        ));
+    }
+    None
+}
+
+fn executed(conn: &PinkConnection, text: &str) -> *mut PinkResult {
+    if conn.inner.closed.load(Ordering::Acquire) {
+        return failed_result(CLASS_INVALID_ARGUMENT, "database is closed");
+    }
+    if conn.inner.read_only
+        && let Some(refused) = check_read_only(text)
+    {
+        return refused;
+    }
+    // A previous interrupt must not leak into this statement.
+    conn.cancel.reset();
+    // SAFETY: the connection is used from one thread at a time by contract;
+    // `pinkdb_interrupt` never touches this cell.
+    let state = unsafe { &mut *conn.state.get() };
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if state.profiling {
+            match state.conn.execute_profiled(text) {
+                Ok(pairs) => build_profiled_result(pairs).map_err(QueryFailure::Build),
+                Err(e) => Err(QueryFailure::Engine(e)),
+            }
+        } else {
+            match state.conn.execute_chunked(text) {
+                Ok(results) => build_result(results).map_err(QueryFailure::Build),
+                Err(e) => Err(QueryFailure::Engine(e)),
+            }
+        }
+    }));
+    match outcome {
+        Ok(Ok(result)) => Box::into_raw(Box::new(result)),
+        Ok(Err(failure)) => failure_result(failure),
+        Err(_) => failed_result(CLASS_INTERNAL, "internal error: statement panicked"),
+    }
+}
+
+fn bind_values(
+    prepared: &PinkPrepared,
+    values: *const PinkValue,
+    value_count: usize,
+) -> Result<Vec<Value>, PinkResult> {
+    if values.is_null() && value_count > 0 {
+        return Err(PinkResult::failed(
+            CLASS_INVALID_ARGUMENT,
+            "null values pointer with non-zero count",
+        ));
+    }
+    // L-7: `value_count` arrives from the caller before the array can be
+    // validated. A `Vec::with_capacity(2^62)` aborts the process, so check the
+    // count against what the prepared statement actually takes (and a hard
+    // ceiling far above any real statement) *before* touching the allocator.
+    const MAX_BOUND_VALUES: usize = 65_536;
+    let expected = prepared.stmt.parameter_count();
+    if value_count > MAX_BOUND_VALUES {
+        return Err(PinkResult::failed(
+            CLASS_INVALID_ARGUMENT,
+            &format!(
+                "value_count {value_count} exceeds the maximum of {MAX_BOUND_VALUES} bound values"
+            ),
+        ));
+    }
+    if value_count != expected {
+        // Keep the engine's established wording (the bindings assert it
+        // verbatim); the only change is that the check now happens before
+        // the allocation.
+        let message = if value_count < expected {
+            format!("values were not provided for prepared statement parameters: {expected}")
+        } else {
+            format!(
+                "parameter count mismatch: the prepared statement takes {expected}, but values \
+                 were provided for: {value_count}"
+            )
+        };
+        return Err(PinkResult::failed(CLASS_PARAMETER, &message));
+    }
+    let mut bound: Vec<Value> = Vec::with_capacity(value_count);
+    for i in 0..value_count {
+        // SAFETY: non-null and valid for `value_count` entries per the API
+        // contract.
+        let raw = unsafe { &*values.add(i) };
+        match value_from_pink(raw) {
+            Ok(v) => bound.push(v),
+            Err(msg) => {
+                return Err(PinkResult::failed(
+                    CLASS_INVALID_ARGUMENT,
+                    &format!("value {i}: {msg}"),
+                ));
+            }
+        }
+    }
+    Ok(bound)
+}
+
+fn prepare_on(conn: &PinkConnection, text: &str) -> Result<PinkPrepared, QueryFailure> {
+    if conn.inner.closed.load(Ordering::Acquire) {
+        return Err(QueryFailure::Build("database is closed".to_string()));
+    }
+    if conn.inner.read_only && read_only_violation(text) {
+        return Err(QueryFailure::Engine(PinkDbError::Permission(
+            "read-only database: only queries are allowed".to_string(),
+        )));
+    }
+    // SAFETY: one thread uses the connection at a time.
+    let state = unsafe { &mut *conn.state.get() };
+    state
+        .conn
+        .prepare(text)
+        .map(|stmt| PinkPrepared { stmt })
+        .map_err(QueryFailure::Engine)
+}
+
+fn executed_prepared(
+    conn: &PinkConnection,
+    prepared: &PinkPrepared,
+    bound: &[Value],
+) -> *mut PinkResult {
+    if conn.inner.closed.load(Ordering::Acquire) {
+        return failed_result(CLASS_INVALID_ARGUMENT, "database is closed");
+    }
+    conn.cancel.reset();
+    // SAFETY: one thread uses the connection at a time.
+    let state = unsafe { &mut *conn.state.get() };
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let bound_stmt = state
+            .conn
+            .bind(&prepared.stmt, bound)
+            .map_err(QueryFailure::Engine)?;
+        if conn.inner.read_only && read_only_violation(bound_stmt.sql()) {
+            return Err(QueryFailure::Engine(PinkDbError::Permission(
+                "read-only database: only queries are allowed".to_string(),
+            )));
+        }
+        if state.profiling {
+            // The engine's profiled runner takes SQL, so run the same
+            // substituted statement through it.
+            match state.conn.execute_profiled(bound_stmt.sql()) {
+                Ok(pairs) => build_profiled_result(pairs).map_err(QueryFailure::Build),
+                Err(e) => Err(QueryFailure::Engine(e)),
+            }
+        } else {
+            match state.conn.execute_bound_chunked(&bound_stmt) {
+                Ok(result) => build_result(vec![result]).map_err(QueryFailure::Build),
+                Err(e) => Err(QueryFailure::Engine(e)),
+            }
+        }
+    }));
+    match outcome {
+        Ok(Ok(result)) => Box::into_raw(Box::new(result)),
+        Ok(Err(failure)) => failure_result(failure),
+        Err(_) => failed_result(CLASS_INTERNAL, "internal error: statement panicked"),
+    }
+}
+
+/// Copy a failed result's error into the v1 thread-local and free it. Every
+/// success passes through unchanged.
+fn v1_result(result: *mut PinkResult) -> *mut PinkResult {
+    if result.is_null() {
+        return result;
+    }
+    // SAFETY: produced by this crate and not yet freed.
+    let r = unsafe { &*result };
+    if let Some(error) = &r.error {
+        set_error(
+            r.error_class.unwrap_or(CLASS_INTERNAL),
+            &error.to_string_lossy(),
+        );
+        // SAFETY: produced by Box::into_raw above, freed once here.
+        drop(unsafe { Box::from_raw(result) });
+        return ptr::null_mut();
+    }
+    result
+}
+
+fn c_path(path: *const c_char) -> Result<String, &'static str> {
     if path.is_null() {
-        set_error(CLASS_INVALID_ARGUMENT, "null path");
-        return None;
+        return Err("null path");
     }
     // SAFETY: non-null and required by the API contract to be a NUL-terminated
     // C string. The pointer need not be aligned; CStr handles bytes.
-    match unsafe { CStr::from_ptr(path) }.to_str() {
-        Ok(s) => Some(s.to_string()),
-        Err(_) => {
-            set_error(CLASS_INVALID_ARGUMENT, "path is not valid UTF-8");
-            None
+    unsafe { CStr::from_ptr(path) }
+        .to_str()
+        .map(str::to_string)
+        .map_err(|_| "path is not valid UTF-8")
+}
+
+fn write_errmsg(errmsg: *mut *mut c_char, message: Option<&str>) {
+    if errmsg.is_null() {
+        return;
+    }
+    // SAFETY: the caller passes a writable out-parameter.
+    unsafe {
+        *errmsg = match message {
+            Some(text) => CString::new(text.replace('\0', "\\0"))
+                .map(CString::into_raw)
+                .unwrap_or(ptr::null_mut()),
+            None => ptr::null_mut(),
+        };
+    }
+}
+
+/// Create an empty configuration. Free with [`pinkdb_destroy_config`].
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_create_config() -> *mut PinkConfig {
+    Box::into_raw(Box::new(PinkConfig::default()))
+}
+
+/// Set one configuration option. Names and accepted values:
+///
+/// - `read_only`: `true`/`false`;
+/// - `access_mode`: `automatic`, `read_only` or `read_write`;
+/// - `memory_limit`: a DuckDB-style size (`1GB`, `512MB`, `-1` for no limit);
+/// - `threads`: a positive integer;
+/// - `wal_sync_method`: `full`, `fsync` or `fdatasync`;
+/// - `allow_sql_load_extension`: `true`/`false`.
+///
+/// Returns 1 on success, 0 on an unknown name or invalid value; see
+/// [`pinkdb_config_error`]. The strings are read only for this call.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_config_set(
+    config: *mut PinkConfig,
+    name: *const c_char,
+    value: *const c_char,
+) -> i32 {
+    if config.is_null() {
+        return 0;
+    }
+    // SAFETY: non-null (checked) and owned by the caller.
+    let config = unsafe { &mut *config };
+    let parsed = c_text(name, "configuration name")
+        .and_then(|name| Ok((name, c_text(value, "configuration value")?)))
+        .and_then(|(name, value)| config_set(config, name, value));
+    match parsed {
+        Ok(()) => {
+            config.error = None;
+            1
+        }
+        Err(message) => {
+            config.error = CString::new(message.replace('\0', "\\0")).ok();
+            0
         }
     }
 }
 
-/// Open a durable database (checkpoint + WAL) at `path` (UTF-8, NUL-terminated
-/// C string). Returns NULL on error; see [`pinkdb_last_error`].
+/// Copy a 32-byte raw encryption key into the configuration. The key is never
+/// logged, echoed, or included in an error message. Returns 0 for a NULL
+/// pointer or a length other than 32; see [`pinkdb_config_error`].
+///
+/// Keyed stores need the library's `encryption` feature; without it the open
+/// fails with a "not compiled in" error. In-memory databases cannot be keyed.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_config_set_encryption_key(
+    config: *mut PinkConfig,
+    key: *const u8,
+    key_len: usize,
+) -> i32 {
+    if config.is_null() {
+        return 0;
+    }
+    // SAFETY: non-null (checked) and owned by the caller.
+    let config = unsafe { &mut *config };
+    if key.is_null() || key_len != 32 {
+        config.error =
+            Some(CString::new("encryption key must be exactly 32 bytes").unwrap_or_default());
+        return 0;
+    }
+    let mut raw = [0u8; 32];
+    // SAFETY: non-null and valid for 32 bytes by the check above and the API
+    // contract.
+    raw.copy_from_slice(unsafe { std::slice::from_raw_parts(key, 32) });
+    config.encryption_key = Some(raw);
+    config.error = None;
+    1
+}
+
+/// The last [`pinkdb_config_set`] / [`pinkdb_config_set_encryption_key`]
+/// failure on this configuration, or NULL. The pointer is owned by the
+/// configuration and valid until its next set call or
+/// [`pinkdb_destroy_config`].
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_config_error(config: *const PinkConfig) -> *const c_char {
+    if config.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: non-null, read-only access by the caller's ownership.
+    match unsafe { &*config }.error.as_ref() {
+        Some(message) => message.as_ptr(),
+        None => ptr::null(),
+    }
+}
+
+/// Destroy a configuration. NULL-safe. Does not touch any database opened
+/// with it (the open copies every setting).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_destroy_config(config: *mut PinkConfig) {
+    if config.is_null() {
+        return;
+    }
+    // SAFETY: produced by Box::into_raw in `pinkdb_create_config`, freed once.
+    drop(unsafe { Box::from_raw(config) });
+}
+
+/// Open a database with an optional configuration.
+///
+/// `path` NULL or `":memory:"` opens an in-memory store; any other path opens
+/// (or creates) a durable checkpoint + WAL. `config` may be NULL for defaults.
+/// Returns 1 on success and 0 on failure. On failure `*out_database` is NULL
+/// and `*errmsg` is a malloc'd string that the caller frees with
+/// [`pinkdb_free`]; on success `*errmsg` is NULL. `out_database` and `errmsg`
+/// must both be non-NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_open_ext(
+    path: *const c_char,
+    config: *const PinkConfig,
+    out_database: *mut *mut PinkDatabase,
+    errmsg: *mut *mut c_char,
+) -> i32 {
+    if !out_database.is_null() {
+        // SAFETY: the caller passes a writable out-parameter.
+        unsafe { *out_database = ptr::null_mut() };
+    }
+    write_errmsg(errmsg, None);
+    if out_database.is_null() || errmsg.is_null() {
+        return 0;
+    }
+    let path = if path.is_null() {
+        None
+    } else {
+        match c_path(path) {
+            Ok(path) if path != ":memory:" => Some(path),
+            Ok(_) => None,
+            Err(message) => {
+                write_errmsg(errmsg, Some(message));
+                return 0;
+            }
+        }
+    };
+    let defaults = PinkConfig::default();
+    // SAFETY: `config` is either NULL or a live configuration owned by the
+    // caller for the duration of the call.
+    let config = if config.is_null() {
+        &defaults
+    } else {
+        unsafe { &*config }
+    };
+    match catch_unwind(AssertUnwindSafe(|| {
+        open_from_config(path.as_deref(), config)
+    })) {
+        Ok(Ok(db)) => {
+            let database = Box::new(PinkDatabase {
+                inner: Arc::new(DbInner {
+                    db,
+                    read_only: config.read_only,
+                    closed: AtomicBool::new(false),
+                    threads: config.threads,
+                    wal_sync_method: config.wal_sync_method.map(WalSyncMethod::as_str),
+                }),
+            });
+            // SAFETY: non-null (checked) and writable.
+            unsafe { *out_database = Box::into_raw(database) };
+            1
+        }
+        Ok(Err(message)) => {
+            write_errmsg(errmsg, Some(&message));
+            0
+        }
+        Err(_) => {
+            write_errmsg(
+                errmsg,
+                Some("internal error: panicked while opening the database"),
+            );
+            0
+        }
+    }
+}
+
+/// Close a database opened by [`pinkdb_open_ext`]. NULL-safe. Existing
+/// connections keep the store memory alive until they are disconnected, but
+/// every later query on them fails with `invalid_argument`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_close_database(database: *mut PinkDatabase) {
+    if database.is_null() {
+        return;
+    }
+    // SAFETY: produced by Box::into_raw in `pinkdb_open_ext`, freed once.
+    let database = unsafe { Box::from_raw(database) };
+    database.inner.closed.store(true, Ordering::Release);
+}
+
+/// Create a connection (session) on a database. Connections are independent:
+/// each has its own transaction, temp tables and settings. Returns 1 on
+/// success and 0 on failure (NULL/closed database or allocation failure).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_connect(
+    database: *mut PinkDatabase,
+    out_connection: *mut *mut PinkConnection,
+) -> i32 {
+    if out_connection.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller passes a writable out-parameter.
+    unsafe { *out_connection = ptr::null_mut() };
+    if database.is_null() {
+        return 0;
+    }
+    // SAFETY: non-null and owned by the caller for the call.
+    let database = unsafe { &*database };
+    if database.inner.closed.load(Ordering::Acquire) {
+        return 0;
+    }
+    match catch_unwind(AssertUnwindSafe(|| {
+        new_connection(Arc::clone(&database.inner))
+    })) {
+        Ok(Ok(connection)) => {
+            // SAFETY: non-null (checked) and writable.
+            unsafe { *out_connection = Box::into_raw(Box::new(connection)) };
+            1
+        }
+        _ => 0,
+    }
+}
+
+/// Disconnect a connection. NULL-safe. A connection must not be used after
+/// this call.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_disconnect(connection: *mut PinkConnection) {
+    if connection.is_null() {
+        return;
+    }
+    // SAFETY: produced by Box::into_raw in `pinkdb_connect`, freed once.
+    drop(unsafe { Box::from_raw(connection) });
+}
+
+/// Ask the statement running on `connection` to stop. May be called from
+/// another thread while that statement runs, and from the same thread before
+/// it starts (the next query clears the flag first, so pre-start interrupts
+/// are ignored). The statement stops at the executor's next cancellation
+/// checkpoint with the `interrupted` error class. NULL-safe.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_interrupt(connection: *mut PinkConnection) {
+    if connection.is_null() {
+        return;
+    }
+    // SAFETY: non-null and owned by the caller; only the cancel flag is
+    // touched, which is why this call is allowed concurrently with a query.
+    unsafe { &*connection }.cancel.cancel();
+}
+
+/// Execute SQL on a connection. Returns 1 when the statements ran and 0 when
+/// they did not; either way `*out_result` receives a result owned by the
+/// caller (free with [`pinkdb_result_free`]). Use
+/// [`pinkdb_result_error`]/[`pinkdb_result_error_class`] to inspect a failed
+/// result. `out_result` must be non-NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_query(
+    connection: *mut PinkConnection,
+    sql: *const c_char,
+    sql_len: usize,
+    out_result: *mut *mut PinkResult,
+) -> i32 {
+    if out_result.is_null() {
+        return 0;
+    }
+    let result = if connection.is_null() {
+        failed_result(CLASS_INVALID_ARGUMENT, "null connection")
+    } else {
+        // SAFETY: the caller guarantees (ptr, len) validity for the call.
+        match unsafe { sql_utf8_result(sql, sql_len) } {
+            Ok(text) => {
+                // SAFETY: non-null and one thread uses the connection at a
+                // time by contract.
+                executed(unsafe { &*connection }, text)
+            }
+            Err(message) => failed_result(CLASS_INVALID_ARGUMENT, message),
+        }
+    };
+    // SAFETY: non-null (checked) and writable.
+    unsafe { *out_result = result };
+    // SAFETY: just stored above and not freed.
+    if unsafe { &*result }.error.is_none() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Parse one statement with `?` placeholders on a connection. Returns 1 on
+/// success and 0 on failure. On failure `*out_prepared` is NULL and `*errmsg`
+/// is freed with [`pinkdb_free`]; on success `*errmsg` is NULL. Both out
+/// parameters must be non-NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_prepare_ext(
+    connection: *mut PinkConnection,
+    sql: *const c_char,
+    sql_len: usize,
+    out_prepared: *mut *mut PinkPrepared,
+    errmsg: *mut *mut c_char,
+) -> i32 {
+    if !out_prepared.is_null() {
+        // SAFETY: the caller passes a writable out-parameter.
+        unsafe { *out_prepared = ptr::null_mut() };
+    }
+    write_errmsg(errmsg, None);
+    if out_prepared.is_null() || errmsg.is_null() {
+        return 0;
+    }
+    if connection.is_null() {
+        write_errmsg(errmsg, Some("null connection"));
+        return 0;
+    }
+    // SAFETY: the caller guarantees (ptr, len) validity for the call.
+    let text = match unsafe { sql_utf8_result(sql, sql_len) } {
+        Ok(text) => text,
+        Err(message) => {
+            write_errmsg(errmsg, Some(message));
+            return 0;
+        }
+    };
+    // SAFETY: non-null and one thread uses the connection at a time.
+    let connection = unsafe { &*connection };
+    let outcome = catch_unwind(AssertUnwindSafe(|| prepare_on(connection, text)));
+    match outcome {
+        Ok(Ok(prepared)) => {
+            // SAFETY: non-null (checked) and writable.
+            unsafe { *out_prepared = Box::into_raw(Box::new(prepared)) };
+            1
+        }
+        Ok(Err(QueryFailure::Engine(e))) => {
+            write_errmsg(errmsg, Some(&e.to_string()));
+            0
+        }
+        Ok(Err(QueryFailure::Build(message))) => {
+            write_errmsg(errmsg, Some(&message));
+            0
+        }
+        Err(_) => {
+            write_errmsg(errmsg, Some("internal error: prepare panicked"));
+            0
+        }
+    }
+}
+
+/// Execute a prepared statement with one `pink_value` per placeholder, in
+/// textual order. Returns 1/0 exactly like [`pinkdb_query`]; `*out_result` is
+/// always set and owned by the caller. Values are read only for the call.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_query_prepared(
+    connection: *mut PinkConnection,
+    prepared: *const PinkPrepared,
+    values: *const PinkValue,
+    value_count: usize,
+    out_result: *mut *mut PinkResult,
+) -> i32 {
+    if out_result.is_null() {
+        return 0;
+    }
+    let result = if connection.is_null() {
+        failed_result(CLASS_INVALID_ARGUMENT, "null connection")
+    } else if prepared.is_null() {
+        failed_result(CLASS_INVALID_ARGUMENT, "null prepared statement")
+    } else {
+        // SAFETY: non-null (checked) and owned by the caller for the call.
+        let conn = unsafe { &*connection };
+        let prep = unsafe { &*prepared };
+        match bind_values(prep, values, value_count) {
+            Ok(bound) => executed_prepared(conn, prep, &bound),
+            Err(result) => Box::into_raw(Box::new(result)),
+        }
+    };
+    // SAFETY: non-null (checked) and writable.
+    unsafe { *out_result = result };
+    // SAFETY: just stored above and not freed.
+    if unsafe { &*result }.error.is_none() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Free a string returned through an `errmsg` out-parameter. NULL-safe. Do
+/// not pass any other pointer: this is not a general-purpose `free`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_free(ptr: *mut c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: every `errmsg` is produced by CString::into_raw, so this is the
+    // matching deallocation.
+    drop(unsafe { CString::from_raw(ptr as *mut c_char) });
+}
+
+/// The error carried by a result, or NULL when the result succeeded. The
+/// pointer is owned by the result and valid until [`pinkdb_result_free`].
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_error(result: *const PinkResult) -> *const c_char {
+    if result.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: non-null, read-only access by the caller's ownership.
+    match unsafe { &*result }.error.as_ref() {
+        Some(message) => message.as_ptr(),
+        None => ptr::null(),
+    }
+}
+
+/// The stable lower-case error class of [`pinkdb_result_error`], or NULL when
+/// the result succeeded. The pointer is static: never free it.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_error_class(result: *const PinkResult) -> *const c_char {
+    if result.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: non-null, read-only access by the caller's ownership.
+    match unsafe { &*result }.error_class {
+        Some(class) => class.as_ptr(),
+        None => ptr::null(),
+    }
+}
+
+/// Open a durable database at `path`. Returns NULL on error; see
+/// [`pinkdb_last_error`]. Kept for the v1 bindings; new code uses
+/// [`pinkdb_open_ext`].
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_open(path: *const c_char) -> *mut PinkHandle {
-    let Some(path) = c_path(path) else {
-        return ptr::null_mut();
+    let path = match c_path(path) {
+        Ok(path) => path,
+        Err(message) => {
+            set_error(CLASS_INVALID_ARGUMENT, message);
+            return ptr::null_mut();
+        }
     };
     clear_error();
-    match catch_unwind(AssertUnwindSafe(|| PinkDb::open_durable(&path))) {
-        Ok(Ok(db)) => Box::into_raw(Box::new(PinkHandle {
-            db,
-            profiling: false,
+    let config = PinkConfig::default();
+    let opened = catch_unwind(AssertUnwindSafe(|| {
+        open_from_config(Some(&path), &config).and_then(|db| {
+            let inner = Arc::new(DbInner {
+                db,
+                read_only: config.read_only,
+                closed: AtomicBool::new(false),
+                threads: config.threads,
+                wal_sync_method: None,
+            });
+            new_connection(inner)
+        })
+    }));
+    match opened {
+        Ok(Ok(conn)) => Box::into_raw(Box::new(PinkHandle {
+            conn: Box::new(conn),
         })),
-        Ok(Err(e)) => {
-            set_engine_error(&e);
+        Ok(Err(message)) => {
+            set_error(CLASS_EXECUTION, &message);
             ptr::null_mut()
         }
         Err(_) => {
@@ -763,18 +1862,30 @@ pub extern "C" fn pinkdb_open(path: *const c_char) -> *mut PinkHandle {
     }
 }
 
-/// Open a fresh in-memory database.
+/// Open a fresh in-memory database. Kept for the v1 bindings; new code uses
+/// [`pinkdb_open_ext`] with a NULL path.
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_open_memory() -> *mut PinkHandle {
     clear_error();
-    // A panic must never unwind across the extern "C" boundary.
+    let config = PinkConfig::default();
     match catch_unwind(AssertUnwindSafe(|| {
-        Box::new(PinkHandle {
-            db: PinkDb::new(),
-            profiling: false,
+        let db = open_from_config(None, &config)?;
+        let inner = Arc::new(DbInner {
+            db,
+            read_only: config.read_only,
+            closed: AtomicBool::new(false),
+            threads: config.threads,
+            wal_sync_method: None,
+        });
+        new_connection(inner).map(|conn| PinkHandle {
+            conn: Box::new(conn),
         })
     })) {
-        Ok(handle) => Box::into_raw(handle),
+        Ok(Ok(handle)) => Box::into_raw(Box::new(handle)),
+        Ok(Err(message)) => {
+            set_error(CLASS_EXECUTION, &message);
+            ptr::null_mut()
+        }
         Err(_) => {
             set_error(
                 CLASS_INTERNAL,
@@ -796,33 +1907,12 @@ pub extern "C" fn pinkdb_close(handle: *mut PinkHandle) {
     drop(unsafe { Box::from_raw(handle) });
 }
 
-/// Box a result, refusing to unwind across the C ABI. The closure runs inside
-/// `catch_unwind` so a panic while marshaling (`build_result`) is contained too.
-fn into_boxed_result(
-    build: impl FnOnce() -> std::result::Result<PinkResult, String>,
-) -> *mut PinkResult {
-    match catch_unwind(AssertUnwindSafe(build)) {
-        Ok(Ok(result)) => Box::into_raw(Box::new(result)),
-        Ok(Err(message)) => {
-            set_error(CLASS_TYPE, &message);
-            ptr::null_mut()
-        }
-        Err(_) => {
-            set_error(
-                CLASS_INTERNAL,
-                "internal error: building the result panicked",
-            );
-            ptr::null_mut()
-        }
-    }
-}
-
 /// Execute one or more SQL statements (UTF-8, `(ptr, len)`, embedded NULs
 /// allowed). Returns NULL on error; free with [`pinkdb_result_free`].
 ///
 /// With profiling enabled on the handle (see [`pinkdb_set_profiling`]) the
 /// result also carries one profile per statement; otherwise this calls the
-/// plain `PinkDb::execute` path (no clocks, no profile allocation).
+/// plain `Connection::execute` path (no clocks, no profile allocation).
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_execute(
     handle: *mut PinkHandle,
@@ -840,32 +1930,8 @@ pub extern "C" fn pinkdb_execute(
     clear_error();
     // SAFETY: non-null (checked) and uniquely owned per the single-handle
     // contract; no other reference exists during the call.
-    let h = unsafe { &mut *handle };
-    if h.profiling {
-        match catch_unwind(AssertUnwindSafe(|| h.db.execute_profiled(text))) {
-            Ok(Ok(pairs)) => into_boxed_result(|| build_profiled_result(pairs)),
-            Ok(Err(e)) => {
-                set_engine_error(&e);
-                ptr::null_mut()
-            }
-            Err(_) => {
-                set_error(CLASS_INTERNAL, "internal error: statement panicked");
-                ptr::null_mut()
-            }
-        }
-    } else {
-        match catch_unwind(AssertUnwindSafe(|| h.db.execute(text))) {
-            Ok(Ok(results)) => into_boxed_result(|| build_result(results)),
-            Ok(Err(e)) => {
-                set_engine_error(&e);
-                ptr::null_mut()
-            }
-            Err(_) => {
-                set_error(CLASS_INTERNAL, "internal error: statement panicked");
-                ptr::null_mut()
-            }
-        }
-    }
+    let h = unsafe { &*handle };
+    v1_result(executed(&h.conn, text))
 }
 
 /// Enable (non-zero) or disable (zero) query profiling on this handle. Off by
@@ -884,8 +1950,9 @@ pub extern "C" fn pinkdb_set_profiling(handle: *mut PinkHandle, enabled: i32) ->
     clear_error();
     // SAFETY: non-null (checked) and uniquely owned per the single-handle
     // contract; no other reference exists during the call.
-    let h = unsafe { &mut *handle };
-    h.profiling = enabled != 0;
+    let h = unsafe { &*handle };
+    // SAFETY: one thread uses the v1 handle at a time.
+    unsafe { &mut *h.conn.state.get() }.profiling = enabled != 0;
     1
 }
 
@@ -910,30 +1977,24 @@ pub extern "C" fn pinkdb_set_allow_sql_load_extension(handle: *mut PinkHandle, a
     clear_error();
     // SAFETY: non-null (checked) and uniquely owned per the single-handle
     // contract; no other reference exists during the call.
-    let h = unsafe { &mut *handle };
-    h.db.set_allow_sql_load_extension(allow != 0);
+    let h = unsafe { &*handle };
+    h.conn.inner.db.set_allow_sql_load_extension(allow != 0);
     1
 }
 
-/// Read an `(ptr, len)` SQL argument as UTF-8, setting the thread-local error
-/// (and returning `None`) on a NULL pointer with a non-zero length or invalid
-/// UTF-8.
+/// Read an `(ptr, len)` SQL argument as UTF-8. The new API reports failures
+/// through its result/`errmsg`; the v1 wrapper below also copies them into
+/// the thread-local.
 ///
 /// # Safety
 ///
 /// `sql` must be non-NULL whenever `sql_len > 0` and valid for `sql_len`
 /// bytes for the duration of the returned borrow (the API contract for every
 /// `(ptr, len)` entry point of this crate).
-unsafe fn sql_utf8<'a>(sql: *const c_char, sql_len: usize) -> Option<&'a str> {
-    // SAFETY: this function's contract (see above) makes the raw-pointer read
-    // below sound; the NULL/non-zero-length check runs first.
+unsafe fn sql_utf8_result<'a>(sql: *const c_char, sql_len: usize) -> Result<&'a str, &'static str> {
     unsafe {
         if sql.is_null() && sql_len > 0 {
-            set_error(
-                CLASS_INVALID_ARGUMENT,
-                "null sql pointer with non-zero length",
-            );
-            return None;
+            return Err("null sql pointer with non-zero length");
         }
         let bytes: &[u8] = if sql_len == 0 {
             &[]
@@ -942,12 +2003,21 @@ unsafe fn sql_utf8<'a>(sql: *const c_char, sql_len: usize) -> Option<&'a str> {
             // per the API contract.
             std::slice::from_raw_parts(sql as *const u8, sql_len)
         };
-        match std::str::from_utf8(bytes) {
-            Ok(t) => Some(t),
-            Err(_) => {
-                set_error(CLASS_INVALID_ARGUMENT, "SQL is not valid UTF-8");
-                None
-            }
+        std::str::from_utf8(bytes).map_err(|_| "SQL is not valid UTF-8")
+    }
+}
+
+/// v1 SQL reader: same as [`sql_utf8_result`] but sets the thread-local error.
+///
+/// # Safety
+///
+/// Same contract as [`sql_utf8_result`].
+unsafe fn sql_utf8<'a>(sql: *const c_char, sql_len: usize) -> Option<&'a str> {
+    match unsafe { sql_utf8_result(sql, sql_len) } {
+        Ok(text) => Some(text),
+        Err(message) => {
+            set_error(CLASS_INVALID_ARGUMENT, message);
+            None
         }
     }
 }
@@ -963,7 +2033,7 @@ pub struct PinkPrepared {
 /// Parse one SQL statement with `?` placeholders into a reusable prepared
 /// statement; NULL on error (see [`pinkdb_last_error`]). A multi-statement
 /// string, or a statement with no placeholders, is refused/allowed the same
-/// way `PinkDb::prepare` is. Free with [`pinkdb_prepared_free`].
+/// way `Connection::prepare` is. Free with [`pinkdb_prepared_free`].
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_prepare(
     handle: *mut PinkHandle,
@@ -982,10 +2052,14 @@ pub extern "C" fn pinkdb_prepare(
     // SAFETY: non-null (checked) and uniquely owned per the single-handle
     // contract.
     let h = unsafe { &*handle };
-    match catch_unwind(AssertUnwindSafe(|| h.db.prepare(text))) {
-        Ok(Ok(stmt)) => Box::into_raw(Box::new(PinkPrepared { stmt })),
-        Ok(Err(e)) => {
+    match catch_unwind(AssertUnwindSafe(|| prepare_on(&h.conn, text))) {
+        Ok(Ok(stmt)) => Box::into_raw(Box::new(stmt)),
+        Ok(Err(QueryFailure::Engine(e))) => {
             set_engine_error(&e);
+            ptr::null_mut()
+        }
+        Ok(Err(QueryFailure::Build(message))) => {
+            set_error(CLASS_TYPE, &message);
             ptr::null_mut()
         }
         Err(_) => {
@@ -1036,93 +2110,25 @@ pub extern "C" fn pinkdb_execute_prepared(
         set_error(CLASS_INVALID_ARGUMENT, "null prepared statement");
         return ptr::null_mut();
     }
-    if values.is_null() && value_count > 0 {
-        set_error(
-            CLASS_INVALID_ARGUMENT,
-            "null values pointer with non-zero count",
-        );
-        return ptr::null_mut();
-    }
-    // L-7: `value_count` arrives from the caller before the array can be
-    // validated. A `Vec::with_capacity(2^62)` aborts the process, so check the
-    // count against what the prepared statement actually takes (and a hard
-    // ceiling far above any real statement) *before* touching the allocator.
-    const MAX_BOUND_VALUES: usize = 65_536;
-    let expected = unsafe { &*prepared }.stmt.parameter_count();
-    if value_count > MAX_BOUND_VALUES {
-        set_error(
-            CLASS_INVALID_ARGUMENT,
-            &format!(
-                "value_count {value_count} exceeds the maximum of {MAX_BOUND_VALUES} bound values"
-            ),
-        );
-        return ptr::null_mut();
-    }
-    if value_count != expected {
-        // Keep the engine's established wording (the bindings assert it
-        // verbatim); the only change is that the check now happens before
-        // the allocation.
-        let message = if value_count < expected {
-            format!("values were not provided for prepared statement parameters: {expected}")
-        } else {
-            format!(
-                "parameter count mismatch: the prepared statement takes {expected}, but values \
-                 were provided for: {value_count}"
-            )
-        };
-        set_error(CLASS_PARAMETER, &message);
-        return ptr::null_mut();
-    }
-    let mut bound: Vec<pinkdb::Value> = Vec::with_capacity(value_count);
-    for i in 0..value_count {
-        // SAFETY: non-null and valid for `value_count` entries per the API
-        // contract.
-        let raw = unsafe { &*values.add(i) };
-        match value_from_pink(raw) {
-            Ok(v) => bound.push(v),
-            Err(msg) => {
-                set_error(CLASS_INVALID_ARGUMENT, &format!("value {i}: {msg}"));
-                return ptr::null_mut();
-            }
+    // SAFETY: non-null (checked) and owned by the caller for the call.
+    let prep = unsafe { &*prepared };
+    let bound = match bind_values(prep, values, value_count) {
+        Ok(bound) => bound,
+        Err(result) => {
+            let message = result
+                .error
+                .as_ref()
+                .map(|e| e.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            set_error(result.error_class.unwrap_or(CLASS_INTERNAL), &message);
+            return ptr::null_mut();
         }
-    }
+    };
     clear_error();
-    // SAFETY: both non-null (checked) and uniquely owned per the
-    // single-handle contract.
-    let h = unsafe { &mut *handle };
-    let stmt = unsafe { &*prepared };
-    if h.profiling {
-        // The engine's profiled runner takes SQL, so bind first (the same bind
-        // `execute_prepared` does) and then run the substituted statement.
-        match catch_unwind(AssertUnwindSafe(|| {
-            let bound_stmt = stmt.stmt.bind(&h.db, h.db.current_ns(), &bound)?;
-            h.db.execute_profiled(bound_stmt.sql())
-        })) {
-            Ok(Ok(pairs)) => into_boxed_result(|| build_profiled_result(pairs)),
-            Ok(Err(e)) => {
-                set_engine_error(&e);
-                ptr::null_mut()
-            }
-            Err(_) => {
-                set_error(CLASS_INTERNAL, "internal error: statement panicked");
-                ptr::null_mut()
-            }
-        }
-    } else {
-        match catch_unwind(AssertUnwindSafe(|| {
-            h.db.execute_prepared(&stmt.stmt, &bound)
-        })) {
-            Ok(Ok(result)) => into_boxed_result(|| build_result(vec![result])),
-            Ok(Err(e)) => {
-                set_engine_error(&e);
-                ptr::null_mut()
-            }
-            Err(_) => {
-                set_error(CLASS_INTERNAL, "internal error: statement panicked");
-                ptr::null_mut()
-            }
-        }
-    }
+    // SAFETY: non-null (checked) and uniquely owned per the single-handle
+    // contract.
+    let h = unsafe { &*handle };
+    v1_result(executed_prepared(&h.conn, prep, &bound))
 }
 
 /// Convert one caller-provided `pink_value` into an engine value: the inverse
@@ -1248,6 +2254,15 @@ pub extern "C" fn pinkdb_result_free(result: *mut PinkResult) {
     drop(unsafe { Box::from_raw(result) });
 }
 
+fn stmt_at_mut<'a>(result: *mut PinkResult, statement: usize) -> Option<&'a mut StmtData> {
+    if result.is_null() {
+        return None;
+    }
+    // SAFETY: non-null, owned by the caller, exclusive access for the fetch.
+    let r = unsafe { &mut *result };
+    r.stmts.get_mut(statement)
+}
+
 fn stmt_at<'a>(result: *const PinkResult, statement: usize) -> Option<&'a StmtData> {
     if result.is_null() {
         return None;
@@ -1320,7 +2335,7 @@ pub extern "C" fn pinkdb_result_column_type(
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_result_row_count(result: *const PinkResult, statement: usize) -> usize {
     match stmt_at(result, statement) {
-        Some(StmtData::Sel(s)) => s.rows.len(),
+        Some(StmtData::Sel(s)) => s.row_count,
         _ => 0,
     }
 }
@@ -1336,13 +2351,269 @@ pub extern "C" fn pinkdb_result_value(
 ) -> PinkValue {
     match stmt_at(result, statement) {
         Some(StmtData::Sel(s)) => s
-            .rows
+            .rows()
             .get(row)
             .and_then(|r| r.get(column))
             .map(Cell::value)
             .unwrap_or_else(PinkValue::null),
         _ => PinkValue::null(),
     }
+}
+
+/// DECIMAL precision, or -1 when the column is not DECIMAL.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_column_decimal_width(
+    result: *const PinkResult,
+    statement: usize,
+    column: usize,
+) -> i32 {
+    match stmt_at(result, statement).and_then(|s| match s {
+        StmtData::Sel(s) => s.dtypes.get(column),
+        _ => None,
+    }) {
+        Some(DataType::Decimal { precision, .. }) => i32::from(*precision),
+        _ => -1,
+    }
+}
+
+/// DECIMAL scale, or -1 when the column is not DECIMAL.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_column_decimal_scale(
+    result: *const PinkResult,
+    statement: usize,
+    column: usize,
+) -> i32 {
+    match stmt_at(result, statement).and_then(|s| match s {
+        StmtData::Sel(s) => s.dtypes.get(column),
+        _ => None,
+    }) {
+        Some(DataType::Decimal { scale, .. }) => i32::from(*scale),
+        _ => -1,
+    }
+}
+
+/// ARRAY element count, or 0 when the column is not an ARRAY.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_column_array_length(
+    result: *const PinkResult,
+    statement: usize,
+    column: usize,
+) -> u64 {
+    match stmt_at(result, statement).and_then(|s| match s {
+        StmtData::Sel(s) => s.dtypes.get(column),
+        _ => None,
+    }) {
+        Some(DataType::Array { len, .. }) => u64::from(*len),
+        _ => 0,
+    }
+}
+
+/// An ARRAY's element type ([`PINKDB_TYPE_DOUBLE`] or
+/// [`PINKDB_TYPE_FLOAT`]), or -1 when the column is not an ARRAY.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_column_array_element_type(
+    result: *const PinkResult,
+    statement: usize,
+    column: usize,
+) -> i32 {
+    match stmt_at(result, statement).and_then(|s| match s {
+        StmtData::Sel(s) => s.dtypes.get(column),
+        _ => None,
+    }) {
+        Some(DataType::Array { elem, .. }) if *elem == pinkdb::ArrayElem::Float => {
+            PINKDB_TYPE_FLOAT
+        }
+        Some(DataType::Array { .. }) => PINKDB_TYPE_DOUBLE,
+        _ => -1,
+    }
+}
+
+/// The next chunk of a SELECT result, or NULL at the end, for a failed result,
+/// or for a non-SELECT statement. The caller owns the chunk and frees it with
+/// [`pinkdb_destroy_chunk`]; a chunk stays valid after its result is freed.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_fetch_chunk(
+    result: *mut PinkResult,
+    statement: usize,
+) -> *mut PinkChunk {
+    let Some(StmtData::Sel(s)) = stmt_at_mut(result, statement) else {
+        return ptr::null_mut();
+    };
+    let Some(chunk) = s.chunks.get(s.next_chunk).cloned() else {
+        return ptr::null_mut();
+    };
+    s.next_chunk += 1;
+    Box::into_raw(Box::new(PinkChunk::new(chunk)))
+}
+
+/// Free a chunk from [`pinkdb_result_fetch_chunk`]. NULL-safe.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_destroy_chunk(chunk: *mut PinkChunk) {
+    if chunk.is_null() {
+        return;
+    }
+    // SAFETY: produced by Box::into_raw in `pinkdb_result_fetch_chunk`,
+    // freed once by its owner.
+    drop(unsafe { Box::from_raw(chunk) });
+}
+
+/// Fill a struct-typed Arrow schema for a SELECT result.
+///
+/// The schema has one child per result column and owns its format/name strings
+/// and children; call its `release` callback when done. Returns 1 on success,
+/// 0 on error (read the result's error for a failed result, otherwise
+/// `pinkdb_last_error`).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_arrow_schema(
+    result: *const PinkResult,
+    statement: usize,
+    out: *mut ArrowSchema,
+) -> i32 {
+    match arrow::result_schema(result, statement, out) {
+        Ok(()) => 1,
+        Err(error) => {
+            error.report();
+            0
+        }
+    }
+}
+
+/// Export one chunk as a struct-typed Arrow array.
+///
+/// The array owns an `Arc` of the chunk's vectors, so it stays valid after the
+/// chunk and result are freed. Returns 1 on success, 0 on error (see
+/// `pinkdb_last_error`).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_chunk_to_arrow(chunk: *const PinkChunk, out: *mut ArrowArray) -> i32 {
+    if out.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null ArrowArray output");
+        return 0;
+    }
+    // SAFETY: out is non-null and writable per the C contract.
+    unsafe { ptr::write(out, ArrowArray::empty()) };
+    if chunk.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null chunk");
+        return 0;
+    }
+    // SAFETY: non-null, valid for the call.
+    match arrow::chunk_to_arrow(&unsafe { &*chunk }._chunk, out) {
+        Ok(()) => 1,
+        Err(error) => {
+            error.report();
+            0
+        }
+    }
+}
+
+/// Fetch the next chunk of a SELECT result and export it as an Arrow array.
+///
+/// At the end of the result (and forever after) this leaves `out->release`
+/// NULL and returns 1. Returns 0 on a null argument, a failed/non-SELECT
+/// result, or an export error; the message is in the result's error for a
+/// failed result, otherwise in `pinkdb_last_error`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_fetch_arrow(
+    result: *mut PinkResult,
+    statement: usize,
+    out: *mut ArrowArray,
+) -> i32 {
+    if out.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null ArrowArray output");
+        return 0;
+    }
+    // SAFETY: out is non-null and writable per the C contract.
+    unsafe { ptr::write(out, ArrowArray::empty()) };
+    if result.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null result");
+        return 0;
+    }
+    // SAFETY: non-null, valid for the call.
+    let result_ref = unsafe { &*result };
+    if let Some(message) = &result_ref.error {
+        set_error(
+            result_ref.error_class.unwrap_or(CLASS_INTERNAL),
+            &message.to_string_lossy(),
+        );
+        return 0;
+    }
+    let Some(StmtData::Sel(sel)) = stmt_at_mut(result, statement) else {
+        set_error(
+            CLASS_INVALID_ARGUMENT,
+            &format!("statement {statement} is not a SELECT"),
+        );
+        return 0;
+    };
+    let Some(chunk) = sel.chunks.get(sel.next_chunk).cloned() else {
+        return 1;
+    };
+    match arrow::chunk_to_arrow(&chunk, out) {
+        Ok(()) => {
+            sel.next_chunk += 1;
+            1
+        }
+        Err(error) => {
+            error.report();
+            0
+        }
+    }
+}
+
+/// Rows in a chunk.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_chunk_size(chunk: *const PinkChunk) -> usize {
+    if chunk.is_null() {
+        return 0;
+    }
+    // SAFETY: non-null, valid for the call.
+    unsafe { &*chunk }.columns.first().map_or(0, |c| c.len)
+}
+
+/// A vector borrowed from `chunk`; NULL when the column is out of range.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_chunk_column(chunk: *const PinkChunk, column: usize) -> *const PinkVector {
+    if chunk.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: non-null, valid for the call; the vector lives as long as the
+    // chunk.
+    unsafe { &*chunk }
+        .columns
+        .get(column)
+        .map_or(ptr::null(), |v| v as *const PinkVector)
+}
+
+/// The vector's typed payload (see the header for each type's layout), or
+/// NULL for a type with no 1.2 payload (ARRAY).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_vector_data(vector: *const PinkVector) -> *const c_void {
+    if vector.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: non-null, valid while its chunk lives.
+    unsafe { &*vector }.data
+}
+
+/// The vector's validity words (bit i set = row i valid), or NULL when every
+/// row is valid.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_vector_validity(vector: *const PinkVector) -> *const u64 {
+    if vector.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: non-null, valid while its chunk lives.
+    unsafe { &*vector }.validity
+}
+
+/// 1 when `row` is valid (or `validity` is NULL, meaning all rows are),
+/// 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_validity_row_is_valid(validity: *const u64, row: usize) -> i32 {
+    if validity.is_null() {
+        return 1;
+    }
+    // SAFETY: the caller passes a mask covering `row`; bit i of word i/64.
+    let word = unsafe { *validity.add(row / 64) };
+    ((word >> (row % 64)) & 1) as i32
 }
 
 /// Affected-row count for INSERT/UPDATE/DELETE results (0 otherwise).
@@ -1515,8 +2786,8 @@ mod tests {
     }
 
     #[test]
-    fn abi_version_is_one() {
-        assert_eq!(pinkdb_abi_version(), 1);
+    fn abi_version_is_one_three() {
+        assert_eq!(pinkdb_abi_version(), (1 << 16) | 3);
     }
 
     #[test]
