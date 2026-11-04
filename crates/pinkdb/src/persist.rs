@@ -5394,7 +5394,33 @@ fn encode_row_group(
             .map(|&(ci, i)| encode(ci, i))
             .collect::<Result<Vec<_>>>()?
     };
+    // The encoded pages come in column order: split them by column, then
+    // assemble each column chunk (page index, pages, checksum, statistics) on
+    // the pool too. Only the offsets are a running sum, set in order below.
     let mut encoded = encoded.into_iter();
+    let column_pages: Vec<Option<Vec<EncodedPage>>> = copies
+        .iter()
+        .map(|copy| {
+            copy.is_none().then(|| {
+                let pages: Vec<EncodedPage> = encoded.by_ref().take(last - first).collect();
+                debug_assert_eq!(pages.len(), last - first);
+                pages
+            })
+        })
+        .collect();
+    let assembled: Vec<Option<AssembledColumn>> =
+        if parallel && work.len() >= PARALLEL_SAVE_MIN_CHUNKS {
+            column_pages
+                .par_iter()
+                .map(|pages| pages.as_deref().map(assemble_column))
+                .collect()
+        } else {
+            column_pages
+                .iter()
+                .map(|pages| pages.as_deref().map(assemble_column))
+                .collect()
+        };
+    drop(column_pages);
     let mut columns: Vec<ColumnChunkDir> = Vec::with_capacity(t.columns.len());
     let mut pieces = Vec::with_capacity(t.columns.len());
     let mut carry: Vec<Vec<CarriedColumnChunk>> = Vec::with_capacity(t.columns.len());
@@ -5404,55 +5430,25 @@ fn encode_row_group(
         .map(|_| ChunkColumnStats::empty())
         .collect();
     let mut running = 0u64;
-    for (ci, copy) in copies.into_iter().enumerate() {
+    for (ci, (copy, assembled)) in copies.into_iter().zip(assembled).enumerate() {
         let Some(copy) = copy else {
-            let pages: Vec<EncodedPage> = encoded.by_ref().take(last - first).collect();
-            debug_assert_eq!(pages.len(), last - first);
-            // The column chunk: the page index, then the pages.
-            let page_count = pages.len() as u32;
-            let index_len = 4 + page_count as usize * 8;
-            let mut chunk = Writer::new();
-            chunk.u32(page_count);
-            let mut rel = index_len as u32;
-            for page in &pages {
-                let len = page.frame.len() as u32;
-                chunk.u32(rel);
-                chunk.u32(len);
-                rel += len;
-            }
-            for page in &pages {
-                chunk.bytes(&page.frame);
-            }
-            let bytes = chunk.buf;
-            let length = bytes.len() as u64;
-            // The column chunk's exact statistics and encoding summary.
-            let mut acc = ChunkColumnStats::empty();
-            let mut encodings = 0u32;
-            for page in &pages {
-                acc.merge(&page.stats);
-                encodings |= 1u32 << page.frame[0];
-            }
+            let AssembledColumn {
+                bytes,
+                mut dir,
+                acc,
+            } = assembled.expect("a column without a copy-through was encoded");
             accs[ci].merge(&acc);
-            columns.push(ColumnChunkDir {
-                offset: running,
-                length,
-                page_count,
-                encodings,
-                crc32c: crc32c(&bytes),
-                null_count: acc.null_count,
-                nan_count: acc.nan_count,
-                min: acc.min,
-                max: acc.max,
-            });
-            running += length;
+            dir.offset = running;
+            running += dir.length;
             // The save repoints this column chunk's handles at the bytes it
             // writes, so the record carries the group-relative directory
             // entry the footer will get.
             carry.push(vec![CarriedColumnChunk {
                 first,
                 rows: Arc::clone(&rows_arc),
-                dir: columns.last().expect("just pushed").clone(),
+                dir: dir.clone(),
             }]);
+            columns.push(dir);
             pieces.push(GroupPiece { bytes });
             continue;
         };
@@ -5495,6 +5491,53 @@ fn encode_row_group(
         carry,
         accs,
     })
+}
+
+/// One encoded column chunk of a row group: its bytes, its directory entry
+/// (offset 0 until the group places it) and its exact statistics.
+struct AssembledColumn {
+    bytes: Vec<u8>,
+    dir: ColumnChunkDir,
+    acc: ChunkColumnStats,
+}
+
+/// Lay out one column chunk from its encoded pages: the page index (count,
+/// then each page's chunk-relative offset and length), then the pages.
+fn assemble_column(pages: &[EncodedPage]) -> AssembledColumn {
+    let page_count = pages.len() as u32;
+    let index_len = 4 + page_count as usize * 8;
+    let mut chunk = Writer::new();
+    chunk.u32(page_count);
+    let mut rel = index_len as u32;
+    for page in pages {
+        let len = page.frame.len() as u32;
+        chunk.u32(rel);
+        chunk.u32(len);
+        rel += len;
+    }
+    for page in pages {
+        chunk.bytes(&page.frame);
+    }
+    let bytes = chunk.buf;
+    // The column chunk's exact statistics and encoding summary.
+    let mut acc = ChunkColumnStats::empty();
+    let mut encodings = 0u32;
+    for page in pages {
+        acc.merge(&page.stats);
+        encodings |= 1u32 << page.frame[0];
+    }
+    let dir = ColumnChunkDir {
+        offset: 0,
+        length: bytes.len() as u64,
+        page_count,
+        encodings,
+        crc32c: crc32c(&bytes),
+        null_count: acc.null_count,
+        nan_count: acc.nan_count,
+        min: acc.min.clone(),
+        max: acc.max.clone(),
+    };
+    AssembledColumn { bytes, dir, acc }
 }
 
 /// Write one table's data region (its column chunks) and collect its footer
