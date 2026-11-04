@@ -243,9 +243,12 @@ pub(crate) fn canonical(name: &str) -> Option<&'static str> {
 /// pinkdb's own switches. They are settings rather than `SET VARIABLE`
 /// variables so that `SET name = value` means one thing, and they have no
 /// DuckDB counterpart: `join_filter_pushdown`, `pipeline_execution` (wave 135:
-/// `false` forces the materialized path) and the two HNSW search knobs are
+/// `false` forces the materialized path), `decoded_cache_limit` (wave 136c-2:
+/// the cap on clean chunks kept decoded; unset, they use whatever room the
+/// operators leave under `memory_limit`) and the two HNSW search knobs are
 /// debugging switches here.
 const PINKDB_SETTINGS: &[&str] = &[
+    "decoded_cache_limit",
     "hnsw_ef_search",
     "hnsw_exact",
     "join_filter_pushdown",
