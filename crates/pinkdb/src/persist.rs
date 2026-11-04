@@ -2300,6 +2300,13 @@ fn encode_double_chunk(values: &[f64]) -> (u8, Vec<u8>) {
 /// frame/FSST candidates on the plain bytes only when they can pay for
 /// themselves (the same gates as before), then build the winner.
 fn encode_varchar_chunk(strs: &[&str]) -> (u8, Vec<u8>) {
+    let (dict, codes) = dict_and_codes(strs);
+    encode_varchar_chunk_with(strs, &dict, &codes)
+}
+
+/// [`encode_varchar_chunk`] over the chunk's already built dictionary (the
+/// page writer builds it once for the encoding and the page statistics).
+fn encode_varchar_chunk_with(strs: &[&str], dict: &[&str], codes: &[u32]) -> (u8, Vec<u8>) {
     let n = strs.len();
     let mut total_bytes = 0usize;
     let mut run_bytes = 0usize;
@@ -2311,7 +2318,6 @@ fn encode_varchar_chunk(strs: &[&str]) -> (u8, Vec<u8>) {
             run_bytes += s.len();
         }
     }
-    let (dict, codes) = dict_and_codes(strs);
     let dict_bytes: usize = dict.iter().map(|s| s.len()).sum();
 
     let plain = 4 + 4 * (n + 1) + total_bytes;
@@ -2368,9 +2374,9 @@ fn encode_varchar_chunk(strs: &[&str]) -> (u8, Vec<u8>) {
         Some(payload) => payload,
         None => match best {
             0 => plain_payload.unwrap_or_else(|| enc_strs_plain(strs)),
-            1 => enc_strs_dict_from(&dict, &codes, n),
+            1 => enc_strs_dict_from(dict, codes, n),
             2 => enc_strs_rle(strs),
-            _ => enc_strs_dict_bitpack_from(&dict, &codes, n),
+            _ => enc_strs_dict_bitpack_from(dict, codes, n),
         },
     };
     (tag, payload)
@@ -3521,7 +3527,21 @@ struct EncodedPage {
 
 /// Encode one page (one engine chunk) from its [`Vector`].
 fn encode_page(v: &Vector) -> EncodedPage {
-    let (tag, payload) = encode_chunk_typed(v);
+    let (tag, payload, stats) = match v.data() {
+        // A VARCHAR chunk's dictionary serves the encoding and the page's
+        // min/max: every distinct value is compared once, not every row.
+        VectorData::VarChar(_) => {
+            let strs = varchar_payload(v);
+            let (dict, codes) = dict_and_codes(&strs);
+            let stats = varchar_zone(v, &dict, &codes);
+            let (tag, payload) = encode_varchar_chunk_with(&strs, &dict, &codes);
+            (tag, payload, stats)
+        }
+        _ => {
+            let (tag, payload) = encode_chunk_typed(v);
+            (tag, payload, crate::stats::Zone::of_vector(v))
+        }
+    };
     let validity = encode_validity(v);
     let mut w = Writer::new();
     w.u8(tag);
@@ -3530,7 +3550,47 @@ fn encode_page(v: &Vector) -> EncodedPage {
     w.bytes(&payload);
     EncodedPage {
         frame: w.buf,
-        stats: crate::stats::Zone::of_vector(v),
+        stats,
+    }
+}
+
+/// [`crate::stats::Zone::of_vector`] of a VARCHAR chunk, from its dictionary:
+/// the NULL count from the validity bits, and min/max over the dictionary
+/// entries some valid row uses (a NULL row's `""` placeholder is in the
+/// dictionary too, and must not count). Strings compare as `str` (bytes), as
+/// the row fold does, so the zone is identical.
+fn varchar_zone(v: &Vector, dict: &[&str], codes: &[u32]) -> crate::stats::Zone {
+    let mut used = vec![false; dict.len()];
+    let mut null_count = 0u64;
+    if v.has_nulls() {
+        let words = v.validity_words();
+        for (row, &code) in codes.iter().enumerate() {
+            if valid_at(words, row) {
+                used[code as usize] = true;
+            } else {
+                null_count += 1;
+            }
+        }
+    } else {
+        used.iter_mut().for_each(|u| *u = true);
+    }
+    let (mut min, mut max): (Option<&str>, Option<&str>) = (None, None);
+    for (entry, &s) in dict.iter().enumerate() {
+        if !used[entry] {
+            continue;
+        }
+        if min.is_none_or(|m| s < m) {
+            min = Some(s);
+        }
+        if max.is_none_or(|m| s > m) {
+            max = Some(s);
+        }
+    }
+    crate::stats::Zone {
+        null_count,
+        min: min.map(|s| Value::Varchar(s.to_string())),
+        max: max.map(|s| Value::Varchar(s.to_string())),
+        nan_count: 0,
     }
 }
 
@@ -9100,6 +9160,104 @@ mod tests {
     /// The sized-selection encoder must choose and write exactly what the
     /// trial encoder (build every candidate, keep the smallest, ties to the
     /// earlier candidate) chose; the corpus exercises every reachable tag.
+    /// A VARCHAR page's statistics from its dictionary equal the row fold
+    /// (`Zone::of_vector`) for every shape the strings can take: NULLs whose
+    /// `""` placeholder sits in the dictionary, real empty strings, all-NULL
+    /// and single-row chunks, prefixes and multi-byte UTF-8 (byte order),
+    /// low and high cardinality, partial chunks.
+    #[test]
+    fn varchar_page_zone_from_the_dictionary_matches_the_row_fold() {
+        let words = [
+            "", "a", "ab", "abc", "b", "z", "é", "zé", "ü", "A", " ", "ab\u{0}",
+        ];
+        let mut cases: Vec<Vec<Value>> = vec![
+            vec![],
+            vec![Value::Null],
+            vec![Value::Null, Value::Null],
+            vec![Value::Varchar(String::new())],
+            vec![Value::Null, Value::Varchar(String::new())],
+            vec![Value::Null, Value::Varchar("b".into()), Value::Null],
+        ];
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        for n in [1usize, 7, 8, 9, 100, 1023, 1024, 1025, 2047, 2048] {
+            for null_every in [0usize, 2, 3, 7] {
+                for distinct in [1usize, 3, words.len(), 5000] {
+                    cases.push(
+                        (0..n)
+                            .map(|i| {
+                                x ^= x << 13;
+                                x ^= x >> 7;
+                                x ^= x << 17;
+                                if null_every > 0 && i % null_every == 0 {
+                                    Value::Null
+                                } else if distinct <= words.len() {
+                                    Value::Varchar(words[(x as usize) % distinct].to_string())
+                                } else {
+                                    Value::Varchar(format!(
+                                        "{}{}",
+                                        words[(x as usize) % words.len()],
+                                        x % 5000
+                                    ))
+                                }
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+        for values in cases {
+            let v = vector_from_values(DataType::Varchar, &values);
+            let strs = varchar_payload(&v);
+            let (dict, codes) = dict_and_codes(&strs);
+            assert_eq!(
+                varchar_zone(&v, &dict, &codes),
+                crate::stats::Zone::of_vector(&v),
+                "{} rows",
+                values.len()
+            );
+            assert_eq!(encode_page(&v).stats, crate::stats::Zone::of_vector(&v));
+        }
+    }
+
+    /// The same equality on chunks shaped by UPDATE and DELETE (values
+    /// replaced, set to NULL and to `''`, rows removed): the page zone is
+    /// always derived from the chunk's current rows, never from the stored
+    /// (widened) zones.
+    #[test]
+    fn varchar_page_zone_matches_after_update_and_delete() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (k INTEGER, s VARCHAR);")
+            .unwrap();
+        let rows: Vec<String> = (0..5000)
+            .map(|i| format!("({i}, '{}')", ["m", "q", "c", "x"][i % 4].repeat(1 + i % 3)))
+            .collect();
+        db.execute(&format!("INSERT INTO t VALUES {};", rows.join(", ")))
+            .unwrap();
+        for sql in [
+            "UPDATE t SET s = 'zzz' WHERE k % 97 = 0;",
+            "UPDATE t SET s = NULL WHERE k % 13 = 0;",
+            "UPDATE t SET s = '' WHERE k % 31 = 0;",
+            "DELETE FROM t WHERE k % 7 = 0;",
+            "DELETE FROM t WHERE k BETWEEN 2100 AND 2300;",
+            "UPDATE t SET s = 'a' WHERE k = 4999;",
+        ] {
+            db.execute(sql).unwrap();
+            let t = db.table("t").unwrap();
+            let col = &t.columns[1];
+            assert!(col.num_chunks() >= 2, "the table spans several chunks");
+            for i in 0..col.num_chunks() {
+                let v = col.chunk(i).unwrap();
+                let strs = varchar_payload(&v);
+                let (dict, codes) = dict_and_codes(&strs);
+                assert_eq!(
+                    varchar_zone(&v, &dict, &codes),
+                    crate::stats::Zone::of_vector(&v),
+                    "{sql} chunk {i}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn selection_matches_trial_encoding() {
         let mut seen = [false; 12];
