@@ -1,6 +1,6 @@
 # Wave 142 — DECIMAL with a 64-bit physical type: design note
 
-Status: proposed 2026-11-04, to be reviewed before the bulk of the code.
+Status: approved and landed on 2026-11-04 (results at the end).
 
 ## Why
 
@@ -90,3 +90,29 @@ unscaled value). For `p ≤ 18` the decoder writes straight into `Vec<i64>` inst
 
 `int16` and `int32` physical types for `p ≤ 9` (DuckDB has them). They would halve again for small
 decimals, but TPC-H gains nothing from them, so this is `i64` only.
+
+## Results (2026-11-04)
+
+Interleaved A/B against `main` 88f1d94, run in the build lock's exclusive bench mode, on the shared
+`cmp/` stores:
+
+| | geomean | notable |
+|---|---|---|
+| SF1, all 22 queries, 3 rounds | 0.975 | Q7 0.88, Q6 0.89, Q1 0.92 |
+| SF10, all 22 queries, 2 rounds | **0.869** | Q19 0.31, Q8 0.59, Q1 0.68, Q10 0.70, Q7 0.74, Q9 0.83 |
+| SF10, Q1/Q6/Q14/Q19/Q10, 5 rounds | 0.752 | Q1 0.70, Q6 0.90, Q14 1.00, Q19 0.55, Q10 0.69 |
+
+**Q17 at SF10: 1.065 over 10 rounds, not traced to decimal code.** A/B of its parts:
+- the decimal `avg` subquery: 0.74;
+- the decimal filter: 0.85;
+- the join plus `sum(l_extendedprice)`: 1.10 in one run and 1.01 in the next;
+- the same join with `count(*)`, no decimals: 1.03.
+
+Profiles of the two builds show no new hotspot. It is recorded as unexplained, most likely code
+layout and run-to-run variance on a ~100 ms join.
+
+**Peak RSS at SF10:** Q6 3,308 → 1,931 MB. Q1, Q9, Q10, Q18 and Q19 are within ±3 %: their peak is
+the decoded cache of non-decimal columns and operator state, not decimals.
+
+**Gates:** the full gate passes 82/82. The `tests/decimal64.rs` expectations were taken from the
+pre-change binary's output.
