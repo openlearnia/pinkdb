@@ -76,3 +76,16 @@ The SF10 Q22 outlier, rechecked at 8 rounds: 1.015. The SF1 Q11 outlier: 1.00.
 
 Next by measured share: a parallel `MatchTable::build` (up to 16 % of Q7), then a parallel
 aggregate merge, then 141c.
+
+## Tried and not landed: parallel chain linking (2026-11-04)
+
+`MatchTable::from_key_vectors` linked its chains serially. A parallel version split the bucket array
+into one contiguous range per task, each walking all rows in reverse, so the chains stayed identical.
+It measured as noise:
+- SF1 1.014 and SF10 0.965 over the 22 queries;
+- reruns flipping per-query signs (Q21 0.72 one run, 1.07 the next; SF1 Q4 1.29, then 0.88).
+
+That was at load 11–23. A re-profile showed why: the build's serial share is spread out, not in
+linking. Once linking ran in parallel, Q7's main thread spent its remaining build time in
+`chunk_approx_bytes` (the build's byte estimate), about 48 samples, and in concatenating per-chunk
+key arrays, about 30. Neither is worth a wave alone. Not landed: no change without a measured gain.
