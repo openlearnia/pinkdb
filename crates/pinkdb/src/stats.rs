@@ -74,6 +74,7 @@ pub(crate) fn key_hash(v: &Vector, row: usize) -> u64 {
         VectorData::Float64(d) => float_key(d[row]),
         VectorData::VarChar(d) => hash_bytes(d[row].as_bytes()),
         VectorData::Decimal { values, scale, .. } => decimal_key(values[row], *scale),
+        VectorData::Decimal64 { values, scale, .. } => decimal_key(i128::from(values[row]), *scale),
         VectorData::Interval(d) => interval_key_of(d[row]),
         // The general encodings (they own the canonical form of these kinds).
         VectorData::Uuid(d) => uuid_key(d[row]),
@@ -247,6 +248,15 @@ impl Hll {
             VectorData::Decimal { values, scale, .. } => {
                 let scale = *scale as u64;
                 self.fold_typed(v, values, move |x: i128| {
+                    mix(x as u64 ^ ((x >> 64) as u64).rotate_left(17) ^ (scale << 56))
+                })
+            }
+            // Hashed as its 128-bit value: a sketch does not depend on the
+            // payload width (wave 142).
+            VectorData::Decimal64 { values, scale, .. } => {
+                let scale = *scale as u64;
+                self.fold_typed(v, values, move |x: i64| {
+                    let x = i128::from(x);
                     mix(x as u64 ^ ((x >> 64) as u64).rotate_left(17) ^ (scale << 56))
                 })
             }
@@ -642,6 +652,11 @@ impl Zone {
                 zone.min = min.map(|x| Value::decimal(x, *scale));
                 zone.max = max.map(|x| Value::decimal(x, *scale));
             }
+            VectorData::Decimal64 { values, scale, .. } => {
+                let (min, max) = int_stats(v, &values[start..start + len], start);
+                zone.min = min.map(|x| Value::decimal(i128::from(x), *scale));
+                zone.max = max.map(|x| Value::decimal(i128::from(x), *scale));
+            }
             VectorData::Int128(data) => {
                 let (min, max) = int_stats(v, &data[start..start + len], start);
                 zone.min = min.map(Value::Hugeint);
@@ -797,6 +812,14 @@ fn fold_zone_and_sketch(v: &Vector) -> (Zone, Hll) {
             &mut hll,
             |x: i128| decimal_key(x, *scale),
             |x: i128| Value::decimal(x, *scale),
+        ),
+        VectorData::Decimal64 { values, scale, .. } => fold_ordered(
+            v,
+            values,
+            &mut zone,
+            &mut hll,
+            |x: i64| decimal_key(i128::from(x), *scale),
+            |x: i64| Value::decimal(i128::from(x), *scale),
         ),
         VectorData::Float64(data) => {
             let (mut min, mut max): (Option<f64>, Option<f64>) = (None, None);

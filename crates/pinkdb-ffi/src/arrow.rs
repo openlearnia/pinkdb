@@ -369,10 +369,15 @@ struct IntervalNano {
 enum Payload {
     None,
     Boolean(Vec<u8>),
-    Utf8 { offsets: Vec<i32>, data: Vec<u8> },
+    Utf8 {
+        offsets: Vec<i32>,
+        data: Vec<u8>,
+    },
     Interval(Vec<IntervalNano>),
     Uuid(Vec<[u8; 16]>),
     Int32(Vec<i32>),
+    /// A 64-bit DECIMAL payload widened to Arrow's decimal128 (wave 142).
+    Decimal128(Vec<i128>),
 }
 
 struct ArrayPrivate {
@@ -550,6 +555,11 @@ fn build_payload(vector: &Vector) -> Result<(Payload, *const c_void), ExportErro
                 )));
             }
             (Payload::None, values.as_ptr().cast())
+        }
+        (DataType::Decimal { .. }, VectorData::Decimal64 { values, .. }) => {
+            let wide: Vec<i128> = values.iter().map(|&v| i128::from(v)).collect();
+            let ptr = wide.as_ptr().cast();
+            (Payload::Decimal128(wide), ptr)
         }
         (DataType::Interval, VectorData::Interval(values)) => {
             let mut converted = Vec::with_capacity(values.len());

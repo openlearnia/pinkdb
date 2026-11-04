@@ -959,6 +959,53 @@ impl PinkDb {
         Ok(())
     }
 
+    /// An `ATTACH` naming a database this store already has. `Ok(true)`: the
+    /// name already serves this very lake with the same options, so the
+    /// statement is a no-op. A store remembers its attachments across reopen,
+    /// and a script that attaches its lake must run again unchanged.
+    /// `Ok(false)`: the name is free. Any other database under the name is an
+    /// error that says what differs.
+    pub(crate) fn existing_attachment(&self, name: &str, spec: &LakeSpec) -> Result<bool> {
+        let Some(cat) = self.databases.get(&Self::db_key(name)) else {
+            return Ok(false);
+        };
+        let DbStorage::Lake(theirs) = &cat.storage else {
+            return Err(PinkDbError::Catalog(format!(
+                "database \"{name}\" already exists"
+            )));
+        };
+        let ours = self.lake_request(name, spec, false, true)?;
+        let held = self.lake_request(&cat.name, theirs, false, true)?;
+        if ours.catalog != held.catalog {
+            return Err(PinkDbError::Catalog(format!(
+                "database \"{name}\" is already attached to lake {}, not {}: DETACH it first",
+                redact_location(&held.catalog),
+                redact_location(&ours.catalog)
+            )));
+        }
+        if ours.data != held.data {
+            return Err(PinkDbError::Catalog(format!(
+                "database \"{name}\" is already attached to this lake with another DATA \
+                 location: DETACH it first"
+            )));
+        }
+        // Same lake: every option must match too. CREATE_IF_NOT_EXISTS only
+        // matters when the lake is created, so it does not count.
+        let options = |s: &LakeSpec| LakeSpec {
+            catalog: None,
+            data: None,
+            create_if_not_exists: false,
+            ..s.clone()
+        };
+        if options(spec) != options(theirs) {
+            return Err(PinkDbError::Catalog(format!(
+                "database \"{name}\" is already attached to this lake with different options \
+                 (READ_ONLY, VERSION, DATA_INLINING_ROW_LIMIT or format): DETACH it first"
+            )));
+        }
+        Ok(true)
+    }
+
     /// `CREATE DATABASE name (TYPE LAKE …)`: create the lake and attach it.
     /// A replay opens the lake the original statement created instead.
     pub(crate) fn create_lake_database(&mut self, name: &str, spec: LakeSpec) -> Result<()> {
@@ -977,10 +1024,14 @@ impl PinkDb {
         spec: LakeSpec,
         create: bool,
     ) -> Result<()> {
-        if self.database_exists(name) {
-            return Err(PinkDbError::Catalog(format!(
-                "database \"{name}\" already exists"
-            )));
+        if create {
+            if self.database_exists(name) {
+                return Err(PinkDbError::Catalog(format!(
+                    "database \"{name}\" already exists"
+                )));
+            }
+        } else if self.existing_attachment(name, &spec)? {
+            return Ok(());
         }
         self.refuse_duplicate_lake(name, &spec)?;
         // A replayed statement re-uses the lake this process already holds

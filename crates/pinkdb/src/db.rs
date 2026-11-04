@@ -537,6 +537,36 @@ impl Drop for Connection {
     }
 }
 
+/// What `execute_one_with` runs: a parsed statement it must bind, or a plan
+/// an internal caller already built (the appender's flush).
+enum ExecInput<'a> {
+    Stmt(&'a crate::sql::ast::Statement),
+    Plan(&'a LogicalPlan),
+}
+
+impl<'a> ExecInput<'a> {
+    fn stmt(&self) -> Option<&'a crate::sql::ast::Statement> {
+        match self {
+            Self::Stmt(stmt) => Some(stmt),
+            Self::Plan(_) => None,
+        }
+    }
+
+    /// Bind under `db`. A plan input is already bound and typed; cloning it
+    /// shares its chunk columns (`Arc`), so a flush copies no row values.
+    fn bind(
+        &self,
+        db: &PinkDb,
+        pre_ns: &crate::storage::SchemaPath,
+        session: &crate::storage::Session,
+    ) -> Result<(LogicalPlan, Vec<String>)> {
+        match self {
+            Self::Stmt(stmt) => crate::sql::bind_tracked_in(db, stmt, pre_ns, session),
+            Self::Plan(plan) => Ok(((*plan).clone(), Vec::new())),
+        }
+    }
+}
+
 impl Connection {
     /// Allow or refuse `external_io` host scalars in this session (the serve
     /// policy's `allow-external-services` switch). Refused calls return a
@@ -872,6 +902,68 @@ impl Connection {
         Ok(())
     }
 
+    /// Open a buffered row/column appender for `schema.table` (the session's
+    /// current schema when `schema` is `None`). The table and its column
+    /// types are resolved now, so later calls need the connection explicitly
+    /// and cannot alias it; see [`crate::appender`] for the flush semantics.
+    pub fn appender(
+        &mut self,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<crate::appender::Appender> {
+        let ns = crate::storage::SchemaPath::new(
+            &self.current_db,
+            schema.unwrap_or(&self.current_schema),
+        );
+        let table = table.to_ascii_lowercase();
+        let schema = self.with_bind_store(|db| db.table_in(&ns, &table).map(|t| t.schema()))?;
+        Ok(crate::appender::Appender::new(ns, table, schema))
+    }
+
+    /// Live column count of the appender's table: a flush refuses when an
+    /// `ALTER TABLE` changed it after the appender resolved its types.
+    pub(crate) fn appender_width(
+        &self,
+        ns: &crate::storage::SchemaPath,
+        table: &str,
+    ) -> Result<usize> {
+        self.with_bind_store(|db| db.table_in(ns, table).map(|t| t.columns.len()))
+    }
+
+    /// Whether a durable flush of `plan` must render SQL text. Autocommit
+    /// appends log a binary chunk, so text is only needed inside an open
+    /// transaction (whose commit record is assembled from statement text);
+    /// in-memory stores and temp-table writes never render literals.
+    pub(crate) fn needs_wal_text_for(&self, plan: &LogicalPlan) -> bool {
+        self.txn.is_some()
+            && self.db.is_durable()
+            && crate::plan::writes_persistent_tables(
+                plan,
+                &crate::storage::SchemaPath::new(&self.current_db, &self.current_schema),
+            )
+    }
+
+    /// Execute an already-bound plan as one statement. Internal callers (the
+    /// appender's flush) bypass parsing and binding; `wal_text` is the
+    /// logical SQL a durable store logs for it (`None` = do not log).
+    pub(crate) fn execute_plan(
+        &mut self,
+        plan: LogicalPlan,
+        wal_text: Option<&str>,
+    ) -> Result<QueryResult> {
+        self.with_bind_store(|db| db.finish_scan_records());
+        // One budget per flush, like `execute_statement`: the deadline starts
+        // before execution and is shared by every evaluation context.
+        let budget = Arc::new(
+            crate::exec::ExecBudget::new(self.exec_limits.as_ref())
+                .with_external_services(self.external_services)
+                .with_cancel(self.cancel.clone()),
+        );
+        Ok(self
+            .execute_one_with(ExecInput::Plan(&plan), wal_text, None, &budget, false)?
+            .into_query_result())
+    }
+
     /// Parse `sql` into a reusable prepared statement (exactly one statement,
     /// `?` placeholders allowed). Pure parsing: no catalog access; types are
     /// resolved by [`Connection::bind`] / [`Connection::execute_prepared`].
@@ -968,8 +1060,13 @@ impl Connection {
                 .with_external_services(self.external_services)
                 .with_cancel(self.cancel.clone()),
         );
-        let result =
-            self.execute_one_with(stmt, sql_text, profile.as_deref_mut(), &budget, keep_chunks);
+        let result = self.execute_one_with(
+            ExecInput::Stmt(stmt),
+            sql_text,
+            profile.as_deref_mut(),
+            &budget,
+            keep_chunks,
+        );
         if let Some(p) = profile {
             p.memory_limit = crate::memory::limit() as u64;
             p.memory_peak = budget.memory_peak() as u64;
@@ -979,7 +1076,7 @@ impl Connection {
 
     fn execute_one_with(
         &mut self,
-        stmt: &crate::sql::ast::Statement,
+        input: ExecInput<'_>,
         sql_text: Option<&str>,
         mut profile: Option<&mut ProfileDraft>,
         budget: &Arc<crate::exec::ExecBudget>,
@@ -993,8 +1090,8 @@ impl Connection {
         self.ensure_login()?;
         // Transaction control never touches table data: handle first. The
         // whole transition (including COMMIT's WAL append) is execution time.
-        match stmt {
-            crate::sql::ast::Statement::Begin => {
+        match input.stmt() {
+            Some(crate::sql::ast::Statement::Begin) => {
                 let start = profile.as_ref().map(|_| Instant::now());
                 let result = self.txn_begin();
                 if let Some(p) = profile.as_deref_mut() {
@@ -1002,7 +1099,7 @@ impl Connection {
                 }
                 return result.map(crate::exec::ChunkedResult::Other);
             }
-            crate::sql::ast::Statement::Commit => {
+            Some(crate::sql::ast::Statement::Commit) => {
                 let start = profile.as_ref().map(|_| Instant::now());
                 let result = self.txn_commit();
                 if let Some(p) = profile.as_deref_mut() {
@@ -1010,7 +1107,7 @@ impl Connection {
                 }
                 return result.map(crate::exec::ChunkedResult::Other);
             }
-            crate::sql::ast::Statement::Rollback => {
+            Some(crate::sql::ast::Statement::Rollback) => {
                 let start = profile.as_ref().map(|_| Instant::now());
                 let result = self.txn_rollback();
                 if let Some(p) = profile.as_deref_mut() {
@@ -1046,7 +1143,7 @@ impl Connection {
                 // per-table snapshot merge cannot undo a whole database, and a
                 // LOAD EXTENSION into the private snapshot would be discarded
                 // at COMMIT/ROLLBACK.
-                if let Some(name) = refused_in_txn(stmt) {
+                if let Some(name) = input.stmt().and_then(refused_in_txn) {
                     return Err(PinkDbError::Execution(format!(
                         "{name} is not allowed inside a transaction"
                     )));
@@ -1055,7 +1152,7 @@ impl Connection {
                 let pre_ns = crate::storage::SchemaPath::new(&pre, &self.current_schema);
                 let bind_start = profile.as_ref().map(|_| Instant::now());
                 let (plan, dynamic_functions_used) =
-                    crate::sql::bind_tracked_in(&txn.work, stmt, &pre_ns, &self.session)?;
+                    input.bind(&txn.work, &pre_ns, &self.session)?;
                 budget.check_deadline()?;
                 let plan = crate::plan::with_mv_source(plan, sql_text);
                 if let Some(p) = profile.as_deref_mut() {
@@ -1193,7 +1290,7 @@ impl Connection {
                 // under the exclusive lock.
                 let shared = read_lock(&self.db.shared);
                 let bind_start = profile.as_ref().map(|_| Instant::now());
-                let (plan, _) = crate::sql::bind_tracked_in(&shared, stmt, &pre_ns, &self.session)?;
+                let (plan, _) = input.bind(&shared, &pre_ns, &self.session)?;
                 budget.check_deadline()?;
                 if let Some(p) = profile.as_deref_mut() {
                     p.bind += bind_start.map(|s| s.elapsed()).unwrap_or_default();
@@ -1202,6 +1299,22 @@ impl Connection {
                 // the same lock the bind took, so no statement can slip
                 // between the check and its execution.
                 enforce(self.gate(), &shared, &plan, &pre_ns)?;
+                // Re-attaching the lake a name already serves, with the same
+                // options, changes nothing: answer it here so it never takes
+                // the write lease or appends a WAL record (a store replays
+                // its attachments, so every reopen would grow the log).
+                // With a secret it still runs, since the secret may be new.
+                if let crate::plan::LogicalPlan::Attach {
+                    name,
+                    source: crate::lake_db::AttachSource::Lake(spec),
+                    secret: None,
+                } = &plan
+                    && shared.existing_attachment(name, spec)?
+                {
+                    return Ok(crate::exec::ChunkedResult::Other(
+                        QueryResult::CreatedDatabase { name: name.clone() },
+                    ));
+                }
                 let result = if is_read_only(&plan) {
                     let exec_start = profile.as_ref().map(|_| Instant::now());
                     let result = if keep_chunks {
@@ -1229,7 +1342,7 @@ impl Connection {
                 } else {
                     drop(shared);
                     crate::exec::ChunkedResult::Other(self.autocommit_write(
-                        stmt,
+                        input,
                         sql_text,
                         &pre,
                         budget.clone(),
@@ -1271,6 +1384,7 @@ impl Connection {
                             &pre_ns,
                             &after,
                             &[text.to_string()],
+                            &[],
                             &[],
                             &[],
                             Some(&sets),
@@ -1332,7 +1446,7 @@ impl Connection {
     /// held by the process the whole time or is acquired here.
     fn autocommit_write(
         &self,
-        stmt: &crate::sql::ast::Statement,
+        input: ExecInput<'_>,
         sql_text: Option<&str>,
         pre: &str,
         budget: Arc<crate::exec::ExecBudget>,
@@ -1346,8 +1460,7 @@ impl Connection {
         // have changed the catalog between the caller's read-guard bind and
         // this lock.
         let bind_start = profile.as_ref().map(|_| Instant::now());
-        let (plan, dynamic_functions_used) =
-            crate::sql::bind_tracked_in(&shared, stmt, &pre_ns, &self.session)?;
+        let (plan, dynamic_functions_used) = input.bind(&shared, &pre_ns, &self.session)?;
         budget.check_deadline()?;
         let plan = crate::plan::with_mv_source(plan, sql_text);
         if let Some(p) = profile.as_deref_mut() {
@@ -1372,8 +1485,7 @@ impl Connection {
             }
             // The refresh/rebind under the lease is execution time: it is the
             // span the caller waits on, not a second bind phase.
-            let (plan, dynamic_functions_used) =
-                crate::sql::bind_tracked_in(&shared, stmt, &pre_ns, &self.session)?;
+            let (plan, dynamic_functions_used) = input.bind(&shared, &pre_ns, &self.session)?;
             budget.check_deadline()?;
             let plan = crate::plan::with_mv_source(plan, sql_text);
             shared.session_principal = self.principal.clone();
@@ -1498,7 +1610,7 @@ impl Connection {
             shared.rebuild_under_lease(g)?;
         }
         shared.note_optimistic_fallback_for_test();
-        let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, &pre_ns)?;
+        let (plan, dynamic_functions_used) = input.bind(&shared, &pre_ns, &self.session)?;
         budget.check_deadline()?;
         let plan = crate::plan::with_mv_source(plan, sql_text);
         shared.session_principal = self.principal.clone();
@@ -1599,6 +1711,7 @@ impl Connection {
                     &stmts,
                     &[],
                     &[],
+                    &[],
                     Some(&sets),
                     None,
                     &memo,
@@ -1608,7 +1721,15 @@ impl Connection {
             }
             return Ok(None);
         }
-        if let Some(text) = sql_text
+        // An appender flush logs its rows as a binary chunk (payload v7), not
+        // SQL text: the text is only needed inside an open transaction, where
+        // the commit record is assembled from statement text.
+        let chunk = if shared.is_durable() {
+            crate::wal::WalChunk::from_plan(plan)
+        } else {
+            None
+        };
+        if (sql_text.is_some() || chunk.is_some())
             && crate::plan::writes_persistent_tables(plan, &pre_ns)
         {
             let after = session_after(result, pre, &self.current_schema, shared);
@@ -1621,10 +1742,12 @@ impl Connection {
                 Some(s) => s.clone(),
                 None => shared.plan_sets_store(plan, &pre_ns),
             };
+            let stmts = sql_text.map(|t| vec![t.to_string()]).unwrap_or_default();
             let pending = shared.wal_append_session_pending(
                 &pre_ns,
                 &after,
-                &[text.to_string()],
+                &stmts,
+                chunk.as_slice(),
                 &touched,
                 &loaded,
                 Some(&sets),
@@ -1832,6 +1955,7 @@ impl Connection {
                 &before,
                 &txn.wal_db_after,
                 &txn.wal_stmts,
+                &[],
                 &txn.wal_ext_paths,
                 &txn.wal_ext_loaded,
                 Some(&sets),

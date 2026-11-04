@@ -9,6 +9,32 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-11-04
+### Wave 142 — DECIMAL up to 18 digits computes in 64 bits ✅
+
+A `DECIMAL` of precision 18 or less is held as 64-bit integers in memory
+instead of 128-bit ones, as DuckDB does. Every TPC-H decimal qualifies.
+Results, result types and error messages are unchanged, and so are the
+on-disk format and what the C API, Arrow and Parquet hand out.
+
+- **Speed**, against the previous build at TPC-H SF10, interleaved: geomean
+  0.87; Q19 3.2× faster, Q8 1.7×, Q1 and Q10 1.4–1.5×, Q7 1.35×. SF1 geomean
+  0.975.
+- **Memory**: a decoded decimal column takes half the bytes (Q6 at SF10
+  peaks at 1.9 GB instead of 3.3 GB).
+
+### Wave 141b — join build sides are freed in parallel ✅
+
+The chunks a hash join built are freed by every worker instead of one thread
+at the end of the statement: TPC-H geomean 0.945 at SF1 and 0.93 at SF10
+against 141a (Q10 1.3× faster, Q7 and Q5 1.2×).
+
+### Wave 141a — joins gather their build columns without per-row dispatch ✅
+
+A hash join's output reads each build-side column through slices resolved once per join, not by
+checking every row's type. Join-heavy TPC-H queries at SF10 run faster (interleaved against the
+previous build): Q10 1.9× faster, Q7 1.3×, Q9 1.2×, Q21 1.15×, geomean 0.888 over all 22 queries
+(SF1 0.986).
+
 ### Faster bulk loads, step 1 ✅
 
 `CREATE TABLE … AS SELECT * FROM read_parquet(…)` / `read_csv(…)` load 1.33×

@@ -130,9 +130,10 @@ try {
 
 ### ABI version
 
-The package targets C ABI v1. `require('@pinkdb/pinkdb')` checks
-`pinkdb_abi_version()` at load time and throws if the addon speaks a different
-ABI; `abiVersion()` exposes the value for diagnostics.
+The package targets C ABI 1.4. `require('@pinkdb/pinkdb')` checks
+`pinkdb_abi_version()` at load time and throws unless the addon speaks major
+version 1 at minor 4 or later. `abiVersion()` returns the encoded value
+(`major << 16 | minor`) and `abiVersionInfo()` returns `{ major, minor }`.
 
 ## Conformance
 

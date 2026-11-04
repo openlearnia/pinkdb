@@ -77,10 +77,10 @@ func main() {
 | `(*Stmt).SQL() string` | The original statement text. |
 | `(*Stmt).Close()` | Free the native prepared statement. Idempotent. |
 | `(*DB).Close()` | Free the native handle. Idempotent; a second call is a no-op. |
-| `(*DB).ABI() uint32` | ABI version reported by the linked library (1); stays callable after `Close`. |
+| `(*DB).ABI() uint32` | ABI version reported by the linked library, `major<<16 \| minor` (split it with `ABIMajorMinor`); stays callable after `Close`. |
 
-Both open functions check `pinkdb_abi_version()` first: a library that is not
-ABI 1 fails with an error naming both versions. `Open` rejects an empty path
+Both open functions check `pinkdb_abi_version()` first: a library whose ABI is not
+major 1 at minor 4 or later fails with an error naming both versions. `Open` rejects an empty path
 or one containing a NUL byte before any native call; a path with invalid
 UTF-8 fails at the native boundary with `path is not valid UTF-8`. SQL that
 is not valid UTF-8 fails with `SQL is not valid UTF-8` and leaves the handle

@@ -38,6 +38,7 @@
 #![cfg_attr(target_arch = "wasm32", allow(clippy::drop_non_drop))]
 
 pub mod agent;
+pub mod appender;
 pub mod array;
 pub mod attached;
 pub mod catalog_image;
@@ -115,6 +116,7 @@ pub mod vector;
 pub mod vector_index;
 pub mod wal;
 
+pub use appender::Appender;
 pub use attached::{
     AtSpec, AttachedLake, AttachedScan, AttachedTable, ColumnStats, PathStats, PruneOp,
     PrunePredicate,
@@ -388,6 +390,22 @@ impl PinkDb {
             let execute: std::time::Duration;
             let log: std::time::Duration;
             let result = 'stmt: {
+                // Re-attaching the lake a name already serves, with the same
+                // options, changes nothing: answer it here so it never takes
+                // the lease or appends a WAL record (a store replays its
+                // attachments, so every reopen would grow the log). With a
+                // secret it still runs, since the secret may be new.
+                if let plan::LogicalPlan::Attach {
+                    name,
+                    source: lake_db::AttachSource::Lake(spec),
+                    secret: None,
+                } = &plan
+                    && self.existing_attachment(name, spec)?
+                {
+                    execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
+                    log = std::time::Duration::ZERO;
+                    break 'stmt QueryResult::CreatedDatabase { name: name.clone() };
+                }
                 // Autocommit writes to plain tables take the optimistic fast
                 // path: execute with no lease, then validate + append under it
                 // (with a pessimistic fallback when the commit conflicts). The

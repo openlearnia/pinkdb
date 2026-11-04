@@ -3,12 +3,13 @@
 //! For `<path>.pink` the log is a sidecar `<path>.pink.wal`:
 //!
 //! ```text
-//! header:  magic "PINKWAL1" (8 bytes) + format version u32 (=5)
+//! header:  magic "PINKWAL1" (8 bytes) + format version u32 (=7)
 //!          + generation u64 + wal_id [16] + crc32(0..36) u32
 //!          + commit slot A (24 bytes) + commit slot B (24 bytes)
 //!          + reserved zero u32×2
 //! record:  payload_len u32 | lsn u64 | crc32(payload) u32 | payload
 //! payload: stmt_count u32 | sets_len u32 | sets | per statement: len u32 + UTF-8 SQL text
+//!          | optional CHUNKS_MARKER + chunk section | memo_count u32 | memo entries
 //! sets:    format u8 (=1) | table_count u32 | (db_len u16 + db, name_len u16 + name)*
 //!          | db_count u32 | (db_len u16 + db)*
 //! ```
@@ -23,10 +24,13 @@
 //! memo** ([`ExtCall`]): the `(function, arguments) → result` pairs of every
 //! `external_io` host scalar the frame called, so replay answers those calls
 //! from the record instead of calling out; a frame that called none carries
-//! an empty memo. Version 2/3 WALs are accepted and upgraded in place under
-//! the write lease (records are re-encoded with unknown sets and an empty
-//! memo); older builds refuse version 5 cleanly through the `BadVersion`
-//! path before reading any record. Encrypted **WAL** containers are version 3; encrypted checkpoints
+//! an empty memo. Version 6 (wave 132b) appends the persistent-secret
+//! snapshot. Version 7 (wave 112d) adds the optional binary appender-chunk
+//! section, so a flush of materialized rows commits without rendering and
+//! re-parsing SQL text. Version 2/3 WALs are accepted and upgraded in place
+//! under the write lease (records are re-encoded with unknown sets and an
+//! empty memo); older builds refuse version 7 cleanly through the
+//! `BadVersion` path before reading any record. Encrypted **WAL** containers are version 3; encrypted checkpoints
 //! stay at container version 2, so `.pink` bytes are unchanged by this wave.
 //!
 //! # Multi-process access (wave 45m) and optimistic commits (wave 45o)
@@ -220,11 +224,12 @@ pub const WAL_MAGIC: &[u8; 8] = b"PINKWAL1";
 /// validate against; version 5 (wave 107c) appends the replay memo of the
 /// record's `external_io` host-scalar calls (see [`ExtCall`]); version 6 (wave
 /// 132b) appends the record's persistent-secret section (see
-/// [`SECRETS_MARKER`]) when the record changed the store's secrets. Every
-/// durable open rewrites a v2/v3 file in place under the write lease; an
-/// older build refuses a v6 file with a clean version error before it reads
-/// any record.
-pub const WAL_VERSION: u32 = 6;
+/// [`SECRETS_MARKER`]) when the record changed the store's secrets; version 7
+/// (wave 112d) adds the optional binary appender-chunk section (see
+/// [`CHUNKS_MARKER`]). Every durable open rewrites a v2/v3 file in place
+/// under the write lease; an older build refuses a v7 file with a clean
+/// version error before it reads any record.
+pub const WAL_VERSION: u32 = 7;
 /// An engine WAL payload detached from a local WAL file. Object-backed
 /// catalog stores use this framing so each immutable object is one logical
 /// WAL record without inheriting a local file's generation, LSN, or nonce.
@@ -1453,6 +1458,14 @@ struct SyncState {
     /// Test hook: fail this many syncs without calling the syscall.
     #[cfg(test)]
     fail_next: usize,
+    /// Test hook: the next sync waits until this many committers are blocked
+    /// behind it, so a test sees a group form instead of hoping threads
+    /// overlap.
+    #[cfg(test)]
+    hold_for: usize,
+    /// Committers blocked on `ready` behind an in-flight sync.
+    #[cfg(test)]
+    waiters: usize,
 }
 
 impl SyncGroup {
@@ -1474,6 +1487,10 @@ impl SyncGroup {
                 last_method: WalSyncMethod::Full,
                 #[cfg(test)]
                 fail_next: 0,
+                #[cfg(test)]
+                hold_for: 0,
+                #[cfg(test)]
+                waiters: 0,
             }),
             ready: Condvar::new(),
         }))
@@ -1516,7 +1533,16 @@ impl SyncGroup {
                 return Ok(());
             }
             if st.in_flight {
+                #[cfg(test)]
+                {
+                    st.waiters += 1;
+                    self.ready.notify_all();
+                }
                 st = self.ready.wait(st).unwrap_or_else(|p| p.into_inner());
+                #[cfg(test)]
+                {
+                    st.waiters -= 1;
+                }
                 continue;
             }
             st.in_flight = true;
@@ -1585,6 +1611,23 @@ impl SyncGroup {
                 st.fail_next -= 1;
                 return Err(std::io::Error::other("injected WAL sync failure"));
             }
+            if st.hold_for > 0 {
+                // Bounded, so a regression that keeps committers out of the
+                // group fails the test's assertion instead of hanging it.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while st.waiters < st.hold_for {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    st = self
+                        .ready
+                        .wait_timeout(st, left)
+                        .unwrap_or_else(|p| p.into_inner())
+                        .0;
+                }
+                st.hold_for = 0;
+            }
         }
         sync_file(method, &self.file)
     }
@@ -1598,6 +1641,11 @@ impl SyncGroup {
     #[cfg(test)]
     fn fail_next_syncs(&self, count: usize) {
         self.lock().fail_next = count;
+    }
+
+    #[cfg(test)]
+    fn hold_next_sync_for(&self, waiters: usize) {
+        self.lock().hold_for = waiters;
     }
 }
 
@@ -1700,6 +1748,10 @@ impl ReplayMemo {
 pub(crate) struct Record {
     lsn: u64,
     stmts: Vec<String>,
+    /// Materialized appender rows (payload v7): the flush's data, kept out
+    /// of the statement text so a large append does not pay SQL rendering
+    /// and re-parsing on every durable commit.
+    chunks: Vec<WalChunk>,
     /// The frame's touched-object set (payload v4); `None` = unknown (a
     /// record adopted from a legacy v2/v3 upgrade).
     sets: Option<FrameSets>,
@@ -1709,6 +1761,47 @@ pub(crate) struct Record {
     /// (wave 132b), in their own section. `None` = no section, so replay
     /// keeps whatever the checkpoint and earlier records installed.
     secrets: Option<Vec<crate::secret::Secret>>,
+}
+
+/// The materialized rows of one appender flush, as stored in a WAL record.
+/// Values carry their own type tags, so replay needs no schema snapshot: the
+/// generated `INSERT` coerces exactly like any other insert.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WalChunk {
+    ns: crate::storage::SchemaPath,
+    table: String,
+    rows: Vec<Vec<Value>>,
+}
+
+impl WalChunk {
+    /// The rows of an appender's `INSERT … SELECT` over materialized chunks.
+    /// Only that plan shape is logged binary; every other statement keeps its
+    /// SQL text.
+    pub(crate) fn from_plan(plan: &crate::plan::LogicalPlan) -> Option<Self> {
+        let crate::plan::LogicalPlan::InsertSelect {
+            ns: Some(ns),
+            table,
+            query,
+            ..
+        } = plan
+        else {
+            return None;
+        };
+        let crate::plan::LogicalPlan::Chunks { chunks } = query.as_ref() else {
+            return None;
+        };
+        let mut rows = Vec::with_capacity(chunks.iter().map(|c| c.num_rows).sum());
+        for chunk in chunks {
+            for row in 0..chunk.num_rows {
+                rows.push(chunk.columns.iter().map(|v| v.get(row)).collect());
+            }
+        }
+        Some(Self {
+            ns: ns.clone(),
+            table: table.clone(),
+            rows,
+        })
+    }
 }
 
 /// Default WAL size that triggers an automatic checkpoint after a commit
@@ -2535,11 +2628,12 @@ impl Wal {
     pub(crate) fn append(
         &mut self,
         stmts: &[String],
+        chunks: &[WalChunk],
         sets: Option<&FrameSets>,
         secrets: Option<&[crate::secret::Secret]>,
         memo: &[ExtCall],
     ) -> Result<()> {
-        match self.append_pending(stmts, sets, secrets, memo)? {
+        match self.append_pending(stmts, chunks, sets, secrets, memo)? {
             Some(pending) => pending.wait(),
             None => Ok(()),
         }
@@ -2551,6 +2645,7 @@ impl Wal {
     fn append_pending(
         &mut self,
         stmts: &[String],
+        chunks: &[WalChunk],
         sets: Option<&FrameSets>,
         secrets: Option<&[crate::secret::Secret]>,
         memo: &[ExtCall],
@@ -2574,7 +2669,7 @@ impl Wal {
         if let Some(s) = &mut sets {
             s.canonicalize();
         }
-        let payload = encode_payload(stmts, sets.as_ref(), secrets, memo)?;
+        let payload = encode_payload(stmts, chunks, sets.as_ref(), secrets, memo)?;
         let len = record_len_guard(payload.len())?;
         let portable = encode_portable_record(&payload)?;
         let lsn = self.last_lsn.checked_add(1).ok_or_else(|| {
@@ -2705,6 +2800,7 @@ impl Wal {
         db_before: Option<&crate::storage::SchemaPath>,
         db_after: &crate::storage::SchemaPath,
         stmts: &[String],
+        chunks: &[WalChunk],
         touched_extensions: &[String],
         loaded_extensions: &[String],
         sets: Option<&FrameSets>,
@@ -2735,7 +2831,7 @@ impl Wal {
             rec.push(format!("LOAD EXTENSION '{}'", path.replace('\'', "''")));
         }
         rec.extend_from_slice(stmts);
-        let pending = self.append_pending(&rec, sets, secrets, memo)?;
+        let pending = self.append_pending(&rec, chunks, sets, secrets, memo)?;
         // Covered only after a successful append.
         self.tracked_extensions
             .extend(touched_extensions.iter().cloned());
@@ -2956,12 +3052,13 @@ fn decode_portable_record(bytes: &[u8], lsn: u64) -> Result<Record> {
             "catalog WAL record checksum mismatch".to_string(),
         ));
     }
-    let (stmts, sets, secrets, memo) = decode_payload(payload).map_err(|message| {
+    let (stmts, chunks, sets, secrets, memo) = decode_payload(payload).map_err(|message| {
         PinkDbError::Execution(format!("invalid catalog WAL record: {message}"))
     })?;
     Ok(Record {
         lsn,
         stmts,
+        chunks,
         sets,
         secrets,
         memo,
@@ -3146,6 +3243,10 @@ const SETS_UNKNOWN: u32 = u32::MAX;
 /// the section refuses the record (its first "statement length" overruns the
 /// payload), never misreads it.
 const SECRETS_MARKER: u32 = 0x5343_5254;
+/// Starts the optional chunk section (payload v7). It sits where the replay
+/// memo's call count would be; a memo count that large cannot fit a record,
+/// so the two are unambiguous.
+const CHUNKS_MARKER: u32 = 0x4348_4E4B;
 
 /// Encode the frame's touched set (payload v4, format 2):
 /// `u8 ver(=2) | u32 n_tables | n*(u16 db_len | db | u16 s_len | s |
@@ -3260,14 +3361,16 @@ fn decode_sets(bytes: &[u8]) -> std::result::Result<FrameSets, String> {
     Ok(sets)
 }
 
-/// Encode a record payload (v5 layout):
+/// Encode a record payload (v7 layout):
 /// `u32 stmt_count | u32 sets_len | sets | stmt_count*(u32 len | UTF-8 SQL) |
-/// u32 memo_count | memo entries`.
+/// [u32 CHUNKS_MARKER | u32 chunk_count | chunks] | u32 memo_count | memo`.
+/// The chunk section is absent for every statement that logs SQL text.
 /// `sets_len` is [`SETS_UNKNOWN`] when the frame's touched set is unknown (a
 /// legacy record adopted by an upgrade), else the [`encode_sets`] block's
 /// byte length.
 fn encode_payload(
     stmts: &[String],
+    chunks: &[WalChunk],
     sets: Option<&FrameSets>,
     secrets: Option<&[crate::secret::Secret]>,
     memo: &[ExtCall],
@@ -3294,7 +3397,8 @@ fn encode_payload(
         None => Vec::new(),
     };
     let memo_bytes = encode_ext_calls(memo)?;
-    let mut total = 8usize + sets_bytes.len() + secrets_bytes.len();
+    let chunk_bytes = encode_chunks(chunks)?;
+    let mut total = 8usize + sets_bytes.len() + secrets_bytes.len() + chunk_bytes.len();
     for s in stmts {
         let n = u32::try_from(s.len()).map_err(|_| {
             PinkDbError::Execution("statement is too large for a WAL record".to_string())
@@ -3317,6 +3421,7 @@ fn encode_payload(
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
         out.extend_from_slice(s.as_bytes());
     }
+    out.extend_from_slice(&chunk_bytes);
     out.extend_from_slice(&memo_bytes);
     debug_assert_eq!(out.len(), total);
     Ok(out)
@@ -3423,6 +3528,83 @@ fn encode_value(out: &mut Vec<u8>, value: &crate::types::Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn encode_chunks(chunks: &[WalChunk]) -> Result<Vec<u8>> {
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let count = u32::try_from(chunks.len())
+        .map_err(|_| PinkDbError::Execution("too many chunks in one WAL record".to_string()))?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&CHUNKS_MARKER.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    for chunk in chunks {
+        encode_bytes(&mut out, chunk.ns.db().as_bytes())?;
+        encode_bytes(&mut out, chunk.ns.schema().as_bytes())?;
+        encode_bytes(&mut out, chunk.table.as_bytes())?;
+        let columns = chunk.rows.first().map(|r| r.len()).unwrap_or(0);
+        let rows = u32::try_from(chunk.rows.len())
+            .map_err(|_| PinkDbError::Execution("too many rows in one WAL chunk".to_string()))?;
+        out.extend_from_slice(&(columns as u32).to_le_bytes());
+        out.extend_from_slice(&rows.to_le_bytes());
+        for row in &chunk.rows {
+            if row.len() != columns {
+                return Err(PinkDbError::Execution(
+                    "a WAL chunk row has the wrong number of columns".to_string(),
+                ));
+            }
+            for value in row {
+                encode_value(&mut out, value)?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn decode_chunks(
+    payload: &[u8],
+    pos: usize,
+) -> std::result::Result<(Vec<WalChunk>, usize), String> {
+    if pos + 4 > payload.len()
+        || u32::from_le_bytes(payload[pos..pos + 4].try_into().expect("4 bytes")) != CHUNKS_MARKER
+    {
+        return Ok((Vec::new(), pos));
+    }
+    let mut r = Payload::new(payload, pos + 4);
+    let count = r.u32()? as usize;
+    if count > payload.len() / 8 + 1 {
+        return Err(format!("implausible chunk count {count}"));
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let db = std::str::from_utf8(r.bytes()?)
+            .map_err(|_| "chunk database is not UTF-8".to_string())?;
+        let schema =
+            std::str::from_utf8(r.bytes()?).map_err(|_| "chunk schema is not UTF-8".to_string())?;
+        let table = std::str::from_utf8(r.bytes()?)
+            .map_err(|_| "chunk table is not UTF-8".to_string())?
+            .to_string();
+        let columns = r.u32()? as usize;
+        let rows = r.u32()? as usize;
+        if rows.checked_mul(columns).is_none_or(|n| n > payload.len()) {
+            return Err("implausible chunk dimensions".to_string());
+        }
+        let mut values = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            let mut row = Vec::with_capacity(columns);
+            for _ in 0..columns {
+                row.push(decode_value(&mut r)?);
+            }
+            values.push(row);
+        }
+        out.push(WalChunk {
+            ns: crate::storage::SchemaPath::new(db, schema),
+            table,
+            rows: values,
+        });
+    }
+    Ok((out, r.pos))
 }
 
 fn encode_ext_calls(calls: &[ExtCall]) -> Result<Vec<u8>> {
@@ -3634,12 +3816,13 @@ fn decode_payload_legacy(payload: &[u8]) -> std::result::Result<Vec<String>, Str
 /// and the replay memo.
 type PayloadParts = (
     Vec<String>,
+    Vec<WalChunk>,
     Option<FrameSets>,
     Option<Vec<crate::secret::Secret>>,
     Vec<ExtCall>,
 );
 
-/// Bounds-checked v4/v5 payload decode. `Err` means a CRC-valid record is
+/// Bounds-checked v4–v7 payload decode. `Err` means a CRC-valid record is
 /// malformed (hard error on replay, never a silent drop).
 fn decode_payload(payload: &[u8]) -> std::result::Result<PayloadParts, String> {
     if payload.len() < 8 {
@@ -3661,8 +3844,9 @@ fn decode_payload(payload: &[u8]) -> std::result::Result<PayloadParts, String> {
     };
     let (secrets, stmts_start) = decode_secrets(payload, sets_end)?;
     let (stmts, pos) = decode_statements(payload, stmts_start, count)?;
+    let (chunks, pos) = decode_chunks(payload, pos)?;
     let memo = decode_ext_calls(payload, pos)?;
-    Ok((stmts, sets, secrets, memo))
+    Ok((stmts, chunks, sets, secrets, memo))
 }
 
 /// Decode the optional secret section at `pos` (wave 132b). Absent when the
@@ -3799,7 +3983,7 @@ fn parse_records(
         if end > data.len() {
             break;
         }
-        let (stmts, sets, secrets, memo) = match cipher {
+        let (stmts, chunks, sets, secrets, memo) = match cipher {
             Some(c) => {
                 let next = ordinal_base
                     .checked_add(ordinal)
@@ -3829,6 +4013,7 @@ fn parse_records(
                                 decode_payload_legacy(&plain).map_err(|e| {
                                     format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
                                 })?,
+                                Vec::new(),
                                 None,
                                 None,
                                 Vec::new(),
@@ -3870,6 +4055,7 @@ fn parse_records(
                         decode_payload_legacy(payload).map_err(|e| {
                             format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
                         })?,
+                        Vec::new(),
                         None,
                         None,
                         Vec::new(),
@@ -3880,6 +4066,7 @@ fn parse_records(
         out.push(Record {
             lsn,
             stmts,
+            chunks,
             sets,
             secrets,
             memo,
@@ -3922,6 +4109,7 @@ fn rewrite_encrypted(
         for rec in records {
             let payload = encode_payload(
                 &rec.stmts,
+                &rec.chunks,
                 rec.sets.as_ref(),
                 rec.secrets.as_deref(),
                 &rec.memo,
@@ -3964,7 +4152,13 @@ fn upgrade_plain(path: &Path, data: &[u8], generation: u64, records_start: usize
     let slot = slot_bytes(1, last_lsn, WAL_SLOT_DOMAIN);
     out[WAL_SLOT_A as usize..WAL_SLOT_A as usize + SLOT_LEN].copy_from_slice(&slot);
     for rec in &records {
-        let payload = encode_payload(&rec.stmts, None, rec.secrets.as_deref(), &rec.memo)?;
+        let payload = encode_payload(
+            &rec.stmts,
+            &rec.chunks,
+            None,
+            rec.secrets.as_deref(),
+            &rec.memo,
+        )?;
         let len = record_len_guard(payload.len())?;
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(&rec.lsn.to_le_bytes());
@@ -6264,6 +6458,37 @@ fn normalized_path(p: &Path) -> Option<PathBuf> {
     Some(dir.join(p.file_name()?))
 }
 
+/// Replay one binary appender chunk through the ordinary INSERT path, so
+/// constraints, triggers, indexes and defaults behave exactly as they did
+/// when the chunk was flushed. Rendering happens only on replay; the commit
+/// itself wrote no SQL text.
+fn replay_chunk(db: &mut PinkDb, chunk: &WalChunk) -> Result<()> {
+    if chunk.rows.is_empty() {
+        return Ok(());
+    }
+    let mut sql = String::new();
+    sql.push_str("INSERT INTO ");
+    sql.push_str(&chunk.ns.to_string());
+    sql.push('.');
+    sql.push_str(&crate::mv::quote_ident(&chunk.table));
+    sql.push_str(" VALUES ");
+    for (n, row) in chunk.rows.iter().enumerate() {
+        if n > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('(');
+        for (i, value) in row.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&crate::prepared::value_literal(value)?);
+        }
+        sql.push(')');
+    }
+    db.execute(&sql)?;
+    Ok(())
+}
+
 /// Apply one recovered record: every statement must replay cleanly. A
 /// CRC-valid record that fails to parse/bind/execute is a hard error.
 fn replay_record(db: &mut PinkDb, rec: &Record) -> Result<()> {
@@ -6305,6 +6530,17 @@ fn replay_record(db: &mut PinkDb, rec: &Record) -> Result<()> {
             break;
         }
     }
+    if outcome.is_ok() {
+        for chunk in &rec.chunks {
+            if let Err(e) = replay_chunk(db, chunk) {
+                outcome = Err(PinkDbError::Execution(format!(
+                    "WAL replay failed at lsn {}: {e}",
+                    rec.lsn
+                )));
+                break;
+            }
+        }
+    }
     db.set_ext_replay(previous);
     db.restore_replay_pins(pins);
     db.volatile.clear();
@@ -6330,6 +6566,7 @@ mod tests {
         let rec = Record {
             lsn: 1,
             stmts: vec!["INSERT INTO t SELECT uuid() FROM range(2);".to_string()],
+            chunks: Vec::new(),
             sets: None,
             secrets: None,
             memo: Vec::new(),
@@ -6448,6 +6685,42 @@ mod tests {
             out.extend_from_slice(s.as_bytes());
         }
         out
+    }
+
+    #[test]
+    fn chunk_payload_round_trips_every_value() {
+        let chunk = WalChunk {
+            ns: crate::storage::SchemaPath::new("main", "main"),
+            table: "t".to_string(),
+            rows: vec![vec![
+                Value::Null,
+                Value::Boolean(true),
+                Value::Integer(-7),
+                Value::Bigint(i64::MIN),
+                Value::Double(-0.0),
+                Value::Varchar("it's".to_string()),
+                Value::Date(0),
+                Value::Timestamp(1),
+                Value::Interval {
+                    months: 1,
+                    days: 2,
+                    micros: 3,
+                },
+                Value::Hugeint(i128::MIN),
+                Value::Uhugeint(u128::MAX),
+                Value::Decimal {
+                    value: -12345,
+                    precision: 10,
+                    scale: 2,
+                },
+                Value::Uuid(42),
+            ]],
+        };
+        let payload = encode_payload(&[], std::slice::from_ref(&chunk), None, None, &[]).unwrap();
+        let (stmts, chunks, sets, secrets, memo) = decode_payload(&payload).unwrap();
+        assert!(stmts.is_empty());
+        assert_eq!(chunks, vec![chunk]);
+        assert!(sets.is_none() && secrets.is_none() && memo.is_empty());
     }
 
     fn records_of(path: &Path) -> Vec<Record> {
@@ -6799,7 +7072,7 @@ mod tests {
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(&Wal::header_fresh(generation)).unwrap();
         for (lsn, stmts) in records {
-            let payload = encode_payload(stmts, None, None, &[]).unwrap();
+            let payload = encode_payload(stmts, &[], None, None, &[]).unwrap();
             f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
             f.write_all(&lsn.to_le_bytes()).unwrap();
             f.write_all(&crc32(&payload).to_le_bytes()).unwrap();
@@ -7651,7 +7924,7 @@ mod tests {
             assert!(err.to_string().contains("exceeds the u32"), "{err}");
         }
         // Real encodings stay far under the limit.
-        let payload = encode_payload(&["SELECT 1".to_string()], None, None, &[]).unwrap();
+        let payload = encode_payload(&["SELECT 1".to_string()], &[], None, None, &[]).unwrap();
         assert!(payload.len() < 100);
     }
 
@@ -8369,7 +8642,7 @@ mod tests {
         let wal = wal_path(&p);
         let mut data = std::fs::read(&wal).unwrap();
         let sql = "LOAD EXTENSION '/nonexistent/pinkdb-h5-test.dylib';";
-        let payload = encode_payload(&[sql.to_string()], None, None, &[]).unwrap();
+        let payload = encode_payload(&[sql.to_string()], &[], None, None, &[]).unwrap();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&2u64.to_le_bytes());
         data.extend_from_slice(&crc32(&payload).to_le_bytes());
@@ -8464,10 +8737,27 @@ mod tests {
         // A crashed publisher: append and fsync a record, never publish.
         let wal = wal_path(&p);
         let mut data = std::fs::read(&wal).unwrap();
-        let payload =
-            encode_payload(&["INSERT INTO t VALUES (7);".to_string()], None, None, &[]).unwrap();
+        let payload = encode_payload(
+            &["INSERT INTO t VALUES (7);".to_string()],
+            &[],
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&crc32(&payload).to_le_bytes());
+        data.extend_from_slice(&payload);
+        // A binary appender chunk in the same crashed state.
+        let chunk = WalChunk {
+            ns: crate::storage::SchemaPath::new("main", "main"),
+            table: "t".to_string(),
+            rows: vec![vec![Value::Integer(9)]],
+        };
+        let payload = encode_payload(&[], &[chunk], None, None, &[]).unwrap();
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&3u64.to_le_bytes());
         data.extend_from_slice(&crc32(&payload).to_le_bytes());
         data.extend_from_slice(&payload);
         std::fs::write(&wal, &data).unwrap();
@@ -8476,12 +8766,15 @@ mod tests {
         // The next write scans under the lease and applies the frame before
         // appending its own.
         b.execute("INSERT INTO t VALUES (8);").unwrap();
-        assert_eq!(ints(&mut b, "SELECT a FROM t ORDER BY a;"), vec![7, 8]);
+        assert_eq!(ints(&mut b, "SELECT a FROM t ORDER BY a;"), vec![7, 8, 9]);
         drop(a);
         drop(b);
-        // A fresh open sees both, exactly once.
+        // A fresh open sees all three, exactly once.
         let mut back = durable(&p);
-        assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![7, 8]);
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+            vec![7, 8, 9]
+        );
         cleanup(&p);
     }
 
@@ -11042,6 +11335,7 @@ mod tests {
             guard
                 .append(
                     &["CREATE DATABASE x;".to_string()],
+                    &[],
                     Some(&sets_of_ns(&[("x", "main", "u")], &[], &["x"])),
                     None,
                     &[],
@@ -11199,6 +11493,7 @@ mod tests {
             guard
                 .append(
                     &["INSERT INTO t VALUES (9);".to_string()],
+                    &[],
                     Some(&sets_of(&[("main", "t")], &[])),
                     None,
                     &[],
@@ -11684,9 +11979,17 @@ mod tests {
         let db = crate::Database::from_store(store);
         let threads = 16;
         let per = 4;
-        // All threads enter the commit path together, which is the shape
-        // group commit is for: one writer's sync is in flight while the
-        // others append.
+        // The first sync waits until every other committer is blocked behind
+        // it, the shape group commit is for: one writer's sync is in flight
+        // while the others append. They then share one more sync, so the
+        // group forms deterministically however the threads are scheduled.
+        observer
+            .durable_handle()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .sync
+            .hold_next_sync_for(threads - 1);
         let start = std::sync::Arc::new(Barrier::new(threads));
         let mut joined = Vec::new();
         for t in 0..threads {

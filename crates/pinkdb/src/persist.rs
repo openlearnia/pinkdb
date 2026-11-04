@@ -1188,6 +1188,19 @@ const DECIMAL_I64_MAX_PRECISION: u8 = 18;
 /// does not fit is a broken invariant — fail loudly, never store a wrong
 /// number.
 fn decimal_i64_payload(v: &Vector) -> Vec<i64> {
+    // Since wave 142 a DECIMAL(p <= 18) vector already holds `i64`s: the
+    // payload is the values, invalid rows zeroed as before.
+    if let VectorData::Decimal64 { values, .. } = v.data() {
+        let words = v.has_nulls().then(|| v.validity_words());
+        return values
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| match words {
+                Some(words) if !valid_at(words, i) => 0,
+                _ => x,
+            })
+            .collect();
+    }
     let VectorData::Decimal { values, .. } = v.data() else {
         unreachable!("decimal_i64_payload on a non-DECIMAL vector")
     };
@@ -3094,15 +3107,16 @@ fn decode_payload(dtype: DataType, tag: u8, r: &mut Reader) -> Result<(VectorDat
             Ok((VectorData::TimestampMicros(r.i64_vec(n)?), n))
         }
         // DECIMAL(p <= 18): the chunk was encoded as BIGINT (see
-        // `encode_chunk_typed`); decode it that way and widen to i128.
+        // `encode_chunk_typed`); decode it that way and keep the 64-bit
+        // values as the DECIMAL payload (wave 142: no widening copy).
         (DataType::Decimal { precision, scale }, _) if precision <= DECIMAL_I64_MAX_PRECISION => {
             let (data, n) = decode_payload(DataType::Bigint, tag, r)?;
-            let VectorData::Int64(ints) = data else {
+            let VectorData::Int64(values) = data else {
                 return r.err("DECIMAL chunk did not decode as 64-bit integers");
             };
             Ok((
-                VectorData::Decimal {
-                    values: ints.into_iter().map(i128::from).collect(),
+                VectorData::Decimal64 {
+                    values,
                     precision,
                     scale,
                 },
@@ -6710,11 +6724,9 @@ fn null_vector(dtype: DataType, rows: usize) -> Vector {
         DataType::Varchar => VectorData::VarChar(StrVec::repeat("", rows)),
         DataType::Date => VectorData::Date32(vec![0; rows]),
         DataType::Timestamp => VectorData::TimestampMicros(vec![0; rows]),
-        DataType::Decimal { precision, scale } => VectorData::Decimal {
-            values: vec![0; rows],
-            precision,
-            scale,
-        },
+        DataType::Decimal { precision, scale } => {
+            VectorData::decimal_from_i128(vec![0; rows], precision, scale)
+        }
         DataType::Uuid => VectorData::Uuid(vec![0; rows]),
         DataType::Hugeint => VectorData::Int128(vec![0; rows]),
         DataType::Uhugeint => VectorData::UInt128(vec![0; rows]),
@@ -8217,6 +8229,10 @@ fn plain_payload(v: &Vector) -> Vec<u8> {
                 w.bytes(&x.to_le_bytes());
             }
             w.buf
+        }
+        // DECIMAL(p <= 18) is stored with the BIGINT encodings.
+        DataType::Decimal { precision, .. } if precision <= DECIMAL_I64_MAX_PRECISION => {
+            enc_ints_plain(&decimal_i64_payload(v))
         }
         DataType::Decimal { .. } => {
             let VectorData::Decimal { values, .. } = v.data() else {

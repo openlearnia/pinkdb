@@ -431,16 +431,7 @@ fn decimal_column(
         |i| nulls.is_none_or(|nb| nb.is_valid(start + i)),
         || 0i128,
         |i| Ok(value(start + i)),
-        |v, w| {
-            Vector::from_raw(
-                VectorData::Decimal {
-                    values: v,
-                    precision,
-                    scale,
-                },
-                w,
-            )
-        },
+        |v, w| Vector::from_raw(VectorData::decimal_from_i128(v, precision, scale), w),
     )
 }
 

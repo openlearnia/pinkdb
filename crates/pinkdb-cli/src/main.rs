@@ -1846,6 +1846,11 @@ fn print_cost_hint(db: &PinkDb, sql: &str) {
 /// Run one SQL string in the session's mode (local or remote) and print the
 /// results with the same renderer and the same timing line either way.
 ///
+/// Each statement of the string runs on its own: a failing statement is
+/// reported and the next one still runs, exactly as the next input line does
+/// after an error (the exit code still reports it). So the results before a
+/// failure are printed, and a statement after it is never silently skipped.
+///
 /// With the timer on, the engine (local) or the server (remote) also profiles
 /// every statement: the line keeps its historical `Run Time (s): real X.XXX`
 /// prefix and appends the summed phases on the same line. Remote mode reports
@@ -1855,6 +1860,37 @@ fn run_sql_session(session: &mut Session, sql: &str) {
     let t0 = Instant::now();
     let timer = TIMER.load(Ordering::Relaxed);
     let mut profiles: Option<Vec<QueryProfile>> = None;
+    for statement in session_statements(sql) {
+        run_statement(session, &statement, timer, &mut profiles);
+    }
+    if timer {
+        print!("Run Time (s): real {:.3}", t0.elapsed().as_secs_f64());
+        if let Some(profiles) = profiles.filter(|ps| !ps.is_empty()) {
+            print_phase_breakdown(&profiles);
+        }
+        println!();
+    }
+}
+
+/// The statements of one input string, split the way the engine splits a
+/// batch (strings, quoted names, comments and `$$` bodies stay whole). A
+/// single statement keeps the input's own text.
+fn session_statements(sql: &str) -> Vec<String> {
+    let texts = pinkdb::sql::statement_texts(sql).unwrap_or_default();
+    if texts.len() <= 1 {
+        return vec![sql.to_string()];
+    }
+    texts.into_iter().map(|text| format!("{text};")).collect()
+}
+
+/// Run and render one statement; its profiles join `profiles` when the timer
+/// is on.
+fn run_statement(
+    session: &mut Session,
+    sql: &str,
+    timer: bool,
+    profiles: &mut Option<Vec<QueryProfile>>,
+) {
     match session {
         Session::Local(local) => {
             if agent_mode() {
@@ -1864,7 +1900,7 @@ fn run_sql_session(session: &mut Session, sql: &str) {
                 match local.run_sql_profiled(sql) {
                     Ok((results, ps)) => {
                         render_results(&results);
-                        profiles = Some(ps);
+                        profiles.get_or_insert_with(Vec::new).extend(ps);
                     }
                     Err(e) => report_sql_error(&e, sql),
                 }
@@ -1882,7 +1918,9 @@ fn run_sql_session(session: &mut Session, sql: &str) {
                     Ok(pairs) => {
                         let (results, ps): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
                         render_results(&results);
-                        profiles = Some(ps.into_iter().flatten().collect());
+                        profiles
+                            .get_or_insert_with(Vec::new)
+                            .extend(ps.into_iter().flatten());
                     }
                     Err(e) => cli_error!("{e}"),
                 }
@@ -1894,25 +1932,14 @@ fn run_sql_session(session: &mut Session, sql: &str) {
             }
         }
     }
-    if timer {
-        print!("Run Time (s): real {:.3}", t0.elapsed().as_secs_f64());
-        if let Some(profiles) = profiles.filter(|ps| !ps.is_empty()) {
-            print_phase_breakdown(&profiles);
-        }
-        println!();
-    }
 }
 
 /// Append ` (parse A, bind B, optimize C, execute D, log E ms)` in
-/// milliseconds with three decimals: bind/optimize/execute/log summed over
-/// `profiles`; `parse` counted once — the whole SQL string is parsed once and
-/// every statement's profile reports that same shared time.
+/// milliseconds with three decimals, every phase summed over `profiles`. The
+/// CLI runs one statement per engine call, so each profile's parse time is its
+/// own statement's.
 fn print_phase_breakdown(profiles: &[QueryProfile]) {
-    let parse = profiles
-        .iter()
-        .map(|p| p.parse)
-        .max()
-        .unwrap_or(Duration::ZERO);
+    let parse: Duration = profiles.iter().map(|p| p.parse).sum();
     let mut bind = Duration::ZERO;
     let mut optimize = Duration::ZERO;
     let mut execute = Duration::ZERO;

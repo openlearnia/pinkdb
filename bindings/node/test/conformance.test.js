@@ -250,7 +250,9 @@ function runCase(kase) {
 
 test('corpus ABI version matches the binding', () => {
   assert.equal(corpus.corpus_version, 1, 'corpus version');
-  assert.equal(corpus.abi_version, ABI_VERSION, 'C ABI version');
+  // The corpus targets a major version and the minor it was written against.
+  assert.equal(corpus.abi_version >>> 16, ABI_VERSION >>> 16, 'C ABI major version');
+  assert.ok((ABI_VERSION & 0xffff) >= (corpus.abi_version & 0xffff), 'C ABI minor version');
 });
 
 for (const kase of corpus.cases) {

@@ -464,7 +464,10 @@ impl StrVec {
         let mut index: crate::types::FastMap<usize, u32> = crate::types::FastMap::default();
         // The last (source, buffer) mapped: consecutive picks mostly repeat it.
         let mut last: Option<(u32, u32, u32)> = None;
-        let mut first = vec![u32::MAX; sources.len()];
+        // Per source, its single buffer's slot in `out.shared`. A map, not a
+        // vector of `sources.len()`: a large join build has thousands of
+        // chunks, and one output chunk's picks touch few of them.
+        let mut first: crate::types::FastMap<u32, u32> = crate::types::FastMap::default();
         for &(c, r) in picks {
             if c == null {
                 out.views.push(StrView::default());
@@ -490,13 +493,13 @@ impl StrVec {
                     let single = src.shared.len() == 1;
                     let mine = match last {
                         Some((lc, lh, m)) if lc == c && lh == h => m,
-                        _ if single && first[c as usize] != u32::MAX => first[c as usize],
+                        _ if single && first.contains_key(&c) => first[&c],
                         _ => {
                             let buffer = &src.shared[h as usize];
                             let key = buffer.as_ptr() as usize;
                             let m = *index.entry(key).or_insert_with(|| out.shared.push(buffer));
                             if single {
-                                first[c as usize] = m;
+                                first.insert(c, m);
                             }
                             last = Some((c, h, m));
                             m

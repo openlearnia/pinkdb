@@ -485,7 +485,7 @@ pub(crate) fn collect(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Output>> {
     if !cx.pipeline_execution() {
         return Ok(None);
     }
-    let Some(compiled) = compile(cx, plan)? else {
+    let Some(mut compiled) = compile(cx, plan)? else {
         return Ok(None);
     };
     let Some(chunks) = run(cx, &compiled, &CollectSink::new())? else {
@@ -495,8 +495,8 @@ pub(crate) fn collect(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Output>> {
     };
     Ok(Some(Output {
         chunks,
-        names: compiled.names,
-        types: compiled.types,
+        names: std::mem::take(&mut compiled.names),
+        types: std::mem::take(&mut compiled.types),
     }))
 }
 
@@ -608,6 +608,25 @@ struct Compiled<'a> {
     names: Vec<String>,
     /// Source rows, the flat table's bucket-count hint (never a result).
     rows: usize,
+}
+
+/// The build sides are freed by every worker, not one (wave 141b). A join's
+/// build outputs can be hundreds of MB of chunks; freeing them on the thread
+/// that returns the result was 8–12 % of TPC-H Q7 and Q10 at SF 10, with
+/// every worker idle meanwhile. The chunks are dropped in parallel and before
+/// the statement returns: a background free would only move that work into
+/// the next statement (measured: Q22 slower).
+impl Drop for Compiled<'_> {
+    fn drop(&mut self) {
+        use rayon::prelude::*;
+        let chunks: Vec<DataChunk> = std::mem::take(&mut self.builds)
+            .into_iter()
+            .flat_map(|build| build.chunks)
+            .collect();
+        if chunks.len() > 1 {
+            chunks.into_par_iter().for_each(drop);
+        }
+    }
 }
 
 /// Partial state a folded row may leave before the aggregate is treated as

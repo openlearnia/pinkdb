@@ -672,6 +672,14 @@ impl Acc {
         {
             return self.add_decimal(values[i], *scale);
         }
+        if let VectorData::Decimal64 { values, scale, .. } = v.data()
+            && matches!(
+                self,
+                Acc::SumInt { .. } | Acc::SumDecimal { .. } | Acc::Avg(_)
+            )
+        {
+            return self.add_decimal(i128::from(values[i]), *scale);
+        }
         match self {
             // `update(Some(_))` increments for every non-NULL payload.
             Acc::Count(n) => *n += 1,
@@ -737,11 +745,13 @@ impl Acc {
                 }
                 _ => {}
             },
-            Acc::SumDecimal { .. } => {
-                if let VectorData::Decimal { values, scale, .. } = v.data() {
-                    self.add_decimal(values[i], *scale);
+            Acc::SumDecimal { .. } => match v.data() {
+                VectorData::Decimal { values, scale, .. } => self.add_decimal(values[i], *scale),
+                VectorData::Decimal64 { values, scale, .. } => {
+                    self.add_decimal(i128::from(values[i]), *scale)
                 }
-            }
+                _ => {}
+            },
             Acc::SumHugeint {
                 sum,
                 overflow,
@@ -774,6 +784,9 @@ impl Acc {
                 VectorData::UInt128(d) => avg.add_f64(d[i] as f64),
                 VectorData::Float64(d) => avg.add_f64(d[i]),
                 VectorData::Decimal { values, scale, .. } => avg.add_decimal(values[i], *scale),
+                VectorData::Decimal64 { values, scale, .. } => {
+                    avg.add_decimal(i128::from(values[i]), *scale)
+                }
                 _ => {}
             },
             Acc::MinMax { cur, is_min } => {
@@ -1489,6 +1502,14 @@ fn compare_cell(data: &VectorData, i: usize, c: &Value) -> std::cmp::Ordering {
                 ..
             },
         ) => crate::types::decimal_cmp(values[i], *scale, *y, *ys),
+        (
+            VectorData::Decimal64 { values, scale, .. },
+            Value::Decimal {
+                value: y,
+                scale: ys,
+                ..
+            },
+        ) => crate::types::decimal_cmp(i128::from(values[i]), *scale, *y, *ys),
         (VectorData::Interval(d), Value::Interval { .. }) => {
             let y = match c {
                 Value::Interval {
@@ -1522,6 +1543,9 @@ fn cell_value(data: &VectorData, i: usize) -> Value {
         VectorData::Date32(d) => Value::Date(d[i]),
         VectorData::TimestampMicros(d) => Value::Timestamp(d[i]),
         VectorData::Decimal { values, scale, .. } => Value::decimal(values[i], *scale),
+        VectorData::Decimal64 { values, scale, .. } => {
+            Value::decimal(i128::from(values[i]), *scale)
+        }
         VectorData::Interval(d) => Value::Interval {
             months: d[i].months,
             days: d[i].days,
@@ -2626,6 +2650,38 @@ pub(crate) fn accumulate<S: AccSlots + ?Sized>(
             for (g, (&sum, &n)) in sums.iter().zip(&counts).enumerate() {
                 if n > 0 {
                     groups.acc(g, j).add_decimal_bulk(sum, n, *scale);
+                }
+            }
+        }
+        // The same bulk sums over the 64-bit payload every DECIMAL(≤18) holds
+        // since wave 142: 2048 cells of at most 18 digits cannot overflow
+        // the local `i128` sum either.
+        VectorData::Decimal64 { values, scale, .. }
+            if !generic
+                && groups.group_count() <= DECIMAL_BULK_GROUPS
+                && (0..groups.group_count())
+                    .all(|g| groups.acc_ref(g, j).takes_decimal_bulk(*scale)) =>
+        {
+            let mut sums = vec![0i128; groups.group_count()];
+            let mut counts = vec![0i64; groups.group_count()];
+            for (k, &g) in gids.iter().enumerate() {
+                let i = row(k);
+                if keep(i) && v.is_valid(i) {
+                    sums[g] += i128::from(values[i]);
+                    counts[g] += 1;
+                }
+            }
+            for (g, (&sum, &n)) in sums.iter().zip(&counts).enumerate() {
+                if n > 0 {
+                    groups.acc(g, j).add_decimal_bulk(sum, n, *scale);
+                }
+            }
+        }
+        VectorData::Decimal64 { values, scale, .. } if !generic => {
+            for (k, &g) in gids.iter().enumerate() {
+                let i = row(k);
+                if keep(i) && v.is_valid(i) {
+                    groups.acc(g, j).add_decimal(i128::from(values[i]), *scale);
                 }
             }
         }

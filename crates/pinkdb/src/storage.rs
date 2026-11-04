@@ -5365,7 +5365,17 @@ impl PinkDb {
                 .cloned()
                 .chain(self.volatile.take_memos())
                 .collect();
-            return self.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets), None, &memo);
+            return self.wal_append_session(
+                &db,
+                &db,
+                &stmts,
+                &[],
+                &[],
+                &[],
+                Some(&sets),
+                None,
+                &memo,
+            );
         }
         // Wave 48: a `CREATE/ALTER USER` is logged in its `PASSWORD_HASH`
         // form — the plaintext of the statement text must never reach the
@@ -5423,7 +5433,7 @@ impl PinkDb {
                 let mut guard = wal.lock().map_err(|_| {
                     PinkDbError::Execution("internal lock error (poisoned)".to_string())
                 })?;
-                guard.append(&[sql.to_string()], Some(&sets), None, memo)?;
+                guard.append(&[sql.to_string()], &[], Some(&sets), None, memo)?;
                 guard.set_session_db(ns);
             }
             return Ok(());
@@ -5438,6 +5448,7 @@ impl PinkDb {
             &ns,
             &ns,
             &[sql.to_string()],
+            &[],
             &touched,
             &loaded,
             Some(&sets),
@@ -5475,6 +5486,7 @@ impl PinkDb {
         db_before: &SchemaPath,
         db_after: &SchemaPath,
         stmts: &[String],
+        chunks: &[crate::wal::WalChunk],
         touched_extensions: &[String],
         loaded_extensions: &[String],
         sets: Option<&crate::wal::FrameSets>,
@@ -5485,6 +5497,7 @@ impl PinkDb {
             db_before,
             db_after,
             stmts,
+            chunks,
             touched_extensions,
             loaded_extensions,
             sets,
@@ -5505,6 +5518,7 @@ impl PinkDb {
         db_before: &SchemaPath,
         db_after: &SchemaPath,
         stmts: &[String],
+        chunks: &[crate::wal::WalChunk],
         touched_extensions: &[String],
         loaded_extensions: &[String],
         sets: Option<&crate::wal::FrameSets>,
@@ -5521,6 +5535,7 @@ impl PinkDb {
             db_before,
             db_after,
             stmts,
+            chunks,
             touched_extensions,
             loaded_extensions,
             sets,
@@ -5540,6 +5555,7 @@ impl PinkDb {
         db_before: &SchemaPath,
         db_after: &SchemaPath,
         stmts: &[String],
+        chunks: &[crate::wal::WalChunk],
         touched_extensions: &[String],
         loaded_extensions: &[String],
         sets: Option<&crate::wal::FrameSets>,
@@ -5550,6 +5566,7 @@ impl PinkDb {
             db_before,
             db_after,
             stmts,
+            chunks,
             touched_extensions,
             loaded_extensions,
             sets,
@@ -5570,6 +5587,7 @@ impl PinkDb {
         db_before: &SchemaPath,
         db_after: &SchemaPath,
         stmts: &[String],
+        chunks: &[crate::wal::WalChunk],
         touched_extensions: &[String],
         loaded_extensions: &[String],
         sets: Option<&crate::wal::FrameSets>,
@@ -5593,6 +5611,7 @@ impl PinkDb {
                 before,
                 db_after,
                 stmts,
+                chunks,
                 touched_extensions,
                 loaded_extensions,
                 sets,
@@ -5734,6 +5753,7 @@ impl PinkDb {
                 &before,
                 &after,
                 &stmts,
+                &[],
                 &touched,
                 &loaded,
                 Some(&sets),

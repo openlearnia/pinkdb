@@ -37,8 +37,8 @@ use std::cell::{RefCell, UnsafeCell};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use pinkdb::db::{Connection, Database};
 use pinkdb::exec::ChunkedResult;
@@ -54,7 +54,7 @@ pub use arrow::{ArrowArray, ArrowSchema};
 /// ABI version reported by [`pinkdb_abi_version`]: `major << 16 | minor`.
 ///
 /// Additions bump the minor; removals or layout changes bump the major.
-pub const PINKDB_ABI_VERSION: u32 = (1 << 16) | 3;
+pub const PINKDB_ABI_VERSION: u32 = (1 << 16) | 4;
 
 // ----- statement kind tags (`pinkdb_result_kind`) -----
 pub const PINKDB_STMT_SELECTED: i32 = 0;
@@ -255,6 +255,39 @@ pub struct PinkValue {
     pub double: f64,
     pub text_ptr: *const c_char,
     pub text_len: usize,
+}
+
+/// INTERVAL payload, by value. Matches `pinkdb_interval`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PinkInterval {
+    pub months: i32,
+    pub days: i32,
+    pub micros: i64,
+}
+
+/// Signed 128-bit payload (HUGEINT, DECIMAL). Matches `pinkdb_hugeint`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PinkHugeint {
+    pub lower: u64,
+    pub upper: i64,
+}
+
+/// Unsigned 128-bit payload (UHUGEINT, UUID). Matches `pinkdb_uhugeint`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PinkUhugeint {
+    pub lower: u64,
+    pub upper: u64,
+}
+
+fn hugeint_value(v: PinkHugeint) -> i128 {
+    (i128::from(v.upper) << 64) | i128::from(v.lower)
+}
+
+fn uhugeint_value(v: PinkUhugeint) -> u128 {
+    (u128::from(v.upper) << 64) | u128::from(v.lower)
 }
 
 // L-10: the struct crosses the C ABI by value. Pin the layout at compile
@@ -706,6 +739,18 @@ impl PinkVector {
             VectorData::Date32(v) => v.as_ptr().cast(),
             VectorData::TimestampMicros(v) => v.as_ptr().cast(),
             VectorData::Decimal { values, .. } => wide_data(values, &mut ints, |v| *v as u128),
+            // The C API's DECIMAL cell stays 16 bytes whatever the engine's
+            // physical width (wave 142): widen into the owned buffer.
+            VectorData::Decimal64 { values, .. } => {
+                ints.extend(values.iter().map(|&v| {
+                    let x = i128::from(v) as u128;
+                    PinkU128 {
+                        lower: x as u64,
+                        upper: (x >> 64) as u64,
+                    }
+                }));
+                ints.as_ptr().cast()
+            }
             VectorData::Interval(v) => v.as_ptr().cast(),
             VectorData::Int128(v) => wide_data(v, &mut ints, |v| *v as u128),
             VectorData::UInt128(v) => wide_data(v, &mut ints, |v| *v),
@@ -1033,12 +1078,122 @@ struct ConnState {
     profiling: bool,
 }
 
-/// Opaque connection handle. A connection is created from any thread but must
-/// not be used from two threads at once, except for `pinkdb_interrupt`.
-pub struct PinkConnection {
+/// The session and cancellation state shared by a connection handle and its
+/// live appenders. `Arc`-shared so destroying the appender's connection
+/// handle cannot free the session under it.
+pub struct ConnShared {
     inner: Arc<DbInner>,
     cancel: CancelFlag,
     state: UnsafeCell<ConnState>,
+    /// Set before a disconnect flushes and detaches its appenders; a later
+    /// appender call fails instead of touching the released session.
+    closed: AtomicBool,
+    /// Live appenders, flushed by the connection's `Drop`. Weak entries stay
+    /// behind after an appender is destroyed (they are skipped on upgrade).
+    appenders: Mutex<Vec<Weak<AppenderCell>>>,
+}
+
+/// One C appender's engine buffer plus the connection it was created on.
+struct AppenderCell {
+    shared: Arc<ConnShared>,
+    app: Mutex<pinkdb::Appender>,
+    /// Set by the connection's `Drop`: the appender no longer has a session
+    /// to flush into, so its calls report `connection is closed`.
+    detached: AtomicBool,
+    error: Mutex<Option<(CString, &'static CStr)>>,
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// The cell is an `UnsafeCell`: exclusive access is the C contract's
+// single-thread-per-connection rule, checked here for a closed session.
+#[allow(clippy::mut_from_ref)]
+fn conn_state_mut(shared: &ConnShared) -> Result<&mut ConnState, (&'static CStr, &'static str)> {
+    if shared.closed.load(Ordering::Acquire) {
+        return Err((CLASS_INVALID_ARGUMENT, "connection is closed"));
+    }
+    if shared.inner.closed.load(Ordering::Acquire) {
+        return Err((CLASS_INVALID_ARGUMENT, "database is closed"));
+    }
+    // SAFETY: the C contract keeps one thread on a connection and its
+    // appenders; `pinkdb_interrupt` never touches this cell.
+    Ok(unsafe { &mut *shared.state.get() })
+}
+
+impl AppenderCell {
+    fn note(&self, class: &'static CStr, msg: &str) {
+        *lock_or_recover(&self.error) = Some((
+            CString::new(msg.replace('\0', "\\0")).unwrap_or_default(),
+            class,
+        ));
+    }
+
+    fn stored_error(&self) -> (&'static CStr, String) {
+        lock_or_recover(&self.error)
+            .as_ref()
+            .map(|(message, class)| (*class, message.to_string_lossy().into_owned()))
+            .unwrap_or((CLASS_INTERNAL, String::new()))
+    }
+
+    fn state_error(&self) -> Option<(&'static CStr, &'static str)> {
+        if self.detached.load(Ordering::Acquire) || self.shared.closed.load(Ordering::Acquire) {
+            Some((CLASS_INVALID_ARGUMENT, "connection is closed"))
+        } else if self.shared.inner.closed.load(Ordering::Acquire) {
+            Some((CLASS_INVALID_ARGUMENT, "database is closed"))
+        } else {
+            None
+        }
+    }
+}
+
+/// Opaque connection handle. A connection is created from any thread but must
+/// not be used from two threads at once, except for `pinkdb_interrupt`.
+pub struct PinkConnection {
+    shared: Arc<ConnShared>,
+}
+
+impl std::ops::Deref for PinkConnection {
+    type Target = ConnShared;
+
+    fn deref(&self) -> &ConnShared {
+        &self.shared
+    }
+}
+
+impl Drop for PinkConnection {
+    fn drop(&mut self) {
+        // Disconnecting with live appenders is defined, not UB: mark the
+        // session closed, then flush every still-buffered appender while the
+        // session is still here and detach it. A flush error is kept on the
+        // appender for `pinkdb_appender_error`; the rows are not retried.
+        let shared = &self.shared;
+        shared.closed.store(true, Ordering::Release);
+        let cells: Vec<Arc<AppenderCell>> = {
+            let mut appenders = lock_or_recover(&shared.appenders);
+            let cells = appenders.iter().filter_map(Weak::upgrade).collect();
+            appenders.clear();
+            cells
+        };
+        for cell in cells {
+            if cell.detached.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            let mut app = lock_or_recover(&cell.app);
+            if app.pending_rows() == 0 {
+                continue;
+            }
+            // SAFETY: the session is alive until this `Drop` returns, and the
+            // appender belongs to the same thread by contract.
+            let state = unsafe { &mut *shared.state.get() };
+            if let Err(e) = app.flush(&mut state.conn) {
+                cell.note(engine_error_class(&e), &e.to_string());
+            }
+        }
+    }
 }
 
 /// Builder for `pinkdb_open_ext`. Fields are validated by
@@ -1156,14 +1311,20 @@ fn new_connection(inner: Arc<DbInner>) -> Result<PinkConnection, String> {
     }
     let cancel = CancelFlag::new();
     conn.set_cancel_flag(Some(cancel.clone()));
-    Ok(PinkConnection {
+    // The C contract is one thread per connection; `Arc` only keeps the
+    // session alive for appenders, it is not a cross-thread promise.
+    #[allow(clippy::arc_with_non_send_sync)]
+    let shared = Arc::new(ConnShared {
+        inner,
         cancel,
         state: UnsafeCell::new(ConnState {
             conn,
             profiling: false,
         }),
-        inner,
-    })
+        closed: AtomicBool::new(false),
+        appenders: Mutex::new(Vec::new()),
+    });
+    Ok(PinkConnection { shared })
 }
 
 /// A query failure before a `PinkResult` exists.
@@ -1307,7 +1468,10 @@ fn prepare_on(conn: &PinkConnection, text: &str) -> Result<PinkPrepared, QueryFa
     state
         .conn
         .prepare(text)
-        .map(|stmt| PinkPrepared { stmt })
+        .map(|stmt| PinkPrepared {
+            bindings: RefCell::new(vec![None; stmt.parameter_count()]),
+            stmt,
+        })
         .map_err(QueryFailure::Engine)
 }
 
@@ -1622,7 +1786,8 @@ pub extern "C" fn pinkdb_connect(
 }
 
 /// Disconnect a connection. NULL-safe. A connection must not be used after
-/// this call.
+/// this call. A still-buffered appender on the connection is flushed and
+/// detached first (see `pinkdb_appender_create`).
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_disconnect(connection: *mut PinkConnection) {
     if connection.is_null() {
@@ -1896,6 +2061,21 @@ pub extern "C" fn pinkdb_open_memory() -> *mut PinkHandle {
     }
 }
 
+/// The connection behind a v1 handle, for bindings that still open with
+/// [`pinkdb_open`] but need the connection-level ABI (typed binding). The
+/// pointer is borrowed and is invalidated by [`pinkdb_close`].
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_handle_connection(handle: *mut PinkHandle) -> *mut PinkConnection {
+    if handle.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null handle");
+        return ptr::null_mut();
+    }
+    // SAFETY: non-null (checked) and uniquely owned per the single-handle
+    // contract; the borrow ends before any other call can run.
+    let handle = unsafe { &mut *handle };
+    &mut *handle.conn
+}
+
 /// Close a handle opened by [`pinkdb_open`]/[`pinkdb_open_memory`]. NULL-safe.
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_close(handle: *mut PinkHandle) {
@@ -2028,6 +2208,9 @@ unsafe fn sql_utf8<'a>(sql: *const c_char, sql_len: usize) -> Option<&'a str> {
 /// like every other handle.
 pub struct PinkPrepared {
     stmt: pinkdb::PreparedStatement,
+    /// Typed bindings set by `pinkdb_bind_*`, 1-based positions held at
+    /// `index - 1`. The v1 `pink_value` array path does not use this.
+    bindings: RefCell<Vec<Option<Value>>>,
 }
 
 /// Parse one SQL statement with `?` placeholders into a reusable prepared
@@ -2080,6 +2263,258 @@ pub extern "C" fn pinkdb_prepared_parameter_count(prepared: *const PinkPrepared)
     unsafe { &*prepared }.stmt.parameter_count()
 }
 
+/// Decode a (pointer, length) text payload. A zero length is the empty
+/// string even with a NULL pointer, matching `pink_value`.
+fn text_payload(ptr: *const c_char, len: usize, what: &str) -> Result<String, String> {
+    if len == 0 {
+        return Ok(String::new());
+    }
+    if ptr.is_null() {
+        return Err(format!("{what} payload has a NULL text pointer"));
+    }
+    // SAFETY: non-null and valid for `len` bytes per the API contract.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| format!("{what} payload is not valid UTF-8"))
+}
+
+fn decimal_value(value: PinkHugeint, width: i32, scale: i32) -> Result<Value, String> {
+    if !(1..=38).contains(&width) {
+        return Err(format!("DECIMAL width {width} is outside 1..=38"));
+    }
+    if scale < 0 || scale > width {
+        return Err(format!("DECIMAL scale {scale} is outside 0..={width}"));
+    }
+    Ok(Value::Decimal {
+        value: hugeint_value(value),
+        precision: width as u8,
+        scale: scale as u8,
+    })
+}
+
+/// Store one typed binding at a 1-based index. Every `pinkdb_bind_*` call
+/// goes through here so index and conversion errors are uniform.
+fn bind_at(prepared: *mut PinkPrepared, index: usize, value: Result<Value, String>) -> i32 {
+    if prepared.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null prepared statement");
+        return 0;
+    }
+    // SAFETY: non-null (checked) and owned by the caller for the call.
+    let prep = unsafe { &*prepared };
+    let count = prep.stmt.parameter_count();
+    if index == 0 || index > count {
+        set_error(
+            CLASS_PARAMETER,
+            &format!(
+                "binding index {index} is out of range: the prepared statement has {count} parameter(s)"
+            ),
+        );
+        return 0;
+    }
+    let value = match value {
+        Ok(value) => value,
+        Err(msg) => {
+            set_error(CLASS_INVALID_ARGUMENT, &format!("binding {index}: {msg}"));
+            return 0;
+        }
+    };
+    prep.bindings.borrow_mut()[index - 1] = Some(value);
+    clear_error();
+    1
+}
+
+/* ----- typed parameter binding (ABI 1.4) ----- */
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_bind_bool(prepared: *mut PinkPrepared, index: usize, value: bool) -> i32 {
+    bind_at(prepared, index, Ok(Value::Boolean(value)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_bind_int32(prepared: *mut PinkPrepared, index: usize, value: i32) -> i32 {
+    bind_at(prepared, index, Ok(Value::Integer(value)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_bind_int64(prepared: *mut PinkPrepared, index: usize, value: i64) -> i32 {
+    bind_at(prepared, index, Ok(Value::Bigint(value)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_bind_double(prepared: *mut PinkPrepared, index: usize, value: f64) -> i32 {
+    bind_at(prepared, index, Ok(Value::Double(value)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_bind_varchar(
+    prepared: *mut PinkPrepared,
+    index: usize,
+    ptr: *const c_char,
+    len: usize,
+) -> i32 {
+    bind_at(
+        prepared,
+        index,
+        text_payload(ptr, len, "VARCHAR").map(Value::Varchar),
+    )
+}
+
+/// The engine has no BLOB scalar type, so this reports a clear error instead
+/// of silently storing bytes as text.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_bind_blob(
+    prepared: *mut PinkPrepared,
+    index: usize,
+    _ptr: *const c_char,
+    _len: usize,
+) -> i32 {
+    bind_at(
+        prepared,
+        index,
+        Err("BLOB is not supported: the engine has no BLOB type".to_string()),
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_bind_date(prepared: *mut PinkPrepared, index: usize, days: i32) -> i32 {
+    bind_at(prepared, index, Ok(Value::Date(days)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_bind_timestamp(
+    prepared: *mut PinkPrepared,
+    index: usize,
+    micros: i64,
+) -> i32 {
+    bind_at(prepared, index, Ok(Value::Timestamp(micros)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_bind_interval(
+    prepared: *mut PinkPrepared,
+    index: usize,
+    value: PinkInterval,
+) -> i32 {
+    bind_at(
+        prepared,
+        index,
+        Ok(Value::Interval {
+            months: value.months,
+            days: value.days,
+            micros: value.micros,
+        }),
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_bind_hugeint(
+    prepared: *mut PinkPrepared,
+    index: usize,
+    value: PinkHugeint,
+) -> i32 {
+    bind_at(prepared, index, Ok(Value::Hugeint(hugeint_value(value))))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_bind_uhugeint(
+    prepared: *mut PinkPrepared,
+    index: usize,
+    value: PinkUhugeint,
+) -> i32 {
+    bind_at(prepared, index, Ok(Value::Uhugeint(uhugeint_value(value))))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_bind_decimal(
+    prepared: *mut PinkPrepared,
+    index: usize,
+    value: PinkHugeint,
+    width: i32,
+    scale: i32,
+) -> i32 {
+    bind_at(prepared, index, decimal_value(value, width, scale))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_bind_uuid(
+    prepared: *mut PinkPrepared,
+    index: usize,
+    value: PinkUhugeint,
+) -> i32 {
+    bind_at(prepared, index, Ok(Value::Uuid(uhugeint_value(value))))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_bind_null(prepared: *mut PinkPrepared, index: usize) -> i32 {
+    bind_at(prepared, index, Ok(Value::Null))
+}
+
+/// Clear every typed binding; the prepared statement itself is unchanged.
+/// Returns 1 on success, 0 for a NULL handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_clear_bindings(prepared: *mut PinkPrepared) -> i32 {
+    if prepared.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null prepared statement");
+        return 0;
+    }
+    // SAFETY: non-null (checked) and owned by the caller for the call.
+    let prep = unsafe { &*prepared };
+    for slot in prep.bindings.borrow_mut().iter_mut() {
+        *slot = None;
+    }
+    clear_error();
+    1
+}
+
+/// Execute a prepared statement with the bindings set by `pinkdb_bind_*`.
+/// Returns and reports exactly like `pinkdb_query_prepared`; a missing
+/// binding is a `parameter` error on the result. Bindings are kept, so the
+/// statement can be executed again (with or without rebinding).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_execute_bound(
+    connection: *mut PinkConnection,
+    prepared: *const PinkPrepared,
+    out_result: *mut *mut PinkResult,
+) -> i32 {
+    if out_result.is_null() {
+        return 0;
+    }
+    let result = if connection.is_null() {
+        failed_result(CLASS_INVALID_ARGUMENT, "null connection")
+    } else if prepared.is_null() {
+        failed_result(CLASS_INVALID_ARGUMENT, "null prepared statement")
+    } else {
+        // SAFETY: non-null (checked) and owned by the caller for the call.
+        let conn = unsafe { &*connection };
+        let prep = unsafe { &*prepared };
+        let bindings = prep.bindings.borrow();
+        let missing = bindings.iter().position(Option::is_none);
+        match missing {
+            Some(index) => failed_result(
+                CLASS_PARAMETER,
+                &format!(
+                    "binding {} was not provided: call pinkdb_bind_* for every parameter",
+                    index + 1
+                ),
+            ),
+            None => {
+                let bound: Vec<Value> = bindings.iter().flatten().cloned().collect();
+                drop(bindings);
+                executed_prepared(conn, prep, &bound)
+            }
+        }
+    };
+    // SAFETY: non-null (checked) and writable.
+    unsafe { *out_result = result };
+    // SAFETY: just stored above and not freed.
+    if unsafe { &*result }.error.is_none() {
+        1
+    } else {
+        0
+    }
+}
+
 /// Free a prepared statement. NULL-safe.
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_prepared_free(prepared: *mut PinkPrepared) {
@@ -2129,6 +2564,489 @@ pub extern "C" fn pinkdb_execute_prepared(
     // contract.
     let h = unsafe { &*handle };
     v1_result(executed_prepared(&h.conn, prep, &bound))
+}
+
+/* ----- table appender (ABI 1.4) ----- */
+
+/// Owns one row/column appender. The engine appender holds no connection
+/// borrow: every call that can flush takes the session explicitly, so a
+/// caller may query the same connection between appends. The cell keeps the
+/// session alive after the connection handle is gone; [`pinkdb_disconnect`]
+/// flushes and detaches live appenders.
+pub struct PinkAppender {
+    cell: Arc<AppenderCell>,
+    columns: usize,
+    row: Vec<Value>,
+    /// Rows successfully ended since creation, for the wrong-count message.
+    ended_rows: u64,
+    /// A failed flush rejects its batch and invalidates the appender, like
+    /// DuckDB's; further calls return the same error and destroy discards the
+    /// buffer instead of retrying it.
+    failed: bool,
+    closed: bool,
+}
+
+fn appender_set_error(app: &mut PinkAppender, class: &'static CStr, msg: &str) {
+    app.cell.note(class, msg);
+    set_error(class, msg);
+}
+
+fn appender_engine_failure(app: &mut PinkAppender, e: &PinkDbError) {
+    let msg = e.to_string();
+    appender_set_error(app, engine_error_class(e), &msg);
+    app.failed = true;
+}
+
+fn appender_ready(app: &PinkAppender) -> bool {
+    if app.failed {
+        let (class, message) = app.cell.stored_error();
+        set_error(class, &message);
+        false
+    } else if app.closed {
+        set_error(CLASS_INVALID_ARGUMENT, "appender is closed");
+        false
+    } else if let Some((class, message)) = app.cell.state_error() {
+        app.cell.note(class, message);
+        set_error(class, message);
+        false
+    } else {
+        true
+    }
+}
+
+fn append_at(appender: *mut PinkAppender, value: Result<Value, String>) -> i32 {
+    if appender.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null appender");
+        return 0;
+    }
+    // SAFETY: non-null (checked) and owned by the caller for the call.
+    let app = unsafe { &mut *appender };
+    if !appender_ready(app) {
+        return 0;
+    }
+    match value {
+        Ok(value) => {
+            app.row.push(value);
+            clear_error();
+            1
+        }
+        Err(msg) => {
+            appender_set_error(app, CLASS_INVALID_ARGUMENT, &msg);
+            0
+        }
+    }
+}
+
+fn appender_flush(app: &mut PinkAppender) -> i32 {
+    if !appender_ready(app) {
+        return 0;
+    }
+    let outcome = match conn_state_mut(&app.cell.shared) {
+        Ok(state) => {
+            let mut engine = lock_or_recover(&app.cell.app);
+            engine.flush(&mut state.conn)
+        }
+        Err((class, message)) => {
+            appender_set_error(app, class, message);
+            return 0;
+        }
+    };
+    match outcome {
+        Ok(()) => {
+            clear_error();
+            1
+        }
+        Err(e) => {
+            appender_engine_failure(app, &e);
+            0
+        }
+    }
+}
+
+fn unregister_appender(cell: &Arc<AppenderCell>) {
+    lock_or_recover(&cell.shared.appenders)
+        .retain(|weak| weak.upgrade().is_some_and(|live| !Arc::ptr_eq(&live, cell)));
+}
+
+/// Create an appender for `schema.table`; `schema` NULL means the
+/// connection's current schema. Returns 1, or 0 with *out_appender NULL and
+/// *errmsg a string freed with `pinkdb_free`.
+///
+/// Interleaving appends with queries on the same connection is allowed; a
+/// query sees only previously flushed rows.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_appender_create(
+    connection: *mut PinkConnection,
+    schema: *const c_char,
+    schema_len: usize,
+    table: *const c_char,
+    table_len: usize,
+    out_appender: *mut *mut PinkAppender,
+    errmsg: *mut *mut c_char,
+) -> i32 {
+    if !out_appender.is_null() {
+        // SAFETY: the caller passes a writable out-parameter.
+        unsafe { *out_appender = ptr::null_mut() };
+    }
+    write_errmsg(errmsg, None);
+    if out_appender.is_null() || errmsg.is_null() {
+        return 0;
+    }
+    if connection.is_null() {
+        write_errmsg(errmsg, Some("null connection"));
+        return 0;
+    }
+    let table = match unsafe { sql_utf8_result(table, table_len) } {
+        Ok(text) => text,
+        Err(message) => {
+            write_errmsg(errmsg, Some(&format!("table: {message}")));
+            return 0;
+        }
+    };
+    let schema = if schema.is_null() {
+        None
+    } else {
+        match unsafe { sql_utf8_result(schema, schema_len) } {
+            Ok(text) => Some(text),
+            Err(message) => {
+                write_errmsg(errmsg, Some(&format!("schema: {message}")));
+                return 0;
+            }
+        }
+    };
+    // SAFETY: non-null (checked) and one thread uses the connection at a time.
+    let connection = unsafe { &*connection };
+    let state = match conn_state_mut(connection) {
+        Ok(state) => state,
+        Err((_, message)) => {
+            write_errmsg(errmsg, Some(message));
+            return 0;
+        }
+    };
+    let outcome = catch_unwind(AssertUnwindSafe(|| state.conn.appender(schema, table)));
+    match outcome {
+        Ok(Ok(app)) => {
+            let columns = app.column_count();
+            #[allow(clippy::arc_with_non_send_sync)]
+            let cell = Arc::new(AppenderCell {
+                shared: Arc::clone(&connection.shared),
+                app: Mutex::new(app),
+                detached: AtomicBool::new(false),
+                error: Mutex::new(None),
+            });
+            lock_or_recover(&connection.shared.appenders).push(Arc::downgrade(&cell));
+            let appender = Box::new(PinkAppender {
+                cell,
+                columns,
+                row: Vec::new(),
+                ended_rows: 0,
+                failed: false,
+                closed: false,
+            });
+            // SAFETY: non-null (checked) and writable.
+            unsafe { *out_appender = Box::into_raw(appender) };
+            clear_error();
+            1
+        }
+        Ok(Err(e)) => {
+            write_errmsg(errmsg, Some(&e.to_string()));
+            0
+        }
+        Err(_) => {
+            write_errmsg(errmsg, Some("internal error: appender creation panicked"));
+            0
+        }
+    }
+}
+
+/// Rows buffered before an automatic flush. Zero selects 1; auto-flush is
+/// never disabled. NULL-safe.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_appender_set_auto_flush(appender: *mut PinkAppender, rows: u64) {
+    if appender.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null appender");
+        return;
+    }
+    // SAFETY: non-null (checked) and owned by the caller for the call.
+    let app = unsafe { &mut *appender };
+    if !appender_ready(app) {
+        return;
+    }
+    lock_or_recover(&app.cell.app)
+        .set_auto_flush(usize::try_from(rows).unwrap_or(usize::MAX).max(1));
+    clear_error();
+}
+
+/// End the current row. A wrong column count is an error naming the row and
+/// leaves the appender usable; the pending values are discarded.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_appender_end_row(appender: *mut PinkAppender) -> i32 {
+    if appender.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null appender");
+        return 0;
+    }
+    // SAFETY: non-null (checked) and owned by the caller for the call.
+    let app = unsafe { &mut *appender };
+    if !appender_ready(app) {
+        return 0;
+    }
+    if app.row.len() != app.columns {
+        let message = format!(
+            "appender row {}: expected {} columns, got {}",
+            app.ended_rows + 1,
+            app.columns,
+            app.row.len()
+        );
+        app.row.clear();
+        appender_set_error(app, CLASS_INVALID_ARGUMENT, &message);
+        return 0;
+    }
+    let row = std::mem::take(&mut app.row);
+    let outcome = match conn_state_mut(&app.cell.shared) {
+        Ok(state) => {
+            let mut engine = lock_or_recover(&app.cell.app);
+            engine.append_row(&mut state.conn, row)
+        }
+        Err((class, message)) => {
+            appender_set_error(app, class, message);
+            return 0;
+        }
+    };
+    match outcome {
+        Ok(()) => {
+            app.ended_rows += 1;
+            clear_error();
+            1
+        }
+        Err(e) => {
+            appender_engine_failure(app, &e);
+            0
+        }
+    }
+}
+
+/// Append one whole chunk (for example a chunk fetched from a result). A
+/// column already typed like the target is adopted without copying when the
+/// buffer is empty. An error invalidates the appender because earlier
+/// auto-flushes in the chunk may already have committed.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_appender_append_chunk(
+    appender: *mut PinkAppender,
+    chunk: *const PinkChunk,
+) -> i32 {
+    if appender.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null appender");
+        return 0;
+    }
+    if chunk.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null chunk");
+        return 0;
+    }
+    // SAFETY: non-null (checked) and owned by the caller for the call.
+    let app = unsafe { &mut *appender };
+    if !appender_ready(app) {
+        return 0;
+    }
+    // SAFETY: non-null (checked) and owned by the caller for the call.
+    let chunk = unsafe { &*chunk };
+    let rows = chunk._chunk.num_rows;
+    let outcome = match conn_state_mut(&app.cell.shared) {
+        Ok(state) => {
+            let mut engine = lock_or_recover(&app.cell.app);
+            engine.append_shared_chunk(&mut state.conn, &chunk._chunk.columns)
+        }
+        Err((class, message)) => {
+            appender_set_error(app, class, message);
+            return 0;
+        }
+    };
+    match outcome {
+        Ok(()) => {
+            app.ended_rows += rows as u64;
+            clear_error();
+            1
+        }
+        Err(e) => {
+            appender_engine_failure(app, &e);
+            0
+        }
+    }
+}
+
+/// Flush buffered rows as one statement. Returns 1, or 0 with the error in
+/// `pinkdb_last_error`/`pinkdb_appender_error`; a failed flush invalidates
+/// the appender.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_appender_flush(appender: *mut PinkAppender) -> i32 {
+    if appender.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null appender");
+        return 0;
+    }
+    // SAFETY: non-null (checked) and owned by the caller for the call.
+    let app = unsafe { &mut *appender };
+    appender_flush(app)
+}
+
+/// Flush and mark the appender closed. Returns like `pinkdb_appender_flush`.
+/// The handle is still freed with `pinkdb_appender_destroy`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_appender_close(appender: *mut PinkAppender) -> i32 {
+    if appender.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null appender");
+        return 0;
+    }
+    // SAFETY: non-null (checked) and owned by the caller for the call.
+    let app = unsafe { &mut *appender };
+    if appender_flush(app) == 0 {
+        return 0;
+    }
+    app.closed = true;
+    1
+}
+
+/// Destroy the appender, flushing first when it is still open. Returns 1 when
+/// it was destroyed cleanly. A final flush error returns 0 and is copied into
+/// `pinkdb_last_error` (the appender itself is still freed). An appender that
+/// already failed a flush is freed without retrying the rejected batch and
+/// returns 0 with its stored error. A detached appender (its connection was
+/// disconnected) is freed and reports `connection is closed`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_appender_destroy(appender: *mut PinkAppender) -> i32 {
+    if appender.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null appender");
+        return 0;
+    }
+    // SAFETY: produced by Box::into_raw in `pinkdb_appender_create`, freed
+    // exactly once here.
+    let mut app = unsafe { Box::from_raw(appender) };
+    unregister_appender(&app.cell);
+    if app.failed {
+        let (class, message) = app.cell.stored_error();
+        set_error(class, &message);
+        return 0;
+    }
+    if app.closed {
+        clear_error();
+        return 1;
+    }
+    if appender_flush(&mut app) == 0 {
+        return 0;
+    }
+    clear_error();
+    1
+}
+
+/// The appender's stored error, or NULL when it has none. Owned by the
+/// appender; valid until the next call on it or `pinkdb_appender_destroy`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_appender_error(appender: *const PinkAppender) -> *const c_char {
+    if appender.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: non-null and owned by the caller, read-only access.
+    let app = unsafe { &*appender };
+    let error = lock_or_recover(&app.cell.error);
+    error
+        .as_ref()
+        .map_or(ptr::null(), |(message, _)| message.as_ptr())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_append_bool(appender: *mut PinkAppender, value: bool) -> i32 {
+    append_at(appender, Ok(Value::Boolean(value)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_append_int32(appender: *mut PinkAppender, value: i32) -> i32 {
+    append_at(appender, Ok(Value::Integer(value)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_append_int64(appender: *mut PinkAppender, value: i64) -> i32 {
+    append_at(appender, Ok(Value::Bigint(value)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_append_double(appender: *mut PinkAppender, value: f64) -> i32 {
+    append_at(appender, Ok(Value::Double(value)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_append_varchar(
+    appender: *mut PinkAppender,
+    ptr: *const c_char,
+    len: usize,
+) -> i32 {
+    append_at(
+        appender,
+        text_payload(ptr, len, "VARCHAR").map(Value::Varchar),
+    )
+}
+
+/// The engine has no BLOB scalar type, so this reports a clear error instead
+/// of silently storing bytes as text.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_append_blob(
+    appender: *mut PinkAppender,
+    _ptr: *const c_char,
+    _len: usize,
+) -> i32 {
+    append_at(
+        appender,
+        Err("BLOB is not supported: the engine has no BLOB type".to_string()),
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_append_date(appender: *mut PinkAppender, days: i32) -> i32 {
+    append_at(appender, Ok(Value::Date(days)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_append_timestamp(appender: *mut PinkAppender, micros: i64) -> i32 {
+    append_at(appender, Ok(Value::Timestamp(micros)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_append_interval(appender: *mut PinkAppender, value: PinkInterval) -> i32 {
+    append_at(
+        appender,
+        Ok(Value::Interval {
+            months: value.months,
+            days: value.days,
+            micros: value.micros,
+        }),
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_append_hugeint(appender: *mut PinkAppender, value: PinkHugeint) -> i32 {
+    append_at(appender, Ok(Value::Hugeint(hugeint_value(value))))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_append_uhugeint(appender: *mut PinkAppender, value: PinkUhugeint) -> i32 {
+    append_at(appender, Ok(Value::Uhugeint(uhugeint_value(value))))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_append_decimal(
+    appender: *mut PinkAppender,
+    value: PinkHugeint,
+    width: i32,
+    scale: i32,
+) -> i32 {
+    append_at(appender, decimal_value(value, width, scale))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_append_uuid(appender: *mut PinkAppender, value: PinkUhugeint) -> i32 {
+    append_at(appender, Ok(Value::Uuid(uhugeint_value(value))))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_append_null(appender: *mut PinkAppender) -> i32 {
+    append_at(appender, Ok(Value::Null))
 }
 
 /// Convert one caller-provided `pink_value` into an engine value: the inverse
@@ -2786,8 +3704,8 @@ mod tests {
     }
 
     #[test]
-    fn abi_version_is_one_three() {
-        assert_eq!(pinkdb_abi_version(), (1 << 16) | 3);
+    fn abi_version_is_one_four() {
+        assert_eq!(pinkdb_abi_version(), (1 << 16) | 4);
     }
 
     #[test]
