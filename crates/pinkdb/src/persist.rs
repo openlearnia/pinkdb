@@ -809,7 +809,7 @@ impl Writer {
 /// The data region is written through this one path, so a `save`'s file and
 /// the lake's in-memory `to_pink_bytes*` images are byte-identical by
 /// construction.
-trait Sink {
+trait Sink: Send {
     fn bytes(&mut self, b: &[u8]) -> Result<()>;
 
     /// The offset the next byte lands at: the row-group directory records
@@ -4791,38 +4791,54 @@ impl PinkDb {
             let n_chunks = t.num_chunks();
             let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
             let mut reused = vec![false; old.map_or(0, |o| o.row_groups.len()).max(n_groups)];
-            for (g, reused_group) in reused.iter_mut().enumerate().take(n_groups) {
-                let first = g * CHUNKS_PER_ROW_GROUP;
-                let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
-                if let Some(old) = old
-                    && let Some(old_group) = old.row_groups.get(g)
-                    && old.schema == schema
-                    && reusable_group(t, old_group, first, last)
-                {
-                    *reused_group = true;
-                    for (ci, column) in old_group.columns.iter().enumerate() {
-                        let mut acc = ChunkColumnStats::empty();
-                        acc.null_count = column.null_count;
-                        acc.nan_count = column.nan_count;
-                        acc.min = column.min.clone();
-                        acc.max = column.max.clone();
-                        accs[ci].merge(&acc);
+            // A group whose stored bytes still match stays where it is; the
+            // others are encoded here and written by `write_group` in order.
+            let steps = reused
+                .iter_mut()
+                .enumerate()
+                .take(n_groups)
+                .map(|(g, reused_group)| {
+                    let first = g * CHUNKS_PER_ROW_GROUP;
+                    let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
+                    if let Some(old) = old
+                        && let Some(old_group) = old.row_groups.get(g)
+                        && old.schema == schema
+                        && reusable_group(t, old_group, first, last)
+                    {
+                        *reused_group = true;
+                        return Ok(GroupStep::Reused(old_group));
                     }
-                    row_groups.push(old_group.clone());
-                    continue;
-                }
-                let group = encode_row_group(ns, name, t, first, last, true)?;
-                let (group, table_carry) = write_group(&mut writer, group)?;
-                for (ci, acc) in group.accs.iter().enumerate() {
-                    accs[ci].merge(acc);
-                }
-                row_groups.push(RowGroupDir {
-                    rows: group.rows,
-                    chunk_rows: group.chunk_rows,
-                    columns: group.columns,
+                    encode_row_group(ns, name, t, first, last, true).map(GroupStep::Encoded)
                 });
-                repoints.push((t, table_carry));
-            }
+            let write = |step: GroupStep<'_>| -> Result<()> {
+                match step {
+                    GroupStep::Reused(old_group) => {
+                        for (ci, column) in old_group.columns.iter().enumerate() {
+                            let mut acc = ChunkColumnStats::empty();
+                            acc.null_count = column.null_count;
+                            acc.nan_count = column.nan_count;
+                            acc.min = column.min.clone();
+                            acc.max = column.max.clone();
+                            accs[ci].merge(&acc);
+                        }
+                        row_groups.push(old_group.clone());
+                    }
+                    GroupStep::Encoded(group) => {
+                        let (group, table_carry) = write_group(&mut writer, group)?;
+                        for (ci, acc) in group.accs.iter().enumerate() {
+                            accs[ci].merge(acc);
+                        }
+                        row_groups.push(RowGroupDir {
+                            rows: group.rows,
+                            chunk_rows: group.chunk_rows,
+                            columns: group.columns,
+                        });
+                        repoints.push((t, table_carry));
+                    }
+                }
+                Ok(())
+            };
+            encode_then_write(steps, write, n_groups > 1)?;
             if let Some(old) = old {
                 for (g, group) in old.row_groups.iter().enumerate() {
                     if reused.get(g).copied().unwrap_or(false) {
@@ -5513,10 +5529,12 @@ fn write_table<S: Sink>(
     let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
     let mut row_groups: Vec<RowGroupDir> = Vec::with_capacity(n_groups);
     let mut table_carry: TableCarry = (0..schema.len()).map(|_| Vec::new()).collect();
-    for g in 0..n_groups {
+    let groups = (0..n_groups).map(|g| {
         let first = g * CHUNKS_PER_ROW_GROUP;
         let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
-        let group = encode_row_group(ns, name, t, first, last, parallel)?;
+        encode_row_group(ns, name, t, first, last, parallel)
+    });
+    let write = |group: GroupBuild| -> Result<()> {
         let GroupBuild {
             rows,
             chunk_rows,
@@ -5549,7 +5567,9 @@ fn write_table<S: Sink>(
             chunk_rows,
             columns,
         });
-    }
+        Ok(())
+    };
+    encode_then_write(groups, write, parallel && n_groups > 1)?;
     Ok((
         finish_table_dir(ns, name, t, row_groups, &accs, collect_stats, saved)?,
         table_carry,
@@ -5727,6 +5747,68 @@ impl CheckpointWriter {
     }
 }
 
+/// One row group of an incremental checkpoint, in table order: kept in place,
+/// or encoded for [`write_group`].
+enum GroupStep<'a> {
+    Reused(&'a RowGroupDir),
+    Encoded(GroupBuild),
+}
+
+/// Run `write` over `groups` in order. With `overlap`, a writer thread stores
+/// group `g` while this thread encodes group `g + 1` (its pages on the pool),
+/// so the file write no longer leaves the pool idle. The writes keep their
+/// order, so every offset and byte is that of the serial loop; the first
+/// error in serial order wins (a write fails before the next encode).
+fn encode_then_write<T: Send>(
+    groups: impl Iterator<Item = Result<T>>,
+    mut write: impl FnMut(T) -> Result<()> + Send,
+    overlap: bool,
+) -> Result<()> {
+    if !overlap {
+        for group in groups {
+            write(group?)?;
+        }
+        return Ok(());
+    }
+    std::thread::scope(|scope| {
+        // Room for one finished group while the writer holds another.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
+        let writer = scope.spawn(move || {
+            let written = rx.into_iter().try_for_each(&mut write);
+            // The reuse counter is per thread: hand the writer's back.
+            #[cfg(test)]
+            let written = (written, first_fits());
+            written
+        });
+        let mut encoded = Ok(());
+        for group in groups {
+            match group {
+                Ok(group) => {
+                    // A closed channel means the writer failed; its error is
+                    // returned below.
+                    if tx.send(group).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    encoded = Err(e);
+                    break;
+                }
+            }
+        }
+        drop(tx);
+        let written = writer
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        #[cfg(test)]
+        let written = {
+            FIRST_FITS.with(|fits| fits.set(fits.get() + written.1));
+            written.0
+        };
+        written.and(encoded)
+    })
+}
+
 /// Write an encoded row group at its allocated offset and remember where its
 /// image-backed chunks landed, so their handles can be repointed on success.
 fn write_group(
@@ -5830,7 +5912,7 @@ fn first_fit(free: &mut Vec<(u64, u64)>, len: u64, min_offset: u64) -> Option<u6
 }
 
 // A test hook: how many times this thread's incremental checkpoint reused a
-// freed range for a row group.
+// freed range for a row group (`encode_then_write` adds its writer thread's).
 #[cfg(test)]
 thread_local! {
     static FIRST_FITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -9310,6 +9392,49 @@ mod tests {
                     "{sql} chunk {i}"
                 );
             }
+        }
+    }
+
+    /// The pipelined checkpoint loop writes in order and reports the first
+    /// error in serial order, as the serial loop does.
+    #[test]
+    fn encode_then_write_keeps_order_and_the_first_error() {
+        let fail = |msg: &str| PinkDbError::Execution(msg.to_string());
+        for overlap in [false, true] {
+            let mut seen = Vec::new();
+            encode_then_write(
+                (0..50).map(Ok),
+                |g| {
+                    seen.push(g);
+                    Ok(())
+                },
+                overlap,
+            )
+            .unwrap();
+            assert_eq!(seen, (0..50).collect::<Vec<_>>());
+
+            // An encode error after three groups: those three are written.
+            let mut seen = Vec::new();
+            let groups = (0..10).map(|g| if g == 3 { Err(fail("encode")) } else { Ok(g) });
+            let err = encode_then_write(
+                groups,
+                |g| {
+                    seen.push(g);
+                    Ok(())
+                },
+                overlap,
+            );
+            assert!(matches!(err, Err(PinkDbError::Execution(m)) if m == "encode"));
+            assert_eq!(seen, vec![0, 1, 2]);
+
+            // A write error stops the loop, and wins over a later encode error.
+            let groups = (0..10).map(|g| if g == 2 { Err(fail("encode")) } else { Ok(g) });
+            let err = encode_then_write(
+                groups,
+                |g| if g == 1 { Err(fail("write")) } else { Ok(()) },
+                overlap,
+            );
+            assert!(matches!(err, Err(PinkDbError::Execution(m)) if m == "write"));
         }
     }
 
