@@ -131,6 +131,10 @@ pub(crate) struct ExecBudget {
     /// the `external_io` host scalars it calls must travel in its record
     /// (wave 107c): replay serves them and never calls the function again.
     collect_external_calls: std::sync::atomic::AtomicBool,
+    /// The store file a `CREATE TABLE … AS` may stream its row groups into
+    /// (the streaming load): set by the statement runner only for an
+    /// autocommit statement on a durable plaintext store, under the lease.
+    stream_load_target: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// The results recorded so far, deduplicated by `(function, arguments)`.
     external_calls: std::sync::Mutex<ExternalCalls>,
     /// Whether this session may call `external_io` host scalars: the serve
@@ -171,6 +175,7 @@ impl ExecBudget {
             result_rows: std::sync::atomic::AtomicUsize::new(0),
             result_bytes: std::sync::atomic::AtomicUsize::new(0),
             collect_external_calls: std::sync::atomic::AtomicBool::new(false),
+            stream_load_target: std::sync::Mutex::new(None),
             external_calls: std::sync::Mutex::new(ExternalCalls::default()),
             external_services: std::sync::atomic::AtomicBool::new(true),
             cancel: None,
@@ -206,6 +211,20 @@ impl ExecBudget {
 
     /// A statement that a durable store WAL-logs must carry the results of
     /// every `external_io` host scalar it calls.
+    pub(crate) fn set_stream_load_target(&self, target: Option<std::path::PathBuf>) {
+        *self
+            .stream_load_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = target;
+    }
+
+    pub(crate) fn stream_load_target(&self) -> Option<std::path::PathBuf> {
+        self.stream_load_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub(crate) fn set_collect_external_calls(&self, collect: bool) {
         self.collect_external_calls
             .store(collect, std::sync::atomic::Ordering::Relaxed);
@@ -1620,6 +1639,131 @@ fn stage_batches(
     Ok(staged)
 }
 
+/// `CREATE TABLE … AS` that writes as it loads (the streaming load): the
+/// query's chunks arrive in order while the scan runs, are staged and
+/// appended to a table built off the catalog, and every row group that is
+/// complete is encoded and written into the store file at `path` (see
+/// `PinkDb::write_pending_group_of`). Its chunks are then clean, so the cache
+/// can drop them: memory holds the groups in flight, not the table. The
+/// table joins the catalog once every row is in; a failure leaves the
+/// catalog as it was and the written groups unreferenced (the next
+/// checkpoint frees them).
+///
+/// `Ok(false)` when the query is not a pipeline the streaming path runs, or
+/// the target is not a table in the store file; the caller then takes the
+/// materialized path. The chunks, and so the file, are the materialized
+/// path's: same chunks, same order, same row groups.
+#[allow(clippy::too_many_arguments)]
+fn stream_create_table_as(
+    db: &mut PinkDb,
+    path: &std::path::Path,
+    target: &crate::storage::SchemaPath,
+    name: &str,
+    query: &LogicalPlan,
+    or_replace: bool,
+    plan: &LogicalPlan,
+    budget: &std::sync::Arc<ExecBudget>,
+) -> Result<bool> {
+    if !matches!(
+        db.database_storage(target.db()),
+        Some(crate::lake_db::DbStorage::Local)
+    ) || db
+        .attached_memory
+        .contains(&target.db().to_ascii_lowercase())
+    {
+        return Ok(false);
+    }
+    const STATS_GROUP: usize = 64;
+    let per_group = crate::persist::CHUNKS_PER_ROW_GROUP;
+    /// The table being loaded and the batches not yet appended to it.
+    struct Load {
+        table: DataTable,
+        schema: Vec<(String, DataType)>,
+        sources: Vec<Option<usize>>,
+        defaults: Vec<Value>,
+        staged: Vec<Vec<std::sync::Arc<Vector>>>,
+        written: usize,
+    }
+    let store: &PinkDb = db;
+    // Fold the staged batches' statistics on the pool, append them, and
+    // write every row group that can no longer change (only the tail chunk
+    // ever grows, so a group is final once a chunk after it exists).
+    let flush = |load: &mut Load, last: bool| -> Result<()> {
+        let stats: Vec<ChunkStats> = load
+            .staged
+            .par_iter()
+            .map(|batch| ChunkStats::of(batch))
+            .collect();
+        for (batch, stats) in load.staged.iter().zip(&stats) {
+            load.table
+                .append_shared_chunk_with_stats(batch, Some(stats))?;
+        }
+        load.staged.clear();
+        let chunks = load.table.num_chunks();
+        while chunks > (load.written + 1) * per_group || (last && chunks > load.written * per_group)
+        {
+            let first = load.written * per_group;
+            let end = (first + per_group).min(chunks);
+            store.write_pending_group_of(path, target, name, &load.table, first, end)?;
+            load.written += 1;
+        }
+        Ok(())
+    };
+    let state: std::cell::RefCell<Option<Load>> = std::cell::RefCell::new(None);
+    let streamed = {
+        let cx = Cx::with_budget(store, budget.clone()).with_projections(plan);
+        crate::exec::pipeline::stream_collect(
+            &cx,
+            query,
+            &mut |names, types| {
+                let schema: Vec<(String, DataType)> =
+                    names.iter().cloned().zip(types.iter().copied()).collect();
+                *state.borrow_mut() = Some(Load {
+                    table: DataTable::new(name.to_string(), schema.clone())?,
+                    sources: (0..schema.len()).map(Some).collect(),
+                    defaults: vec![Value::Null; schema.len()],
+                    schema,
+                    staged: Vec::new(),
+                    written: 0,
+                });
+                Ok(())
+            },
+            &mut |chunk| {
+                budget.check_deadline()?;
+                let mut guard = state.borrow_mut();
+                let load = guard.as_mut().expect("begun before the first chunk");
+                for start in (0..chunk.num_rows()).step_by(CHUNK_SIZE) {
+                    let end = (start + CHUNK_SIZE).min(chunk.num_rows());
+                    let batch = stage_batch(
+                        &chunk,
+                        start..end,
+                        &load.sources,
+                        &load.schema,
+                        &load.defaults,
+                    )?;
+                    load.staged.push(batch);
+                }
+                if load.staged.len() >= STATS_GROUP {
+                    flush(load, false)?;
+                }
+                Ok(())
+            },
+        )?
+    };
+    let Some(mut load) = state.into_inner().filter(|_| streamed.is_some()) else {
+        return Ok(false);
+    };
+    flush(&mut load, true)?;
+    store.sync_pending_load()?;
+    let Load { table, schema, .. } = load;
+    if or_replace {
+        replace_table(db, target, name)?;
+    }
+    db.create_table_in(target, name, schema)?;
+    *db.table_mut_in(target, name)? = table;
+    Ok(true)
+}
+
 /// One [`stage_batches`] batch: the rows `rows` of `chunk` in target schema
 /// order.
 fn stage_batch(
@@ -1717,6 +1861,20 @@ pub(crate) fn run_plain(
         } => {
             let target = resolve_ns(db, qdb);
             if *if_not_exists && db.table_in(&target, name).is_ok() {
+                return Ok(QueryResult::Created);
+            }
+            if let Some(path) = budget.stream_load_target()
+                && stream_create_table_as(
+                    db,
+                    &path,
+                    &target,
+                    name,
+                    query,
+                    *or_replace,
+                    plan,
+                    &budget,
+                )?
+            {
                 return Ok(QueryResult::Created);
             }
             // Evaluate the query first (it must not see the new table), then

@@ -1378,6 +1378,224 @@ where
     Ok(Some(items))
 }
 
+/// Run `plan`'s pipeline and hand every output chunk to `consume` in the
+/// order [`collect`] would return them, as soon as the chunks before it are
+/// done: a bulk load encodes and writes while the scan still runs (the
+/// streaming load). `Ok(None)` when the plan is not a pipeline this module
+/// compiles (neither callback ran); otherwise the output's names and types,
+/// which `begin` also receives before the first chunk.
+///
+/// `consume` runs on the calling thread. At most a few morsels per worker
+/// wait for it: a worker ahead of the consumer yields to the pool instead of
+/// claiming another morsel, so the consumer's own parallel work (the row
+/// group encode) runs on the threads the scan would otherwise hold.
+pub(crate) fn stream_collect(
+    cx: &Cx,
+    plan: &LogicalPlan,
+    begin: &mut dyn FnMut(&[String], &[DataType]) -> Result<()>,
+    consume: &mut dyn FnMut(DataChunk) -> Result<()>,
+) -> Result<Option<(Vec<String>, Vec<DataType>)>> {
+    if !cx.pipeline_execution() {
+        return Ok(None);
+    }
+    let Some(compiled) = compile(cx, plan)? else {
+        return Ok(None);
+    };
+    // The output's shape is known before the first chunk.
+    begin(&compiled.names, &compiled.types)?;
+    let steps = steps(cx, &compiled.builds, &compiled.ops)?;
+    let sink = PassSink;
+    let declined = || {
+        PinkDbError::Execution("internal: the pipeline's collect sink declined a chunk".to_string())
+    };
+    match &compiled.source {
+        Source::Chunks(output) => {
+            let Some(chunks) = run_chunks(cx, &steps, &sink, &output.chunks)? else {
+                return Err(declined());
+            };
+            for chunk in chunks {
+                consume(chunk)?;
+            }
+        }
+        Source::Streamed(source) => {
+            if !run_streamed_ordered(cx, &steps, &sink, source.as_ref(), consume)? {
+                return Err(declined());
+            }
+        }
+    }
+    Ok(Some((compiled.names.clone(), compiled.types.clone())))
+}
+
+/// [`CollectSink`] without the statement charge: a streamed load hands each
+/// chunk on as soon as it is in order, so the chunks never accumulate here.
+struct PassSink;
+
+impl Sink for PassSink {
+    type Partial = DataChunk;
+
+    fn fold_into(
+        &self,
+        _cx: &Cx,
+        chunk: &DataChunk,
+        sel: Option<&[u32]>,
+    ) -> Result<Option<DataChunk>> {
+        Ok(Some(match sel {
+            None => chunk.clone(),
+            Some(sel) => chunk.take(sel),
+        }))
+    }
+
+    fn finish(self, items: Vec<DataChunk>, _cx: &Cx) -> Result<Vec<DataChunk>> {
+        Ok(items)
+    }
+
+    fn state(part: &DataChunk) -> usize {
+        chunk_approx_bytes(part)
+    }
+}
+
+/// Morsels a streamed load may hold ahead of its consumer, per worker.
+const ORDERED_AHEAD_PER_WORKER: u64 = 2;
+
+/// [`run_streamed`] for [`stream_collect`]: the same workers and morsel order,
+/// but each morsel's chunks go to `consume` once every earlier morsel's have.
+/// `Ok(false)` when the sink declined a chunk.
+fn run_streamed_ordered<S: Sink<Partial = DataChunk> + Sync>(
+    cx: &Cx,
+    steps: &[Step<'_>],
+    sink: &S,
+    source: &dyn MorselSource,
+    consume: &mut dyn FnMut(DataChunk) -> Result<()>,
+) -> Result<bool> {
+    type Folded = Result<Option<Vec<DataChunk>>>;
+    struct Reorder {
+        next: u64,
+        ready: std::collections::BTreeMap<u64, Folded>,
+    }
+    let workers = rayon::current_num_threads().max(1);
+    let ahead_cap = ORDERED_AHEAD_PER_WORKER * workers as u64;
+    let stop = AtomicBool::new(false);
+    let in_flight = AtomicU64::new(0);
+    let peak = AtomicU64::new(0);
+    // Morsels claimed but not yet taken by the consumer.
+    let ahead = AtomicU64::new(0);
+    let reorder = Mutex::new(Reorder {
+        next: 0,
+        ready: std::collections::BTreeMap::new(),
+    });
+    let (tx, rx) = std::sync::mpsc::channel::<Folded>();
+    let (stop, ahead, in_flight, peak, reorder) = (&stop, &ahead, &in_flight, &peak, &reorder);
+    let outcome = std::thread::scope(|scope| {
+        // The producer owns the sender: the channel closes when it is done.
+        let producer = scope.spawn(move || {
+            (0..workers).into_par_iter().for_each(|_| {
+                let tx = tx.clone();
+                while !stop.load(Ordering::Relaxed) {
+                    // Backpressure without blocking a pool thread: run other
+                    // pool work (the consumer's encode) until there is room.
+                    if ahead.load(Ordering::Acquire) >= ahead_cap {
+                        if rayon::yield_now() != Some(rayon::Yield::Executed) {
+                            std::thread::sleep(std::time::Duration::from_micros(50));
+                        }
+                        continue;
+                    }
+                    let morsel = match source.next_morsel() {
+                        Ok(Some(morsel)) => morsel,
+                        Ok(None) => return,
+                        Err(error) => {
+                            stop.store(true, Ordering::Relaxed);
+                            let _ = tx.send(Err(error));
+                            return;
+                        }
+                    };
+                    ahead.fetch_add(1, Ordering::AcqRel);
+                    if morsel % CHECK_DEADLINE_EVERY as u64 == 0
+                        && let Err(error) = cx.check_deadline()
+                    {
+                        stop.store(true, Ordering::Relaxed);
+                        let _ = tx.send(Err(error));
+                        return;
+                    }
+                    let now = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+                    peak.fetch_max(now, Ordering::Relaxed);
+                    let mut partials = Vec::new();
+                    let mut declined = false;
+                    let decoded = source.decode(morsel, &mut |chunk| {
+                        if declined {
+                            return Ok(());
+                        }
+                        match flow(cx, steps, sink, &chunk) {
+                            Ok(Some(mut folded)) => {
+                                partials.append(&mut folded);
+                                Ok(())
+                            }
+                            Ok(None) => {
+                                declined = true;
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    });
+                    in_flight.fetch_sub(1, Ordering::Relaxed);
+                    let folded = decoded.map(|()| (!declined).then_some(partials));
+                    if declined || folded.is_err() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    // Hand over every morsel that is now next in order.
+                    let mut order = reorder.lock().unwrap_or_else(|e| e.into_inner());
+                    order.ready.insert(morsel, folded);
+                    loop {
+                        let next = order.next;
+                        let Some(item) = order.ready.remove(&next) else {
+                            break;
+                        };
+                        order.next += 1;
+                        if tx.send(item).is_err() {
+                            stop.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                    // Give the consumer's pool work a turn between morsels.
+                    let _ = rayon::yield_now();
+                }
+            });
+        });
+        let mut result: Result<bool> = Ok(true);
+        for item in rx.iter() {
+            ahead.fetch_sub(1, Ordering::AcqRel);
+            match item {
+                Ok(Some(chunks)) => {
+                    for chunk in chunks {
+                        if let Err(error) = consume(chunk) {
+                            result = Err(error);
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => result = Ok(false),
+                Err(error) => result = Err(error),
+            }
+            if !matches!(result, Ok(true)) {
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+        // Workers still running stop at their next claim; dropping the
+        // receiver makes their sends fail instead of queueing.
+        drop(rx);
+        producer
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        result
+    });
+    if source.reports_io() {
+        let mut io = source.io();
+        io.in_flight_peak = peak.load(Ordering::Relaxed);
+        cx.db.record_scan(source.label(), io);
+    }
+    outcome
+}
+
 /// The morsels one source chunk becomes after the operators above it: the chunk
 /// itself plus whatever a probe adds.
 fn morsels(cx: &Cx, steps: &[Step<'_>], chunk: &DataChunk) -> Result<Vec<Morsel>> {

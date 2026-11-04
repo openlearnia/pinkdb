@@ -8029,10 +8029,13 @@ mod tests {
         db.sync_pending_load().unwrap();
     }
 
+    /// Create and fill `table` on the materialized path (inside a
+    /// transaction a `CREATE TABLE … AS` never streams), so a test can write
+    /// its pending groups explicitly.
     fn fill(db: &mut PinkDb, table: &str, rows: usize) {
         db.execute(&format!(
-            "CREATE TABLE {table} AS SELECT i AS a, 'v' || (i % 977) AS v, i * 0.5 AS d \
-             FROM range({rows}) t(i);"
+            "BEGIN; CREATE TABLE {table} AS SELECT i AS a, 'v' || (i % 977) AS v, i * 0.5 AS d \
+             FROM range({rows}) t(i); COMMIT;"
         ))
         .unwrap();
     }
@@ -8180,6 +8183,44 @@ mod tests {
         assert!(back.execute("SELECT * FROM gone;").is_err());
         drop(back);
         cleanup(&p);
+    }
+
+    /// The streaming load end to end: an autocommit `CREATE TABLE … AS`
+    /// writes its row groups while it runs, and its first checkpoint is
+    /// byte-identical to the same statement's materialized path (inside a
+    /// transaction, which never streams).
+    #[test]
+    fn a_streamed_ctas_checkpoints_like_the_materialized_one() {
+        let plain = tmp_ckpt("ctas_plain");
+        let streamed = tmp_ckpt("ctas_streamed");
+        let ctas = "CREATE TABLE t AS SELECT i AS a, 'v' || (i % 977) AS v, i * 0.5 AS d \
+                    FROM range(300000) t(i);";
+        let mut a = durable(&plain);
+        a.execute(&format!("BEGIN; {ctas} COMMIT;")).unwrap();
+        assert_eq!(crate::persist::pending_load_state(&a), None);
+        a.checkpoint().unwrap();
+        let mut b = durable(&streamed);
+        b.execute(ctas).unwrap();
+        assert_eq!(
+            crate::persist::pending_load_state(&b),
+            Some(true),
+            "the autocommit CTAS must stream into a staging file"
+        );
+        assert_eq!(ints(&mut b, "SELECT sum(a) FROM t;"), vec![44_999_850_000]);
+        b.checkpoint().unwrap();
+        assert_eq!(crate::persist::last_first_image_staged(), Some(true));
+        assert_eq!(
+            std::fs::read(&*plain).unwrap(),
+            std::fs::read(&*streamed).unwrap(),
+            "a streamed CTAS must checkpoint to the materialized bytes"
+        );
+        drop(b);
+        let mut back = durable(&streamed);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM t;"), vec![300_000]);
+        drop(back);
+        drop(a);
+        cleanup(&plain);
+        cleanup(&streamed);
     }
 
     /// The image witness across two handles (two leases, as two processes):

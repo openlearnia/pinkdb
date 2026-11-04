@@ -5949,13 +5949,16 @@ impl PendingLoad {
         first: usize,
         last: usize,
     ) -> Option<(usize, &PendingGroup)> {
-        let (i, group) = self.groups.iter().enumerate().find(|(_, g)| {
+        // A table may have been loaded more than once since the checkpoint
+        // (a replaced table, or groups written again): the one it names wins.
+        self.groups.iter().enumerate().find(|(_, g)| {
             g.first == first
+                && g.dir.chunk_rows.len() == last - first
                 && g.table.eq_ignore_ascii_case(name)
                 && g.schema.eq_ignore_ascii_case(ns.schema())
                 && g.db.eq_ignore_ascii_case(ns.db())
-        })?;
-        (group.dir.chunk_rows.len() == last - first && group.still_named(t)).then_some((i, group))
+                && g.still_named(t)
+        })
     }
 }
 
@@ -6087,6 +6090,26 @@ impl PinkDb {
             ));
         }
         let t = self.table_in(ns, name)?;
+        self.write_pending_group_of(target, ns, name, t, first, last)
+    }
+
+    /// [`PinkDb::write_pending_group`] for a table that is not (yet) in the
+    /// catalog: a streamed `CREATE TABLE … AS` builds its table off the
+    /// catalog and adds it under `ns.name` once every row is in.
+    pub(crate) fn write_pending_group_of(
+        &self,
+        target: &std::path::Path,
+        ns: &crate::storage::SchemaPath,
+        name: &str,
+        t: &DataTable,
+        first: usize,
+        last: usize,
+    ) -> Result<()> {
+        if self.encryption_key.is_some() {
+            return Err(PinkDbError::Execution(
+                "an encrypted store cannot stream a load into its file".to_string(),
+            ));
+        }
         let group = encode_row_group(ns, name, t, first, last, true)?;
         let mut guard = self.pending_load.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {

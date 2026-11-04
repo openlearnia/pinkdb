@@ -1498,6 +1498,14 @@ impl Connection {
             budget.set_collect_external_calls(
                 shared.is_durable() && crate::plan::writes_tables(&plan),
             );
+            // The streaming load (see `PinkDb::execute`): a `CREATE TABLE …
+            // AS` under the lease on a plaintext store file.
+            if lease.is_some()
+                && shared.encryption_key.is_none()
+                && matches!(plan, crate::plan::LogicalPlan::CreateTableAs { .. })
+            {
+                budget.set_stream_load_target(shared.durable_path());
+            }
             // Wave 83: an autocommit CALL may COMMIT/ROLLBACK in its body.
             shared.standalone_call = true;
             shared.begin_volatile_statement(&plan)?;

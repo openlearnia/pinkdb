@@ -524,6 +524,17 @@ impl PinkDb {
                     }
                     None => (plan, dynamic_functions_used),
                 };
+                // The streaming load: a `CREATE TABLE … AS` that runs under
+                // the lease (no other process may checkpoint over the row
+                // groups it writes ahead of the checkpoint) on a plaintext
+                // store file.
+                if lease.is_some()
+                    && !self.replaying
+                    && self.encryption_key.is_none()
+                    && matches!(plan, plan::LogicalPlan::CreateTableAs { .. })
+                {
+                    budget.set_stream_load_target(self.durable_path());
+                }
                 // Wave 83: a `CALL` outside a transaction may `COMMIT`/`ROLLBACK`
                 // in its body (the flag never outlives this statement).
                 self.standalone_call = !self.in_transaction();
