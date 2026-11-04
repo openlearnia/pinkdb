@@ -6002,12 +6002,20 @@ pub(crate) fn staging_path(target: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Whether two handles name the same file (not just the same path).
+#[cfg(unix)]
 fn same_file(a: &std::fs::File, b: &std::fs::File) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (a.metadata(), b.metadata()) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
     }
+}
+
+/// Without a file identity, nothing is known to be the same file: pending
+/// groups are then copied like any stored chunk instead of referenced.
+#[cfg(not(unix))]
+fn same_file(_: &std::fs::File, _: &std::fs::File) -> bool {
+    false
 }
 
 /// A first checkpoint that publishes a load's staging file as the image: every
