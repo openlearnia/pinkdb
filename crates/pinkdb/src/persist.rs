@@ -1592,10 +1592,10 @@ fn varchar_offsets_fit(total: u64) -> bool {
 fn dict_and_codes<T: AsRef<str>>(strs: &[T]) -> (Vec<&str>, Vec<u32>) {
     let mut dict: Vec<&str> = Vec::new();
     let mut index: HashMap<&str, u32, foldhash::fast::FixedState> =
-        HashMap::with_capacity_and_hasher(
-            strs.len().min(256),
-            foldhash::fast::FixedState::default(),
-        );
+        // Sized for a chunk of distinct strings: a growing table rehashes
+        // every key it holds, and the first-occurrence order never depends on
+        // the capacity.
+        HashMap::with_capacity_and_hasher(strs.len(), foldhash::fast::FixedState::default());
     let mut codes = Vec::with_capacity(strs.len());
     for s in strs {
         let s = s.as_ref();
@@ -2357,17 +2357,23 @@ fn encode_varchar_chunk(strs: &[&str]) -> (u8, Vec<u8>) {
 /// page writer builds it once for the encoding and the page statistics).
 fn encode_varchar_chunk_with(strs: &[&str], dict: &[&str], codes: &[u32]) -> (u8, Vec<u8>) {
     let n = strs.len();
+    // Equal strings share a code, so runs are counted on the codes: one
+    // integer compare per row instead of a string compare.
+    let lens: Vec<usize> = dict.iter().map(|s| s.len()).collect();
     let mut total_bytes = 0usize;
     let mut run_bytes = 0usize;
     let mut runs = 0usize;
-    for (i, s) in strs.iter().enumerate() {
-        total_bytes += s.len();
-        if i == 0 || strs[i - 1] != *s {
+    let mut prev = u32::MAX;
+    for &c in codes {
+        let len = lens[c as usize];
+        total_bytes += len;
+        if c != prev {
             runs += 1;
-            run_bytes += s.len();
+            run_bytes += len;
+            prev = c;
         }
     }
-    let dict_bytes: usize = dict.iter().map(|s| s.len()).sum();
+    let dict_bytes: usize = lens.iter().sum();
 
     let plain = 4 + 4 * (n + 1) + total_bytes;
     let dict_size = 4 + 4 + 4 * (dict.len() + 1) + dict_bytes + 4 * n;
