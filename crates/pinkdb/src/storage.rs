@@ -916,17 +916,29 @@ impl std::fmt::Debug for ChunkHandle {
 /// The cache of decoded, clean, lazily backed chunks in decode order, oldest
 /// first: the eviction candidates, weakly held so a dropped column leaves no
 /// trace (and a stale entry is pruned on the next pass).
-static DECODED: Mutex<Vec<std::sync::Weak<ChunkHandle>>> = Mutex::new(Vec::new());
+static DECODED: Mutex<std::collections::VecDeque<std::sync::Weak<ChunkHandle>>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// Entries one eviction pass may look at. A materialized reader (a join side,
+/// a semi join's filtered table) pins every chunk it holds for the statement,
+/// so with a small cache most of the LRU can be pinned at once; a pass that
+/// walked all of it on every failing reservation was quadratic in the table's
+/// chunks (TPC-H Q4 at `decoded_cache_limit = '32MB'`: 2,838 entries walked
+/// per decoded chunk at SF1). A bounded pass gives up quickly, and the chunk
+/// is decoded for its reader alone.
+const EVICT_PROBES: usize = 64;
 
 /// Note a just-decoded chunk as a candidate, after the currently oldest.
 fn register(handle: &std::sync::Weak<ChunkHandle>) {
     let mut lru = DECODED.lock().unwrap_or_else(|e| e.into_inner());
-    lru.push(handle.clone());
+    lru.push_back(handle.clone());
 }
 
 /// The pool's evictor (see [`crate::memory::set_evictor`]): drop decoded
 /// chunks that are clean, still backed by the image and unpinned, oldest
-/// first, until `want` bytes are back or nothing is left to drop.
+/// first, until `want` bytes are back, nothing is left to drop, or
+/// [`EVICT_PROBES`] entries were looked at. A pinned entry moves to the back:
+/// it is in use, so it is the most recently used.
 ///
 /// This runs on the thread whose reservation is failing, so it never waits for
 /// a handle: another thread may hold one while it reserves (a chunk growing
@@ -934,27 +946,27 @@ fn register(handle: &std::sync::Weak<ChunkHandle>) {
 /// threads against each other. `try_lock` plus the retry in
 /// [`crate::memory::acquire`] is what makes the eviction best-effort instead.
 fn evict_decoded(want: usize) -> usize {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let trace = *TRACE.get_or_init(|| std::env::var_os("PINKDB_EVICT_TRACE").is_some());
     let mut lru = DECODED.lock().unwrap_or_else(|e| e.into_inner());
     let mut freed = 0;
-    let mut i = 0;
-    while i < lru.len() && freed < want {
-        let Some(handle) = lru[i].upgrade() else {
-            lru.remove(i);
+    let mut probes = 0;
+    while freed < want && probes < EVICT_PROBES {
+        let Some(weak) = lru.pop_front() else {
+            break;
+        };
+        let Some(handle) = weak.upgrade() else {
             continue;
         };
+        probes += 1;
         let result = handle.evict();
-        if std::env::var_os("PINKDB_EVICT_TRACE").is_some() {
+        if trace {
             eprintln!("EVICT lru={} used={}", lru.len(), crate::memory::used());
         }
         match result {
-            Evict::Freed(bytes) => {
-                freed += bytes;
-                lru.remove(i);
-            }
-            Evict::Busy => i += 1,
-            Evict::Never => {
-                lru.remove(i);
-            }
+            Evict::Freed(bytes) => freed += bytes,
+            Evict::Busy => lru.push_back(weak),
+            Evict::Never => {}
         }
     }
     freed
