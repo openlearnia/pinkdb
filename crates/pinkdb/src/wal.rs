@@ -27,9 +27,10 @@
 //! an empty memo. Version 6 (wave 132b) appends the persistent-secret
 //! snapshot. Version 7 (wave 112d) adds the optional binary appender-chunk
 //! section, so a flush of materialized rows commits without rendering and
-//! re-parsing SQL text. Version 2/3 WALs are accepted and upgraded in place
+//! re-parsing SQL text; version 8 writes that section column by column and
+//! replays it as the flush's own `INSERT … SELECT`. Version 2/3 WALs are accepted and upgraded in place
 //! under the write lease (records are re-encoded with unknown sets and an
-//! empty memo); older builds refuse version 7 cleanly through the
+//! empty memo); older builds refuse version 8 cleanly through the
 //! `BadVersion` path before reading any record. Encrypted **WAL** containers are version 3; encrypted checkpoints
 //! stay at container version 2, so `.pink` bytes are unchanged by this wave.
 //!
@@ -226,10 +227,11 @@ pub const WAL_MAGIC: &[u8; 8] = b"PINKWAL1";
 /// 132b) appends the record's persistent-secret section (see
 /// [`SECRETS_MARKER`]) when the record changed the store's secrets; version 7
 /// (wave 112d) adds the optional binary appender-chunk section (see
-/// [`CHUNKS_MARKER`]). Every durable open rewrites a v2/v3 file in place
-/// under the write lease; an older build refuses a v7 file with a clean
+/// [`CHUNKS_MARKER`]); version 8 writes that section column by column (see
+/// [`encode_chunks`]). Every durable open rewrites a v2/v3 file in place
+/// under the write lease; an older build refuses a v8 file with a clean
 /// version error before it reads any record.
-pub const WAL_VERSION: u32 = 7;
+pub const WAL_VERSION: u32 = 8;
 /// An engine WAL payload detached from a local WAL file. Object-backed
 /// catalog stores use this framing so each immutable object is one logical
 /// WAL record without inheriting a local file's generation, LSN, or nonce.
@@ -1748,7 +1750,7 @@ impl ReplayMemo {
 pub(crate) struct Record {
     lsn: u64,
     stmts: Vec<String>,
-    /// Materialized appender rows (payload v7): the flush's data, kept out
+    /// Materialized appender rows (payload v7, column-wise since v8): the flush's data, kept out
     /// of the statement text so a large append does not pay SQL rendering
     /// and re-parsing on every durable commit.
     chunks: Vec<WalChunk>,
@@ -1763,20 +1765,22 @@ pub(crate) struct Record {
     secrets: Option<Vec<crate::secret::Secret>>,
 }
 
-/// The materialized rows of one appender flush, as stored in a WAL record.
-/// Values carry their own type tags, so replay needs no schema snapshot: the
-/// generated `INSERT` coerces exactly like any other insert.
+/// The materialized rows of one appender flush, as stored in a WAL record:
+/// the flush's own chunks, shared with the plan rather than copied, and
+/// written column by column (see [`encode_chunks`]). Replay runs the same
+/// `INSERT … SELECT` over them, so it coerces and checks exactly like the
+/// original flush.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WalChunk {
     ns: crate::storage::SchemaPath,
     table: String,
-    rows: Vec<Vec<Value>>,
+    chunks: Vec<crate::vector::DataChunk>,
 }
 
 impl WalChunk {
-    /// The rows of an appender's `INSERT … SELECT` over materialized chunks.
-    /// Only that plan shape is logged binary; every other statement keeps its
-    /// SQL text.
+    /// The chunks of an appender's `INSERT … SELECT` over materialized
+    /// chunks. Only that plan shape is logged binary; every other statement
+    /// keeps its SQL text.
     pub(crate) fn from_plan(plan: &crate::plan::LogicalPlan) -> Option<Self> {
         let crate::plan::LogicalPlan::InsertSelect {
             ns: Some(ns),
@@ -1790,16 +1794,10 @@ impl WalChunk {
         let crate::plan::LogicalPlan::Chunks { chunks } = query.as_ref() else {
             return None;
         };
-        let mut rows = Vec::with_capacity(chunks.iter().map(|c| c.num_rows).sum());
-        for chunk in chunks {
-            for row in 0..chunk.num_rows {
-                rows.push(chunk.columns.iter().map(|v| v.get(row)).collect());
-            }
-        }
         Some(Self {
             ns: ns.clone(),
             table: table.clone(),
-            rows,
+            chunks: chunks.clone(),
         })
     }
 }
@@ -3259,7 +3257,7 @@ const SETS_UNKNOWN: u32 = u32::MAX;
 /// the section refuses the record (its first "statement length" overruns the
 /// payload), never misreads it.
 const SECRETS_MARKER: u32 = 0x5343_5254;
-/// Starts the optional chunk section (payload v7). It sits where the replay
+/// Starts the optional chunk section (payload v7; column-wise since v8). It sits where the replay
 /// memo's call count would be; a memo count that large cannot fit a record,
 /// so the two are unambiguous.
 const CHUNKS_MARKER: u32 = 0x4348_4E4B;
@@ -3546,36 +3544,325 @@ fn encode_value(out: &mut Vec<u8>, value: &crate::types::Value) -> Result<()> {
     Ok(())
 }
 
+/// Column payload kinds of the chunk section. A kind names the vector's
+/// storage, so decoding rebuilds the same payload without a schema.
+const COL_BOOLEAN: u8 = 0;
+const COL_INT32: u8 = 1;
+const COL_INT64: u8 = 2;
+const COL_FLOAT64: u8 = 3;
+const COL_VARCHAR: u8 = 4;
+const COL_DATE32: u8 = 5;
+const COL_TIMESTAMP: u8 = 6;
+const COL_DECIMAL128: u8 = 7;
+const COL_DECIMAL64: u8 = 8;
+const COL_INTERVAL: u8 = 9;
+const COL_UUID: u8 = 10;
+const COL_INT128: u8 = 11;
+const COL_UINT128: u8 = 12;
+/// VARIANT and ARRAY: the type, then one tagged value per row.
+const COL_VALUES: u8 = 13;
+
+fn chunk_len_u32(n: usize, what: &str) -> Result<u32> {
+    u32::try_from(n)
+        .map_err(|_| PinkDbError::Execution(format!("too many {what} in one WAL chunk")))
+}
+
+/// The appender chunk section (payload v8), column by column:
+/// `u32 CHUNKS_MARKER | u32 count | count × (db | schema | table |
+/// u32 n_cols | u32 n_chunks | n_chunks × (u32 rows | n_cols × column))`,
+/// where a column is `u8 kind | [kind params] | validity words |
+/// payload`. Fixed-width payloads are their little-endian values back to
+/// back; VARCHAR is `rows × u32 length` then the bytes; VARIANT and ARRAY
+/// fall back to one tagged value per row. Writing a column is a copy of its
+/// buffers, not a value per cell.
 fn encode_chunks(chunks: &[WalChunk]) -> Result<Vec<u8>> {
+    use crate::vector::VectorData;
     if chunks.is_empty() {
         return Ok(Vec::new());
     }
     let count = u32::try_from(chunks.len())
         .map_err(|_| PinkDbError::Execution("too many chunks in one WAL record".to_string()))?;
-    let mut out = Vec::new();
+    let bytes: usize = chunks
+        .iter()
+        .flat_map(|c| &c.chunks)
+        .flat_map(|c| &c.columns)
+        .map(|v| v.len() * 16 + 64)
+        .sum();
+    let mut out = Vec::with_capacity(bytes);
     out.extend_from_slice(&CHUNKS_MARKER.to_le_bytes());
     out.extend_from_slice(&count.to_le_bytes());
     for chunk in chunks {
         encode_bytes(&mut out, chunk.ns.db().as_bytes())?;
         encode_bytes(&mut out, chunk.ns.schema().as_bytes())?;
         encode_bytes(&mut out, chunk.table.as_bytes())?;
-        let columns = chunk.rows.first().map(|r| r.len()).unwrap_or(0);
-        let rows = u32::try_from(chunk.rows.len())
-            .map_err(|_| PinkDbError::Execution("too many rows in one WAL chunk".to_string()))?;
-        out.extend_from_slice(&(columns as u32).to_le_bytes());
-        out.extend_from_slice(&rows.to_le_bytes());
-        for row in &chunk.rows {
-            if row.len() != columns {
+        let width = chunk.chunks.first().map_or(0, |c| c.columns.len());
+        out.extend_from_slice(&chunk_len_u32(width, "columns")?.to_le_bytes());
+        out.extend_from_slice(&chunk_len_u32(chunk.chunks.len(), "chunks")?.to_le_bytes());
+        for data in &chunk.chunks {
+            if data.columns.len() != width {
                 return Err(PinkDbError::Execution(
-                    "a WAL chunk row has the wrong number of columns".to_string(),
+                    "a WAL chunk has the wrong number of columns".to_string(),
                 ));
             }
-            for value in row {
-                encode_value(&mut out, value)?;
+            let rows = data.num_rows;
+            out.extend_from_slice(&chunk_len_u32(rows, "rows")?.to_le_bytes());
+            for column in &data.columns {
+                if column.len() != rows {
+                    return Err(PinkDbError::Execution(
+                        "a WAL chunk column has the wrong number of rows".to_string(),
+                    ));
+                }
+                let header = |out: &mut Vec<u8>, kind: u8| {
+                    out.push(kind);
+                };
+                let validity = |out: &mut Vec<u8>| {
+                    let words = column.validity();
+                    for i in 0..rows.div_ceil(64) {
+                        out.extend_from_slice(&words.get(i).copied().unwrap_or(0).to_le_bytes());
+                    }
+                };
+                match column.data() {
+                    VectorData::Boolean(v) => {
+                        header(&mut out, COL_BOOLEAN);
+                        validity(&mut out);
+                        out.extend(v.iter().map(|&b| u8::from(b)));
+                    }
+                    VectorData::Int32(v) | VectorData::Date32(v) => {
+                        let kind = if matches!(column.data(), VectorData::Int32(_)) {
+                            COL_INT32
+                        } else {
+                            COL_DATE32
+                        };
+                        header(&mut out, kind);
+                        validity(&mut out);
+                        for x in v {
+                            out.extend_from_slice(&x.to_le_bytes());
+                        }
+                    }
+                    VectorData::Int64(v) | VectorData::TimestampMicros(v) => {
+                        let kind = if matches!(column.data(), VectorData::Int64(_)) {
+                            COL_INT64
+                        } else {
+                            COL_TIMESTAMP
+                        };
+                        header(&mut out, kind);
+                        validity(&mut out);
+                        for x in v {
+                            out.extend_from_slice(&x.to_le_bytes());
+                        }
+                    }
+                    VectorData::Float64(v) => {
+                        header(&mut out, COL_FLOAT64);
+                        validity(&mut out);
+                        for x in v {
+                            out.extend_from_slice(&x.to_bits().to_le_bytes());
+                        }
+                    }
+                    VectorData::VarChar(v) => {
+                        header(&mut out, COL_VARCHAR);
+                        validity(&mut out);
+                        for i in 0..rows {
+                            let len = chunk_len_u32(v.get(i).len(), "string bytes")?;
+                            out.extend_from_slice(&len.to_le_bytes());
+                        }
+                        for i in 0..rows {
+                            out.extend_from_slice(v.get(i).as_bytes());
+                        }
+                    }
+                    VectorData::Decimal {
+                        values,
+                        precision,
+                        scale,
+                    } => {
+                        header(&mut out, COL_DECIMAL128);
+                        out.extend_from_slice(&[*precision, *scale]);
+                        validity(&mut out);
+                        for x in values {
+                            out.extend_from_slice(&x.to_le_bytes());
+                        }
+                    }
+                    VectorData::Decimal64 {
+                        values,
+                        precision,
+                        scale,
+                    } => {
+                        header(&mut out, COL_DECIMAL64);
+                        out.extend_from_slice(&[*precision, *scale]);
+                        validity(&mut out);
+                        for x in values {
+                            out.extend_from_slice(&x.to_le_bytes());
+                        }
+                    }
+                    VectorData::Interval(v) => {
+                        header(&mut out, COL_INTERVAL);
+                        validity(&mut out);
+                        for x in v {
+                            out.extend_from_slice(&x.months.to_le_bytes());
+                            out.extend_from_slice(&x.days.to_le_bytes());
+                            out.extend_from_slice(&x.micros.to_le_bytes());
+                        }
+                    }
+                    VectorData::Uuid(v) | VectorData::UInt128(v) => {
+                        let kind = if matches!(column.data(), VectorData::Uuid(_)) {
+                            COL_UUID
+                        } else {
+                            COL_UINT128
+                        };
+                        header(&mut out, kind);
+                        validity(&mut out);
+                        for x in v {
+                            out.extend_from_slice(&x.to_le_bytes());
+                        }
+                    }
+                    VectorData::Int128(v) => {
+                        header(&mut out, COL_INT128);
+                        validity(&mut out);
+                        for x in v {
+                            out.extend_from_slice(&x.to_le_bytes());
+                        }
+                    }
+                    VectorData::Variant(_) | VectorData::Array { .. } => {
+                        header(&mut out, COL_VALUES);
+                        encode_dtype(&mut out, column.dtype());
+                        for i in 0..rows {
+                            encode_value(&mut out, &column.get(i))?;
+                        }
+                    }
+                }
             }
         }
     }
     Ok(out)
+}
+
+/// A VARIANT or ARRAY column's type, for the [`COL_VALUES`] fallback.
+fn encode_dtype(out: &mut Vec<u8>, dtype: crate::types::DataType) {
+    use crate::types::{ArrayElem, DataType};
+    match dtype {
+        DataType::Array { elem, len } => {
+            out.push(1);
+            out.push(match elem {
+                ArrayElem::Integer => 0,
+                ArrayElem::Bigint => 1,
+                ArrayElem::Float => 2,
+                ArrayElem::Double => 3,
+            });
+            out.extend_from_slice(&len.to_le_bytes());
+        }
+        _ => out.push(0),
+    }
+}
+
+fn decode_dtype(r: &mut Payload<'_>) -> std::result::Result<crate::types::DataType, String> {
+    use crate::types::{ArrayElem, DataType};
+    match r.u8()? {
+        0 => Ok(DataType::Variant),
+        1 => {
+            let elem = match r.u8()? {
+                0 => ArrayElem::Integer,
+                1 => ArrayElem::Bigint,
+                2 => ArrayElem::Float,
+                3 => ArrayElem::Double,
+                other => return Err(format!("unknown ARRAY element kind {other} in a WAL chunk")),
+            };
+            Ok(DataType::Array {
+                elem,
+                len: r.u32()?,
+            })
+        }
+        other => Err(format!("unknown value-column type {other} in a WAL chunk")),
+    }
+}
+
+/// `rows` fixed-width little-endian values of `N` bytes each.
+fn decode_fixed<const N: usize, T>(
+    r: &mut Payload<'_>,
+    rows: usize,
+    f: impl Fn([u8; N]) -> T,
+) -> std::result::Result<Vec<T>, String> {
+    let bytes = r.take(rows.checked_mul(N).ok_or("implausible WAL chunk size")?)?;
+    Ok(bytes.as_chunks::<N>().0.iter().map(|b| f(*b)).collect())
+}
+
+fn decode_column(
+    r: &mut Payload<'_>,
+    rows: usize,
+) -> std::result::Result<crate::vector::Vector, String> {
+    use crate::vector::{Vector, VectorData};
+    let kind = r.u8()?;
+    if kind == COL_VALUES {
+        let dtype = decode_dtype(r)?;
+        let mut vector = Vector::with_capacity(dtype, rows);
+        for _ in 0..rows {
+            vector
+                .push_value(decode_value(r)?)
+                .map_err(|e| format!("WAL chunk value: {e}"))?;
+        }
+        return Ok(vector);
+    }
+    let params = if matches!(kind, COL_DECIMAL128 | COL_DECIMAL64) {
+        Some((r.u8()?, r.u8()?))
+    } else {
+        None
+    };
+    let validity = decode_fixed::<8, u64>(r, rows.div_ceil(64), u64::from_le_bytes)?;
+    let data = match kind {
+        COL_BOOLEAN => VectorData::Boolean(decode_fixed::<1, bool>(r, rows, |b| b[0] != 0)?),
+        COL_INT32 => VectorData::Int32(decode_fixed::<4, i32>(r, rows, i32::from_le_bytes)?),
+        COL_DATE32 => VectorData::Date32(decode_fixed::<4, i32>(r, rows, i32::from_le_bytes)?),
+        COL_INT64 => VectorData::Int64(decode_fixed::<8, i64>(r, rows, i64::from_le_bytes)?),
+        COL_TIMESTAMP => {
+            VectorData::TimestampMicros(decode_fixed::<8, i64>(r, rows, i64::from_le_bytes)?)
+        }
+        COL_FLOAT64 => VectorData::Float64(decode_fixed::<8, f64>(r, rows, |b| {
+            f64::from_bits(u64::from_le_bytes(b))
+        })?),
+        COL_VARCHAR => {
+            let lens = decode_fixed::<4, u32>(r, rows, u32::from_le_bytes)?;
+            let mut strings = crate::strings::StrVec::new();
+            for len in lens {
+                let bytes = r.take(len as usize)?;
+                strings.push(
+                    std::str::from_utf8(bytes)
+                        .map_err(|_| "a WAL chunk string is not UTF-8".to_string())?,
+                );
+            }
+            VectorData::VarChar(strings)
+        }
+        COL_DECIMAL128 => {
+            let (precision, scale) = params.expect("decimal params");
+            VectorData::Decimal {
+                values: decode_fixed::<16, i128>(r, rows, i128::from_le_bytes)?,
+                precision,
+                scale,
+            }
+        }
+        COL_DECIMAL64 => {
+            let (precision, scale) = params.expect("decimal params");
+            VectorData::Decimal64 {
+                values: decode_fixed::<8, i64>(r, rows, i64::from_le_bytes)?,
+                precision,
+                scale,
+            }
+        }
+        COL_INTERVAL => {
+            VectorData::Interval(decode_fixed::<16, crate::types::Interval>(r, rows, |b| {
+                crate::types::Interval {
+                    months: i32::from_le_bytes(b[0..4].try_into().expect("4 bytes")),
+                    days: i32::from_le_bytes(b[4..8].try_into().expect("4 bytes")),
+                    micros: i64::from_le_bytes(b[8..16].try_into().expect("8 bytes")),
+                }
+            })?)
+        }
+        COL_UUID => VectorData::Uuid(decode_fixed::<16, u128>(r, rows, u128::from_le_bytes)?),
+        COL_INT128 => VectorData::Int128(decode_fixed::<16, i128>(r, rows, i128::from_le_bytes)?),
+        COL_UINT128 => VectorData::UInt128(decode_fixed::<16, u128>(r, rows, u128::from_le_bytes)?),
+        other => return Err(format!("unknown WAL chunk column kind {other}")),
+    };
+    if !data.decimal_width_ok() {
+        return Err("a WAL chunk DECIMAL has the wrong width for its precision".to_string());
+    }
+    Ok(Vector::from_parts(data, validity, rows))
 }
 
 fn decode_chunks(
@@ -3601,23 +3888,27 @@ fn decode_chunks(
         let table = std::str::from_utf8(r.bytes()?)
             .map_err(|_| "chunk table is not UTF-8".to_string())?
             .to_string();
-        let columns = r.u32()? as usize;
-        let rows = r.u32()? as usize;
-        if rows.checked_mul(columns).is_none_or(|n| n > payload.len()) {
+        let width = r.u32()? as usize;
+        let n_chunks = r.u32()? as usize;
+        if width > r.remaining() || n_chunks > r.remaining() {
             return Err("implausible chunk dimensions".to_string());
         }
-        let mut values = Vec::with_capacity(rows);
-        for _ in 0..rows {
-            let mut row = Vec::with_capacity(columns);
-            for _ in 0..columns {
-                row.push(decode_value(&mut r)?);
+        let mut chunks = Vec::with_capacity(n_chunks);
+        for _ in 0..n_chunks {
+            let rows = r.u32()? as usize;
+            if rows > r.remaining() {
+                return Err("implausible chunk row count".to_string());
             }
-            values.push(row);
+            let mut columns = Vec::with_capacity(width);
+            for _ in 0..width {
+                columns.push(std::sync::Arc::new(decode_column(&mut r, rows)?));
+            }
+            chunks.push(crate::vector::DataChunk::projected(columns, rows));
         }
         out.push(WalChunk {
             ns: crate::storage::SchemaPath::new(db, schema),
             table,
-            rows: values,
+            chunks,
         });
     }
     Ok((out, r.pos))
@@ -4255,7 +4546,7 @@ fn wal_header_invalid(path: &Path) -> Result<bool> {
     match parse_wal_header(data) {
         Ok(_) => Ok(false),
         Err(e) => {
-            if header_torn(data.len(), &e) {
+            if header_torn(data.len(), &e) || older_and_empty(data) {
                 Ok(true)
             } else {
                 Err(PinkDbError::Execution(header_error(path, &e)))
@@ -4347,6 +4638,9 @@ fn scan_wal(
     refuse_container(path, &data)?;
     let mut header = match parse_wal_header(&data) {
         Ok(h) => h,
+        Err(_) if older_and_empty(&data) => {
+            return created(recreate_gen, fresh_cipher(recreate_gen)?);
+        }
         Err(e) if header_torn(data.len(), &e) => {
             // A torn creation (crash while creating/recreating the WAL): no
             // record can have been acknowledged yet, so the file is
@@ -4775,6 +5069,12 @@ fn header_error(path: &Path, e: &HeaderError) -> String {
         HeaderError::BadMagic => {
             format!("{} is not a pinkdb WAL file (bad magic)", path.display())
         }
+        HeaderError::BadVersion(v) if *v < WAL_VERSION => format!(
+            "{}: WAL format version {v} is not supported (want {WAL_VERSION}): an older \
+             pinkdb wrote records here that this build cannot replay. Open the store with \
+             that version and run CHECKPOINT (it empties the WAL), or regenerate the store",
+            path.display()
+        ),
         HeaderError::BadVersion(v) => {
             format!("WAL format version {v} is not supported (want {WAL_VERSION})")
         }
@@ -4798,6 +5098,20 @@ fn header_error(path: &Path, e: &HeaderError) -> String {
             format!("{}: {what}", path.display())
         }
     }
+}
+
+/// A WAL an older build created in the current header layout (formats 4 up
+/// to the current one) and never wrote a record to: one verified header and
+/// nothing after it, so there is nothing to replay. It is recreated in the
+/// current format like a torn creation. One that holds records is refused
+/// with what to do (see [`header_error`]).
+fn older_and_empty(data: &[u8]) -> bool {
+    if data.len() != HEADER_LEN || &data[..8] != WAL_MAGIC {
+        return false;
+    }
+    let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
+    let crc = u32::from_le_bytes(data[36..40].try_into().expect("4 bytes"));
+    (4..WAL_VERSION).contains(&version) && crc == crc32(&data[..36]) && data[88..96] == [0u8; 8]
 }
 
 /// May a failed header parse on a file of this length be treated as a torn
@@ -4894,7 +5208,7 @@ fn probe_wal(path: &Path, key: Option<&EncryptionKey>) -> Result<Option<WalProbe
                 has_records: !records.is_empty(),
             }))
         }
-        Err(e) if header_torn(data.len(), &e) => Ok(Some(WalProbe {
+        Err(e) if header_torn(data.len(), &e) || older_and_empty(&data) => Ok(Some(WalProbe {
             generation: None,
             has_records: false,
         })),
@@ -6478,30 +6792,27 @@ fn normalized_path(p: &Path) -> Option<PathBuf> {
 /// constraints, triggers, indexes and defaults behave exactly as they did
 /// when the chunk was flushed. Rendering happens only on replay; the commit
 /// itself wrote no SQL text.
+/// Replay an appender flush: the same `INSERT … SELECT` over its chunks,
+/// so coercion, constraints, defaults, triggers and indexes behave as they
+/// did when it committed, without rendering or parsing SQL.
 fn replay_chunk(db: &mut PinkDb, chunk: &WalChunk) -> Result<()> {
-    if chunk.rows.is_empty() {
+    if chunk.chunks.iter().all(|c| c.num_rows == 0) {
         return Ok(());
     }
-    let mut sql = String::new();
-    sql.push_str("INSERT INTO ");
-    sql.push_str(&chunk.ns.to_string());
-    sql.push('.');
-    sql.push_str(&crate::mv::quote_ident(&chunk.table));
-    sql.push_str(" VALUES ");
-    for (n, row) in chunk.rows.iter().enumerate() {
-        if n > 0 {
-            sql.push_str(", ");
-        }
-        sql.push('(');
-        for (i, value) in row.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&crate::prepared::value_literal(value)?);
-        }
-        sql.push(')');
-    }
-    db.execute(&sql)?;
+    let width = chunk.chunks.first().map_or(0, |c| c.columns.len());
+    let plan = crate::plan::LogicalPlan::InsertSelect {
+        ns: Some(chunk.ns.clone()),
+        table: chunk.table.clone(),
+        columns: None,
+        defaults: vec![None; width],
+        query: Box::new(crate::plan::LogicalPlan::Chunks {
+            chunks: chunk.chunks.clone(),
+        }),
+        conflict: None,
+        returning: None,
+    };
+    db.rebuild_stale_indexes();
+    crate::exec::run_with_budget(db, &plan, Arc::new(crate::exec::ExecBudget::new(None)))?;
     Ok(())
 }
 
@@ -6705,38 +7016,64 @@ mod tests {
 
     #[test]
     fn chunk_payload_round_trips_every_value() {
+        // Every vector storage the engine has, a NULL in every column, and a
+        // second chunk, written column by column and read back.
+        let db = crate::Database::new();
+        let mut c = db.connect();
+        let select = "SELECT true AS b, -7 AS i, -9223372036854775808::BIGINT AS l, \
+             -0.0::DOUBLE AS d, 'it''s' AS s, DATE '1970-01-01' AS dt, \
+             TIMESTAMP '1970-01-01 00:00:00.000001' AS ts, \
+             CAST('-123.45' AS DECIMAL(10,2)) AS d64, \
+             CAST('-123.45' AS DECIMAL(30,2)) AS d128, \
+             INTERVAL '1 month 2 days 00:00:00.000003' AS iv, \
+             '00000000-0000-0000-0000-00000000002a'::UUID AS u, \
+             '-170141183460469231731687303715884105728'::HUGEINT AS h, \
+             '340282366920938463463374607431768211455'::UHUGEINT AS uh, \
+             CAST('{\"a\":1}' AS VARIANT) AS v, [1.5, 2.5]::DOUBLE[2] AS a";
+        let nulls = "SELECT NULL::BOOLEAN, NULL::INTEGER, NULL::BIGINT, NULL::DOUBLE, \
+             NULL::VARCHAR, NULL::DATE, NULL::TIMESTAMP, NULL::DECIMAL(10,2), \
+             NULL::DECIMAL(30,2), NULL::INTERVAL, NULL::UUID, NULL::HUGEINT, \
+             NULL::UHUGEINT, NULL::VARIANT, NULL::DOUBLE[2]";
+        let chunks_of = |c: &mut crate::Connection, sql: &str| match c
+            .execute_chunked(sql)
+            .unwrap()
+            .pop()
+            .unwrap()
+        {
+            crate::exec::ChunkedResult::Selected { chunks, .. } => chunks,
+            _ => panic!("expected chunks"),
+        };
+        let mut chunks = chunks_of(&mut c, &format!("{select} UNION ALL {nulls}"));
+        chunks.extend(chunks_of(&mut c, select));
         let chunk = WalChunk {
             ns: crate::storage::SchemaPath::new("main", "main"),
             table: "t".to_string(),
-            rows: vec![vec![
-                Value::Null,
-                Value::Boolean(true),
-                Value::Integer(-7),
-                Value::Bigint(i64::MIN),
-                Value::Double(-0.0),
-                Value::Varchar("it's".to_string()),
-                Value::Date(0),
-                Value::Timestamp(1),
-                Value::Interval {
-                    months: 1,
-                    days: 2,
-                    micros: 3,
-                },
-                Value::Hugeint(i128::MIN),
-                Value::Uhugeint(u128::MAX),
-                Value::Decimal {
-                    value: -12345,
-                    precision: 10,
-                    scale: 2,
-                },
-                Value::Uuid(42),
-            ]],
+            chunks,
         };
         let payload = encode_payload(&[], std::slice::from_ref(&chunk), None, None, &[]).unwrap();
-        let (stmts, chunks, sets, secrets, memo) = decode_payload(&payload).unwrap();
+        let (stmts, decoded, sets, secrets, memo) = decode_payload(&payload).unwrap();
         assert!(stmts.is_empty());
-        assert_eq!(chunks, vec![chunk]);
         assert!(sets.is_none() && secrets.is_none() && memo.is_empty());
+        let rows = |w: &WalChunk| -> Vec<Vec<Value>> {
+            w.chunks
+                .iter()
+                .flat_map(|c| {
+                    (0..c.num_rows).map(move |r| c.columns.iter().map(|v| v.get(r)).collect())
+                })
+                .collect()
+        };
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].table, "t");
+        let (want, got) = (rows(&chunk), rows(&decoded[0]));
+        assert_eq!(want.len(), 3);
+        assert_eq!(got, want);
+        for (a, b) in chunk.chunks[0]
+            .columns
+            .iter()
+            .zip(&decoded[0].chunks[0].columns)
+        {
+            assert_eq!(a.dtype(), b.dtype(), "storage type survives");
+        }
     }
 
     fn records_of(path: &Path) -> Vec<Record> {
@@ -7578,6 +7915,54 @@ mod tests {
         assert!(matches!(err, HeaderError::ContainerVersion(99)), "{err:?}");
         assert!(!header_torn(data.len(), &err), "must not be torn");
         assert!(header_error(Path::new("w"), &err).contains("99"));
+    }
+
+    /// A header-only WAL an older build left behind holds nothing to replay:
+    /// it is recreated in the current format and the store opens. One with
+    /// records is refused with what to do.
+    #[test]
+    fn an_older_header_only_wal_is_recreated() {
+        let p = tmp_ckpt("older_empty_wal");
+        {
+            let mut db = PinkDb::open_durable(p.to_str().unwrap()).unwrap();
+            db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (7); CHECKPOINT;")
+                .unwrap();
+        }
+        assert_eq!(wal_len(&p), HEADER_LEN as u64);
+        // Rewrite the header as the previous format, with a valid checksum.
+        let as_previous = |bytes: &mut Vec<u8>| {
+            bytes[8..12].copy_from_slice(&(WAL_VERSION - 1).to_le_bytes());
+            let crc = crc32(&bytes[..36]);
+            bytes[36..40].copy_from_slice(&crc.to_le_bytes());
+        };
+        let mut header = std::fs::read(wal_path(&p)).unwrap();
+        as_previous(&mut header);
+        std::fs::write(wal_path(&p), &header).unwrap();
+        {
+            let mut db = PinkDb::open_durable(p.to_str().unwrap()).unwrap();
+            assert_eq!(ints(&mut db, "SELECT a FROM t;"), vec![7]);
+            db.execute("INSERT INTO t VALUES (8);").unwrap();
+        }
+        let now = std::fs::read(wal_path(&p)).unwrap();
+        assert_eq!(
+            &now[8..12],
+            &WAL_VERSION.to_le_bytes(),
+            "rewritten as current"
+        );
+        let mut db = PinkDb::open_durable(p.to_str().unwrap()).unwrap();
+        assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![7, 8]);
+        drop(db);
+
+        // The previous format with a record after the header: refused, and
+        // the error says how to get out.
+        let mut with_record = now.clone();
+        as_previous(&mut with_record);
+        std::fs::write(wal_path(&p), &with_record).unwrap();
+        let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("an older pinkdb wrote records"), "{msg}");
+        assert!(msg.contains("run CHECKPOINT"), "{msg}");
+        cleanup(&p);
     }
 
     #[test]
@@ -9108,10 +9493,15 @@ mod tests {
         data.extend_from_slice(&crc32(&payload).to_le_bytes());
         data.extend_from_slice(&payload);
         // A binary appender chunk in the same crashed state.
+        let mut column = crate::vector::Vector::with_capacity(crate::types::DataType::Integer, 1);
+        column.push_value(Value::Integer(9)).unwrap();
         let chunk = WalChunk {
             ns: crate::storage::SchemaPath::new("main", "main"),
             table: "t".to_string(),
-            rows: vec![vec![Value::Integer(9)]],
+            chunks: vec![crate::vector::DataChunk::projected(
+                vec![std::sync::Arc::new(column)],
+                1,
+            )],
         };
         let payload = encode_payload(&[], &[chunk], None, None, &[]).unwrap();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());

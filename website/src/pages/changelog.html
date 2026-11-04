@@ -9,6 +9,14 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-11-04</h2>
+<h3>Wave 136 (step c-2) — the decoded cache lives inside <code>memory_limit</code> ✅</h3>
+<p>Decoded chunks are a cache, not a pin: they use whatever room <code>memory_limit</code> leaves free, and a query that needs the memory takes it from them.</p>
+<ul>
+<li><strong>One budget</strong>: clean decoded chunks and operator state share <code>memory_limit</code>, the way DuckDB's buffer pool lives inside <code>max_memory</code>. An operator reservation that does not fit evicts clean chunks in one batch before it fails; dirty chunks are never evicted. <code>SET decoded_cache_limit</code> caps the cache below that (a size, <code>0</code> for no cache, <code>-1</code>/<code>RESET</code> for the free room).</li>
+<li><strong>Speed</strong>: warm TPC-H SF1 against step c-1, interleaved: geomean 1.001 at the default limit, 0.999 at <code>memory_limit = '256MB'</code>.</li>
+<li><strong>Memory</strong>: TPC-H Q1 peaks at 656 MB at the default limit and 300 MB at <code>memory_limit = '256MB'</code> (973 MB at step b-4). A small limit costs speed: TPC-H SF1 takes 2.3× as long at 256 MB, because every scan decodes again; the decoder port that narrows that gap is the next step.</li>
+<li>The QuackLab chart server (16 clients × 10 rounds) is unchanged at 476–525 MB peak, 17 MB live after the load: its peak is per-statement working memory the allocator keeps, a separate item.</li>
+</ul>
 <h3>Wave 142 — DECIMAL up to 18 digits computes in 64 bits ✅</h3>
 <p>A <code>DECIMAL</code> of precision 18 or less is held as 64-bit integers in memory instead of 128-bit ones, as DuckDB does. Every TPC-H decimal qualifies. Results, result types and error messages are unchanged, and so are the on-disk format and what the C API, Arrow and Parquet hand out.</p>
 <ul>

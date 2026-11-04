@@ -59,6 +59,7 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         memory::reset_limit();
+        memory::reset_cache_limit();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -111,17 +112,20 @@ fn a_second_statement_evicts_the_first_tables_chunks() {
     let expected = range_sum(chunks * CHUNK_SIZE);
     // 30 BIGINT chunks are ~500 KB decoded: 900 KiB fits one table and the
     // chunks a statement decodes at once, not both tables.
-    memory::set_limit(700 * 1024);
-    let limit = memory::limit();
+    memory::set_cache_limit(700 * 1024);
+    let limit = memory::cache_limit();
 
     assert_eq!(int(&mut a, "SELECT sum(i) FROM a"), expected);
-    assert!(memory::used() > 0, "the decoded chunks are not charged");
-    assert!(memory::used() <= limit);
+    assert!(
+        memory::cache_used() > 0,
+        "the decoded chunks are not charged to the cache"
+    );
+    assert!(memory::cache_used() <= limit);
     let watched = Arc::downgrade(&first_chunk(&a, "a"));
     assert!(watched.upgrade().is_some(), "a's chunk is not decoded");
 
     assert_eq!(int(&mut b, "SELECT sum(i) FROM b"), expected);
-    assert!(memory::used() <= limit);
+    assert!(memory::cache_used() <= limit);
     assert!(
         watched.upgrade().is_none(),
         "b did not evict a's chunk, so 60 chunks fit in a 30-chunk limit"
@@ -129,7 +133,8 @@ fn a_second_statement_evicts_the_first_tables_chunks() {
 
     // Decoded again from the retained image, CRC and all.
     assert_eq!(int(&mut a, "SELECT sum(i) FROM a"), expected);
-    assert!(memory::used() <= limit);
+    assert!(memory::cache_used() <= limit);
+    memory::reset_cache_limit();
 }
 
 /// A reader holding payloads pins them: a failing reservation cannot evict
@@ -144,20 +149,20 @@ fn held_chunks_are_not_evicted() {
         .collect();
     assert!(held.iter().all(|v| v.len() == CHUNK_SIZE));
 
-    // A cache hit returns the charged payload, it does not charge again.
-    let used = memory::used();
+    // A cache hit returns the cached payload, it does not charge again.
+    let used = memory::cache_used();
     assert!(Arc::ptr_eq(&column.chunk(0).unwrap(), &held[0]));
-    assert_eq!(memory::used(), used, "a cache hit charged the pool again");
+    assert_eq!(
+        memory::cache_used(),
+        used,
+        "a cache hit charged the budget again"
+    );
 
     // One byte of headroom: a 1 KiB reservation can only fit by evicting.
-    memory::set_limit(used + 1);
-    let err = match memory::reserve(1024) {
-        Ok(_) => panic!("a reservation over the limit succeeded"),
-        Err(e) => e.to_string(),
-    };
+    memory::set_cache_limit(used + 1);
     assert!(
-        err.starts_with("Out of Memory Error: failed to allocate"),
-        "{err}"
+        memory::reserve_decoded(1024).is_none(),
+        "a reservation over the budget succeeded"
     );
     let watched: Vec<_> = held.iter().map(Arc::downgrade).collect();
     assert!(
@@ -167,11 +172,12 @@ fn held_chunks_are_not_evicted() {
 
     // Without the readers the same reservation evicts a chunk.
     drop(held);
-    memory::reserve(1024).unwrap();
+    assert!(memory::reserve_decoded(1024).is_some());
     assert!(
         watched.iter().any(|w| w.upgrade().is_none()),
         "nothing was evicted after the readers let go"
     );
+    memory::reset_cache_limit();
 }
 
 /// A dirty chunk is never a candidate, and `.save` writes the update.
@@ -184,17 +190,18 @@ fn a_dirty_chunk_is_never_evicted_and_survives_save() {
     let dirty = Arc::downgrade(&column.chunk(0).unwrap());
     let clean = Arc::downgrade(&column.chunk(1).unwrap());
 
-    // One byte of headroom: the reservation only fits by evicting the clean
-    // second chunk, and the dirty first chunk stays put.
-    memory::set_limit(memory::used() + 1);
-    let limit = memory::limit();
-    memory::reserve(1024).unwrap();
+    // One byte of headroom in the cache: the reservation only fits by evicting
+    // the clean second chunk, and the dirty first chunk stays put.
+    memory::set_cache_limit(memory::cache_used() + 1);
+    let limit = memory::cache_limit();
+    assert!(memory::reserve_decoded(1024).is_some());
     assert!(dirty.upgrade().is_some(), "the dirty chunk was evicted");
     assert!(
         clean.upgrade().is_none(),
         "the clean chunk was not evicted to make room"
     );
-    assert!(memory::used() <= limit);
+    assert!(memory::cache_used() <= limit);
+    memory::reset_cache_limit();
 
     // Saving writes the update back, re-encoding only the dirty chunk.
     memory::reset_limit();
@@ -229,13 +236,17 @@ fn built_chunks_are_charged_and_an_open_charges_nothing() {
     assert_eq!(memory::used(), before, "a dropped store keeps its charge");
 
     let mut db = PinkDb::open(&path).unwrap();
+    let cached = memory::cache_used();
     assert_eq!(
         memory::used(),
         before,
         "open charged a chunk it did not decode"
     );
     assert_eq!(int(&mut db, "SELECT sum(i) FROM t"), 3);
-    assert!(memory::used() > before, "the decoded chunk is not charged");
+    assert!(
+        memory::cache_used() > cached,
+        "the decoded chunk is not charged to the cache"
+    );
 }
 
 /// Two threads scan one store chunk by chunk, 50 rounds, while the pool is too
@@ -246,8 +257,8 @@ fn concurrent_readers_evict_without_deadlock() {
     let store = Store::new("threads");
     let chunks = 40;
     let path = store.save("t", chunks);
-    memory::set_limit(128 * 1024);
-    let limit = memory::limit();
+    memory::set_cache_limit(128 * 1024);
+    let limit = memory::cache_limit();
     let expected = range_sum(chunks * CHUNK_SIZE);
     for round in 0..50 {
         let answers = std::thread::scope(|scope| {
@@ -257,7 +268,7 @@ fn concurrent_readers_evict_without_deadlock() {
                     scope.spawn(move || {
                         let db = PinkDb::open(path).unwrap();
                         let sum = sum_chunks(db.table("t").unwrap());
-                        assert!(memory::used() <= limit);
+                        assert!(memory::cache_used() <= limit);
                         sum
                     })
                 })
@@ -268,7 +279,7 @@ fn concurrent_readers_evict_without_deadlock() {
                 .collect::<Vec<_>>()
         });
         assert_eq!(answers, vec![expected; 2], "round {round}");
-        assert!(memory::used() <= limit);
+        assert!(memory::cache_used() <= limit);
     }
 }
 
@@ -382,14 +393,14 @@ fn a_saved_dirty_chunk_is_evictable() {
 
     let out = store.path("out.pink");
     db.save(&out).unwrap();
-    memory::set_limit(memory::used() + 1);
-    memory::reserve(1024).unwrap();
+    memory::set_cache_limit(memory::cache_used() + 1);
+    assert!(memory::reserve_decoded(1024).is_some());
     assert!(
         watched.upgrade().is_none(),
         "a saved chunk is still not evictable"
     );
 
-    memory::reset_limit();
+    memory::reset_cache_limit();
     assert_eq!(
         int(&mut db, "SELECT sum(i) FROM t"),
         range_sum(CHUNK_SIZE) + CHUNK_SIZE as i64
@@ -421,13 +432,13 @@ fn a_save_while_a_reader_holds_chunks_writes_the_update() {
 
     let watched: Vec<_> = held.iter().map(Arc::downgrade).collect();
     drop(held);
-    memory::set_limit(memory::used() + 1);
-    memory::reserve(1024).unwrap();
+    memory::set_cache_limit(memory::cache_used() + 1);
+    assert!(memory::reserve_decoded(1024).is_some());
     assert!(
         watched.iter().any(|w| w.upgrade().is_none()),
         "nothing was evicted after the reader let go"
     );
-    memory::reset_limit();
+    memory::reset_cache_limit();
     drop(db);
 
     let mut back = PinkDb::open(&out).unwrap();
