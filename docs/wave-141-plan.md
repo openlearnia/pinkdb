@@ -94,22 +94,27 @@ key arrays, about 30. Neither is worth a wave alone. Not landed: no change witho
 
 After 141a, 141b and 142, Q10's output assembly is still about 48 % of worker time. Strings
 dominate it: `StrVec::gather` is 23 %, of which `SharedList::push` is 10 %, because every output
-chunk re-registers the buffers of the roughly 280 build chunks it touches. The attempt:
-- concatenate each VARCHAR build column once per join into one `StrVec` whose shared list holds
-  every build chunk's buffer;
-- gather by view copy plus one list clone.
+chunk maps the buffers of the build chunks it touches again. The attempt: concatenate each VARCHAR
+build column once per join into one `StrVec`, then gather by view copy plus one list clone.
 
-The bench-mode A/B against main:
-- Q10 at SF10: 3.2× slower;
-- Q5 at SF1: 50× slower;
-- Q5 at SF10: failed.
+- **First version** (buffer lists appended per source, no deduplication), bench-mode A/B against
+  main:
+  - Q10 at SF10: 3.2× slower;
+  - Q5 at SF1: 50× slower;
+  - Q5 at SF10: failed.
 
-The cause is accounting, not the gather. `StrVec::memory_size` charges every buffer a vector
-references, in full, by design (the pool errs high). With the whole build column's list attached,
-each output chunk was charged, and walked, the entire build side's string bytes. Reverted.
+  Cause: a build side that is itself a join's output (Q5's chain, Q10's nation⋈customer⋈orders) has
+  chunks that each reference hundreds of the same buffers. Appending every chunk's list gave a list
+  of roughly chunks × buffers entries, which every downstream gather then walked. (It was not
+  memory accounting: join outputs are charged by `chunk_approx_bytes`, which counts only held string
+  bytes.)
+- **Second version** (deduplicated by buffer address): no blow-up, and no gain.
+  - SF10 geomean 1.027 over Q10/Q7/Q5/Q3/Q9/Q18/Q21/Q2: Q10 1.02, Q2 1.12, Q21 0.93.
+  - SF1 geomean 1.026: Q10 0.93, Q7 1.08.
 
-What this means for 141c: a row layout or a shared build heap only works if a gathered string's
-buffer is charged once per join, not once per output chunk. DuckDB does that: a result vector holds
-a reference to the build's heap block, and the buffer manager accounts by block, not by vector.
-That needs a change to how `StrVec` reports shared bytes (count a join's build heap once, for
-example as a handle the join owns) before string gathering can be made cheaper.
+  The once-per-join concatenation, done serially on the main thread, costs about what the cheaper
+  per-chunk gather saves.
+
+Not landed. The string gather's remaining cost is inherent to columnar build chunks. A row-layout
+build heap (141c proper) would have to make the gather cheaper without a per-join copy, which DuckDB
+achieves by building its heap during the build itself.
