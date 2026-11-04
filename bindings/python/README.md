@@ -1,7 +1,7 @@
 # pinkdb Python binding
 
 A dependency-free Python wrapper over the pinkdb C ABI
-(`crates/pinkdb-ffi/include/pinkdb.h`, ABI 1.3), implemented with the standard
+(`crates/pinkdb-ffi/include/pinkdb.h`, ABI 1.4), implemented with the standard
 library `ctypes` module only. It has two layers:
 
 - a **PEP 249 (DB-API 2.0)** module: `connect()`, `Connection`, `Cursor`,
@@ -29,7 +29,7 @@ The package looks for the shared library in this order:
 If neither exists, importing `pinkdb` raises a `pinkdb.Error` telling you to
 run the build above (or to set `PINKDB_FFI_LIB`). Importing also fails with
 `pinkdb.Error` when the file it loads is not a pinkdb-ffi library (it lacks
-the `pinkdb_*` symbols) or reports an ABI other than major 1 at minor 3 or
+the `pinkdb_*` symbols) or reports an ABI other than major 1 at minor 4 or
 later. `pinkdb.abi_version()` returns the encoded value (`major << 16 |
 minor`) and `pinkdb.abi_version_info()` the `(major, minor)` tuple.
 
