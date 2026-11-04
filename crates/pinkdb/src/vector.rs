@@ -185,7 +185,7 @@ impl VectorData {
     }
 
     /// The wave-142 invariant: `Decimal64` exactly for precision ≤ 18.
-    fn decimal_width_ok(&self) -> bool {
+    pub(crate) fn decimal_width_ok(&self) -> bool {
         match self {
             VectorData::Decimal { precision, .. } => *precision > DECIMAL64_MAX_PRECISION,
             VectorData::Decimal64 { precision, .. } => *precision <= DECIMAL64_MAX_PRECISION,
