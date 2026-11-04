@@ -734,6 +734,31 @@ impl ScanPlan {
         }
     }
 
+    /// What the plan knows about logical column `column` in morsel `index`
+    /// before decoding it: a row group's statistics from its file's morsel
+    /// plan, or a whole file's zone map. `None` when unknown, or when the
+    /// file stores the column as another type (its bounds would compare
+    /// differently).
+    fn morsel_stats(&self, index: u64, column: usize) -> Option<(pinkdb::ColumnStats, u64)> {
+        match self.morsels.get(index as usize)? {
+            Morsel::Group { file, morsel } => {
+                let planned = self.files.get(*file as usize)?;
+                let plan = planned.plan.as_ref()?;
+                let physical = plan.mapping.physical.get(column).copied().flatten()?;
+                if plan.physical_schema.get(physical)?.1 != *self.types.get(column)? {
+                    return None;
+                }
+                planned.morsels.as_ref()?.stats(*morsel as usize, physical)
+            }
+            Morsel::File { file } => {
+                let file = &self.files.get(*file as usize)?.file;
+                let stats = file.zone.as_ref()?.get(column)?.clone();
+                Some((stats, file.rows))
+            }
+            Morsel::Inlined => None,
+        }
+    }
+
     /// The scan's accounting: what the plan pruned, plus what the decodes read
     /// from the backend since the plan was built.
     fn io(&self) -> pinkdb::ScanIo {
@@ -786,6 +811,10 @@ impl pinkdb::MorselSource for PlanSource {
         sink: &mut dyn FnMut(DataChunk) -> pinkdb::Result<()>,
     ) -> pinkdb::Result<()> {
         self.plan.decode(morsel, sink)
+    }
+
+    fn morsel_stats(&self, morsel: u64, column: usize) -> Option<(pinkdb::ColumnStats, u64)> {
+        self.plan.morsel_stats(morsel, column)
     }
 
     fn io(&self) -> pinkdb::ScanIo {
