@@ -3834,7 +3834,10 @@ pub struct PinkDb {
     pub(crate) stream_folded_rows: std::sync::atomic::AtomicU64,
     /// One record per scan source of the statement now running (wave 133b).
     /// The executor holds `&PinkDb`, so both scan logs are behind a `Mutex`.
-    pub(crate) scan_records: std::sync::Mutex<Vec<crate::morsel::ScanRecord>>,
+    /// A result cursor's snapshot shares this log with the store it was taken
+    /// from ([`PinkDb::cursor_snapshot`]), so the scans it runs are the
+    /// statement's; any other clone gets a copy of its own.
+    pub(crate) scan_records: Arc<std::sync::Mutex<Vec<crate::morsel::ScanRecord>>>,
     /// The log the last finished statement left: what `EXPLAIN ANALYZE` and
     /// `pinkdb_scan_io()` report until the running statement replaces it.
     pub(crate) finished_scans: std::sync::Mutex<Vec<crate::morsel::ScanRecord>>,
@@ -4017,12 +4020,12 @@ impl Clone for PinkDb {
                 self.stream_folded_rows
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
-            scan_records: std::sync::Mutex::new(
+            scan_records: Arc::new(std::sync::Mutex::new(
                 self.scan_records
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
-            ),
+            )),
             finished_scans: std::sync::Mutex::new(
                 self.finished_scans
                     .lock()
@@ -4126,7 +4129,7 @@ impl PinkDb {
             stream_buffered_rows: std::sync::atomic::AtomicUsize::new(0),
             stream_peak_rows: std::sync::atomic::AtomicUsize::new(0),
             stream_folded_rows: std::sync::atomic::AtomicU64::new(0),
-            scan_records: std::sync::Mutex::new(Vec::new()),
+            scan_records: Arc::new(std::sync::Mutex::new(Vec::new())),
             finished_scans: std::sync::Mutex::new(Vec::new()),
             superseded: Mutex::new(Vec::new()),
         }
@@ -4623,6 +4626,15 @@ impl PinkDb {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// The snapshot a result cursor reads: a clone (tables share their
+    /// chunks) whose scan log is this store's, so `pinkdb_scan_io()` after a
+    /// streamed statement reports what it read.
+    pub(crate) fn cursor_snapshot(&self) -> PinkDb {
+        let mut snapshot = self.clone();
+        snapshot.scan_records = Arc::clone(&self.scan_records);
+        snapshot
     }
 
     /// Start a statement's scan log (the statement boundary calls this): the

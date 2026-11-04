@@ -589,7 +589,7 @@ impl Connection {
     /// Multi-statement strings mix freely (each statement locks as needed).
     pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
         Ok(self
-            .execute_inner(sql, None, false)?
+            .execute_inner(sql, None, crate::exec::ResultMode::Rows)?
             .into_iter()
             .map(crate::exec::ChunkedResult::into_query_result)
             .collect())
@@ -602,7 +602,28 @@ impl Connection {
     /// still row-shaped and returned as
     /// [`crate::exec::ChunkedResult::Other`].
     pub fn execute_chunked(&mut self, sql: &str) -> Result<Vec<crate::exec::ChunkedResult>> {
-        self.execute_inner(sql, None, true)
+        self.execute_inner(sql, None, crate::exec::ResultMode::Chunks)
+    }
+
+    /// Run one statement and return its result as a streaming
+    /// [`crate::exec::QueryCursor`]: a SELECT's chunks are pulled on demand
+    /// from a snapshot of the store (or of the open transaction), so the
+    /// result is never materialized whole and no lock is held while it is
+    /// read. Any other statement runs to completion and the cursor carries its
+    /// outcome ([`crate::exec::QueryCursor::result`]). `sql` must be exactly
+    /// one statement.
+    pub fn query_cursor(&mut self, sql: &str) -> Result<crate::exec::QueryCursor> {
+        let statements = crate::sql::parse_statements(sql)?.len();
+        if statements != 1 {
+            return Err(PinkDbError::Execution(format!(
+                "a result cursor runs exactly one statement, got {statements}"
+            )));
+        }
+        let mut results = self.execute_inner(sql, None, crate::exec::ResultMode::Cursor)?;
+        match results.pop().expect("one result") {
+            crate::exec::ChunkedResult::Cursor(cursor) => Ok(cursor),
+            other => crate::exec::QueryCursor::from_result(other.into_query_result()),
+        }
     }
 
     /// Run every statement like [`Connection::execute`], also returning one
@@ -617,7 +638,8 @@ impl Connection {
     /// [`QueryProfile::optimize`] is always zero here.
     pub fn execute_profiled(&mut self, sql: &str) -> Result<Vec<(QueryResult, QueryProfile)>> {
         let mut profiles = Vec::new();
-        let results = self.execute_inner(sql, Some(&mut profiles), false)?;
+        let results =
+            self.execute_inner(sql, Some(&mut profiles), crate::exec::ResultMode::Rows)?;
         Ok(results
             .into_iter()
             .map(crate::exec::ChunkedResult::into_query_result)
@@ -632,7 +654,7 @@ impl Connection {
         &mut self,
         sql: &str,
         mut profiles: Option<&mut Vec<QueryProfile>>,
-        keep_chunks: bool,
+        mode: crate::exec::ResultMode,
     ) -> Result<Vec<crate::exec::ChunkedResult>> {
         let profiling = profiles.is_some();
         read_lock(&self.db.shared).ensure_wal_healthy()?;
@@ -658,7 +680,7 @@ impl Connection {
                 let in_transaction = self.txn.is_some();
                 let stmt_start = Instant::now();
                 let mut draft = ProfileDraft::default();
-                let result = self.execute_one(stmt, text, Some(&mut draft), keep_chunks)?;
+                let result = self.execute_one(stmt, text, Some(&mut draft), mode)?;
                 let total = stmt_start.elapsed() + if i == 0 { parse } else { Duration::ZERO };
                 let (rows, columns, kind) = match &result {
                     crate::exec::ChunkedResult::Selected { names, chunks, .. } => (
@@ -667,6 +689,9 @@ impl Connection {
                         "selected",
                     ),
                     crate::exec::ChunkedResult::Other(result) => crate::result_facts(result),
+                    crate::exec::ChunkedResult::Cursor(cursor) => {
+                        (0, cursor.names().len() as u32, "selected")
+                    }
                 };
                 if let Some(sink) = profiles.as_deref_mut() {
                     sink.push(QueryProfile {
@@ -687,7 +712,7 @@ impl Connection {
                 }
                 out.push(result);
             } else {
-                out.push(self.execute_one(stmt, text, None, keep_chunks)?);
+                out.push(self.execute_one(stmt, text, None, mode)?);
             }
         }
         Ok(out)
@@ -960,7 +985,13 @@ impl Connection {
                 .with_cancel(self.cancel.clone()),
         );
         Ok(self
-            .execute_one_with(ExecInput::Plan(&plan), wal_text, None, &budget, false)?
+            .execute_one_with(
+                ExecInput::Plan(&plan),
+                wal_text,
+                None,
+                &budget,
+                crate::exec::ResultMode::Rows,
+            )?
             .into_query_result())
     }
 
@@ -1037,12 +1068,12 @@ impl Connection {
         stmt: &crate::sql::ast::Statement,
         sql_text: Option<&str>,
         profile: Option<&mut ProfileDraft>,
-        keep_chunks: bool,
+        mode: crate::exec::ResultMode,
     ) -> Result<crate::exec::ChunkedResult> {
         // The previous statement's scan log is what `pinkdb_scan_io()`
         // reports; this statement records into a fresh one (wave 133b).
         self.with_bind_store(|db| db.finish_scan_records());
-        self.execute_statement(stmt, sql_text, profile, keep_chunks)
+        self.execute_statement(stmt, sql_text, profile, mode)
     }
 
     fn execute_statement(
@@ -1050,7 +1081,7 @@ impl Connection {
         stmt: &crate::sql::ast::Statement,
         sql_text: Option<&str>,
         mut profile: Option<&mut ProfileDraft>,
-        keep_chunks: bool,
+        mode: crate::exec::ResultMode,
     ) -> Result<crate::exec::ChunkedResult> {
         // One budget per statement: the deadline starts here (before bind)
         // and is shared by every evaluation context of this statement. No
@@ -1065,7 +1096,7 @@ impl Connection {
             sql_text,
             profile.as_deref_mut(),
             &budget,
-            keep_chunks,
+            mode,
         );
         if let Some(p) = profile {
             p.memory_limit = crate::memory::limit() as u64;
@@ -1080,7 +1111,7 @@ impl Connection {
         sql_text: Option<&str>,
         mut profile: Option<&mut ProfileDraft>,
         budget: &Arc<crate::exec::ExecBudget>,
-        keep_chunks: bool,
+        mode: crate::exec::ResultMode,
     ) -> Result<crate::exec::ChunkedResult> {
         // Network authentication gate: evaluated before *every* statement of
         // a batch with the store's current user catalog, so the first
@@ -1191,6 +1222,19 @@ impl Connection {
                     // never replays).
                     let stmt_sets = txn.work.plan_sets_store(&plan, &pre_ns);
                     txn.wal_sets.extend(&stmt_sets);
+                }
+                // A cursor inside a transaction reads a snapshot of the
+                // transaction's own view (its uncommitted writes included).
+                if mode == crate::exec::ResultMode::Cursor
+                    && crate::exec::cursor::streams_rows(&plan)
+                {
+                    return crate::exec::QueryCursor::start(
+                        &txn.work,
+                        plan,
+                        budget.clone(),
+                        self.session.clone(),
+                    )
+                    .map(crate::exec::ChunkedResult::Cursor);
                 }
                 budget.set_collect_external_calls(
                     txn.work.is_durable() && crate::plan::writes_tables(&plan),
@@ -1315,9 +1359,23 @@ impl Connection {
                         QueryResult::CreatedDatabase { name: name.clone() },
                     ));
                 }
-                let result = if is_read_only(&plan) {
+                let result = if mode == crate::exec::ResultMode::Cursor
+                    && crate::exec::cursor::streams_rows(&plan)
+                {
+                    // The cursor's inline phase runs under this lock; a large
+                    // streaming result continues over a snapshot, so the lock
+                    // is released as soon as `start` returns.
+                    let cursor = crate::exec::QueryCursor::start(
+                        &shared,
+                        plan,
+                        budget.clone(),
+                        self.session.clone(),
+                    );
+                    drop(shared);
+                    return cursor.map(crate::exec::ChunkedResult::Cursor);
+                } else if is_read_only(&plan) {
                     let exec_start = profile.as_ref().map(|_| Instant::now());
-                    let result = if keep_chunks {
+                    let result = if mode == crate::exec::ResultMode::Chunks {
                         crate::exec::run_read_chunks_with_budget(
                             &shared,
                             &plan,

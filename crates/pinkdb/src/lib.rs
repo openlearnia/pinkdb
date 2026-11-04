@@ -123,7 +123,7 @@ pub use attached::{
 };
 pub use crypto::EncryptionKey;
 pub use db::{AUTHENTICATION_REQUIRED, Connection, Database};
-pub use exec::{CancelFlag, ExecLimits, QueryResult, STATEMENT_CANCELLED};
+pub use exec::{CancelFlag, ExecLimits, QueryCursor, QueryResult, STATEMENT_CANCELLED};
 pub use filefmt::FileFormat;
 pub use fsutil::{CopyToPolicy, write_atomic_private};
 pub use install::{InstalledExtension, NO_REPO_SUPPORT};
@@ -234,6 +234,83 @@ impl PinkDb {
         let mut profiles = Vec::new();
         let results = self.execute_inner(sql, Some(&mut profiles), Some(limits))?;
         Ok(results.into_iter().zip(profiles).collect())
+    }
+
+    /// Run one statement and return its result as a streaming
+    /// [`QueryCursor`]: a SELECT's chunks are pulled on demand from a
+    /// snapshot of this store (or of the open transaction), so the result is
+    /// never materialized whole. Any other statement runs through
+    /// [`PinkDb::execute`] and the cursor carries its outcome
+    /// ([`QueryCursor::result`]). `sql` must be exactly one statement.
+    pub fn query_cursor(&mut self, sql: &str) -> types::Result<QueryCursor> {
+        self.query_cursor_inner(sql, None)
+    }
+
+    /// [`PinkDb::query_cursor`] under per-statement [`ExecLimits`]; the row
+    /// and byte caps count the rows as they stream.
+    pub fn query_cursor_with_limits(
+        &mut self,
+        sql: &str,
+        limits: ExecLimits,
+    ) -> types::Result<QueryCursor> {
+        self.query_cursor_inner(sql, Some(limits))
+    }
+
+    fn query_cursor_inner(
+        &mut self,
+        sql: &str,
+        limits: Option<ExecLimits>,
+    ) -> types::Result<QueryCursor> {
+        let stmts = sql::parse_statements(sql)?;
+        if stmts.len() != 1 {
+            return Err(types::PinkDbError::Execution(format!(
+                "a result cursor runs exactly one statement, got {}",
+                stmts.len()
+            )));
+        }
+        self.ensure_wal_healthy()?;
+        // The statement boundary, exactly as `execute_inner` runs it.
+        self.finish_scan_records();
+        self.proc_frame_reset();
+        if self.is_durable() && !self.in_transaction() {
+            self.refresh_if_stale()?;
+        }
+        if !self.in_transaction() && !self.replaying {
+            self.boundary_auto_refresh()?;
+        }
+        let ns = self.current_ns().clone();
+        self.rebuild_stale_indexes();
+        let budget = std::sync::Arc::new(
+            exec::ExecBudget::new(limits.as_ref()).with_external_services(self.external_services()),
+        );
+        let (plan, _) = sql::bind_tracked(self, &stmts[0], &ns)?;
+        let plan = optimizer::optimize(self, plan);
+        if !exec::cursor::streams_rows(&plan) {
+            let mut results = match limits {
+                Some(limits) => self.execute_with_limits(sql, limits)?,
+                None => self.execute(sql)?,
+            };
+            let result = results.pop().ok_or_else(|| {
+                types::PinkDbError::Execution(
+                    "internal error: a statement produced no result".to_string(),
+                )
+            })?;
+            return QueryCursor::from_result(result);
+        }
+        let txn_storages = if self.in_transaction() {
+            self.txn_storages.clone()
+        } else {
+            Default::default()
+        };
+        self.check_statement_storages(&plan, ns.db(), &txn_storages)?;
+        // Inside a transaction a read joins the set COMMIT validates, like
+        // any statement `execute` runs.
+        if self.in_transaction() && self.is_durable() {
+            let sets = self.plan_sets_store(&plan, &ns);
+            self.txn_touched.extend(&sets);
+        }
+        let session = self.session.clone();
+        QueryCursor::start(self, plan, budget, session)
     }
 
     /// The one runner behind [`PinkDb::execute`] and
