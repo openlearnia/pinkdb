@@ -950,7 +950,9 @@ and no per-statement timing (`.timer on` turns it back on; the line reads
 `Run Time (s): real 0.012 (parse 0.010, bind 0.020, optimize 0.005, execute
 11.900, log 0.090 ms)`, from the local engine or, remote, from the server's
 profiles), and the process
-**exits 1** if any statement or dot-command failed. A statement still open at
+**exits 1** if any statement or dot-command failed. A failing statement is
+reported and the next one still runs, whether it is on the same line or the
+next. A statement still open at
 end of input runs as if terminated, and `;` is recognized outside strings and
 comments (`SELECT 1; -- note` completes; `SELECT ';'` does not).
 `.read <file.sql>` runs a script in the current session.
@@ -1600,6 +1602,11 @@ SHOW DATABASES;                                          -- storage, location, v
   store or one lake database, never both (a trigger or `CALL` that tries is
   undone). A local write that *reads* a lake records the lake version it read
   in its WAL record, so it replays exactly after the lake moved on.
+- **Attachments are remembered.** A store logs its `ATTACH` and reopens the
+  lake, so running the same `ATTACH` again (same location, same options) is
+  a no-op that logs nothing; a script that attaches its lake runs unchanged
+  every time. Another location or other options under that name are an
+  error until you `DETACH` it.
 - **Unavailable lakes** (unreachable, removed) are listed with the reason;
   the server starts, and only statements on them fail.
 - **Location policy.** `ATTACH`/`DETACH`/`CREATE DATABASE` are ADMIN-only.
