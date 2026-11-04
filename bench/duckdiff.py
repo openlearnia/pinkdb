@@ -1673,17 +1673,19 @@ def run_attach():
     # A plain database file is not a second store pinkdb can own (see
     # docs/sql-conformance.md); DuckDB attaches it, so this is pinkdb-only.
     plain = os.path.join(dirs[0], "plain.db")
-    got = pink_query("", f"ATTACH ':memory:' AS ok; ATTACH '{plain}' AS f; SELECT 1;")
+    # The CLI reports the refusal and still runs the SELECT after it.
+    got = pink_tables("", f"ATTACH ':memory:' AS ok; ATTACH '{plain}' AS f; SELECT 1;")
     check("attach-file-refused",
-          got[0] == "error" and "is not a lake" in got[1] and ":memory:" in got[1],
+          len(got) == 2 and got[0][0] == "error" and "is not a lake" in got[0][1]
+          and ":memory:" in got[0][1] and got[1][0] == "rows",
           f"pinkdb answered {got}")
 
     # A file DuckDB wrote is refused by its header, never opened as pinkdb.
     duck_file = os.path.join(dirs[1], "duckformat.db")
     duck_query("", f"ATTACH '{duck_file}' AS d; CREATE TABLE d.t (a INTEGER);")
-    got = pink_query("", f"ATTACH '{duck_file}' AS d; SELECT 42;")
+    got = pink_tables("", f"ATTACH '{duck_file}' AS d; SELECT 42;")
     check("attach-refuses-duckdb-file",
-          got[0] == "error" and "DuckDB database file" in got[1],
+          len(got) == 2 and got[0][0] == "error" and "DuckDB database file" in got[0][1],
           f"pinkdb answered {got}")
 
 

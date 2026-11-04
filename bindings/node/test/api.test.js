@@ -10,7 +10,7 @@ const { mkdtempSync, rmSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 
-const { ABI_VERSION, PinkdbError, abiVersion, open, openMemory } = require('..');
+const { ABI_VERSION, PinkdbError, abiVersion, abiVersionInfo, open, openMemory } = require('..');
 
 function tempDatabase(name = 'test.pinkdb') {
   const directory = mkdtempSync(path.join(tmpdir(), 'pinkdb-node-'));
@@ -21,8 +21,10 @@ function tempDatabase(name = 'test.pinkdb') {
 }
 
 test('abiVersion matches the package constant', () => {
-  assert.equal(abiVersion(), ABI_VERSION);
-  assert.equal(abiVersion(), (1 << 16) | 3);
+  const { major, minor } = abiVersionInfo();
+  assert.equal(major, ABI_VERSION >>> 16);
+  assert.ok(minor >= (ABI_VERSION & 0xffff), `minor ${minor}`);
+  assert.equal(abiVersion(), (major << 16) | minor);
 });
 
 test('a file database survives close and reopen', () => {

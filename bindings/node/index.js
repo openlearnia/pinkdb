@@ -157,8 +157,15 @@ function openMemory() {
   return open();
 }
 
+/** The native C ABI version, encoded `major << 16 | minor` (65539 is 1.3). */
 function abiVersion() {
   return native.abiVersion();
+}
+
+/** The native C ABI version as `{ major, minor }`; a newer minor only adds calls. */
+function abiVersionInfo() {
+  const version = abiVersion();
+  return { major: version >>> 16, minor: version & 0xffff };
 }
 
 const actualAbi = guard(() => native.abiVersion());
@@ -178,6 +185,7 @@ module.exports = {
   Prepared,
   RowStream,
   abiVersion,
+  abiVersionInfo,
   open,
   openMemory,
 };

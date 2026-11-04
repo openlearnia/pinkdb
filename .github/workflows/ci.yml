@@ -491,7 +491,7 @@ jobs:
 
           library = pathlib.Path(pinkdb.library_path).resolve()
           assert "site-packages" in library.parts, library
-          assert pinkdb.abi_version() == 1, pinkdb.abi_version()
+          assert pinkdb.abi_version_info()[0] == 1, pinkdb.abi_version_info()
           print("installed wheel loads", library)
           PY
           PINKDB_CONFORMANCE="$GITHUB_WORKSPACE/bindings/conformance/corpus.json" \

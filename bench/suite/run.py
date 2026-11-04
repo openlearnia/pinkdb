@@ -156,6 +156,16 @@ def pinkdb_bin() -> Path:
     return ROOT / "target" / "release" / "pinkdb"
 
 
+def remove_store(store: Path) -> None:
+    """Delete a .pink store and its sidecars (.wal, rolled WAL generations,
+    .lock, .open, .ckpt). Deleting only the store left its WAL behind, and the
+    next run replayed it into a fresh store and failed (2026-11-04)."""
+    store.unlink(missing_ok=True)
+    for side in store.parent.glob(store.name + ".*"):
+        if side.is_file():
+            side.unlink(missing_ok=True)
+
+
 def pink(script: str, timeout: float = 600, env: dict | None = None, agent: bool = False):
     return sh(
         [pinkdb_bin(), "-agent" if agent else "-no-agent"],
@@ -295,7 +305,7 @@ def ensure_tpch(work: Path, scale: float, force: bool = False) -> Path:
 
 
 def build_pink_store(pq: Path, store: Path, scale: float) -> dict:
-    store.unlink(missing_ok=True)
+    remove_store(store)
     Path(str(store) + ".wal").unlink(missing_ok=True)
     Path(str(store) + ".lock").unlink(missing_ok=True)
     lines = [".timer on"]
@@ -553,7 +563,7 @@ class Suite:
                     for _ in range(3):
                         if engine == "pink":
                             store = self.work / f"ingest_{fmt}_{t}.pink"
-                            store.unlink(missing_ok=True)
+                            remove_store(store)
                             if fmt == "csv":
                                 script = f".open {store}\n.import {path} {t}\n"
                                 r = pink(script, timeout=1800)
@@ -629,7 +639,7 @@ class Suite:
         # Single-row autocommit through the CLI: the client-visible cost.
         store = self.work / "durable_cli.pink"
         for tag, rows in (("autocommit", n), ("batched", n)):
-            store.unlink(missing_ok=True)
+            remove_store(store)
             lines = [".timer on", "CREATE TABLE t (i BIGINT);"]
             if tag == "autocommit":
                 lines += [f"INSERT INTO t VALUES ({i});" for i in range(rows)]
@@ -644,7 +654,7 @@ class Suite:
             else:
                 out[tag] = {"rows": rows, "wall_s": wall, "rows_per_s": rows / wall}
             print(f"  cli {tag}: {out[tag]}", flush=True)
-            store.unlink(missing_ok=True)
+            remove_store(store)
         # Multi-process writers: the checked-in harness, with small counts.
         mp = sh(
             [
@@ -854,7 +864,7 @@ class Suite:
                 for i in range(docs):
                     body = " ".join(words[(i * 7 + j * 13) % len(words)] for j in range(12))
                     f.write(f'{i},"document {i}","{body}"\n')
-        store.unlink(missing_ok=True)
+        remove_store(store)
         r = pink(
             f".open {store}\n.import {csv} docs\n.timer on\nCALL create_fts_index('docs', 'id', 'title', 'body');\n",
             timeout=3600,
@@ -868,7 +878,7 @@ class Suite:
         )
         r = pink(f".open {store}\n.timer on\n" + (q + "\n") * 6, timeout=900)
         tv = timer_values(r.stdout + r.stderr)
-        store.unlink(missing_ok=True)
+        remove_store(store)
         result = {
             "docs": docs,
             "build_ms": build[-1] * 1000,
@@ -921,7 +931,7 @@ class Suite:
                     "latency": lat,
                 }
             print(f"  hnsw {tag}: {out[tag]}", flush=True)
-        store.unlink(missing_ok=True)
+        remove_store(store)
         return out
 
     # -- footprint -----------------------------------------------------
@@ -1015,7 +1025,7 @@ class Suite:
         csv = self.work / "ci_lineitem.csv"
         gen_ci_lineitem(csv, rows)
         store = self.work / "ci.pink"
-        store.unlink(missing_ok=True)
+        remove_store(store)
         r = pink(f".open {store}\n.import {csv} lineitem\n")
         if r.returncode != 0:
             raise SystemExit(f"ci import failed: {(r.stdout + r.stderr)[-1000:]}")
@@ -1029,7 +1039,7 @@ class Suite:
         pink(f".open {store}\n" + "".join(f"INSERT INTO lineitem VALUES ({i},1,1.0,0.0,0.0,'1994-01-01','O','F');\n" for i in range(200)))
         out["insert_200_ms"] = (now() - t0) * 1000
         out["binary_bytes"] = pinkdb_bin().stat().st_size
-        store.unlink(missing_ok=True)
+        remove_store(store)
         baseline_path = ROOT / "bench" / "suite" / "baseline-ci.json"
         baseline = json.loads(baseline_path.read_text()) if baseline_path.exists() else None
         regressions = []
@@ -1037,12 +1047,16 @@ class Suite:
             # The fastest warm run is compared, not the median: these queries
             # take 1-3 ms, and on shared runners a median moved 3 -> 8 ms for
             # the same plan (corr_not_in, 2026-11-03). A real regression slows
-            # every run, so it still shows in the fastest one.
+            # every run, so it still shows in the fastest one. Even the fastest
+            # run reached 8 ms on one runner (2026-11-04, 16bb4b8) while two
+            # builds measured 2.0 ms in all 5 rounds on a quiet machine, so the
+            # absolute allowance is 10 ms: this guard catches large regressions,
+            # and the interleaved TPC-H comparisons catch small ones.
             for key, _ in queries:
                 base = baseline.get(key, {}).get("median_ms")
                 warm = out[key]["runs_ms"][1:]
                 got = min(warm) if warm else None
-                if base and got and got > max(2 * base, base + 5):
+                if base and got and got > max(2 * base, base + 10):
                     regressions.append(f"{key}: fastest {got:.1f}ms vs baseline {base:.1f}ms")
             # Binary sizes differ by platform (Mach-O vs ELF, linkers), so the
             # baseline keeps one per sys.platform; a platform without one is

@@ -91,8 +91,12 @@ func TestConformanceCorpus(t *testing.T) {
 	if c.CorpusVersion != 1 {
 		t.Fatalf("corpus_version = %d, want 1", c.CorpusVersion)
 	}
-	if c.ABIVersion != SupportedABI {
-		t.Fatalf("corpus targets ABI v%d, binding speaks v%d", c.ABIVersion, SupportedABI)
+	// The corpus targets a major version and the minor it was written
+	// against; a newer minor of the same major only adds calls.
+	wantMajor, wantMinor := ABIMajorMinor(uint32(c.ABIVersion))
+	gotMajor, gotMinor := ABIMajorMinor(SupportedABI)
+	if wantMajor != gotMajor || gotMinor < wantMinor {
+		t.Fatalf("corpus targets ABI v%d.%d, binding speaks v%d.%d", wantMajor, wantMinor, gotMajor, gotMinor)
 	}
 	for _, testCase := range c.Cases {
 		t.Run(testCase.Name, func(t *testing.T) {
