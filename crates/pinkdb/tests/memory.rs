@@ -59,6 +59,7 @@ impl Pool {
 impl Drop for Pool {
     fn drop(&mut self) {
         memory::reset_limit();
+        memory::reset_cache_limit();
     }
 }
 
@@ -261,4 +262,40 @@ fn a_failed_grow_keeps_the_pool_where_it_was() {
     drop(held);
     assert_eq!(memory::used(), before);
     memory::reset_limit();
+}
+
+#[test]
+fn decoded_cache_limit_set_reset_and_lives_inside_the_limit() {
+    let mut p = Pool::new();
+    // No budget of its own by default: clean chunks take the room the
+    // operators leave free (DuckDB's buffer pool inside `max_memory`).
+    assert_eq!(memory::cache_limit(), memory::limit());
+    p.exec("SET decoded_cache_limit = '32MB'");
+    assert_eq!(
+        p.text("SELECT current_setting('decoded_cache_limit')"),
+        "30.5 MiB"
+    );
+    assert_eq!(memory::cache_limit(), 32_000_000);
+    p.exec("RESET decoded_cache_limit");
+    assert_eq!(memory::cache_limit(), memory::limit());
+    // Shrinking the operator pool shrinks the room the cache may use.
+    p.limit("1GB");
+    assert_eq!(memory::cache_limit(), 1_000_000_000);
+    assert_eq!(
+        p.text("SELECT current_setting('decoded_cache_limit')"),
+        "953.6 MiB"
+    );
+    // `0` is "no cache": a bare zero, the only size without a unit.
+    p.exec("SET decoded_cache_limit = '0'");
+    assert_eq!(memory::cache_limit(), 0);
+    p.exec("RESET decoded_cache_limit");
+    // -1 makes the cache unbounded, like `memory_limit`.
+    p.exec("SET decoded_cache_limit = '-1'");
+    assert_eq!(memory::cache_limit(), memory::UNLIMITED);
+    // It is a setting, not a session variable: the name is DuckDB's error
+    // shape when it does not exist.
+    assert!(
+        p.err("SET nosuch_cache_limit = '1MB'")
+            .contains("unrecognized configuration parameter")
+    );
 }

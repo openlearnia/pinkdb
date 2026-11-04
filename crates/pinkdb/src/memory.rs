@@ -47,10 +47,11 @@ pub fn set_evictor(evict: Evictor) {
 /// Reserve `bytes` from the pool without an [`Account`]: a storage chunk's
 /// charge, which follows the chunk's own lifetime rather than a statement's.
 pub fn reserve(bytes: usize) -> Result<Reservation> {
-    acquire(bytes)?;
+    acquire(Pool::Operator, bytes)?;
     Ok(Reservation {
         bytes,
         account: None,
+        pool: Pool::Operator,
     })
 }
 
@@ -68,11 +69,13 @@ pub fn limit() -> usize {
 pub fn set_limit(bytes: usize) {
     LIMIT.store(bytes, Ordering::Relaxed);
     EXPLICIT.store(true, Ordering::Relaxed);
+    trim_cache();
 }
 
 /// `RESET memory_limit`: back to 80% of the memory the process may use.
 pub fn reset_limit() {
     EXPLICIT.store(false, Ordering::Relaxed);
+    trim_cache();
 }
 
 /// Bytes currently reserved across the process.
@@ -83,6 +86,78 @@ pub fn used() -> usize {
 /// The highest [`used`] value since the process started.
 pub fn peak() -> usize {
     PEAK.load(Ordering::Relaxed)
+}
+
+/// Bytes the decoded cache holds: clean decoded chunks, charged to their own
+/// budget so a scan's cache can never take an operator's room (wave 136c-2).
+static CACHE_USED: AtomicUsize = AtomicUsize::new(0);
+static CACHE_PEAK: AtomicUsize = AtomicUsize::new(0);
+/// The last explicit `SET decoded_cache_limit`; `CACHE_EXPLICIT` says
+/// whether it applies.
+static CACHE_LIMIT: AtomicUsize = AtomicUsize::new(0);
+static CACHE_EXPLICIT: AtomicBool = AtomicBool::new(false);
+
+/// Bytes held by the decoded cache across the process.
+pub fn cache_used() -> usize {
+    CACHE_USED.load(Ordering::Relaxed)
+}
+
+/// The highest [`cache_used`] value since the process started.
+pub fn cache_peak() -> usize {
+    CACHE_PEAK.load(Ordering::Relaxed)
+}
+
+/// The decoded cache's budget: the explicit setting, else no budget of its
+/// own — clean chunks may use whatever `memory_limit` leaves free (see
+/// `try_acquire`), the way DuckDB's buffer pool lives inside `max_memory`.
+pub fn cache_limit() -> usize {
+    if CACHE_EXPLICIT.load(Ordering::Relaxed) {
+        CACHE_LIMIT.load(Ordering::Relaxed)
+    } else {
+        limit()
+    }
+}
+
+/// `SET decoded_cache_limit`: cap clean decoded chunks below the free room.
+pub fn set_cache_limit(bytes: usize) {
+    CACHE_LIMIT.store(bytes, Ordering::Relaxed);
+    CACHE_EXPLICIT.store(true, Ordering::Relaxed);
+    trim_cache();
+}
+
+/// `RESET decoded_cache_limit`: back to the free room under `memory_limit`.
+pub fn reset_cache_limit() {
+    CACHE_EXPLICIT.store(false, Ordering::Relaxed);
+    trim_cache();
+}
+
+/// Drop cache entries until the budget holds again, after it shrank.
+fn trim_cache() {
+    let used = cache_used();
+    let limit = cache_limit();
+    if used <= limit {
+        return;
+    }
+    if let Some(evict) = EVICTOR.get() {
+        evict(used - limit);
+    }
+}
+
+/// Charge `bytes` to the decoded cache, evicting clean chunks to make room.
+/// `None` when the budget is still full: the caller then decodes without
+/// caching, so a query never fails because the cache is full.
+pub fn reserve_decoded(bytes: usize) -> Option<Reservation> {
+    reserve_in(Pool::Cache, bytes)
+}
+
+/// Which budget a reservation charges: operators (and the chunks a write
+/// decodes, which are the truth until saved) are never evicted, so a scan's
+/// cache yields to them first; clean decoded chunks are evictable and live in
+/// whatever room is left. [`used`] stays what spill reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pool {
+    Operator,
+    Cache,
 }
 
 /// DuckDB's `StringUtil::BytesToHumanReadableString`: binary units, one
@@ -137,7 +212,11 @@ pub fn parse_limit(input: &str) -> Result<usize> {
     if number < 0.0 {
         return Ok(UNLIMITED);
     }
+    // A bare `0` is the only unitless size: "no cache" for the decoded cache.
     let unit = text[end..].trim();
+    if unit.is_empty() && number == 0.0 {
+        return Ok(0);
+    }
     if unit == "%" {
         if !(0.0..=100.0).contains(&number) {
             return Err(PinkDbError::Execution(format!(
@@ -266,10 +345,11 @@ impl Account {
     /// Reserve `bytes` from the pool and from this account, or fail with the
     /// out-of-memory error without reserving anything.
     pub fn reserve(&self, bytes: usize) -> Result<Reservation> {
-        acquire(bytes)?;
+        acquire(Pool::Operator, bytes)?;
         let reservation = Reservation {
             bytes,
             account: self.0.clone(),
+            pool: Pool::Operator,
         };
         reservation.charge_account(bytes);
         Ok(reservation)
@@ -281,6 +361,7 @@ impl Account {
         Reservation {
             bytes: 0,
             account: self.0.clone(),
+            pool: Pool::Operator,
         }
     }
 
@@ -298,6 +379,7 @@ impl Account {
 pub struct Reservation {
     bytes: usize,
     account: Option<Arc<AccountState>>,
+    pool: Pool,
 }
 
 impl Reservation {
@@ -306,6 +388,7 @@ impl Reservation {
         Reservation {
             bytes: 0,
             account: None,
+            pool: Pool::Operator,
         }
     }
 
@@ -329,7 +412,7 @@ impl Reservation {
     /// Reserve `add` more bytes, failing (and keeping the current size) when
     /// the pool would pass its limit.
     pub fn grow(&mut self, add: usize) -> Result<()> {
-        acquire(add)?;
+        acquire(self.pool, add)?;
         self.bytes = self.bytes.saturating_add(add);
         self.charge_account(add);
         Ok(())
@@ -338,7 +421,7 @@ impl Reservation {
     /// Give `sub` bytes back (never more than held).
     pub fn shrink(&mut self, sub: usize) {
         let sub = sub.min(self.bytes);
-        release(sub);
+        release(self.pool, sub);
         self.bytes -= sub;
         if let Some(state) = &self.account {
             uncharge(state, sub);
@@ -355,15 +438,15 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        release(self.bytes);
+        release(self.pool, self.bytes);
         if let Some(state) = &self.account {
             uncharge(state, self.bytes);
         }
     }
 }
 
-fn acquire(bytes: usize) -> Result<()> {
-    if try_acquire(bytes) {
+fn acquire(pool: Pool, bytes: usize) -> Result<()> {
+    if try_acquire(pool, bytes) {
         return Ok(());
     }
     // Over the limit. The storage layer caches decoded chunks it can drop and
@@ -378,25 +461,72 @@ fn acquire(bytes: usize) -> Result<()> {
         return Err(out_of_memory(bytes));
     };
     while evict(bytes.saturating_mul(2)) > 0 {
-        if try_acquire(bytes) {
+        if try_acquire(pool, bytes) {
             return Ok(());
         }
     }
     Err(out_of_memory(bytes))
 }
 
-/// Charge `bytes` if the pool has room; `false` when they would pass the limit.
-fn try_acquire(bytes: usize) -> bool {
+/// [`reserve_decoded`]'s body: the cache budget, with the same
+/// evict-then-retry shape as an operator reservation, but a `None` answer
+/// instead of an out-of-memory error.
+fn reserve_in(pool: Pool, bytes: usize) -> Option<Reservation> {
+    if try_acquire(pool, bytes) {
+        return Some(Reservation {
+            bytes,
+            account: None,
+            pool,
+        });
+    }
+    let evict = EVICTOR.get()?;
+    while evict(bytes.saturating_mul(2)) > 0 {
+        if try_acquire(pool, bytes) {
+            return Some(Reservation {
+                bytes,
+                account: None,
+                pool,
+            });
+        }
+    }
+    None
+}
+
+/// Charge `bytes` if the budget has room; `false` when they would pass it.
+///
+/// Both pools share `memory_limit`, the way DuckDB's buffer pool shares
+/// `max_memory`: the cache may only take what the operators leave free, so an
+/// operator reservation that does not fit evicts clean chunks (`acquire`)
+/// before it fails. An explicit `decoded_cache_limit` caps the cache below
+/// that free room; `-1` in the cache setting means the whole pool.
+fn try_acquire(pool: Pool, bytes: usize) -> bool {
     let limit = limit();
-    let mut used = USED.load(Ordering::Relaxed);
+    let counter = match pool {
+        Pool::Operator => &USED,
+        Pool::Cache => &CACHE_USED,
+    };
+    let mut used = counter.load(Ordering::Relaxed);
     loop {
         let next = used.saturating_add(bytes);
-        if next > limit {
+        let (operators, cache) = if pool == Pool::Operator {
+            (next, CACHE_USED.load(Ordering::Relaxed))
+        } else {
+            (USED.load(Ordering::Relaxed), next)
+        };
+        let fits = operators.saturating_add(cache) <= limit
+            && (pool == Pool::Operator
+                || !CACHE_EXPLICIT.load(Ordering::Relaxed)
+                || next <= CACHE_LIMIT.load(Ordering::Relaxed));
+        if !fits {
             return false;
         }
-        match USED.compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Relaxed) {
+        match counter.compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Relaxed) {
             Ok(_) => {
-                PEAK.fetch_max(next, Ordering::Relaxed);
+                let peak = match pool {
+                    Pool::Operator => &PEAK,
+                    Pool::Cache => &CACHE_PEAK,
+                };
+                peak.fetch_max(next, Ordering::Relaxed);
                 return true;
             }
             Err(current) => used = current,
@@ -404,9 +534,13 @@ fn try_acquire(bytes: usize) -> bool {
     }
 }
 
-fn release(bytes: usize) {
+fn release(pool: Pool, bytes: usize) {
     if bytes > 0 {
-        let before = USED.fetch_sub(bytes, Ordering::AcqRel);
+        let counter = match pool {
+            Pool::Operator => &USED,
+            Pool::Cache => &CACHE_USED,
+        };
+        let before = counter.fetch_sub(bytes, Ordering::AcqRel);
         debug_assert!(before >= bytes, "memory pool released more than it holds");
     }
 }
@@ -438,6 +572,12 @@ pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// True for the setting name `SET`/`RESET`/`current_setting` treat as the
 /// process-wide memory limit (DuckDB's `max_memory`, aliased `memory_limit`).
+/// The decoded cache's own budget (wave 136c-2): like `memory_limit` a
+/// process-wide knob, not session state.
+pub fn is_cache_limit_setting(name: &str) -> bool {
+    name.eq_ignore_ascii_case("decoded_cache_limit")
+}
+
 pub fn is_limit_setting(name: &str) -> bool {
     name.eq_ignore_ascii_case("memory_limit") || name.eq_ignore_ascii_case("max_memory")
 }
