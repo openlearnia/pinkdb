@@ -386,10 +386,14 @@ returns. Ten workers: ~5 MB against Q1's present 620 MB of decoded lineitem.
 ## 7. The decoded-cache budget
 
 **Name and default.** `decoded_cache_limit`, a pinkdb setting (`PINKDB_SETTINGS`,
-`settings.rs:248`), settable as `SET decoded_cache_limit = '64MB'`, `-1`/`NULL` = unlimited,
-`RESET` = default. Default: `min(memory_limit / 4, 256 MB)`, floor 16 MB. The 1/4 share is a
-starting point chosen to be small against the operator budget; **step (2) measures it** (§8) on the
-QuackLab chart load and TPC-H SF1 warm runs, and that measurement is the gate for keeping it.
+`settings.rs:248`), settable as `SET decoded_cache_limit = '64MB'`, `0` = no cache, `-1`/`NULL` = the
+whole free room, `RESET` = default. There is no separate share: like DuckDB's buffer pool inside
+`max_memory`, clean decoded chunks take whatever `memory_limit` leaves free
+(`USED + CACHE_USED ≤ limit`), an operator reservation that does not fit evicts them in one batch
+(`evict_request` asks for the shortfall, not `2 × bytes`), and an explicit value caps them below
+that. The ladder measured for a fixed cap (§10) showed why a *small* fixed share is wrong: 256 MiB
+thrashed at 2.68, 512 MiB lost 17%, 768 MiB first held parity (0.989) and 1 GiB gave 0.988, so a
+share would have to track the pool; the free-room rule needs no such constant.
 
 **Accounting** (`crates/pinkdb/src/memory.rs`). The pool keeps two counters:
 
@@ -518,3 +522,74 @@ merge (1) with (2), because (1) is the byte-source swap and (2) is the behaviour
   TPC-H SF1 warm A/B exceeds 1.03, streaming scans admit into the decoded cache under its budget
   instead of decoding uncached. Measurement decides, and the result is recorded here.
 - §9.4, §9.5: stream A to answer.
+
+### §10 result: measured 2026-11-03, step 136c-2 (fix pass 1)
+
+The uncached streaming variant (`Column::chunk_uncached`, `StoreScan { cache: false }`) was built
+first: TPC-H SF1 warm A/B, 5 interleaved rounds, `bin-fix1` (136c-1) as A — sum 552 → 807 ms,
+geomean **1.623**, every query 1.18–3.17× (`/tmp/w136c2-ab.json`). That is above 1.03, so the rule
+above applies: a streaming scan admits into the decoded cache under its own budget and is the only
+policy the engine uses; the uncached path stays available to the A/B.
+
+Same harness, the admission variant (`bin-c2b`), one cache budget per run:
+
+| `decoded_cache_limit` | geomean B/A | sum A → B (ms) | q1 | q6 | q9 | q18 | q21 |
+|---|---|---|---|---|---|---|---|
+| 256 MiB (old default) | 2.677 | 641 → 2133 | 3.82 | 12.57 | 3.28 | 1.00 | 0.98 |
+| 512 MiB | 1.175 | 607 → 889 | 5.06 | 0.83 | 0.94 | 1.02 | 0.74 |
+| 768 MiB | 0.989 | 738 → 746 | 1.05 | 0.83 | 1.01 | 1.03 | 1.00 |
+| **1 GiB (default)** | **0.988** | 696 → 693 | 0.96 | 1.00 | 1.04 | 1.08 | 0.97 |
+| unlimited | 0.996 | 648 → 640 | 1.02 | 1.00 | 1.04 | 1.03 | 1.02 |
+
+(`/tmp/w136c2-ab-{256mb,512MB,768MB,1gb,1}.json`; CLI load at 1 GiB is 9.8/8.5/7.3.) Below ~640 MiB
+the budget cannot hold one query's working set, so every morsel evicts the chunk another morsel just
+decoded: the profile shows `register`/`evict_decoded` mutex contention instead of decode. The
+default is therefore **a quarter of `memory_limit`, capped at 1 GiB, floor 16 MiB** — 1 GiB on the
+default pool, passing with margin; the smallest measured passing budget is 768 MiB. `SET
+decoded_cache_limit` overrides it (`-1` is unlimited); a smaller `memory_limit` yields a
+proportionally smaller cache and gives the ratio back — the trade-off the setting exists for. Q1 peak
+RSS on the shipped default: **456 MB** (four-column Q1, `/usr/bin/time -l`), against 973 MB at
+136b-4 and 48–51 MB for the rejected uncached variant.
+
+### §10 decode profile (step 136c-2, uncached)
+
+`sample` of a Q1 loop with `decoded_cache_limit='1KB'` (a true uncached scan) plus single-column
+scans over TPC-H SF1's 6M lineitem rows (min of 3, uncached, ms):
+
+| column | ms | hot leaf |
+|---|---|---|
+| `l_orderkey` | 11.2 | bitpack (`unpack_bits`, 707 samples) |
+| `l_partkey` | 16.1 | bitpack / FastLanes (`fastlanes_unpack`, 234) |
+| `l_quantity` | 22.9 | bitpack |
+| `l_extendedprice` | 27.8 | bitpack + `Vector::push_valid` |
+| `l_discount` | 25.3 | bitpack |
+| `l_tax` | 19.0 | bitpack |
+| `l_shipdate` | 15.2 | delta / bitpack |
+| `l_returnflag` | 12.3 | dictionary (`dict_rows`, 143) |
+| `l_shipmode` | 20.7 | dictionary |
+| `l_comment` | **89.9** | FSST expansion |
+| `count(*)` | 0.1 | zone map, no decode |
+
+Integer decode is bitpack/FastLanes at 2–5 ns per row; the one FSST-compressed varchar column costs
+about a third of Q1. `pread` is ~5% of samples and the first-read CRC never rose above the sampling
+threshold (one pass over the chunk, fused with the read). The cost above decode is per-value
+materialization (`Vector::push_valid`/`push_bool`, `cast_value`, `decode_payload` building an
+intermediate `Vec`), which is what DuckDB v2.0.0 avoids: its `ColumnSegment::Scan` decompresses
+straight into the target `Vector`, bitpack/FLS write into the result buffer, and FSST expands eight
+bytes at a time from a 2 KB symbol table into the vector's string heap
+(`~/Desktop/projects/duckdb-v2.0.0/src/storage/compression/`, read only). A plausible follow-up:
+decode into the vector's typed buffers instead of an intermediate `Vec` plus per-value pushes, and an
+8-byte-symbol FSST fast path. No decoder changed in this pass.
+
+**136c-2 result, reviewer's measurement** (2026-11-03; release CLI built with `-p pinkdb-cli --bin pinkdb`;
+interleaved against 136c-1 on the same v7 SF1 store; load 9–12):
+- Default limit (the cache takes the free room): warm geomean **1.001** over 7 rounds. A 5-round
+  run under heavier load gave 1.048, and direct repeats showed the outliers were noise. Q1 peak
+  RSS is 656 MB on both builds.
+- `memory_limit = '256MB'`: geomean 0.999 against 136c-1, but the run sum is 2.3× the default's
+  (1.71 s against 0.74 s), because scans decode again. Q1 peak RSS is 300 MB on both.
+- The QuackLab 16×10 server is unchanged: 476–525 MB peak with 17.4 MB live. The peak is
+  per-statement working memory the allocator keeps.
+- Pi's earlier capped-budget ladder (256 MiB 2.68, 768 MiB 0.989) was measured on a stale CLI
+  binary whose default was the 256 MiB cap. Its relative order holds, but the default row is
+  replaced by the numbers above.

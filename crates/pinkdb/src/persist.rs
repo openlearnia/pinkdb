@@ -8050,16 +8050,21 @@ fn read_principal_grants(
 /// are ungated (`nan_count` and zero doubles are kept); `pink-lake` applies
 /// the one exactness gate shared with its footer path, so the two cannot
 /// drift apart.
-/// Folds a table's statistics. The table is materialized first: the lake
-/// folds over tables it has just read, and a table cloned out of a lazily
-/// opened store still carries encoded chunks.
+/// Folds a table's statistics. The fold reads values, so the table is
+/// materialized first — through the decoded cache, whose budget pays for the
+/// payloads (a table cloned out of a lazily opened store still carries encoded
+/// chunks; wave 136c-2).
 pub fn table_stats(
     db: &str,
     schema_name: &str,
     table: &str,
     src: &DataTable,
 ) -> Result<SavedTableStats> {
-    src.decode_all()?;
+    for column in &src.columns {
+        for i in 0..column.num_chunks() {
+            column.chunk(i)?;
+        }
+    }
     let schema = src.schema();
     let mut accs: Vec<ChunkColumnStats> =
         schema.iter().map(|_| ChunkColumnStats::empty()).collect();
@@ -12571,37 +12576,54 @@ mod tests {
         }
     }
 
-    /// Opening decodes nothing; a projected read decodes that column's chunks
-    /// only, and a zone-pruned scan decodes the surviving chunk only.
+    /// Opening decodes nothing; a streaming scan decodes each chunk for its
+    /// morsel and drops it, and the zone map keeps the pruned chunks from being
+    /// touched at all (wave 136c-2).
     #[test]
     fn open_is_lazy_and_projected_scans_decode_only_what_they_read() {
-        let db = wide_db(5000);
-        let bytes = db.to_bytes().unwrap();
-
-        // A fresh open for each query: a chunk stays decoded once touched.
-        let mut pruned = PinkDb::load_bytes(&bytes).unwrap();
+        // The scan now admits into the process-wide decoded cache, so this
+        // test takes the cache lock the other budget tests take.
+        let _lock = crate::memory::test_lock();
+        let path = temp_file("lazy-projected");
+        wide_db(5000).save(path.to_str().unwrap()).unwrap();
+        let mut db = PinkDb::open(path.to_str().unwrap()).unwrap();
         assert_eq!(
-            pruned.table("w").unwrap().decoded_chunks(),
+            db.table("w").unwrap().decoded_chunks(),
             0,
             "an open must not decode a chunk"
         );
+
+        // The zone map leaves one chunk; the streaming scan admits it into the
+        // decoded cache under the cache's own budget (design §10: uncached
+        // streaming measured 1.62x, so the scan caches).
         assert_eq!(
-            select(&mut pruned, "SELECT a FROM w WHERE a = 0;"),
+            select(&mut db, "SELECT a FROM w WHERE a = 0;"),
             vec![vec![Value::Integer(0)]]
         );
+        let table = db.table("w").unwrap();
         assert_eq!(
-            pruned.table("w").unwrap().decoded_chunks(),
+            table.columns[0].decoded_chunks(),
             1,
-            "the zone map prunes the other two chunks before they are decoded"
+            "the zone map leaves one chunk of the projected column"
+        );
+        assert_eq!(
+            table.columns[1].decoded_chunks(),
+            0,
+            "a projection never decodes b"
         );
 
-        let mut projected = PinkDb::load_bytes(&bytes).unwrap();
-        assert_eq!(select(&mut projected, "SELECT a FROM w;").len(), 5000);
-        assert_eq!(
-            projected.table("w").unwrap().columns[0].decoded_chunks(),
-            3,
-            "5000 rows are three chunks of the projected column"
+        // A full scan of `a` caches its three chunks; the other columns stay
+        // encoded.
+        assert_eq!(select(&mut db, "SELECT a FROM w;").len(), 5000);
+        let table = db.table("w").unwrap();
+        assert_eq!(table.columns[0].decoded_chunks(), 3);
+        assert_eq!(table.columns[1].decoded_chunks(), 0);
+        assert_eq!(table.columns[2].decoded_chunks(), 0);
+        assert!(
+            crate::memory::cache_used() > 0,
+            "the scan's chunks are cache entries"
         );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A lazily opened store answers exactly like one whose chunks were all
@@ -12656,6 +12678,58 @@ mod tests {
     }
 
     /// The open-time CRC sweep catches a damaged chunk without decoding it.
+    /// Wave 136c-2: a streaming scan decodes each chunk for its own use and
+    /// drops it, and a full cache never fails a query.
+    #[test]
+    fn a_streamed_scan_caches_nothing_and_a_small_budget_still_answers() {
+        let _lock = crate::memory::test_lock();
+        crate::memory::reset_cache_limit();
+        let p = temp_file("lazy-scan-cache");
+        wide_db(5000).save(p.to_str().unwrap()).unwrap();
+        let mut db = PinkDb::open(p.to_str().unwrap()).unwrap();
+        let table = db.table("w").unwrap();
+        let before = crate::memory::cache_used();
+        for i in 0..table.num_chunks() {
+            assert!(table.scan_chunk_uncached(i).unwrap().is_some());
+        }
+        for column in &table.columns {
+            assert_eq!(
+                column.decoded_chunks(),
+                0,
+                "an uncached decode leaves no payload on the handle"
+            );
+        }
+        assert_eq!(crate::memory::cache_used(), before);
+        // One MiB of cache: the first chunks fit, the rest are decoded for the
+        // scan alone. Either way the query answers, and the cache stays within
+        // its budget.
+        crate::memory::set_cache_limit(1024 * 1024);
+        assert_eq!(
+            select(&mut db, "SELECT count(*) FROM w"),
+            vec![vec![Value::Bigint(5000)]]
+        );
+        assert!(crate::memory::cache_used() <= crate::memory::cache_limit());
+        crate::memory::reset_cache_limit();
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A write's chunk is the truth until saved: it lives on the operator pool
+    /// and is never counted in (or evicted by) the decoded cache.
+    #[test]
+    fn a_dirty_chunk_stays_on_the_operator_pool() {
+        let _lock = crate::memory::test_lock();
+        crate::memory::reset_cache_limit();
+        crate::memory::set_cache_limit(1);
+        let db = wide_db(5000);
+        let used = crate::memory::used();
+        let table = db.table("w").unwrap();
+        let chunk = table.columns[0].chunk(0).unwrap();
+        assert_eq!(crate::memory::cache_used(), 0);
+        assert!(crate::memory::used() >= used);
+        drop(chunk);
+        crate::memory::reset_cache_limit();
+    }
+
     #[test]
     fn a_corrupt_chunk_fails_when_it_is_read() {
         let db = wide_db(100);
@@ -12729,9 +12803,9 @@ mod tests {
         db.save(path.to_str().unwrap()).unwrap();
         let file = std::fs::read(&path).unwrap();
         let (_, footer_len) = footer_span(&file).unwrap();
-        let before = crate::storage::source_read_bytes();
+        let before = crate::storage::source_read_bytes_local();
         let db = PinkDb::open(path.to_str().unwrap()).unwrap();
-        let open_read = crate::storage::source_read_bytes() - before;
+        let open_read = crate::storage::source_read_bytes_local() - before;
         assert_eq!(
             open_read,
             2 * HEADER_SLOT_LEN as u64 + 8 + footer_len,
@@ -12771,9 +12845,12 @@ mod tests {
             back.table("t").unwrap().indexes[0].map().is_some(),
             "the first use builds the map"
         );
+        // Counted decodes, not cache residency: whether the cache keeps the
+        // decoded chunk depends on the process-wide budget other tests set.
+        let t = back.table("t").unwrap();
         assert_eq!(
-            back.table("t").unwrap().decoded_chunks(),
-            1,
+            (t.columns[0].decodes(), t.columns[1].decodes()),
+            (1, 0),
             "building the map decodes the indexed column only"
         );
         assert_eq!(
