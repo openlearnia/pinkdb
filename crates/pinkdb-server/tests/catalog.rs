@@ -430,6 +430,14 @@ fn one_writer_per_lake_and_a_killed_servers_lake_reopens() {
         .execute(&format!("ATTACH 'lake:{catalog}' AS ro (READ_ONLY);"))
         .unwrap();
     assert_eq!(ints(&mut other, "SELECT count(*) FROM ro.t;"), vec![2]);
+    // The identical ATTACH again is a no-op (a client script reruns it); the
+    // same name with other options is refused.
+    other
+        .execute(&format!("ATTACH 'lake:{catalog}' AS ro (READ_ONLY);"))
+        .unwrap();
+    let msg = error(&mut other, &format!("ATTACH 'lake:{catalog}' AS ro;"));
+    assert!(msg.contains("with different options"), "{msg}");
+    assert_eq!(ints(&mut other, "SELECT count(*) FROM ro.t;"), vec![2]);
     drop(other);
     assert!(b.terminate().success());
 

@@ -1602,6 +1602,103 @@ fn durable_session_wal_covers_lake_commits() {
     cleanup(&dir);
 }
 
+/// A store remembers its ATTACH across reopen, so a script that attaches its
+/// lake must run again unchanged: the identical ATTACH is a no-op that logs
+/// nothing, and the rest of its line still runs. Another location or other
+/// options under the name stay errors.
+#[test]
+fn reattaching_the_same_lake_is_a_no_op_across_reopen() {
+    let dir = scratch("reattach");
+    let lake = dir.join("lake");
+    let other = dir.join("other");
+    let db = dir.join("d.pink");
+    let wal = dir.join("d.pink.wal");
+    let db = db.display().to_string();
+    for target in [&lake, &other] {
+        run(&format!(
+            "CREATE TABLE t (a INTEGER);
+INSERT INTO t VALUES (1), (2), (3);
+             .lake save {}
+.quit
+",
+            target.display()
+        ));
+    }
+    // The reported script: attach, switch to it and query, all on one line.
+    let script = format!(
+        ".open {db}
+ATTACH 'lake:{}' AS lk (READ_ONLY); USE lk; SELECT SUM(a) AS total FROM t;
+.quit
+",
+        lake.display()
+    );
+    for round in 0..3 {
+        let (out, err, code) = run_captured(&script);
+        assert_eq!(code, 0, "round {round}: {out}{err}");
+        assert!(!err.contains("Error"), "round {round}: {err}");
+        assert!(out.contains("│ 6 "), "round {round}: {out}");
+    }
+    // The first run logged the ATTACH; an identical one appends nothing. (The
+    // script's `USE` is logged on every run, so the ATTACH runs alone here.)
+    let wal_len = || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    let before = wal_len();
+    assert!(before > 0, "the first ATTACH is in the WAL");
+    let (out, err, code) = run_captured(&format!(
+        ".open {db}\nATTACH 'lake:{}' AS lk (READ_ONLY);\n.quit\n",
+        lake.display()
+    ));
+    assert_eq!(code, 0, "{out}{err}");
+    assert_eq!(wal_len(), before, "an identical re-ATTACH grew the WAL");
+
+    // Different options, a different lake, and a local database under the
+    // name are still refused; the identical one still answers.
+    let (out, err, code) = run_captured(&format!(
+        ".open {db}
+         ATTACH 'lake:{lake}' AS lk;
+         ATTACH 'lake:{other}' AS lk (READ_ONLY);
+         CREATE DATABASE loc;
+         ATTACH 'lake:{other}' AS loc (READ_ONLY);
+         ATTACH 'lake:{lake}' AS lk (READ_ONLY);
+         SELECT COUNT(*) AS n FROM lk.t;
+.quit
+",
+        lake = lake.display(),
+        other = other.display()
+    ));
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(err.contains("with different options"), "{err}");
+    assert!(err.contains("is already attached to lake"), "{err}");
+    assert!(err.contains("database \"loc\" already exists"), "{err}");
+    assert!(out.contains("│ 3 "), "{out}");
+    cleanup(&dir);
+}
+
+/// A failing statement on a line is reported and the statements after it
+/// still run, as the next line does after an error; the exit code reports
+/// the failure.
+#[test]
+fn a_failed_statement_does_not_swallow_the_rest_of_its_line() {
+    let (out, err, code) = run_captured(
+        "SELECT 41 + 1 AS first; SELECT * FROM missing; SELECT 'after' AS second;
+.quit
+",
+    );
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(out.contains("42"), "{out}");
+    assert!(err.contains("missing"), "{err}");
+    assert!(out.contains("after"), "{out}");
+    // A one-line transaction still commits, and a string holding `;` stays
+    // one statement.
+    let out = run(
+        "CREATE TABLE t (s VARCHAR); BEGIN; INSERT INTO t VALUES ('a;b'); COMMIT;
+         SELECT s, COUNT(*) OVER () AS n FROM t;
+.quit
+",
+    );
+    assert!(out.contains("a;b"), "{out}");
+    assert!(out.contains("│ 1 "), "{out}");
+}
+
 /// `.lake partition` end to end (wave 66): set a spec, commit split by value,
 /// read with file pruning, then clear the spec and commit unpartitioned
 /// again.

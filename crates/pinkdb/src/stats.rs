@@ -66,26 +66,18 @@ pub(crate) fn filter_hash(v: &Vector, row: usize) -> u64 {
 /// probe scan does not materialize a `Value` per row.
 pub(crate) fn key_hash(v: &Vector, row: usize) -> u64 {
     match v.data() {
-        VectorData::Boolean(d) => mix(d[row] as u64 ^ 0x10),
-        VectorData::Int32(d) => mix(d[row] as u64),
-        VectorData::Int64(d) => mix(d[row] as u64 ^ 0x20),
-        VectorData::Date32(d) => mix(d[row] as u64 ^ 0x30),
-        VectorData::TimestampMicros(d) => mix(d[row] as u64 ^ 0x40),
-        VectorData::Float64(d) => mix(double_bits(d[row])),
+        VectorData::Boolean(d) => bool_key(d[row]),
+        VectorData::Int32(d) => int32_key(d[row]),
+        VectorData::Int64(d) => int64_key(d[row]),
+        VectorData::Date32(d) => date_key(d[row]),
+        VectorData::TimestampMicros(d) => timestamp_key(d[row]),
+        VectorData::Float64(d) => float_key(d[row]),
         VectorData::VarChar(d) => hash_bytes(d[row].as_bytes()),
-        VectorData::Decimal { values, scale, .. } => {
-            let x = values[row];
-            mix(x as u64 ^ ((x >> 64) as u64).rotate_left(17) ^ ((*scale as u64) << 56))
-        }
-        VectorData::Interval(d) => {
-            let iv = d[row];
-            mix(crate::types::interval_key(iv.months, iv.days, iv.micros) as u64 ^ 0x50)
-        }
+        VectorData::Decimal { values, scale, .. } => decimal_key(values[row], *scale),
+        VectorData::Decimal64 { values, scale, .. } => decimal_key(i128::from(values[row]), *scale),
+        VectorData::Interval(d) => interval_key_of(d[row]),
         // The general encodings (they own the canonical form of these kinds).
-        VectorData::Uuid(d) => {
-            let x = d[row];
-            mix(x as u64 ^ ((x >> 64) as u64).rotate_left(17) ^ 0x60)
-        }
+        VectorData::Uuid(d) => uuid_key(d[row]),
         // 128-bit integers hash by value, so every row of the column reaches
         // the bloom probe's hash unchanged.
         VectorData::Int128(d) => hash_int128(d[row]),
@@ -133,6 +125,45 @@ pub(crate) fn value_hash(v: &Value) -> u64 {
 /// buckets.
 fn hash_int128(x: i128) -> u64 {
     mix((x as u64) ^ ((x >> 64) as u64).rotate_left(17))
+}
+
+// One scalar's hash, shared by [`key_hash`] (the row-at-a-time path) and the
+// fused chunk fold, so the two can never disagree.
+#[inline]
+fn bool_key(b: bool) -> u64 {
+    mix(b as u64 ^ 0x10)
+}
+#[inline]
+fn int32_key(i: i32) -> u64 {
+    mix(i as u64)
+}
+#[inline]
+fn int64_key(i: i64) -> u64 {
+    mix(i as u64 ^ 0x20)
+}
+#[inline]
+fn date_key(d: i32) -> u64 {
+    mix(d as u64 ^ 0x30)
+}
+#[inline]
+fn timestamp_key(us: i64) -> u64 {
+    mix(us as u64 ^ 0x40)
+}
+#[inline]
+fn float_key(x: f64) -> u64 {
+    mix(double_bits(x))
+}
+#[inline]
+fn decimal_key(x: i128, scale: u8) -> u64 {
+    mix(x as u64 ^ ((x >> 64) as u64).rotate_left(17) ^ ((scale as u64) << 56))
+}
+#[inline]
+fn interval_key_of(iv: Interval) -> u64 {
+    mix(crate::types::interval_key(iv.months, iv.days, iv.micros) as u64 ^ 0x50)
+}
+#[inline]
+fn uuid_key(x: u128) -> u64 {
+    mix(x as u64 ^ ((x >> 64) as u64).rotate_left(17) ^ 0x60)
 }
 
 /// `-0.0` and every NaN collapse to one bit pattern, exactly as equality (and
@@ -217,6 +248,15 @@ impl Hll {
             VectorData::Decimal { values, scale, .. } => {
                 let scale = *scale as u64;
                 self.fold_typed(v, values, move |x: i128| {
+                    mix(x as u64 ^ ((x >> 64) as u64).rotate_left(17) ^ (scale << 56))
+                })
+            }
+            // Hashed as its 128-bit value: a sketch does not depend on the
+            // payload width (wave 142).
+            VectorData::Decimal64 { values, scale, .. } => {
+                let scale = *scale as u64;
+                self.fold_typed(v, values, move |x: i64| {
+                    let x = i128::from(x);
                     mix(x as u64 ^ ((x >> 64) as u64).rotate_left(17) ^ (scale << 56))
                 })
             }
@@ -612,6 +652,11 @@ impl Zone {
                 zone.min = min.map(|x| Value::decimal(x, *scale));
                 zone.max = max.map(|x| Value::decimal(x, *scale));
             }
+            VectorData::Decimal64 { values, scale, .. } => {
+                let (min, max) = int_stats(v, &values[start..start + len], start);
+                zone.min = min.map(|x| Value::decimal(i128::from(x), *scale));
+                zone.max = max.map(|x| Value::decimal(i128::from(x), *scale));
+            }
             VectorData::Int128(data) => {
                 let (min, max) = int_stats(v, &data[start..start + len], start);
                 zone.min = min.map(Value::Hugeint);
@@ -660,6 +705,258 @@ impl Zone {
         }
         zone
     }
+}
+
+// ---------- precomputed chunk statistics ----------
+
+/// One chunk's statistics, folded once where the chunk was produced.
+///
+/// [`crate::storage::DataTable::append_shared_chunk_with_stats`] merges these
+/// instead of re-reading every column, so a bulk load folds on the pool over
+/// the chunks it already holds and a table source may fold on the worker that
+/// decoded the chunk. [`ChunkStats::of`] is one pass per column: the zone's
+/// bounds and the sketch's hashes share the traversal, and the hashes are the
+/// same [`key_hash`] values a table fold would produce.
+#[derive(Debug, Clone, Default)]
+pub struct ChunkStats {
+    cols: Vec<ColumnChunk>,
+}
+
+#[derive(Debug, Clone)]
+struct ColumnChunk {
+    zone: Zone,
+    sketch: Hll,
+}
+
+impl ChunkStats {
+    /// Fold every column of one chunk.
+    pub fn of(columns: &[Arc<Vector>]) -> Self {
+        Self {
+            cols: columns
+                .iter()
+                .map(|v| {
+                    let (zone, sketch) = fold_zone_and_sketch(v);
+                    ColumnChunk { zone, sketch }
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether these statistics describe a `columns`-wide chunk.
+    pub(crate) fn matches(&self, columns: usize) -> bool {
+        self.cols.len() == columns
+    }
+
+    pub(crate) fn zone(&self, col: usize) -> Option<&Zone> {
+        self.cols.get(col).map(|c| &c.zone)
+    }
+
+    pub(crate) fn sketch(&self, col: usize) -> Option<&Hll> {
+        self.cols.get(col).map(|c| &c.sketch)
+    }
+}
+
+/// One column's zone and sketch in a single pass over its values.
+fn fold_zone_and_sketch(v: &Vector) -> (Zone, Hll) {
+    let mut zone = Zone::empty();
+    let mut hll = Hll::new();
+    match v.data() {
+        VectorData::Boolean(data) => {
+            let (mut has_false, mut has_true) = (false, false);
+            for_each_valid(v, data, &mut zone, |x| {
+                hll.insert_hash(bool_key(x));
+                if x {
+                    has_true = true;
+                } else {
+                    has_false = true;
+                }
+            });
+            if has_false || has_true {
+                zone.min = Some(Value::Boolean(!has_false));
+                zone.max = Some(Value::Boolean(has_true));
+            }
+        }
+        VectorData::Int32(data) => {
+            fold_ordered(v, data, &mut zone, &mut hll, int32_key, Value::Integer)
+        }
+        VectorData::Int64(data) => {
+            fold_ordered(v, data, &mut zone, &mut hll, int64_key, Value::Bigint)
+        }
+        VectorData::Date32(data) => {
+            fold_ordered(v, data, &mut zone, &mut hll, date_key, Value::Date)
+        }
+        VectorData::TimestampMicros(data) => fold_ordered(
+            v,
+            data,
+            &mut zone,
+            &mut hll,
+            timestamp_key,
+            Value::Timestamp,
+        ),
+        VectorData::Uuid(data) => fold_ordered(v, data, &mut zone, &mut hll, uuid_key, Value::Uuid),
+        VectorData::Int128(data) => {
+            fold_ordered(v, data, &mut zone, &mut hll, hash_int128, Value::Hugeint)
+        }
+        VectorData::UInt128(data) => fold_ordered(
+            v,
+            data,
+            &mut zone,
+            &mut hll,
+            |x: u128| hash_int128(x as i128),
+            Value::Uhugeint,
+        ),
+        VectorData::Decimal { values, scale, .. } => fold_ordered(
+            v,
+            values,
+            &mut zone,
+            &mut hll,
+            |x: i128| decimal_key(x, *scale),
+            |x: i128| Value::decimal(x, *scale),
+        ),
+        VectorData::Decimal64 { values, scale, .. } => fold_ordered(
+            v,
+            values,
+            &mut zone,
+            &mut hll,
+            |x: i64| decimal_key(i128::from(x), *scale),
+            |x: i64| Value::decimal(i128::from(x), *scale),
+        ),
+        VectorData::Float64(data) => {
+            let (mut min, mut max): (Option<f64>, Option<f64>) = (None, None);
+            let mut see = |x: f64| {
+                hll.insert_hash(float_key(x));
+                if x.is_nan() {
+                    zone.nan_count += 1;
+                    return;
+                }
+                if min.is_none_or(|m| x < m) {
+                    min = Some(x);
+                }
+                if max.is_none_or(|m| x > m) {
+                    max = Some(x);
+                }
+            };
+            if v.has_nulls() {
+                for (row, &x) in data.iter().enumerate() {
+                    if v.is_valid(row) {
+                        see(x);
+                    } else {
+                        zone.null_count += 1;
+                    }
+                }
+            } else {
+                for &x in data {
+                    see(x);
+                }
+            }
+            zone.min = min.map(Value::Double);
+            zone.max = max.map(Value::Double);
+        }
+        VectorData::Interval(data) => {
+            let mut min: Option<Interval> = None;
+            let mut max: Option<Interval> = None;
+            for_each_valid(v, data, &mut zone, |x: Interval| {
+                hll.insert_hash(interval_key_of(x));
+                if min.is_none_or(|m| crate::types::interval_cmp(x, m).is_lt()) {
+                    min = Some(x);
+                }
+                if max.is_none_or(|m| crate::types::interval_cmp(x, m).is_gt()) {
+                    max = Some(x);
+                }
+            });
+            let value = |iv: Interval| Value::Interval {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            };
+            zone.min = min.map(value);
+            zone.max = max.map(value);
+        }
+        VectorData::VarChar(data) => {
+            /// Bounds and hash of one string; the bounds borrow the column so
+            /// no bound is copied per value.
+            fn see<'a>(
+                x: &'a str,
+                hll: &mut Hll,
+                min: &mut Option<&'a str>,
+                max: &mut Option<&'a str>,
+            ) {
+                hll.insert_hash(hash_bytes(x.as_bytes()));
+                if min.is_none_or(|m| x < m) {
+                    *min = Some(x);
+                }
+                if max.is_none_or(|m| x > m) {
+                    *max = Some(x);
+                }
+            }
+            let (mut min, mut max): (Option<&str>, Option<&str>) = (None, None);
+            if v.has_nulls() {
+                for row in 0..v.len() {
+                    if v.is_valid(row) {
+                        see(data.get(row), &mut hll, &mut min, &mut max);
+                    } else {
+                        zone.null_count += 1;
+                    }
+                }
+            } else {
+                for row in 0..v.len() {
+                    see(data.get(row), &mut hll, &mut min, &mut max);
+                }
+            }
+            zone.min = min.map(|s| Value::Varchar(s.to_string()));
+            zone.max = max.map(|s| Value::Varchar(s.to_string()));
+        }
+        // No bounds: the total order spans kinds (see the module docs).
+        VectorData::Variant(_) | VectorData::Array { .. } => {
+            if v.has_nulls() {
+                zone.null_count = (0..v.len()).filter(|&row| v.is_null(row)).count() as u64;
+            }
+            hll.fold_vector(v);
+        }
+    }
+    (zone, hll)
+}
+
+/// Visit the non-NULL values of a fixed-width column, counting NULLs into
+/// `zone`, without a validity bit read when the column has none.
+fn for_each_valid<T: Copy>(v: &Vector, data: &[T], zone: &mut Zone, mut f: impl FnMut(T)) {
+    if v.has_nulls() {
+        for (row, &x) in data.iter().enumerate() {
+            if v.is_valid(row) {
+                f(x);
+            } else {
+                zone.null_count += 1;
+            }
+        }
+    } else {
+        for &x in data {
+            f(x);
+        }
+    }
+}
+
+/// [`for_each_valid`] plus min/max for an ordered fixed-width type: one
+/// traversal for bounds and hashes, first-seen on ties.
+fn fold_ordered<T: Copy + Ord>(
+    v: &Vector,
+    data: &[T],
+    zone: &mut Zone,
+    hll: &mut Hll,
+    key: impl Fn(T) -> u64,
+    wrap: impl Fn(T) -> Value,
+) {
+    let (mut min, mut max): (Option<T>, Option<T>) = (None, None);
+    for_each_valid(v, data, zone, |x| {
+        hll.insert_hash(key(x));
+        if min.is_none_or(|m| x < m) {
+            min = Some(x);
+        }
+        if max.is_none_or(|m| x > m) {
+            max = Some(x);
+        }
+    });
+    zone.min = min.map(&wrap);
+    zone.max = max.map(&wrap);
 }
 
 /// min/max over the valid elements of an integer chunk, first-seen on ties.
@@ -812,6 +1109,16 @@ impl ColStats {
     pub(crate) fn set_sketch(&mut self, hll: Option<Arc<Hll>>) {
         if hll.is_some() {
             self.hll = hll;
+        }
+    }
+
+    /// Merge a chunk's standalone sketch in (`None` keeps an unknown sketch).
+    pub(crate) fn merge_sketch(&mut self, hll: &Hll) {
+        match &mut self.hll {
+            Some(current) => Arc::make_mut(current).merge(hll),
+            // A placeholder column has no sketch yet; adopt this one, exactly
+            // as the fold path's `set_sketch` would.
+            None => self.hll = Some(Arc::new(hll.clone())),
         }
     }
 
@@ -1416,5 +1723,158 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The fused chunk fold (bounds and sketch in one traversal) must produce
+    /// exactly what the two separate folds the append path used before did.
+    #[test]
+    fn fused_chunk_fold_matches_the_two_pass_folds() {
+        let mut cases = Vec::new();
+        let mut v = Vector::new_empty(DataType::Boolean);
+        for x in [Some(true), None, Some(false), Some(true)] {
+            match x {
+                Some(b) => v.push_bool(b),
+                None => v.push_null(),
+            }
+            .unwrap();
+        }
+        cases.push(v);
+        let mut v = Vector::new_empty(DataType::Integer);
+        for x in [Some(3), None, Some(-7), Some(0), Some(3)] {
+            match x {
+                Some(x) => v.push_int32(x),
+                None => v.push_null(),
+            }
+            .unwrap();
+        }
+        cases.push(v);
+        let mut v = Vector::new_empty(DataType::Bigint);
+        for x in [Some(i64::MIN), None, Some(9), Some(i64::MAX)] {
+            match x {
+                Some(x) => v.push_int64(x),
+                None => v.push_null(),
+            }
+            .unwrap();
+        }
+        cases.push(v);
+        let mut v = Vector::new_empty(DataType::Decimal {
+            precision: 12,
+            scale: 2,
+        });
+        for x in [Some(1234), None, Some(-5), Some(0)] {
+            match x {
+                Some(x) => v.push_decimal(x, 2),
+                None => v.push_null(),
+            }
+            .unwrap();
+        }
+        cases.push(v);
+        let mut v = Vector::new_empty(DataType::Date);
+        for x in [Some(19_000), None, Some(18_000)] {
+            match x {
+                Some(x) => v.push_date(x),
+                None => v.push_null(),
+            }
+            .unwrap();
+        }
+        cases.push(v);
+        let mut v = Vector::new_empty(DataType::Timestamp);
+        for x in [Some(1_700_000_000_000_000), None, Some(0)] {
+            match x {
+                Some(x) => v.push_timestamp(x),
+                None => v.push_null(),
+            }
+            .unwrap();
+        }
+        cases.push(v);
+        let mut v = Vector::new_empty(DataType::Double);
+        for x in [Some(1.5), None, Some(f64::NAN), Some(-2.25), Some(-0.0)] {
+            match x {
+                Some(x) => v.push_float64(x),
+                None => v.push_null(),
+            }
+            .unwrap();
+        }
+        cases.push(v);
+        let mut v = Vector::new_empty(DataType::Varchar);
+        for x in [Some("ann"), None, Some(""), Some("zed"), Some("ann")] {
+            match x {
+                Some(x) => v.push_str(x),
+                None => v.push_null(),
+            }
+            .unwrap();
+        }
+        cases.push(v);
+        let mut v = Vector::new_empty(DataType::Interval);
+        for x in [
+            Some(Interval {
+                months: 1,
+                days: 2,
+                micros: 3,
+            }),
+            None,
+            Some(Interval {
+                months: -1,
+                days: 0,
+                micros: 0,
+            }),
+        ] {
+            match x {
+                Some(x) => v.push_interval(x),
+                None => v.push_null(),
+            }
+            .unwrap();
+        }
+        cases.push(v);
+        let mut v = Vector::new_empty(DataType::Uuid);
+        for x in [Some(1), None, Some(u128::MAX)] {
+            match x {
+                Some(x) => v.push_uuid(x),
+                None => v.push_null(),
+            }
+            .unwrap();
+        }
+        cases.push(v);
+        let mut v = Vector::new_empty(DataType::Hugeint);
+        for x in [Some(i128::MIN), None, Some(i128::MAX)] {
+            match x {
+                Some(x) => v.push_i128(x),
+                None => v.push_null(),
+            }
+            .unwrap();
+        }
+        cases.push(v);
+        let mut v = Vector::new_empty(DataType::Uhugeint);
+        for x in [Some(u128::MAX), None, Some(0)] {
+            match x {
+                Some(x) => v.push_u128(x),
+                None => v.push_null(),
+            }
+            .unwrap();
+        }
+        cases.push(v);
+
+        for v in &cases {
+            let (zone, hll) = fold_zone_and_sketch(v);
+            assert_eq!(zone, Zone::of_vector(v), "zone for {:?}", v.dtype());
+            let mut want = Hll::new();
+            want.fold_vector(v);
+            assert_eq!(
+                hll.to_bytes(),
+                want.to_bytes(),
+                "sketch for {:?}",
+                v.dtype()
+            );
+        }
+
+        let stats = ChunkStats::of(&[Arc::new(cases[0].clone()), Arc::new(cases[7].clone())]);
+        assert!(stats.matches(2));
+        let mut want = Hll::new();
+        want.fold_vector(&cases[0]);
+        assert_eq!(stats.zone(0), Some(&Zone::of_vector(&cases[0])));
+        assert_eq!(stats.sketch(0).map(Hll::to_bytes), Some(want.to_bytes()));
+        assert!(!stats.matches(3));
+        assert!(stats.zone(2).is_none());
+        assert!(stats.sketch(2).is_none());
     }
 }

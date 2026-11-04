@@ -1299,6 +1299,22 @@ impl Connection {
                 // the same lock the bind took, so no statement can slip
                 // between the check and its execution.
                 enforce(self.gate(), &shared, &plan, &pre_ns)?;
+                // Re-attaching the lake a name already serves, with the same
+                // options, changes nothing: answer it here so it never takes
+                // the write lease or appends a WAL record (a store replays
+                // its attachments, so every reopen would grow the log).
+                // With a secret it still runs, since the secret may be new.
+                if let crate::plan::LogicalPlan::Attach {
+                    name,
+                    source: crate::lake_db::AttachSource::Lake(spec),
+                    secret: None,
+                } = &plan
+                    && shared.existing_attachment(name, spec)?
+                {
+                    return Ok(crate::exec::ChunkedResult::Other(
+                        QueryResult::CreatedDatabase { name: name.clone() },
+                    ));
+                }
                 let result = if is_read_only(&plan) {
                     let exec_start = profile.as_ref().map(|_| Instant::now());
                     let result = if keep_chunks {

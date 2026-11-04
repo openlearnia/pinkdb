@@ -35,6 +35,7 @@ use crate::plan::{
 };
 use crate::sql::ast::{BinaryOp, JoinKind, SortSpec};
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr, common_numeric};
+use crate::stats::ChunkStats;
 use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};
@@ -1740,8 +1741,19 @@ pub(crate) fn run_plain(
             }
             db.create_table_in(&target, name, schema)?;
             let t = db.table_mut_in(&target, name)?;
-            for batch in &staged {
-                t.append_shared_chunk(batch)?;
+            // Fold statistics on the pool, then hand them to the table: the
+            // append path would otherwise rescan every column it just
+            // received. Statistics describe one batch, so at most 64 batches
+            // (≈4 MB of sketches for 16 columns) are in flight.
+            const STATS_GROUP: usize = 64;
+            for group in staged.chunks(STATS_GROUP) {
+                let stats: Vec<ChunkStats> = group
+                    .par_iter()
+                    .map(|batch| ChunkStats::of(batch))
+                    .collect();
+                for (batch, stats) in group.iter().zip(&stats) {
+                    t.append_shared_chunk_with_stats(batch, Some(stats))?;
+                }
             }
             Ok(QueryResult::Created)
         }
@@ -6352,6 +6364,7 @@ fn residual_selection(
     preserved: &DataChunk,
     preserved_cols: usize,
     build: &[DataChunk],
+    gathers: Option<&[crate::vector::GatherColumn<'_>]>,
 ) -> Result<selection::Selection> {
     if pairs.is_empty() {
         return Ok(Vec::new());
@@ -6381,12 +6394,17 @@ fn residual_selection(
                 if c < preserved_cols {
                     preserved.columns[c].take(&rows)
                 } else {
+                    // Every build chunk shares one schema.
+                    let dtype = build[0].columns[c - preserved_cols].dtype();
+                    if let Some(g) = gathers {
+                        // Resolved once per join: the gather touches only the
+                        // picked rows, not every build chunk per batch.
+                        return g[c - preserved_cols].gather(dtype, &picks);
+                    }
                     let sources: Vec<&Vector> = build
                         .iter()
                         .map(|chunk| chunk.columns[c - preserved_cols].as_ref())
                         .collect();
-                    // Every build chunk shares one schema.
-                    let dtype = build[0].columns[c - preserved_cols].dtype();
                     Vector::gather_located(dtype, &sources, &picks)
                 }
             })
@@ -6964,6 +6982,7 @@ fn semi_by_marking_left(
                     chunk,
                     right.types.len(),
                     left.chunks,
+                    None,
                 )?;
                 for k in kept {
                     let (_, c, i) = pairs[k as usize];
@@ -7232,8 +7251,15 @@ fn mark_probe_chunk(
         None => None,
         Some(residual) => {
             let pairs = candidate_pairs(chunk, &probe, &how.table, how.filters.as_deref());
-            let kept =
-                residual_selection(cx, residual, &pairs, chunk, how.preserved_cols, how.build)?;
+            let kept = residual_selection(
+                cx,
+                residual,
+                &pairs,
+                chunk,
+                how.preserved_cols,
+                how.build,
+                None,
+            )?;
             let mut pass = vec![false; chunk.num_rows()];
             for k in kept {
                 pass[pairs[k as usize].0 as usize] = true;
@@ -7460,8 +7486,9 @@ struct JoinAssembler<'a> {
     n_left: usize,
     preserved_is_right: bool,
     placeholders: Vec<Option<std::sync::Arc<Vector>>>,
-    /// Per build-side column, that column of every build chunk.
-    build_cols: &'a [Vec<&'a Vector>],
+    /// Per build-side column, its build chunks resolved for gathering once
+    /// per join (wave 141a).
+    build_cols: &'a [crate::vector::GatherColumn<'a>],
     rows: Vec<u32>,
     picks: Vec<(u32, u32)>,
     finished: Vec<DataChunk>,
@@ -7474,7 +7501,7 @@ impl<'a> JoinAssembler<'a> {
         n_left: usize,
         preserved_is_right: bool,
         present: Option<&[bool]>,
-        build_cols: &'a [Vec<&'a Vector>],
+        build_cols: &'a [crate::vector::GatherColumn<'a>],
     ) -> Self {
         let present: Vec<bool> = match present {
             Some(mask) if mask.len() == dtypes.len() => mask.to_vec(),
@@ -7549,7 +7576,7 @@ impl<'a> JoinAssembler<'a> {
                         k - self.n_left
                     };
                     debug_assert!(j < n_build);
-                    Vector::gather_located(self.dtypes[k], &self.build_cols[j], &self.picks)
+                    self.build_cols[j].gather(self.dtypes[k], &self.picks)
                 } else {
                     let j = if self.preserved_is_right {
                         k - self.n_left
@@ -7647,7 +7674,7 @@ struct ProbePlan<'a> {
     sel_safe: bool,
     /// The build side's columns, per column: the gather layout every probe of
     /// a preserved chunk shares, so it is built once per statement.
-    build_cols: Vec<Vec<&'a Vector>>,
+    build_cols: Vec<crate::vector::GatherColumn<'a>>,
 }
 
 impl<'a> ProbePlan<'a> {
@@ -7690,7 +7717,10 @@ impl<'a> ProbePlan<'a> {
         let sel_safe = preserved_keys
             .iter()
             .all(|key| matches!(key, BoundExpr::Column { .. }));
-        let build_cols = JoinAssembler::build_columns(build, build_types.len());
+        let build_cols = JoinAssembler::build_columns(build, build_types.len())
+            .iter()
+            .map(|sources| Vector::gather_column(sources))
+            .collect();
         let residual = residual.map(|r| GatheredResidual::new(cx, r)).transpose()?;
         Ok(ProbePlan {
             table,
@@ -7753,8 +7783,15 @@ impl<'a> ProbePlan<'a> {
             // Two passes: the residual decides which candidate pairs are
             // matches before any of them is assembled.
             let pairs = candidate_pairs(chunk, &probe, &self.table, self.filters.as_deref());
-            let kept =
-                residual_selection(cx, residual, &pairs, chunk, self.n_preserved, self.build)?;
+            let kept = residual_selection(
+                cx,
+                residual,
+                &pairs,
+                chunk,
+                self.n_preserved,
+                self.build,
+                Some(&self.build_cols),
+            )?;
             for k in kept {
                 let (row, bci, bi) = pairs[k as usize];
                 sink.push(chunk, row as usize, (bci, bi))?;
@@ -8206,6 +8243,7 @@ fn encode_key_into(v: &Vector, idx: usize, spec: SortSpec, out: &mut Vec<u8>) {
         // DECIMAL: one scale per column, so plain i128 order works (sign bit
         // flipped like the integer encodings).
         VectorData::Decimal { values, .. } => push_be_i128(out, values[idx], desc),
+        VectorData::Decimal64 { values, .. } => push_be_i128(out, i128::from(values[idx]), desc),
         // INTERVAL: encode the comparison key (months → 30 days, days →
         // micros), which is monotone in `interval_cmp`.
         VectorData::Interval(d) => {

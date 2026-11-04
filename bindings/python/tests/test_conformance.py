@@ -89,12 +89,15 @@ class ConformanceTest(unittest.TestCase):
 
     def test_corpus_metadata(self):
         self.assertEqual(CORPUS["corpus_version"], 1)
-        self.assertEqual(CORPUS["abi_version"], (1 << 16) | 4)
+        # The corpus targets a major version and the minor it was written
+        # against; a newer minor of the same major only adds calls.
+        major, minor = pinkdb.abi_version_info()
         self.assertEqual(
-            CORPUS["abi_version"],
-            pinkdb.abi_version(),
-            "the corpus targets a different C ABI version than this binding",
+            CORPUS["abi_version"] >> 16,
+            major,
+            "the corpus targets a different C ABI major version than this library",
         )
+        self.assertGreaterEqual(minor, CORPUS["abi_version"] & 0xFFFF)
         self.assertTrue(CORPUS["cases"])
 
     # ----- case / step machinery -----

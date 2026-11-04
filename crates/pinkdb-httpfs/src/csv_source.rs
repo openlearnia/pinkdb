@@ -1608,4 +1608,75 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// A `CREATE TABLE AS` load folds each chunk's statistics while it is
+    /// decoded; an `INSERT ... SELECT` of the same file folds them after the
+    /// fact. Both must leave exactly the same column statistics.
+    #[test]
+    fn ctas_load_statistics_match_the_append_path() {
+        let dir = scratch_dir("load_stats");
+        let path = dir.join("t.csv");
+        let mut data = String::from("i,b,d,dt,ts,s,x\n");
+        for n in 0..5000i64 {
+            let i = if n % 7 == 0 {
+                String::new()
+            } else {
+                n.to_string()
+            };
+            let b = if n % 11 == 0 {
+                String::new()
+            } else {
+                (-n * 3).to_string()
+            };
+            let d = if n % 13 == 0 {
+                String::new()
+            } else {
+                format!("{}.{:02}", n % 1000, n % 100)
+            };
+            let day = n % 28 + 1;
+            let s = if n % 5 == 0 {
+                String::new()
+            } else {
+                format!("s{n}")
+            };
+            let x = if n % 17 == 0 {
+                String::new()
+            } else {
+                format!("{:.1}", n as f64 / 4.0)
+            };
+            data.push_str(&format!(
+                "{i},{b},{d},2020-01-{day:02},2020-01-{day:02} 12:00:00,{s},{x}\n"
+            ));
+        }
+        std::fs::write(&path, data).unwrap();
+        let path = path.to_str().unwrap();
+        let types = "types = {'i': 'INTEGER', 'b': 'BIGINT', 'd': 'DECIMAL(12,2)', \
+                     'dt': 'DATE', 'ts': 'TIMESTAMP', 's': 'VARCHAR', 'x': 'DOUBLE'}";
+        let mut db = PinkDb::new();
+        register(&mut db);
+        db.execute(&format!(
+            "CREATE TABLE fused AS SELECT * FROM read_csv('{path}', header=true, {types})"
+        ))
+        .expect("CTAS");
+        db.execute(
+            "CREATE TABLE folded (i INTEGER, b BIGINT, d DECIMAL(12,2), dt DATE, \
+             ts TIMESTAMP, s VARCHAR, x DOUBLE)",
+        )
+        .expect("create");
+        db.execute(&format!(
+            "INSERT INTO folded SELECT * FROM read_csv('{path}', header=true, {types})"
+        ))
+        .expect("insert");
+        let mut fused = rows(&mut db, "SELECT * FROM pinkdb_column_stats('fused')");
+        let mut folded = rows(&mut db, "SELECT * FROM pinkdb_column_stats('folded')");
+        // The table name (column 1) is the only expected difference.
+        for table in [&mut fused, &mut folded] {
+            for row in table.iter_mut() {
+                row[1] = Value::Null;
+            }
+        }
+        assert_eq!(fused.len(), 7);
+        assert_eq!(fused, folded, "a CTAS load kept different statistics");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

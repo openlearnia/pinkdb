@@ -12,7 +12,7 @@ use pinkdb_ext_loader::{ExtFunction, ExtHandle};
 use crate::crypto::EncryptionKey;
 use crate::plan::ColumnDefault;
 use crate::sql::ast::Select;
-use crate::stats::{ColStats, Hll, TableStats, Zone};
+use crate::stats::{ChunkStats, ColStats, Hll, TableStats, Zone};
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{CHUNK_SIZE, DataChunk, Vector};
 use crate::wal::Wal;
@@ -1839,6 +1839,35 @@ impl DataTable {
     /// chunk boundary: the second zone covers rows `split..`, so each chunk's
     /// zone still describes only the rows it holds. The caller merges both
     /// zones into the table-level bounds.
+    /// A batch's zones as they land in the table: the whole batch's
+    /// precomputed zone when it fits in one chunk, otherwise the two range
+    /// zones it straddles (a precomputed zone cannot answer for one part).
+    fn landing_zones(
+        &self,
+        chunk: &[Arc<Vector>],
+        split: usize,
+        stats: &ChunkStats,
+    ) -> Vec<(Zone, Zone)> {
+        let whole = split >= chunk.first().map(|c| c.len()).unwrap_or(0);
+        chunk
+            .iter()
+            .enumerate()
+            .map(|(ci, src)| {
+                if whole && let Some(zone) = stats.zone(ci) {
+                    return (zone.clone(), Zone::empty());
+                }
+                let split = split.min(src.len());
+                let zone = Zone::of_vector_range(src, 0, split);
+                let rest = if split < src.len() {
+                    Zone::of_vector_range(src, split, src.len() - split)
+                } else {
+                    Zone::empty()
+                };
+                (zone, rest)
+            })
+            .collect()
+    }
+
     fn fold_chunk_stats(
         &self,
         chunk: &[std::sync::Arc<Vector>],
@@ -2456,10 +2485,26 @@ impl DataTable {
     /// The lake loader uses this to hand decoded chunks straight to the
     /// destination table without deep-cloning megabytes of payload.
     pub fn append_shared_chunk(&mut self, chunk: &[Arc<Vector>]) -> Result<()> {
-        self.append_shared_chunk_inner(chunk)
+        self.append_shared_chunk_inner(chunk, None)
     }
 
-    fn append_shared_chunk_inner(&mut self, chunk: &[Arc<Vector>]) -> Result<()> {
+    /// [`Self::append_shared_chunk`] with statistics already folded on the
+    /// chunk (by the worker that decoded it, or by the caller over a pool):
+    /// the table merges them instead of rescanning every column. `stats` must
+    /// describe `chunk`; a column-count mismatch falls back to folding.
+    pub fn append_shared_chunk_with_stats(
+        &mut self,
+        chunk: &[Arc<Vector>],
+        stats: Option<&ChunkStats>,
+    ) -> Result<()> {
+        self.append_shared_chunk_inner(chunk, stats)
+    }
+
+    fn append_shared_chunk_inner(
+        &mut self,
+        chunk: &[Arc<Vector>],
+        stats: Option<&ChunkStats>,
+    ) -> Result<()> {
         if chunk.len() != self.columns.len() {
             return Err(PinkDbError::Execution(format!(
                 "chunk has {} columns but table \"{}\" has {}",
@@ -2493,6 +2538,7 @@ impl DataTable {
         if rows == 0 {
             return Ok(());
         }
+        let stats = stats.filter(|stats| stats.matches(chunk.len()));
         let start = self.num_rows;
         // Fast paths (rows ≤ CHUNK_SIZE by the check above): the batch fills
         // an empty tail chunk, or starts a new chunk after a full one — share
@@ -2516,14 +2562,35 @@ impl DataTable {
                     col.push_chunk(Arc::clone(src))?;
                 }
             }
-            let folded = self.fold_chunk_stats(chunk, rows);
-            for (ci, (zone, _, hll)) in folded.into_iter().enumerate() {
-                self.stats.cols[ci].absorb_zone(&zone);
-                self.stats.cols[ci].set_sketch(hll.map(std::sync::Arc::new));
-                if replacing {
-                    *self.zones[ci].last_mut().expect("tail zone exists") = zone;
-                } else {
-                    self.zones[ci].push(zone);
+            match stats {
+                Some(stats) => {
+                    for (ci, (zone, _)) in self
+                        .landing_zones(chunk, rows, stats)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        self.stats.cols[ci].absorb_zone(&zone);
+                        if let Some(sketch) = stats.sketch(ci) {
+                            self.stats.cols[ci].merge_sketch(sketch);
+                        }
+                        if replacing {
+                            *self.zones[ci].last_mut().expect("tail zone exists") = zone;
+                        } else {
+                            self.zones[ci].push(zone);
+                        }
+                    }
+                }
+                None => {
+                    let folded = self.fold_chunk_stats(chunk, rows);
+                    for (ci, (zone, _, hll)) in folded.into_iter().enumerate() {
+                        self.stats.cols[ci].absorb_zone(&zone);
+                        self.stats.cols[ci].set_sketch(hll.map(Arc::new));
+                        if replacing {
+                            *self.zones[ci].last_mut().expect("tail zone exists") = zone;
+                        } else {
+                            self.zones[ci].push(zone);
+                        }
+                    }
                 }
             }
             self.num_rows += rows;
@@ -2572,14 +2639,35 @@ impl DataTable {
         // rows that landed in them — re-deriving a whole chunk here would
         // copy its existing rows again, which was most of an append's cost.
         // The sketch is folded once over the whole batch either way.
-        let folded = self.fold_chunk_stats(chunk, split);
-        for (ci, (zone, rest, hll)) in folded.into_iter().enumerate() {
-            self.stats.cols[ci].absorb_zone(&zone);
-            self.stats.cols[ci].absorb_zone(&rest);
-            self.stats.cols[ci].set_sketch(hll.map(std::sync::Arc::new));
-            self.zones[ci][first_chunk].merge(&zone);
-            if split < rows {
-                self.zones[ci][first_chunk + 1] = rest;
+        match stats {
+            Some(stats) => {
+                for (ci, (zone, rest)) in self
+                    .landing_zones(chunk, split, stats)
+                    .into_iter()
+                    .enumerate()
+                {
+                    self.stats.cols[ci].absorb_zone(&zone);
+                    self.stats.cols[ci].absorb_zone(&rest);
+                    if let Some(sketch) = stats.sketch(ci) {
+                        self.stats.cols[ci].merge_sketch(sketch);
+                    }
+                    self.zones[ci][first_chunk].merge(&zone);
+                    if split < rows {
+                        self.zones[ci][first_chunk + 1] = rest;
+                    }
+                }
+            }
+            None => {
+                let folded = self.fold_chunk_stats(chunk, split);
+                for (ci, (zone, rest, hll)) in folded.into_iter().enumerate() {
+                    self.stats.cols[ci].absorb_zone(&zone);
+                    self.stats.cols[ci].absorb_zone(&rest);
+                    self.stats.cols[ci].set_sketch(hll.map(Arc::new));
+                    self.zones[ci][first_chunk].merge(&zone);
+                    if split < rows {
+                        self.zones[ci][first_chunk + 1] = rest;
+                    }
+                }
             }
         }
         self.version = next_table_version();
@@ -6470,6 +6558,84 @@ mod tests {
             &t.columns[0].chunk(0).unwrap()
         ));
         assert!(t.columns[0].chunk_mut(1).is_err());
+    }
+
+    #[test]
+    fn precomputed_chunk_stats_match_folding_the_batch() {
+        let schema = vec![
+            ("i".to_string(), DataType::Integer),
+            ("b".to_string(), DataType::Bigint),
+            (
+                "d".to_string(),
+                DataType::Decimal {
+                    precision: 12,
+                    scale: 2,
+                },
+            ),
+            ("dt".to_string(), DataType::Date),
+            ("ts".to_string(), DataType::Timestamp),
+            ("s".to_string(), DataType::Varchar),
+            ("x".to_string(), DataType::Double),
+        ];
+        let mut folded = DataTable::new("folded".to_string(), schema.clone()).unwrap();
+        let mut fused = DataTable::new("fused".to_string(), schema).unwrap();
+        let chunk = |start: i64, rows: usize| -> Vec<Arc<Vector>> {
+            let mut i = Vector::with_capacity(DataType::Integer, rows);
+            let mut b = Vector::with_capacity(DataType::Bigint, rows);
+            let mut d = Vector::with_capacity(
+                DataType::Decimal {
+                    precision: 12,
+                    scale: 2,
+                },
+                rows,
+            );
+            let mut dt = Vector::with_capacity(DataType::Date, rows);
+            let mut ts = Vector::with_capacity(DataType::Timestamp, rows);
+            let mut s = Vector::with_capacity(DataType::Varchar, rows);
+            let mut x = Vector::with_capacity(DataType::Double, rows);
+            for row in 0..rows {
+                let n = start + row as i64;
+                i.push_int32(n as i32).unwrap();
+                if n % 7 == 0 {
+                    b.push_null().unwrap();
+                } else {
+                    b.push_int64(-n).unwrap();
+                }
+                d.push_decimal(n as i128 * 100, 2).unwrap();
+                dt.push_date(19_000 + n as i32).unwrap();
+                ts.push_timestamp(n * 1_000_000).unwrap();
+                if n % 5 == 0 {
+                    s.push_null().unwrap();
+                } else {
+                    s.push_str(&format!("v{n}")).unwrap();
+                }
+                if n % 11 == 0 {
+                    x.push_float64(f64::NAN).unwrap();
+                } else {
+                    x.push_float64(n as f64 / 3.0).unwrap();
+                }
+            }
+            vec![i, b, d, dt, ts, s, x]
+                .into_iter()
+                .map(Arc::new)
+                .collect()
+        };
+        let mut start = 0i64;
+        // An empty tail, then batches that straddle chunk boundaries: the
+        // precomputed zone answers for a whole chunk, the straddling parts are
+        // still derived per range.
+        for rows in [3usize, CHUNK_SIZE, CHUNK_SIZE, 2] {
+            let c = chunk(start, rows);
+            let stats = ChunkStats::of(&c);
+            fused
+                .append_shared_chunk_with_stats(&c, Some(&stats))
+                .unwrap();
+            folded.append_shared_chunk(&c).unwrap();
+            assert_eq!(fused.stats, folded.stats, "stats after {rows} rows");
+            assert_eq!(fused.zones, folded.zones, "zones after {rows} rows");
+            start += rows as i64;
+        }
+        assert_eq!(fused.num_rows(), folded.num_rows());
     }
 
     #[test]

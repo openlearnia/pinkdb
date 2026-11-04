@@ -21,7 +21,7 @@ use crate::types::FastSet;
 use crate::types::{
     DataType, POW10_I128, PinkDbError, Result, Value, decimal_fits, format_decimal, rescale_decimal,
 };
-use crate::vector::{DataChunk, Vector, VectorData};
+use crate::vector::{DECIMAL64_MAX_PRECISION, DataChunk, Vector, VectorData};
 
 /// Evaluate `expr` over every row of `chunk`.
 pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<Vector> {
@@ -128,6 +128,16 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
                             out.push_null()?;
                         } else {
                             out.push_float64(-x)?;
+                        }
+                    }
+                }
+                (VectorData::Decimal64 { values, scale, .. }, DataType::Decimal { .. }) => {
+                    // An 18-digit value negates within 64 bits.
+                    for (i, &x) in values.iter().enumerate() {
+                        if v.is_null(i) {
+                            out.push_null()?;
+                        } else {
+                            out.push_decimal(-i128::from(x), *scale)?;
                         }
                     }
                 }
@@ -966,6 +976,39 @@ fn eval_comparison(
                     &mut out,
                 )?;
             }
+            // Same scale, both 64-bit: a plain integer compare (wave 142).
+            (
+                VectorData::Decimal64 {
+                    values: a,
+                    scale: sa,
+                    ..
+                },
+                VectorData::Decimal64 {
+                    values: b,
+                    scale: sb,
+                    ..
+                },
+            ) if sa == sb => {
+                cmp_loop(op, &l, &r, a, b, |x, y| x.cmp(y), &mut out)?;
+            }
+            // Any other DECIMAL pair (a 64-bit side, or two scales): compare
+            // the 128-bit values, as two `Decimal` payloads would.
+            (
+                VectorData::Decimal64 { scale: sa, .. } | VectorData::Decimal { scale: sa, .. },
+                VectorData::Decimal64 { scale: sb, .. } | VectorData::Decimal { scale: sb, .. },
+            ) => {
+                let a = l.data().decimal_values_i128().expect("a DECIMAL payload");
+                let b = r.data().decimal_values_i128().expect("a DECIMAL payload");
+                cmp_loop(
+                    op,
+                    &l,
+                    &r,
+                    &a,
+                    &b,
+                    |x, y| crate::types::decimal_cmp(*x, *sa, *y, *sb),
+                    &mut out,
+                )?;
+            }
             (VectorData::Interval(a), VectorData::Interval(b)) => {
                 cmp_loop(
                     op,
@@ -1091,6 +1134,10 @@ enum CmpKind<'a> {
     DecInt(&'a [i128], u8, i128),
     DecFloat(&'a [i128], u8, f64),
     DecDec(&'a [i128], u8, i128, u8),
+    /// The 64-bit DECIMAL payload (wave 142) against the same literals.
+    Dec64Int(&'a [i64], u8, i128),
+    Dec64Float(&'a [i64], u8, f64),
+    Dec64Dec(&'a [i64], u8, i128, u8),
     Bool(&'a [bool], bool),
     VarChar(&'a crate::strings::StrVec, std::sync::Arc<str>),
     Date(&'a [i32], i32),
@@ -1150,6 +1197,23 @@ impl<'a> ScalarCmp<'a> {
                     ..
                 },
             ) => CmpKind::DecDec(values, *scale, *s, *ss),
+            (V::Decimal64 { values, scale, .. }, Value::Integer(s)) => {
+                CmpKind::Dec64Int(values, *scale, *s as i128)
+            }
+            (V::Decimal64 { values, scale, .. }, Value::Bigint(s)) => {
+                CmpKind::Dec64Int(values, *scale, *s as i128)
+            }
+            (V::Decimal64 { values, scale, .. }, Value::Double(s)) => {
+                CmpKind::Dec64Float(values, *scale, *s)
+            }
+            (
+                V::Decimal64 { values, scale, .. },
+                Value::Decimal {
+                    value: s,
+                    scale: ss,
+                    ..
+                },
+            ) => CmpKind::Dec64Dec(values, *scale, *s, *ss),
             (V::Boolean(a), Value::Boolean(s)) => CmpKind::Bool(a, *s),
             // One `Arc<str>` for the scalar (one allocation per chunk)
             // instead of one clone per element.
@@ -1242,6 +1306,30 @@ impl<'a> ScalarCmp<'a> {
                 |x| crate::types::decimal_cmp(*x, *sa, *s, *ss),
                 out,
             ),
+            CmpKind::Dec64Int(a, sa, s) => push_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| crate::types::decimal_cmp(i128::from(*x), *sa, *s, 0),
+                out,
+            ),
+            CmpKind::Dec64Float(a, sa, s) => push_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| num_cmp(crate::types::decimal_to_f64(i128::from(*x), *sa), *s),
+                out,
+            ),
+            CmpKind::Dec64Dec(a, sa, s, ss) => push_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| crate::types::decimal_cmp(i128::from(*x), *sa, *s, *ss),
+                out,
+            ),
             CmpKind::Bool(a, s) => push_cmp(col, a, op, flipped, |x| x.cmp(s), out),
             CmpKind::VarChar(a, s) => {
                 let a: Vec<&str> = a.iter().collect();
@@ -1328,6 +1416,30 @@ impl<'a> ScalarCmp<'a> {
                 |x| crate::types::decimal_cmp(*x, *sa, *s, *ss),
                 sel,
             ),
+            CmpKind::Dec64Int(a, sa, s) => retain_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| crate::types::decimal_cmp(i128::from(*x), *sa, *s, 0),
+                sel,
+            ),
+            CmpKind::Dec64Float(a, sa, s) => retain_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| num_cmp(crate::types::decimal_to_f64(i128::from(*x), *sa), *s),
+                sel,
+            ),
+            CmpKind::Dec64Dec(a, sa, s, ss) => retain_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| crate::types::decimal_cmp(i128::from(*x), *sa, *s, *ss),
+                sel,
+            ),
             CmpKind::Bool(a, s) => retain_cmp(col, a, op, flipped, |x| x.cmp(s), sel),
             CmpKind::VarChar(a, s) => {
                 let a: Vec<&str> = a.iter().collect();
@@ -1383,6 +1495,38 @@ impl ScalarCmp<'_> {
                     Some(s) => retain_ordered(col, a, s, op, sel),
                     None => return false,
                 }
+            }
+            // The literal moved to the column's scale must also fit 64 bits;
+            // one that does not is beyond every 18-digit value, and the
+            // generic loop answers it.
+            CmpKind::Dec64Dec(a, sa, s, ss) if sa >= ss => {
+                match s
+                    .checked_mul(crate::types::POW10_I128[(sa - ss) as usize])
+                    .and_then(|s| i64::try_from(s).ok())
+                {
+                    Some(s) => retain_ordered(col, a, s, op, sel),
+                    None => return false,
+                }
+            }
+            CmpKind::Dec64Int(a, sa, s) => {
+                match s
+                    .checked_mul(crate::types::POW10_I128[*sa as usize])
+                    .and_then(|s| i64::try_from(s).ok())
+                {
+                    Some(s) => retain_ordered(col, a, s, op, sel),
+                    None => return false,
+                }
+            }
+            CmpKind::Dec64Float(a, sa, s) => {
+                let at_least =
+                    |strict| first_passing(*s, strict, |x| crate::types::decimal_to_f64(x, *sa));
+                let (Some(lo), Some(hi)) = (at_least(false), at_least(true)) else {
+                    return false;
+                };
+                // An 18-digit payload never reaches the i64 bounds, so
+                // clamping a bound there keeps every row's answer.
+                let clamp = |b: i128| b.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+                retain_int_range(col, a, op, clamp(lo), clamp(hi), sel)
             }
             CmpKind::VarChar(a, s) => retain_strings(
                 col,
@@ -1510,12 +1654,12 @@ fn retain_ordered<T: Copy + Ord>(col: &Vector, a: &[T], s: T, op: BinaryOp, sel:
 
 /// `column <op> s` for a monotone row test given as integer bounds: `lo` is
 /// the first payload value comparing `>= s`, `hi` the first comparing `> s`.
-fn retain_int_range(
+fn retain_int_range<T: Copy + PartialOrd>(
     col: &Vector,
-    a: &[i128],
+    a: &[T],
     op: BinaryOp,
-    lo: i128,
-    hi: i128,
+    lo: T,
+    hi: T,
     sel: &mut Vec<u32>,
 ) {
     match op {
@@ -1625,11 +1769,7 @@ fn decimal_from_int(
         values.push(y);
     }
     Ok(Vector::from_parts(
-        VectorData::Decimal {
-            values,
-            precision,
-            scale,
-        },
+        VectorData::decimal_from_i128(values, precision, scale),
         v.validity().to_vec(),
         v.len(),
     ))
@@ -1714,11 +1854,7 @@ pub(crate) fn coerce_to(v: &Vector, target: DataType) -> Result<Vector> {
                     })?;
                 values.push(y);
             }
-            let data = VectorData::Decimal {
-                values,
-                precision,
-                scale,
-            };
+            let data = VectorData::decimal_from_i128(values, precision, scale);
             Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
         }
         // DECIMAL → DOUBLE: `/` widens both sides to DOUBLE (DuckDB rule);
@@ -1728,6 +1864,15 @@ pub(crate) fn coerce_to(v: &Vector, target: DataType) -> Result<Vector> {
                 values
                     .iter()
                     .map(|&x| crate::types::decimal_to_f64(x, *scale))
+                    .collect(),
+            );
+            Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
+        }
+        (VectorData::Decimal64 { values, scale, .. }, DataType::Double) => {
+            let data = VectorData::Float64(
+                values
+                    .iter()
+                    .map(|&x| crate::types::decimal_to_f64(i128::from(x), *scale))
                     .collect(),
             );
             Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
@@ -1745,12 +1890,13 @@ pub(crate) fn coerce_to(v: &Vector, target: DataType) -> Result<Vector> {
         // DECIMAL → DECIMAL rescale: exact when widening the scale, rounding
         // half away from zero when narrowing (DuckDB's cast rule).
         (
-            VectorData::Decimal { values, scale, .. },
+            VectorData::Decimal { scale, .. } | VectorData::Decimal64 { scale, .. },
             DataType::Decimal {
                 precision,
                 scale: want,
             },
         ) => {
+            let values = v.data().decimal_values_i128().expect("a DECIMAL payload");
             let mut out: Vec<i128> = Vec::with_capacity(values.len());
             for (i, &x) in values.iter().enumerate() {
                 if v.is_null(i) {
@@ -1767,11 +1913,7 @@ pub(crate) fn coerce_to(v: &Vector, target: DataType) -> Result<Vector> {
                     })?;
                 out.push(y);
             }
-            let data = VectorData::Decimal {
-                values: out,
-                precision,
-                scale: want,
-            };
+            let data = VectorData::decimal_from_i128(out, precision, want);
             Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
         }
         // Everything else: existing generic loop (errors unchanged).
@@ -2030,6 +2172,9 @@ fn eval_arith(
 /// their sum (DuckDB rule). Operands are DECIMAL columns/literals or the
 /// integer types the binder converts to DECIMAL(10,0)/DECIMAL(19,0).
 fn eval_decimal_mul(l: &Vector, r: &Vector, dtype: DataType) -> Result<Vector> {
+    if let Some(out) = decimal64_mul(l, r, dtype) {
+        return Ok(out);
+    }
     let (lv, ls) = decimal_operand(l)?;
     let (rv, rs) = decimal_operand(r)?;
     let DataType::Decimal { precision, .. } = dtype else {
@@ -2065,11 +2210,7 @@ fn eval_decimal_mul(l: &Vector, r: &Vector, dtype: DataType) -> Result<Vector> {
             zero_invalid(&mut values, &validity);
         }
         return Ok(Vector::from_parts(
-            VectorData::Decimal {
-                values,
-                precision,
-                scale: ls + rs,
-            },
+            VectorData::decimal_from_i128(values, precision, ls + rs),
             validity,
             len,
         ));
@@ -2102,11 +2243,7 @@ fn eval_decimal_mul(l: &Vector, r: &Vector, dtype: DataType) -> Result<Vector> {
         values.push(product);
     }
     Ok(Vector::from_parts(
-        VectorData::Decimal {
-            values,
-            precision,
-            scale: ls + rs,
-        },
+        VectorData::decimal_from_i128(values, precision, ls + rs),
         validity,
         len,
     ))
@@ -2137,6 +2274,10 @@ fn zero_invalid(values: &mut [i128], validity: &[u64]) {
 fn decimal_operand(v: &Vector) -> Result<(std::borrow::Cow<'_, [i128]>, u8)> {
     Ok(match v.data() {
         VectorData::Decimal { values, scale, .. } => (std::borrow::Cow::Borrowed(values), *scale),
+        VectorData::Decimal64 { values, scale, .. } => (
+            std::borrow::Cow::Owned(values.iter().map(|&x| i128::from(x)).collect()),
+            *scale,
+        ),
         VectorData::Int32(src) => (
             std::borrow::Cow::Owned(src.iter().map(|&x| x as i128).collect()),
             0,
@@ -2220,6 +2361,19 @@ fn arith_typed(op: BinaryOp, int_div: bool, l: &Vector, r: &Vector) -> Result<Op
             }
             // `*` never reaches here (eval_arith routes it earlier); `/` is
             // typed DOUBLE by the binder.
+            _ => Ok(None),
+        },
+        (
+            VectorData::Decimal64 {
+                values: a,
+                precision,
+                scale,
+            },
+            VectorData::Decimal64 { values: b, .. },
+        ) => match op {
+            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Modulo => {
+                Ok(Some(arith_decimal64(op, l, r, a, b, *precision, *scale)?))
+            }
             _ => Ok(None),
         },
         _ => Ok(None),
@@ -2309,11 +2463,7 @@ fn arith_decimal(
         };
         zero_invalid(&mut values, &validity);
         return Ok(Vector::from_parts(
-            VectorData::Decimal {
-                values,
-                precision,
-                scale,
-            },
+            VectorData::decimal_from_i128(values, precision, scale),
             validity,
             len,
         ));
@@ -2327,11 +2477,7 @@ fn arith_decimal(
         values.push(decimal_arith_row(op, x, y, precision, scale)?);
     }
     Ok(Vector::from_parts(
-        VectorData::Decimal {
-            values,
-            precision,
-            scale,
-        },
+        VectorData::decimal_from_i128(values, precision, scale),
         validity,
         len,
     ))
@@ -2365,11 +2511,7 @@ fn arith_decimal_const(
         };
         zero_invalid(&mut values, &validity);
         return Ok(Vector::from_parts(
-            VectorData::Decimal {
-                values,
-                precision,
-                scale,
-            },
+            VectorData::decimal_from_i128(values, precision, scale),
             validity,
             len,
         ));
@@ -2387,7 +2529,196 @@ fn arith_decimal_const(
         });
     }
     Ok(Vector::from_parts(
-        VectorData::Decimal {
+        VectorData::decimal_from_i128(values, precision, scale),
+        validity,
+        len,
+    ))
+}
+
+/// The largest `|x|` in a 64-bit decimal payload, widened (wave 142).
+#[inline]
+fn max_abs_i64(values: &[i64]) -> u128 {
+    values
+        .iter()
+        .map(|x| u128::from(x.unsigned_abs()))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Zero the payload of NULL rows of a 64-bit decimal payload.
+fn zero_invalid_i64(values: &mut [i64], validity: &[u64]) {
+    for (i, v) in values.iter_mut().enumerate() {
+        if (validity[i / 64] >> (i % 64)) & 1 == 0 {
+            *v = 0;
+        }
+    }
+}
+
+/// DECIMAL `*` on two 64-bit payloads into a result of at most 18 digits,
+/// when the chunk bound proves no row can overflow: `max|a| · max|b| <
+/// 10^p ≤ 10^18`, so every product is an exact `i64` multiply (wave 142).
+/// `None` sends the chunk to the checked `i128` path, which raises today's
+/// overflow error at the offending row.
+fn decimal64_mul(l: &Vector, r: &Vector, dtype: DataType) -> Option<Vector> {
+    let (
+        VectorData::Decimal64 {
+            values: a,
+            scale: ls,
+            ..
+        },
+        VectorData::Decimal64 {
+            values: b,
+            scale: rs,
+            ..
+        },
+    ) = (l.data(), r.data())
+    else {
+        return None;
+    };
+    let DataType::Decimal { precision, .. } = dtype else {
+        return None;
+    };
+    if precision > DECIMAL64_MAX_PRECISION {
+        return None;
+    }
+    let limit = crate::types::POW10_I128[precision as usize] as u128;
+    if !max_abs_i64(a)
+        .checked_mul(max_abs_i64(b))
+        .is_some_and(|p| p < limit)
+    {
+        return None;
+    }
+    let len = l.len();
+    let mut validity = l.validity().to_vec();
+    validity.resize(len.div_ceil(64), 0);
+    for (word, other) in validity.iter_mut().zip(r.validity()) {
+        *word &= *other;
+    }
+    let mut values: Vec<i64> = a.iter().zip(b).map(|(&x, &y)| x * y).collect();
+    if l.has_nulls() || r.has_nulls() {
+        zero_invalid_i64(&mut values, &validity);
+    }
+    Some(Vector::from_parts(
+        VectorData::Decimal64 {
+            values,
+            precision,
+            scale: ls + rs,
+        },
+        validity,
+        len,
+    ))
+}
+
+/// DECIMAL `+`/`-`/`%` at a shared scale on 64-bit payloads (wave 142): the
+/// i64 form of [`arith_decimal`]. The chunk bound drops the per-row check as
+/// there; otherwise every row runs [`decimal_arith_row`] in i128, so errors
+/// are the same text at the same row.
+fn arith_decimal64(
+    op: BinaryOp,
+    l: &Vector,
+    r: &Vector,
+    a: &[i64],
+    b: &[i64],
+    precision: u8,
+    scale: u8,
+) -> Result<Vector> {
+    let len = a.len();
+    let mut validity = l.validity().to_vec();
+    validity.resize(len.div_ceil(64), 0);
+    for (word, other) in validity.iter_mut().zip(r.validity()) {
+        *word &= *other;
+    }
+    if matches!(op, BinaryOp::Add | BinaryOp::Subtract)
+        && max_abs_i64(a)
+            .checked_add(max_abs_i64(b))
+            .is_some_and(|s| s < crate::types::POW10_I128[precision as usize] as u128)
+    {
+        let mut values: Vec<i64> = if op == BinaryOp::Add {
+            a.iter().zip(b).map(|(&x, &y)| x + y).collect()
+        } else {
+            a.iter().zip(b).map(|(&x, &y)| x - y).collect()
+        };
+        zero_invalid_i64(&mut values, &validity);
+        return Ok(Vector::from_parts(
+            VectorData::Decimal64 {
+                values,
+                precision,
+                scale,
+            },
+            validity,
+            len,
+        ));
+    }
+    let mut values: Vec<i64> = Vec::with_capacity(len);
+    for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
+        if (validity[i / 64] >> (i % 64)) & 1 == 0 {
+            values.push(0);
+            continue;
+        }
+        let v = decimal_arith_row(op, i128::from(x), i128::from(y), precision, scale)?;
+        values.push(v as i64);
+    }
+    Ok(Vector::from_parts(
+        VectorData::Decimal64 {
+            values,
+            precision,
+            scale,
+        },
+        validity,
+        len,
+    ))
+}
+
+/// [`arith_decimal_const`] on a 64-bit payload into a 64-bit result.
+fn arith_decimal64_const(
+    op: BinaryOp,
+    col: &Vector,
+    a: &[i64],
+    k: i64,
+    precision: u8,
+    scale: u8,
+    const_left: bool,
+) -> Result<Vector> {
+    let len = a.len();
+    let mut validity = col.validity().to_vec();
+    validity.resize(len.div_ceil(64), 0);
+    if matches!(op, BinaryOp::Add | BinaryOp::Subtract)
+        && max_abs_i64(a)
+            .checked_add(u128::from(k.unsigned_abs()))
+            .is_some_and(|s| s < crate::types::POW10_I128[precision as usize] as u128)
+    {
+        let mut values: Vec<i64> = match (op, const_left) {
+            (BinaryOp::Add, _) => a.iter().map(|&x| x + k).collect(),
+            (_, true) => a.iter().map(|&x| k - x).collect(),
+            (_, false) => a.iter().map(|&x| x - k).collect(),
+        };
+        zero_invalid_i64(&mut values, &validity);
+        return Ok(Vector::from_parts(
+            VectorData::Decimal64 {
+                values,
+                precision,
+                scale,
+            },
+            validity,
+            len,
+        ));
+    }
+    let (k, mut values) = (i128::from(k), Vec::with_capacity(len));
+    for (i, &x) in a.iter().enumerate() {
+        if (validity[i / 64] >> (i % 64)) & 1 == 0 {
+            values.push(0);
+            continue;
+        }
+        let x = i128::from(x);
+        let v = if const_left {
+            decimal_arith_row(op, k, x, precision, scale)?
+        } else {
+            decimal_arith_row(op, x, k, precision, scale)?
+        };
+        values.push(v as i64);
+    }
+    Ok(Vector::from_parts(
+        VectorData::Decimal64 {
             values,
             precision,
             scale,
@@ -2430,23 +2761,36 @@ fn eval_decimal_const(
     // the other path performs can never reject a value, so only the scale has
     // to agree.
     let v = eval_expr(column, chunk, cx)?;
-    let VectorData::Decimal {
-        values,
-        precision: src,
-        scale: col_scale,
-    } = v.data()
-    else {
-        return Ok(None);
+    let (src, col_scale) = match v.data() {
+        VectorData::Decimal {
+            precision, scale, ..
+        }
+        | VectorData::Decimal64 {
+            precision, scale, ..
+        } => (*precision, *scale),
+        _ => return Ok(None),
     };
-    if *col_scale != scale || *src > precision {
+    if col_scale != scale || src > precision {
         return Ok(None);
     }
     let Value::Decimal { value: k, .. } = coerce_value(lit.clone(), dtype)? else {
         return Ok(None);
     };
-    Ok(Some(arith_decimal_const(
-        op, &v, values, k, precision, scale, const_left,
-    )?))
+    match v.data() {
+        // A 64-bit column against a result that is 64-bit too: the i64 kernel.
+        VectorData::Decimal64 { values, .. } if precision <= DECIMAL64_MAX_PRECISION => {
+            let k = i64::try_from(k).expect("a DECIMAL(p <= 18) constant fits i64");
+            Ok(Some(arith_decimal64_const(
+                op, &v, values, k, precision, scale, const_left,
+            )?))
+        }
+        _ => {
+            let values = v.data().decimal_values_i128().expect("a DECIMAL payload");
+            Ok(Some(arith_decimal_const(
+                op, &v, &values, k, precision, scale, const_left,
+            )?))
+        }
+    }
 }
 
 /// DuckDB-style integer overflow error (`+`/`-`/`*`, negation, `abs`).
@@ -4825,6 +5169,18 @@ fn retain_column_pair(
                 ..
             },
             V::Decimal {
+                values: y,
+                scale: sy,
+                ..
+            },
+        ) if sx == sy => retain_pair(a, b, x, y, op, sel, |p, q| p.cmp(q)),
+        (
+            V::Decimal64 {
+                values: x,
+                scale: sx,
+                ..
+            },
+            V::Decimal64 {
                 values: y,
                 scale: sy,
                 ..

@@ -1139,6 +1139,19 @@ const DECIMAL_I64_MAX_PRECISION: u8 = 18;
 /// does not fit is a broken invariant — fail loudly, never store a wrong
 /// number.
 fn decimal_i64_payload(v: &Vector) -> Vec<i64> {
+    // Since wave 142 a DECIMAL(p <= 18) vector already holds `i64`s: the
+    // payload is the values, invalid rows zeroed as before.
+    if let VectorData::Decimal64 { values, .. } = v.data() {
+        let words = v.has_nulls().then(|| v.validity_words());
+        return values
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| match words {
+                Some(words) if !valid_at(words, i) => 0,
+                _ => x,
+            })
+            .collect();
+    }
     let VectorData::Decimal { values, .. } = v.data() else {
         unreachable!("decimal_i64_payload on a non-DECIMAL vector")
     };
@@ -1536,9 +1549,17 @@ fn varchar_offsets_fit(total: u64) -> bool {
 }
 
 /// Dictionary (first-occurrence order) + one code per row.
+///
+/// The index is foldhash's fixed-seed hasher: SipHash dominated the dictionary
+/// build in the ingest profile. Dictionary order is first occurrence, never
+/// hash order, so the hasher does not affect the bytes.
 fn dict_and_codes<T: AsRef<str>>(strs: &[T]) -> (Vec<&str>, Vec<u32>) {
     let mut dict: Vec<&str> = Vec::new();
-    let mut index: HashMap<&str, u32> = HashMap::new();
+    let mut index: HashMap<&str, u32, foldhash::fast::FixedState> =
+        HashMap::with_capacity_and_hasher(
+            strs.len().min(256),
+            foldhash::fast::FixedState::default(),
+        );
     let mut codes = Vec::with_capacity(strs.len());
     for s in strs {
         let s = s.as_ref();
@@ -1563,16 +1584,22 @@ fn enc_strs_plain<T: AsRef<str>>(strs: &[T]) -> Vec<u8> {
     w.buf
 }
 
-fn enc_strs_dict<T: AsRef<str>>(strs: &[T]) -> Vec<u8> {
+/// The DICT payload for an already built dictionary (one build per chunk).
+fn enc_strs_dict_from(dict: &[&str], codes: &[u32], rows: usize) -> Vec<u8> {
     let mut w = Writer::new();
-    let (dict, codes) = dict_and_codes(strs);
-    w.u32(strs.len() as u32);
+    w.u32(rows as u32);
     w.u32(dict.len() as u32);
-    encode_strs_offsets(&mut w, &dict);
-    for c in codes {
+    encode_strs_offsets(&mut w, dict);
+    for &c in codes {
         w.u32(c);
     }
     w.buf
+}
+
+#[cfg(test)]
+fn enc_strs_dict<T: AsRef<str>>(strs: &[T]) -> Vec<u8> {
+    let (dict, codes) = dict_and_codes(strs);
+    enc_strs_dict_from(&dict, &codes, strs.len())
 }
 
 /// Bitpacked dictionary codes: the same dictionary (first-occurrence order,
@@ -1581,12 +1608,12 @@ fn enc_strs_dict<T: AsRef<str>>(strs: &[T]) -> Vec<u8> {
 /// The codes themselves are packed in the **FastLanes transposed layout**
 /// (see [`fastlanes_pack`]): 1,024-value blocks whose lanes are transposed,
 /// so the decode is branch-free.
-fn enc_strs_dict_bitpack<T: AsRef<str> + PartialEq>(strs: &[T]) -> Vec<u8> {
+/// The DICT_BITPACK payload for an already built dictionary.
+fn enc_strs_dict_bitpack_from(dict: &[&str], codes: &[u32], rows: usize) -> Vec<u8> {
     let mut w = Writer::new();
-    let (dict, codes) = dict_and_codes(strs);
-    w.u32(strs.len() as u32);
+    w.u32(rows as u32);
     w.u32(dict.len() as u32);
-    encode_strs_offsets(&mut w, &dict);
+    encode_strs_offsets(&mut w, dict);
     // 0 when the chunk has at most one distinct value; 1..=11 otherwise
     // (CHUNK_SIZE = 2048 distinct values need 11 bits).
     let width = if dict.len() <= 1 {
@@ -1600,6 +1627,12 @@ fn enc_strs_dict_bitpack<T: AsRef<str> + PartialEq>(strs: &[T]) -> Vec<u8> {
         fastlanes_pack(&mut w, &shifted, width);
     }
     w.buf
+}
+
+#[cfg(test)]
+fn enc_strs_dict_bitpack<T: AsRef<str> + PartialEq>(strs: &[T]) -> Vec<u8> {
+    let (dict, codes) = dict_and_codes(strs);
+    enc_strs_dict_bitpack_from(&dict, &codes, strs.len())
 }
 
 fn enc_strs_rle<T: AsRef<str> + PartialEq>(strs: &[T]) -> Vec<u8> {
@@ -1644,19 +1677,28 @@ const FASTLANES_BLOCK: usize = 1024;
 /// The output is, per 1,024-value block, `width` lanes of `ceil(n/8)` bytes:
 /// lane `p`'s byte `j` holds bit `p` of the values `8j .. 8j+8` (bit `i % 8`
 /// of the byte is value `8j + i % 8`'s bit `p`).
+/// The lanes are written straight into the writer, eight values at a time:
+/// no per-plane allocation and no data-dependent branch.
 fn fastlanes_pack(w: &mut Writer, values: &[u64], width: u32) {
     debug_assert!(width > 0 && width <= 64);
+    let planes = width as usize;
     for block in values.chunks(FASTLANES_BLOCK) {
-        let n = block.len();
-        let bytes = n.div_ceil(8);
-        for p in 0..width {
-            let mut lane = vec![0u8; bytes];
-            for (i, &v) in block.iter().enumerate() {
-                if (v >> p) & 1 == 1 {
-                    lane[i / 8] |= 1 << (i % 8);
+        let bytes = block.len().div_ceil(8);
+        let start = w.buf.len();
+        w.buf.resize(start + planes * bytes, 0);
+        let out = &mut w.buf[start..];
+        for (j, group) in block.chunks(8).enumerate() {
+            // The tail group is zero-padded; the reader never consumes the
+            // padding bits (it reads exactly `block.len()` values).
+            let mut v = [0u64; 8];
+            v[..group.len()].copy_from_slice(group);
+            for p in 0..planes {
+                let mut byte = 0u8;
+                for (i, &x) in v.iter().enumerate() {
+                    byte |= (((x >> p) & 1) as u8) << i;
                 }
+                out[p * bytes + j] = byte;
             }
-            w.bytes(&lane);
         }
     }
 }
@@ -1696,6 +1738,9 @@ fn enc_ints_fastlanes<T: IntElem>(nums: &[T]) -> Vec<u8> {
     let mut w = Writer::new();
     w.u32(nums.len() as u32);
     w.u32(FASTLANES_BLOCK as u32);
+    // One shifted scratch buffer for all blocks (one block's worth of values
+    // at most).
+    let mut shifted = Vec::with_capacity(FASTLANES_BLOCK);
     for block in nums.chunks(FASTLANES_BLOCK) {
         let min = block.iter().map(|n| n.to_i64()).min().unwrap_or(0);
         let max = block.iter().map(|n| n.to_i64()).max().unwrap_or(0);
@@ -1703,10 +1748,8 @@ fn enc_ints_fastlanes<T: IntElem>(nums: &[T]) -> Vec<u8> {
         w.u64(min as u64);
         w.u8(width as u8);
         if width > 0 {
-            let shifted: Vec<u64> = block
-                .iter()
-                .map(|&n| n.to_i64().wrapping_sub(min) as u64)
-                .collect();
+            shifted.clear();
+            shifted.extend(block.iter().map(|&n| n.to_i64().wrapping_sub(min) as u64));
             fastlanes_pack(&mut w, &shifted, width);
         }
     }
@@ -2108,43 +2151,263 @@ fn lz_decompress(tokens: &[u8], raw_len: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+// ---------- candidate sizing (encode-side selection) ----------
+//
+// `encode_chunk_typed` must write exactly the candidate `consider_best` kept
+// when every payload was built: the smallest, ties to the earlier candidate.
+// Each candidate's exact size follows from one statistics pass, so only the
+// winner is encoded. `encode_chunk_typed_trial` keeps the old
+// build-everything path as the test-only byte-equality reference.
+
+/// Bytes `pack_bits` writes for `n` values of `width` bits.
+fn packed_bytes(n: usize, width: u32) -> usize {
+    (n * width as usize).div_ceil(8)
+}
+
+/// Bytes `fastlanes_pack` writes for `n` values of `width` bits.
+fn fastlanes_bytes(n: usize, width: u32) -> usize {
+    let mut total = 0;
+    let mut left = n;
+    while left > 0 {
+        let take = left.min(FASTLANES_BLOCK);
+        total += take.div_ceil(8) * width as usize;
+        left -= take;
+    }
+    total
+}
+
+/// The first strictly smallest candidate: equal sizes keep the earlier one,
+/// exactly like [`consider_best`].
+fn smallest(sizes: &[usize]) -> usize {
+    let mut best = 0;
+    for i in 1..sizes.len() {
+        if sizes[i] < sizes[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+fn run_count<T: PartialEq>(items: &[T]) -> usize {
+    let mut runs = 0;
+    for (i, x) in items.iter().enumerate() {
+        if i == 0 || items[i - 1] != *x {
+            runs += 1;
+        }
+    }
+    runs
+}
+
+/// Exact candidate sizes in `encode_chunk_typed`'s order: PLAIN, RLE,
+/// BITPACK, DELTA_BITPACK, FASTLANES.
+fn int_candidate_sizes<T: IntElem>(nums: &[T]) -> [usize; 5] {
+    let n = nums.len();
+    let elem = std::mem::size_of::<T>();
+    if n == 0 {
+        // PLAIN (4) | RLE (8) | BITPACK (13) | DELTA (12) | FASTLANES (8).
+        return [4, 8, 13, 12, 8];
+    }
+    let mut min = nums[0].to_i64();
+    let mut max = min;
+    let mut runs = 1usize;
+    let mut delta_min = i64::MAX;
+    let mut delta_max = i64::MIN;
+    let mut prev = min;
+    for i in 1..n {
+        let v = nums[i].to_i64();
+        min = min.min(v);
+        max = max.max(v);
+        if nums[i] != nums[i - 1] {
+            runs += 1;
+        }
+        let d = v.wrapping_sub(prev);
+        delta_min = delta_min.min(d);
+        delta_max = delta_max.max(d);
+        prev = v;
+    }
+    let mut fastlanes = 4 + 4;
+    for block in nums.chunks(FASTLANES_BLOCK) {
+        let mut block_min = block[0].to_i64();
+        let mut block_max = block_min;
+        for &x in &block[1..] {
+            let v = x.to_i64();
+            block_min = block_min.min(v);
+            block_max = block_max.max(v);
+        }
+        let width = bits_needed_exact(block_max.wrapping_sub(block_min) as u64);
+        fastlanes += 8 + 1 + fastlanes_bytes(block.len(), width);
+    }
+    let bitpack_width = bits_needed(max.wrapping_sub(min) as u64);
+    let delta = if n < 2 {
+        12
+    } else {
+        let width = bits_needed_exact(delta_max.wrapping_sub(delta_min) as u64);
+        4 + 8
+            + 8
+            + 1
+            + if width > 0 {
+                packed_bytes(n - 1, width)
+            } else {
+                0
+            }
+    };
+    [
+        4 + std::mem::size_of_val(nums),
+        8 + runs * (elem + 4),
+        4 + 8 + 1 + packed_bytes(n, bitpack_width),
+        delta,
+        fastlanes,
+    ]
+}
+
+/// One integer-family chunk: score every candidate, then build the winner.
+fn encode_int_chunk<T: IntElem>(nums: &[T]) -> (u8, Vec<u8>) {
+    const TAGS: [u8; 5] = [
+        ENC_PLAIN,
+        ENC_RLE,
+        ENC_BITPACK,
+        ENC_DELTA_BITPACK,
+        ENC_FASTLANES,
+    ];
+    let best = smallest(&int_candidate_sizes(nums));
+    let payload = match best {
+        0 => enc_ints_plain(nums),
+        1 => enc_ints_rle(nums),
+        2 => enc_ints_bitpack(nums),
+        3 => enc_ints_delta(nums),
+        _ => enc_ints_fastlanes(nums),
+    };
+    (TAGS[best], payload)
+}
+
+fn encode_bool_chunk(bits: &[bool]) -> (u8, Vec<u8>) {
+    let plain = 4 + bits.len().div_ceil(8);
+    let rle = 8 + run_count(bits) * (1 + 4);
+    if rle < plain {
+        (ENC_RLE, enc_bool_rle(bits))
+    } else {
+        (ENC_PLAIN, enc_bool_plain(bits))
+    }
+}
+
+fn encode_double_chunk(values: &[f64]) -> (u8, Vec<u8>) {
+    let bits: Vec<u64> = values.iter().map(|x| x.to_bits()).collect();
+    let plain = 4 + bits.len() * 8;
+    let rle = 8 + run_count(&bits) * (8 + 4);
+    let structural = plain.min(rle);
+    // ALP is the expensive candidate: give it the best size so far so a
+    // scale that cannot win bails out early (its own bound, not a heuristic).
+    if let Some(alp) = enc_alp(values, structural)
+        && alp.len() < structural
+    {
+        return (ENC_ALP, alp);
+    }
+    if rle < plain {
+        (ENC_RLE, enc_u64_rle(&bits))
+    } else {
+        (ENC_PLAIN, enc_u64_plain(&bits))
+    }
+}
+
+/// One VARCHAR chunk: score the four structural candidates, then try the
+/// frame/FSST candidates on the plain bytes only when they can pay for
+/// themselves (the same gates as before), then build the winner.
+fn encode_varchar_chunk(strs: &[&str]) -> (u8, Vec<u8>) {
+    let n = strs.len();
+    let mut total_bytes = 0usize;
+    let mut run_bytes = 0usize;
+    let mut runs = 0usize;
+    for (i, s) in strs.iter().enumerate() {
+        total_bytes += s.len();
+        if i == 0 || strs[i - 1] != *s {
+            runs += 1;
+            run_bytes += s.len();
+        }
+    }
+    let (dict, codes) = dict_and_codes(strs);
+    let dict_bytes: usize = dict.iter().map(|s| s.len()).sum();
+
+    let plain = 4 + 4 * (n + 1) + total_bytes;
+    let dict_size = 4 + 4 + 4 * (dict.len() + 1) + dict_bytes + 4 * n;
+    let rle = 4 + 4 + 4 * (runs + 1) + run_bytes + 4 * runs;
+    let codes_width = if dict.len() <= 1 {
+        0
+    } else {
+        bits_needed((dict.len() - 1) as u64)
+    };
+    let dict_bitpack =
+        4 + 4 + 4 * (dict.len() + 1) + dict_bytes + 1 + fastlanes_bytes(n, codes_width);
+    let sizes = [plain, dict_size, rle, dict_bitpack];
+    let best = smallest(&sizes);
+    let best_len = sizes[best];
+
+    // The frame wraps the plain payload, so build it only when a frame (or
+    // FSST, which rides the same probe) can win.
+    let mut plain_payload = None;
+    let mut frame = None;
+    let mut compressible = false;
+    if best_len >= LZ_MIN_ATTEMPT {
+        let payload = enc_strs_plain(strs);
+        compressible = lz_probe(&payload[4 + (n + 1) * 4..]);
+        if compressible {
+            frame = enc_compressed_frame(ENC_PLAIN, &payload);
+        }
+        plain_payload = Some(payload);
+    }
+    let after_frame = frame.as_ref().map_or(best_len, |f| best_len.min(f.len()));
+    let fsst = if compressible && after_frame >= LZ_MIN_ATTEMPT {
+        enc_strs_fsst(strs)
+    } else {
+        None
+    };
+
+    let mut tag = [ENC_PLAIN, ENC_DICT, ENC_RLE, ENC_DICT_BITPACK][best];
+    let mut len = best_len;
+    let mut chosen: Option<Vec<u8>> = None;
+    if let Some(frame) = frame
+        && frame.len() < len
+    {
+        tag = ENC_LZ_FRAME;
+        len = frame.len();
+        chosen = Some(frame);
+    }
+    if let Some(fsst) = fsst
+        && fsst.len() < len
+    {
+        tag = ENC_FSST;
+        chosen = Some(fsst);
+    }
+    let payload = match chosen {
+        Some(payload) => payload,
+        None => match best {
+            0 => plain_payload.unwrap_or_else(|| enc_strs_plain(strs)),
+            1 => enc_strs_dict_from(&dict, &codes, n),
+            2 => enc_strs_rle(strs),
+            _ => enc_strs_dict_bitpack_from(&dict, &codes, n),
+        },
+    };
+    (tag, payload)
+}
+
 /// Encode one column chunk straight from the [`Vector`]: returns
 /// (encoding tag, payload bytes). Candidate order is part of the format
 /// contract; ties keep the earlier candidate.
 fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
     let dtype = v.dtype();
-    let mut best: Option<(u8, Vec<u8>)> = None;
+    // Set by every arm that does not return a sized candidate above.
+    let mut best: Option<(u8, Vec<u8>)>;
     match dtype {
-        DataType::Integer | DataType::Date => {
-            let nums = int32_payload(v);
-            consider_best(&mut best, ENC_PLAIN, enc_ints_plain(&nums));
-            consider_best(&mut best, ENC_RLE, enc_ints_rle(&nums));
-            consider_best(&mut best, ENC_BITPACK, enc_ints_bitpack(&nums));
-            consider_best(&mut best, ENC_DELTA_BITPACK, enc_ints_delta(&nums));
-            consider_best(&mut best, ENC_FASTLANES, enc_ints_fastlanes(&nums));
-        }
+        DataType::Integer | DataType::Date => return encode_int_chunk(&int32_payload(v)),
         // Bigint and timestamp share the 64-bit codecs; the dtype tag on the
         // chunk keeps them distinct on decode.
-        DataType::Bigint | DataType::Timestamp => {
-            let nums = int64_payload(v);
-            consider_best(&mut best, ENC_PLAIN, enc_ints_plain(&nums));
-            consider_best(&mut best, ENC_RLE, enc_ints_rle(&nums));
-            consider_best(&mut best, ENC_BITPACK, enc_ints_bitpack(&nums));
-            consider_best(&mut best, ENC_DELTA_BITPACK, enc_ints_delta(&nums));
-            consider_best(&mut best, ENC_FASTLANES, enc_ints_fastlanes(&nums));
-        }
+        DataType::Bigint | DataType::Timestamp => return encode_int_chunk(&int64_payload(v)),
         // DECIMAL with precision <= 18: every unscaled value fits an i64
         // (|x| < 10^18 < 2^63), so the chunk is encoded exactly like a BIGINT
         // chunk — same candidates, same payloads — and decode widens back to
         // i128 using the schema's precision. TPC-H money columns
         // (DECIMAL(15,2)) shrink from 16 raw bytes per value to a few bits.
         DataType::Decimal { precision, .. } if precision <= DECIMAL_I64_MAX_PRECISION => {
-            let nums = decimal_i64_payload(v);
-            consider_best(&mut best, ENC_PLAIN, enc_ints_plain(&nums));
-            consider_best(&mut best, ENC_RLE, enc_ints_rle(&nums));
-            consider_best(&mut best, ENC_BITPACK, enc_ints_bitpack(&nums));
-            consider_best(&mut best, ENC_DELTA_BITPACK, enc_ints_delta(&nums));
-            consider_best(&mut best, ENC_FASTLANES, enc_ints_fastlanes(&nums));
+            return encode_int_chunk(&decimal_i64_payload(v));
         }
         // Wider DECIMAL (precision > 18): `u32 row count | raw unscaled
         // i128 values` (the schema carries precision/scale on disk). Invalid
@@ -2251,82 +2514,9 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
                 consider_best(&mut best, ENC_LZ_FRAME, frame);
             }
         }
-        DataType::Double => {
-            let values = float64_payload(v);
-            let bits: Vec<u64> = values.iter().map(|x| x.to_bits()).collect();
-            consider_best(&mut best, ENC_PLAIN, enc_u64_plain(&bits));
-            consider_best(&mut best, ENC_RLE, enc_u64_rle(&bits));
-            // ALP is the expensive candidate: pass the best payload so far
-            // so a scale that cannot win bails out early.
-            let limit = best.as_ref().map_or(usize::MAX, |(_, b)| b.len());
-            if let Some(alp) = enc_alp(&values, limit) {
-                consider_best(&mut best, ENC_ALP, alp);
-            }
-        }
-        DataType::Boolean => {
-            let bits = bool_payload(v);
-            consider_best(&mut best, ENC_PLAIN, enc_bool_plain(&bits));
-            consider_best(&mut best, ENC_RLE, enc_bool_rle(&bits));
-        }
-        DataType::Varchar => {
-            let strs = varchar_payload(v);
-            let plain = enc_strs_plain(&strs);
-            let dict = enc_strs_dict(&strs);
-            let rle = enc_strs_rle(&strs);
-            let dict_bp = enc_strs_dict_bitpack(&strs);
-            // The compression frame (the last structural candidate) wraps the
-            // plain layout. It is only tried when the best structural
-            // candidate is still big enough to have room for a win
-            // (`LZ_MIN_ATTEMPT`) and a bounded prefix probe says the string
-            // bytes repeat: sales' low-cardinality VARCHAR chunks win with a
-            // ~300-byte bitpacked dictionary and never pay for a scan. The
-            // frame is only kept when strictly smaller, and ties keep the
-            // earlier candidate, so files that never win with it stay
-            // byte-identical to the pre-frame writer.
-            let (frame, compressible) = {
-                let best_len = plain
-                    .len()
-                    .min(dict.len())
-                    .min(rle.len())
-                    .min(dict_bp.len());
-                let data_start = 4 + (strs.len() + 1) * 4;
-                let compressible = best_len >= LZ_MIN_ATTEMPT && lz_probe(&plain[data_start..]);
-                let frame = if compressible {
-                    enc_compressed_frame(ENC_PLAIN, &plain)
-                } else {
-                    None
-                };
-                (frame, compressible)
-            };
-            // FSST: the symbol table rewrites the string bytes so the second
-            // compression stage sees a smaller alphabet. It is the last
-            // candidate, it rides the same probe as the compression frame
-            // (a symbol table over incompressible bytes is pure cost), and it
-            // only wins when it is strictly smaller.
-            let fsst = {
-                let best_len = plain
-                    .len()
-                    .min(dict.len())
-                    .min(rle.len())
-                    .min(dict_bp.len())
-                    .min(frame.as_ref().map_or(usize::MAX, |f| f.len()));
-                if best_len >= LZ_MIN_ATTEMPT && compressible {
-                    enc_strs_fsst(&strs)
-                } else {
-                    None
-                }
-            };
-            consider_best(&mut best, ENC_PLAIN, plain);
-            consider_best(&mut best, ENC_DICT, dict);
-            consider_best(&mut best, ENC_RLE, rle);
-            consider_best(&mut best, ENC_DICT_BITPACK, dict_bp);
-            if let Some(frame) = frame {
-                consider_best(&mut best, ENC_LZ_FRAME, frame);
-            }
-            if let Some(fsst) = fsst {
-                consider_best(&mut best, ENC_FSST, fsst);
-            }
-        }
+        DataType::Double => return encode_double_chunk(&float64_payload(v)),
+        DataType::Boolean => return encode_bool_chunk(&bool_payload(v)),
+        DataType::Varchar => return encode_varchar_chunk(&varchar_payload(v)),
         // HUGEINT/UHUGEINT: `u32 row count | raw 16-byte little-endian
         // values`, the same shape as wide DECIMAL and UUID. Invalid rows are
         // zeroed so the bytes stay deterministic; the validity bitmap wins on
@@ -2358,6 +2548,106 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
             debug_assert_eq!(w.buf.len(), 4 + 16 * n);
             best = Some((ENC_PLAIN, w.buf));
         }
+    }
+    best.expect("at least plain encoding")
+}
+
+/// The pre-sizing encoder: build every candidate and keep the smallest, ties
+/// to the earlier candidate. Kept as the byte-equality reference for
+/// [`encode_chunk_typed`], which must pick the same encoding without building
+/// the losers.
+#[cfg(test)]
+fn encode_chunk_typed_trial(v: &Vector) -> (u8, Vec<u8>) {
+    let dtype = v.dtype();
+    let mut best: Option<(u8, Vec<u8>)> = None;
+    match dtype {
+        DataType::Integer | DataType::Date => {
+            let nums = int32_payload(v);
+            consider_best(&mut best, ENC_PLAIN, enc_ints_plain(&nums));
+            consider_best(&mut best, ENC_RLE, enc_ints_rle(&nums));
+            consider_best(&mut best, ENC_BITPACK, enc_ints_bitpack(&nums));
+            consider_best(&mut best, ENC_DELTA_BITPACK, enc_ints_delta(&nums));
+            consider_best(&mut best, ENC_FASTLANES, enc_ints_fastlanes(&nums));
+        }
+        DataType::Bigint | DataType::Timestamp => {
+            let nums = int64_payload(v);
+            consider_best(&mut best, ENC_PLAIN, enc_ints_plain(&nums));
+            consider_best(&mut best, ENC_RLE, enc_ints_rle(&nums));
+            consider_best(&mut best, ENC_BITPACK, enc_ints_bitpack(&nums));
+            consider_best(&mut best, ENC_DELTA_BITPACK, enc_ints_delta(&nums));
+            consider_best(&mut best, ENC_FASTLANES, enc_ints_fastlanes(&nums));
+        }
+        DataType::Decimal { precision, .. } if precision <= DECIMAL_I64_MAX_PRECISION => {
+            let nums = decimal_i64_payload(v);
+            consider_best(&mut best, ENC_PLAIN, enc_ints_plain(&nums));
+            consider_best(&mut best, ENC_RLE, enc_ints_rle(&nums));
+            consider_best(&mut best, ENC_BITPACK, enc_ints_bitpack(&nums));
+            consider_best(&mut best, ENC_DELTA_BITPACK, enc_ints_delta(&nums));
+            consider_best(&mut best, ENC_FASTLANES, enc_ints_fastlanes(&nums));
+        }
+        DataType::Double => {
+            let values = float64_payload(v);
+            let bits: Vec<u64> = values.iter().map(|x| x.to_bits()).collect();
+            consider_best(&mut best, ENC_PLAIN, enc_u64_plain(&bits));
+            consider_best(&mut best, ENC_RLE, enc_u64_rle(&bits));
+            // ALP is the expensive candidate: pass the best payload so far
+            // so a scale that cannot win bails out early.
+            let limit = best.as_ref().map_or(usize::MAX, |(_, b)| b.len());
+            if let Some(alp) = enc_alp(&values, limit) {
+                consider_best(&mut best, ENC_ALP, alp);
+            }
+        }
+        DataType::Boolean => {
+            let bits = bool_payload(v);
+            consider_best(&mut best, ENC_PLAIN, enc_bool_plain(&bits));
+            consider_best(&mut best, ENC_RLE, enc_bool_rle(&bits));
+        }
+        DataType::Varchar => {
+            let strs = varchar_payload(v);
+            let plain = enc_strs_plain(&strs);
+            let dict = enc_strs_dict(&strs);
+            let rle = enc_strs_rle(&strs);
+            let dict_bp = enc_strs_dict_bitpack(&strs);
+            let (frame, compressible) = {
+                let best_len = plain
+                    .len()
+                    .min(dict.len())
+                    .min(rle.len())
+                    .min(dict_bp.len());
+                let data_start = 4 + (strs.len() + 1) * 4;
+                let compressible = best_len >= LZ_MIN_ATTEMPT && lz_probe(&plain[data_start..]);
+                let frame = if compressible {
+                    enc_compressed_frame(ENC_PLAIN, &plain)
+                } else {
+                    None
+                };
+                (frame, compressible)
+            };
+            let fsst = {
+                let best_len = plain
+                    .len()
+                    .min(dict.len())
+                    .min(rle.len())
+                    .min(dict_bp.len())
+                    .min(frame.as_ref().map_or(usize::MAX, |f| f.len()));
+                if best_len >= LZ_MIN_ATTEMPT && compressible {
+                    enc_strs_fsst(&strs)
+                } else {
+                    None
+                }
+            };
+            consider_best(&mut best, ENC_PLAIN, plain);
+            consider_best(&mut best, ENC_DICT, dict);
+            consider_best(&mut best, ENC_RLE, rle);
+            consider_best(&mut best, ENC_DICT_BITPACK, dict_bp);
+            if let Some(frame) = frame {
+                consider_best(&mut best, ENC_LZ_FRAME, frame);
+            }
+            if let Some(fsst) = fsst {
+                consider_best(&mut best, ENC_FSST, fsst);
+            }
+        }
+        _ => return encode_chunk_typed(v),
     }
     best.expect("at least plain encoding")
 }
@@ -2756,15 +3046,16 @@ fn decode_payload(dtype: DataType, tag: u8, r: &mut Reader) -> Result<(VectorDat
             Ok((VectorData::TimestampMicros(r.i64_vec(n)?), n))
         }
         // DECIMAL(p <= 18): the chunk was encoded as BIGINT (see
-        // `encode_chunk_typed`); decode it that way and widen to i128.
+        // `encode_chunk_typed`); decode it that way and keep the 64-bit
+        // values as the DECIMAL payload (wave 142: no widening copy).
         (DataType::Decimal { precision, scale }, _) if precision <= DECIMAL_I64_MAX_PRECISION => {
             let (data, n) = decode_payload(DataType::Bigint, tag, r)?;
-            let VectorData::Int64(ints) = data else {
+            let VectorData::Int64(values) = data else {
                 return r.err("DECIMAL chunk did not decode as 64-bit integers");
             };
             Ok((
-                VectorData::Decimal {
-                    values: ints.into_iter().map(i128::from).collect(),
+                VectorData::Decimal64 {
+                    values,
                     precision,
                     scale,
                 },
@@ -6193,11 +6484,9 @@ fn null_vector(dtype: DataType, rows: usize) -> Vector {
         DataType::Varchar => VectorData::VarChar(StrVec::repeat("", rows)),
         DataType::Date => VectorData::Date32(vec![0; rows]),
         DataType::Timestamp => VectorData::TimestampMicros(vec![0; rows]),
-        DataType::Decimal { precision, scale } => VectorData::Decimal {
-            values: vec![0; rows],
-            precision,
-            scale,
-        },
+        DataType::Decimal { precision, scale } => {
+            VectorData::decimal_from_i128(vec![0; rows], precision, scale)
+        }
         DataType::Uuid => VectorData::Uuid(vec![0; rows]),
         DataType::Hugeint => VectorData::Int128(vec![0; rows]),
         DataType::Uhugeint => VectorData::UInt128(vec![0; rows]),
@@ -7701,6 +7990,10 @@ fn plain_payload(v: &Vector) -> Vec<u8> {
             }
             w.buf
         }
+        // DECIMAL(p <= 18) is stored with the BIGINT encodings.
+        DataType::Decimal { precision, .. } if precision <= DECIMAL_I64_MAX_PRECISION => {
+            enc_ints_plain(&decimal_i64_payload(v))
+        }
         DataType::Decimal { .. } => {
             let VectorData::Decimal { values, .. } = v.data() else {
                 unreachable!()
@@ -8523,6 +8816,333 @@ mod tests {
             roundtrip_chunk(DataType::Bigint, ex.clone(), ENC_FASTLANES),
             ex
         );
+    }
+
+    /// Deterministic stress corpus for the encoder's choice: lengths on both
+    /// sides of `FASTLANES_BLOCK` and `CHUNK_SIZE`, nulls, runs, sorted and
+    /// clustered runs, wide and narrow ranges, cardinality extremes, ALP money
+    /// and corners, and string shapes that favour the frame.
+    fn encoding_corpus() -> Vec<(DataType, Vec<Value>)> {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+        }
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut cases = Vec::new();
+        // FastLanes wins when each 1,024-value block is narrow but the blocks
+        // sit far apart: global bitpacking needs the full range, and the
+        // delta at the block boundary widens every delta.
+        for n in [1025usize, 2048] {
+            let far =
+                |i: usize, r: u64| (i / FASTLANES_BLOCK) as i64 * 1_000_000_000 + (r % 16) as i64;
+            cases.push((
+                DataType::Integer,
+                (0..n)
+                    .map(|i| Value::Integer((far(i, rng.next()) / 2) as i32))
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Bigint,
+                (0..n).map(|i| Value::Bigint(far(i, rng.next()))).collect(),
+            ));
+        }
+        for &n in &[0usize, 1, 2, 7, 8, 9, 63, 100, 1023, 1024, 1025, 2047, 2048] {
+            cases.push((
+                DataType::Integer,
+                (0..n)
+                    .map(|_| Value::Integer((rng.next() % 2_000_001) as i32 - 1_000_000))
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Integer,
+                (0..n)
+                    .map(|i| {
+                        if i % 5 == 0 {
+                            Value::Null
+                        } else {
+                            Value::Integer(7)
+                        }
+                    })
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Integer,
+                (0..n).map(|i| Value::Integer(i as i32)).collect(),
+            ));
+            cases.push((
+                DataType::Integer,
+                (0..n).map(|i| Value::Integer((i % 4) as i32 - 2)).collect(),
+            ));
+            cases.push((
+                DataType::Integer,
+                (0..n)
+                    .map(|i| {
+                        if i % 2 == 0 {
+                            Value::Integer(i32::MIN)
+                        } else {
+                            Value::Integer(i32::MAX)
+                        }
+                    })
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Integer,
+                (0..n)
+                    .map(|i| {
+                        let base = ((i / 512) * 1000) as i32;
+                        Value::Integer(base + (i % 512) as i32)
+                    })
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Bigint,
+                (0..n).map(|_| Value::Bigint(rng.next() as i64)).collect(),
+            ));
+            cases.push((
+                DataType::Bigint,
+                (0..n)
+                    .map(|i| Value::Bigint(i as i64 * 86_400_000_000))
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Bigint,
+                (0..n)
+                    .map(|i| {
+                        if i % 2 == 0 {
+                            Value::Bigint(i64::MIN)
+                        } else {
+                            Value::Bigint(i64::MAX)
+                        }
+                    })
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Timestamp,
+                (0..n)
+                    .map(|_| Value::Timestamp((rng.next() % 1_000_000_000) as i64))
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Date,
+                (0..n)
+                    .map(|i| Value::Date(20_000 + (i as i32) % 400))
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Date,
+                (0..n)
+                    .map(|i| {
+                        if i % 3 == 0 {
+                            Value::Null
+                        } else {
+                            Value::Date(19_000)
+                        }
+                    })
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+                (0..n)
+                    .map(|i| Value::Decimal {
+                        value: (rng.next() % 100_000_000) as i128 * if i % 2 == 0 { 1 } else { -1 },
+                        precision: 15,
+                        scale: 2,
+                    })
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Double,
+                (0..n)
+                    .map(|_| Value::Double(f64::from_bits(rng.next())))
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Double,
+                (0..n).map(|i| Value::Double((i as f64) / 100.0)).collect(),
+            ));
+            cases.push((
+                DataType::Double,
+                (0..n).map(|_| Value::Double(1.5)).collect(),
+            ));
+            cases.push((
+                DataType::Boolean,
+                (0..n)
+                    .map(|_| Value::Boolean(rng.next() & 1 == 0))
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Boolean,
+                (0..n).map(|_| Value::Boolean(true)).collect(),
+            ));
+            cases.push((
+                DataType::Boolean,
+                (0..n).map(|i| Value::Boolean(i % 1000 < 500)).collect(),
+            ));
+            cases.push((
+                DataType::Varchar,
+                (0..n)
+                    .map(|_| Value::Varchar(format!("row-{}", rng.next() % 1_000_000)))
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Varchar,
+                (0..n)
+                    .map(|i| Value::Varchar(format!("cat-{}", i % 5)))
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Varchar,
+                (0..n)
+                    .map(|i| {
+                        if i % 11 == 0 {
+                            Value::Null
+                        } else {
+                            Value::Varchar("same".to_string())
+                        }
+                    })
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Varchar,
+                (0..n)
+                    .map(|i| {
+                        Value::Varchar(format!(
+                            "{{\"id\":{},\"name\":\"alpha-beta-gamma\",\"n\":{},\"note\":\"the quick brown fox jumps over the lazy dog\"}}",
+                            i % 17,
+                            i % 3
+                        ))
+                    })
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Varchar,
+                (0..n)
+                    .map(|i| Value::Varchar(((b'a' + (i % 26) as u8) as char).to_string()))
+                    .collect(),
+            ));
+            cases.push((
+                DataType::Varchar,
+                (0..n).map(|_| Value::Varchar(String::new())).collect(),
+            ));
+            cases.push((
+                DataType::Varchar,
+                (0..n)
+                    .map(|i| Value::Varchar(format!("{}{}", "x".repeat(200), i % 7)))
+                    .collect(),
+            ));
+        }
+        // TPC-H lineitem shapes at CHUNK_SIZE.
+        let n = CHUNK_SIZE;
+        cases.push((
+            DataType::Integer,
+            (0..n)
+                .map(|i| Value::Integer(((i / 7) * 4) as i32))
+                .collect(),
+        ));
+        cases.push((
+            DataType::Integer,
+            (0..n).map(|i| Value::Integer(1 + (i % 7) as i32)).collect(),
+        ));
+        cases.push((
+            DataType::Double,
+            (0..n)
+                .map(|i| Value::Double(900.0 + (i % 1000) as f64 * 0.13))
+                .collect(),
+        ));
+        cases.push((
+            DataType::Double,
+            (0..n)
+                .map(|i| Value::Double(((i % 11) as f64) / 100.0))
+                .collect(),
+        ));
+        cases.push((
+            DataType::Decimal {
+                precision: 15,
+                scale: 2,
+            },
+            (0..n)
+                .map(|i| Value::Decimal {
+                    value: 100_000 + (i as i128 % 90_000),
+                    precision: 15,
+                    scale: 2,
+                })
+                .collect(),
+        ));
+        cases.push((
+            DataType::Date,
+            (0..n)
+                .map(|i| Value::Date(8_500 + (i as i32 % 2_500)))
+                .collect(),
+        ));
+        cases.push((
+            DataType::Varchar,
+            (0..n)
+                .map(|i| Value::Varchar(["A", "N", "R"][i % 3].to_string()))
+                .collect(),
+        ));
+        cases.push((
+            DataType::Varchar,
+            (0..n)
+                .map(|i| {
+                    Value::Varchar(
+                        [
+                            "DELIVER IN PERSON",
+                            "COLLECT COD",
+                            "NONE",
+                            "TAKE BACK RETURN",
+                        ][i % 4]
+                            .to_string(),
+                    )
+                })
+                .collect(),
+        ));
+        cases.push((
+            DataType::Varchar,
+            (0..n)
+                .map(|i| Value::Varchar(format!("{} foxes sleep. {}", "quick brown", i)))
+                .collect(),
+        ));
+        cases
+    }
+
+    /// The sized-selection encoder must choose and write exactly what the
+    /// trial encoder (build every candidate, keep the smallest, ties to the
+    /// earlier candidate) chose; the corpus exercises every reachable tag.
+    #[test]
+    fn selection_matches_trial_encoding() {
+        let mut seen = [false; 12];
+        for (dtype, values) in encoding_corpus() {
+            let v = vector_from_values(dtype, &values);
+            let (tag, bytes) = encode_chunk_typed(&v);
+            let (want_tag, want) = encode_chunk_typed_trial(&v);
+            assert_eq!(tag, want_tag, "{dtype:?} len {}", values.len());
+            assert_eq!(bytes, want, "bytes differ: {dtype:?} tag {tag}");
+            assert_eq!(encode_chunk(dtype, &values), (want_tag, want));
+            seen[tag as usize] = true;
+        }
+        // Every codec the selection can reach, FSST and ALP included (their
+        // decoders are stream C's next port, so their bytes must be proven).
+        for tag in [
+            ENC_PLAIN,
+            ENC_RLE,
+            ENC_BITPACK,
+            ENC_DELTA_BITPACK,
+            ENC_FASTLANES,
+            ENC_ALP,
+            ENC_DICT_BITPACK,
+            ENC_LZ_FRAME,
+            ENC_FSST,
+        ] {
+            assert!(seen[tag as usize], "corpus never selects tag {tag}");
+        }
     }
 
     /// The FastLanes encoding is a *candidate*: it wins when the per-block

@@ -388,13 +388,20 @@ func OpenMemory() (*DB, error) {
 	return &DB{handle: handle}, nil
 }
 
-// ABI returns the C ABI version reported by the linked pinkdb-ffi library
-// (currently 1). It is a library-wide constant and does not touch the
-// database handle; the mutex keeps all native calls serialized.
+// ABI returns the C ABI version reported by the linked pinkdb-ffi library,
+// encoded major<<16 | minor (65539 is 1.3; see ABIMajorMinor). It is a
+// library-wide constant and does not touch the database handle; the mutex
+// keeps all native calls serialized.
 func (db *DB) ABI() uint32 {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return uint32(C.pinkdb_abi_version())
+}
+
+// ABIMajorMinor splits an encoded C ABI version (ABI, SupportedABI) into its
+// major and minor parts. A newer minor of the same major only adds calls.
+func ABIMajorMinor(v uint32) (major, minor uint32) {
+	return v >> 16, v & 0xffff
 }
 
 // Execute runs one or more ';'-separated SQL statements and materializes one
