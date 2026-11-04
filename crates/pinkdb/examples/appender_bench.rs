@@ -132,7 +132,10 @@ fn main() {
     drop(source_db);
 
     if let Ok(sweep) = std::env::var("APPENDER_FLUSH_SWEEP") {
-        let sizes: Vec<usize> = sweep.split(',').map(|s| s.trim().parse().unwrap()).collect();
+        let sizes: Vec<usize> = sweep
+            .split(',')
+            .map(|s| s.trim().parse().unwrap())
+            .collect();
         let mut times = vec![(Vec::new(), Vec::new()); sizes.len()];
         for round in 0..3 {
             for (i, &size) in sizes.iter().enumerate() {
