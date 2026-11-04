@@ -5358,6 +5358,16 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 keys,
             } = over_sort
             {
+                // A pipeline input streams into per-worker candidate sets
+                // instead of materializing every row first.
+                expr::prime(cx, keys.iter().map(|(e, _)| e))?;
+                if let Some(out) = pipeline::top_n_streamed(cx, sort_in, keys, *limit)? {
+                    let mut out = truncate_output(out, *limit);
+                    for projection in projections.iter().rev() {
+                        out = project_output(cx, projection, out)?;
+                    }
+                    return Ok(out);
+                }
                 // Evaluate the sort input once: the top-N path and the
                 // fallback full sort below both consume these chunks
                 // (re-evaluating `sort_in` here would run the whole
@@ -8491,6 +8501,42 @@ fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, SortSpec)]) -> Result
     let rows: Vec<u32> = rows.into_iter().map(|(_, r)| r).collect();
     let out = rebuild_sorted(chunks, &rows)?;
     held.resize(chunks_approx_bytes(&out) + arena.bytes.len() + n * 12)?;
+    Ok(out)
+}
+
+/// The first `limit` rows of `chunks` under `keys`, in order, ties in input
+/// order: the top-N heaps when the limit is small against the rows, a full
+/// sort otherwise. What the `LIMIT` arm returns for the same chunks.
+fn select_top(
+    cx: &Cx,
+    chunks: &[DataChunk],
+    keys: &[(BoundExpr, SortSpec)],
+    limit: usize,
+) -> Result<Vec<DataChunk>> {
+    let n: usize = chunks.iter().map(DataChunk::num_rows).sum();
+    let sorted = if n > limit && limit.saturating_mul(16) <= n {
+        match top_n(cx, chunks, keys, limit)? {
+            Some(chunks) => chunks,
+            None => sort(cx, chunks, keys)?,
+        }
+    } else {
+        sort(cx, chunks, keys)?
+    };
+    let mut out = Vec::new();
+    let mut left = limit;
+    for chunk in sorted {
+        if left == 0 {
+            break;
+        }
+        if chunk.num_rows() <= left {
+            left -= chunk.num_rows();
+            out.push(chunk);
+        } else {
+            let sel: Vec<usize> = (0..left).collect();
+            out.push(chunk.gather(&sel));
+            left = 0;
+        }
+    }
     Ok(out)
 }
 
@@ -14753,6 +14799,41 @@ mod tests {
         // the permuted ids prove the tiebreak is input order, not id order.
         assert_eq!(topn[0][3], V::Integer(0));
         assert_eq!(topn[1][3], V::Integer(((60 * 37) % N) as i32));
+    }
+
+    /// The streamed top-N compacts each worker's candidates many times over
+    /// heavy ties: the result must still be the full sort's rows, ties in
+    /// input order, for a limit inside one chunk and one spanning several.
+    #[test]
+    fn streamed_top_n_keeps_input_order_through_compaction() {
+        const N: usize = 60_000;
+        let mut db = PinkDb::new();
+        db.execute(&format!(
+            "CREATE TABLE t AS SELECT i AS id, i % 3 AS k, (i * 7919) % 1000 AS w \
+             FROM range({N}) r(i);"
+        ))
+        .unwrap();
+        for (limited, full, take) in [
+            (
+                "SELECT id FROM t ORDER BY k LIMIT 7;",
+                "SELECT id FROM t ORDER BY k;",
+                7,
+            ),
+            (
+                "SELECT id, w FROM t ORDER BY k DESC LIMIT 3000;",
+                "SELECT id, w FROM t ORDER BY k DESC;",
+                3000,
+            ),
+            (
+                "SELECT id FROM t ORDER BY w, k DESC LIMIT 150;",
+                "SELECT id FROM t ORDER BY w, k DESC;",
+                150,
+            ),
+        ] {
+            let got = select(&mut db, limited);
+            let all = select(&mut db, full);
+            assert_eq!(got, all[..take].to_vec(), "{limited}");
+        }
     }
 
     /// Top-N under projections (`ORDER BY` a column the SELECT list leaves
