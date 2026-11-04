@@ -4239,7 +4239,7 @@ fn wal_header_invalid(path: &Path) -> Result<bool> {
     match parse_wal_header(data) {
         Ok(_) => Ok(false),
         Err(e) => {
-            if header_torn(data.len(), &e) {
+            if header_torn(data.len(), &e) || older_and_empty(data) {
                 Ok(true)
             } else {
                 Err(PinkDbError::Execution(header_error(path, &e)))
@@ -4331,6 +4331,9 @@ fn scan_wal(
     refuse_container(path, &data)?;
     let mut header = match parse_wal_header(&data) {
         Ok(h) => h,
+        Err(_) if older_and_empty(&data) => {
+            return created(recreate_gen, fresh_cipher(recreate_gen)?);
+        }
         Err(e) if header_torn(data.len(), &e) => {
             // A torn creation (crash while creating/recreating the WAL): no
             // record can have been acknowledged yet, so the file is
@@ -4759,6 +4762,12 @@ fn header_error(path: &Path, e: &HeaderError) -> String {
         HeaderError::BadMagic => {
             format!("{} is not a pinkdb WAL file (bad magic)", path.display())
         }
+        HeaderError::BadVersion(v) if *v < WAL_VERSION => format!(
+            "{}: WAL format version {v} is not supported (want {WAL_VERSION}): an older \
+             pinkdb wrote records here that this build cannot replay. Open the store with \
+             that version and run CHECKPOINT (it empties the WAL), or regenerate the store",
+            path.display()
+        ),
         HeaderError::BadVersion(v) => {
             format!("WAL format version {v} is not supported (want {WAL_VERSION})")
         }
@@ -4782,6 +4791,20 @@ fn header_error(path: &Path, e: &HeaderError) -> String {
             format!("{}: {what}", path.display())
         }
     }
+}
+
+/// A WAL an older build created in the current header layout (formats 4 up
+/// to the current one) and never wrote a record to: one verified header and
+/// nothing after it, so there is nothing to replay. It is recreated in the
+/// current format like a torn creation. One that holds records is refused
+/// with what to do (see [`header_error`]).
+fn older_and_empty(data: &[u8]) -> bool {
+    if data.len() != HEADER_LEN || &data[..8] != WAL_MAGIC {
+        return false;
+    }
+    let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
+    let crc = u32::from_le_bytes(data[36..40].try_into().expect("4 bytes"));
+    (4..WAL_VERSION).contains(&version) && crc == crc32(&data[..36]) && data[88..96] == [0u8; 8]
 }
 
 /// May a failed header parse on a file of this length be treated as a torn
@@ -4878,7 +4901,7 @@ fn probe_wal(path: &Path, key: Option<&EncryptionKey>) -> Result<Option<WalProbe
                 has_records: !records.is_empty(),
             }))
         }
-        Err(e) if header_torn(data.len(), &e) => Ok(Some(WalProbe {
+        Err(e) if header_torn(data.len(), &e) || older_and_empty(&data) => Ok(Some(WalProbe {
             generation: None,
             has_records: false,
         })),
@@ -7562,6 +7585,54 @@ mod tests {
         assert!(matches!(err, HeaderError::ContainerVersion(99)), "{err:?}");
         assert!(!header_torn(data.len(), &err), "must not be torn");
         assert!(header_error(Path::new("w"), &err).contains("99"));
+    }
+
+    /// A header-only WAL an older build left behind holds nothing to replay:
+    /// it is recreated in the current format and the store opens. One with
+    /// records is refused with what to do.
+    #[test]
+    fn an_older_header_only_wal_is_recreated() {
+        let p = tmp_ckpt("older_empty_wal");
+        {
+            let mut db = PinkDb::open_durable(p.to_str().unwrap()).unwrap();
+            db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (7); CHECKPOINT;")
+                .unwrap();
+        }
+        assert_eq!(wal_len(&p), HEADER_LEN as u64);
+        // Rewrite the header as the previous format, with a valid checksum.
+        let as_previous = |bytes: &mut Vec<u8>| {
+            bytes[8..12].copy_from_slice(&(WAL_VERSION - 1).to_le_bytes());
+            let crc = crc32(&bytes[..36]);
+            bytes[36..40].copy_from_slice(&crc.to_le_bytes());
+        };
+        let mut header = std::fs::read(wal_path(&p)).unwrap();
+        as_previous(&mut header);
+        std::fs::write(wal_path(&p), &header).unwrap();
+        {
+            let mut db = PinkDb::open_durable(p.to_str().unwrap()).unwrap();
+            assert_eq!(ints(&mut db, "SELECT a FROM t;"), vec![7]);
+            db.execute("INSERT INTO t VALUES (8);").unwrap();
+        }
+        let now = std::fs::read(wal_path(&p)).unwrap();
+        assert_eq!(
+            &now[8..12],
+            &WAL_VERSION.to_le_bytes(),
+            "rewritten as current"
+        );
+        let mut db = PinkDb::open_durable(p.to_str().unwrap()).unwrap();
+        assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![7, 8]);
+        drop(db);
+
+        // The previous format with a record after the header: refused, and
+        // the error says how to get out.
+        let mut with_record = now.clone();
+        as_previous(&mut with_record);
+        std::fs::write(wal_path(&p), &with_record).unwrap();
+        let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("an older pinkdb wrote records"), "{msg}");
+        assert!(msg.contains("run CHECKPOINT"), "{msg}");
+        cleanup(&p);
     }
 
     #[test]
