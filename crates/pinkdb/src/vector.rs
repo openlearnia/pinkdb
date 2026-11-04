@@ -1465,6 +1465,12 @@ impl Vector {
         Vector::from_parts(data, validity, n)
     }
 
+    /// A hash join's build column prepared once per join: see
+    /// [`GatherColumn`]. [`Vector::gather_located`] stays the one-off form.
+    pub(crate) fn gather_column<'a>(sources: &[&'a Vector]) -> GatherColumn<'a> {
+        GatherColumn::new(sources)
+    }
+
     /// The rows at `selection` (any order, repeats allowed), copied payload
     /// by payload instead of one `push_from` per row; strings and variants
     /// share their `Arc`s. ARRAY columns, whose elements and element bitmap
@@ -1715,6 +1721,159 @@ impl DataChunk {
             ordinal: self.ordinal,
         }
     }
+}
+
+/// One hash-join build column, resolved once per join (wave 141a).
+///
+/// A join's output gathers a build column at `(chunk, row)` locations for
+/// every match. [`Vector::gather_located`] does that per call, matching each
+/// pick's source payload by type, which is a branch per row per column.
+/// `GatherColumn` resolves every build chunk's payload slice, validity mask
+/// and the column's NULL-freedom once, so a gather is an indexed copy over the
+/// picks only — never a pass over all build chunks, which outnumber the
+/// picks of one output chunk on a large build side.
+pub(crate) struct GatherColumn<'a> {
+    sources: Vec<&'a Vector>,
+    typed: GatherSlices<'a>,
+    masks: Vec<&'a [u64]>,
+    has_nulls: bool,
+}
+
+enum GatherSlices<'a> {
+    Boolean(Vec<&'a [bool]>),
+    Int32(Vec<&'a [i32]>),
+    Int64(Vec<&'a [i64]>),
+    Float64(Vec<&'a [f64]>),
+    Date32(Vec<&'a [i32]>),
+    TimestampMicros(Vec<&'a [i64]>),
+    Decimal(Vec<&'a [i128]>, u8, u8),
+    Interval(Vec<&'a [Interval]>),
+    Uuid(Vec<&'a [u128]>),
+    Int128(Vec<&'a [i128]>),
+    UInt128(Vec<&'a [u128]>),
+    VarChar(Vec<&'a crate::strings::StrVec>),
+    /// VARIANT, ARRAY, or no sources: [`Vector::gather_located`]'s own path.
+    Other,
+}
+
+impl<'a> GatherColumn<'a> {
+    fn new(sources: &[&'a Vector]) -> Self {
+        macro_rules! slices {
+            ($variant:ident) => {
+                sources
+                    .iter()
+                    .map(|v| match v.data() {
+                        VectorData::$variant(x) => &x[..],
+                        _ => unreachable!("gather sources of mixed types"),
+                    })
+                    .collect()
+            };
+        }
+        let typed = match sources.first().map(|v| v.data()) {
+            Some(VectorData::Boolean(_)) => GatherSlices::Boolean(slices!(Boolean)),
+            Some(VectorData::Int32(_)) => GatherSlices::Int32(slices!(Int32)),
+            Some(VectorData::Int64(_)) => GatherSlices::Int64(slices!(Int64)),
+            Some(VectorData::Float64(_)) => GatherSlices::Float64(slices!(Float64)),
+            Some(VectorData::Date32(_)) => GatherSlices::Date32(slices!(Date32)),
+            Some(VectorData::TimestampMicros(_)) => {
+                GatherSlices::TimestampMicros(slices!(TimestampMicros))
+            }
+            Some(VectorData::Decimal {
+                precision, scale, ..
+            }) => GatherSlices::Decimal(
+                sources
+                    .iter()
+                    .map(|v| match v.data() {
+                        VectorData::Decimal { values, .. } => &values[..],
+                        _ => unreachable!("gather sources of mixed types"),
+                    })
+                    .collect(),
+                *precision,
+                *scale,
+            ),
+            Some(VectorData::Interval(_)) => GatherSlices::Interval(slices!(Interval)),
+            Some(VectorData::Uuid(_)) => GatherSlices::Uuid(slices!(Uuid)),
+            Some(VectorData::Int128(_)) => GatherSlices::Int128(slices!(Int128)),
+            Some(VectorData::UInt128(_)) => GatherSlices::UInt128(slices!(UInt128)),
+            Some(VectorData::VarChar(_)) => GatherSlices::VarChar(
+                sources
+                    .iter()
+                    .map(|v| match v.data() {
+                        VectorData::VarChar(x) => x,
+                        _ => unreachable!("gather sources of mixed types"),
+                    })
+                    .collect(),
+            ),
+            _ => GatherSlices::Other,
+        };
+        GatherColumn {
+            sources: sources.to_vec(),
+            typed,
+            masks: sources.iter().map(|v| &v.validity[..]).collect(),
+            has_nulls: sources.iter().any(|v| v.has_nulls()),
+        }
+    }
+
+    /// The build rows at `picks` (`(chunk, row)`, or [`GATHER_NULL`] for an
+    /// outer join's unmatched row): the same vector
+    /// [`Vector::gather_located`] returns.
+    pub(crate) fn gather(&self, dtype: DataType, picks: &[(u32, u32)]) -> Vector {
+        fn copy<T: Copy>(slices: &[&[T]], picks: &[(u32, u32)], default: T) -> Vec<T> {
+            picks
+                .iter()
+                .map(|&(c, r)| {
+                    if c == GATHER_NULL {
+                        default
+                    } else {
+                        slices[c as usize][r as usize]
+                    }
+                })
+                .collect()
+        }
+        let data = match &self.typed {
+            GatherSlices::Boolean(s) => VectorData::Boolean(copy(s, picks, false)),
+            GatherSlices::Int32(s) => VectorData::Int32(copy(s, picks, 0)),
+            GatherSlices::Int64(s) => VectorData::Int64(copy(s, picks, 0)),
+            GatherSlices::Float64(s) => VectorData::Float64(copy(s, picks, 0.0)),
+            GatherSlices::Date32(s) => VectorData::Date32(copy(s, picks, 0)),
+            GatherSlices::TimestampMicros(s) => VectorData::TimestampMicros(copy(s, picks, 0)),
+            GatherSlices::Decimal(s, precision, scale) => VectorData::Decimal {
+                values: copy(s, picks, 0),
+                precision: *precision,
+                scale: *scale,
+            },
+            GatherSlices::Interval(s) => VectorData::Interval(copy(s, picks, Interval::default())),
+            GatherSlices::Uuid(s) => VectorData::Uuid(copy(s, picks, 0)),
+            GatherSlices::Int128(s) => VectorData::Int128(copy(s, picks, 0)),
+            GatherSlices::UInt128(s) => VectorData::UInt128(copy(s, picks, 0)),
+            GatherSlices::VarChar(s) => {
+                VectorData::VarChar(crate::strings::StrVec::gather(s, picks, GATHER_NULL))
+            }
+            GatherSlices::Other => return Vector::gather_located(dtype, &self.sources, picks),
+        };
+        let n = picks.len();
+        if !self.has_nulls && !picks.iter().any(|&(c, _)| c == GATHER_NULL) {
+            return Vector::from_parts(data, all_valid_mask(n), n);
+        }
+        let mut validity = vec![0u64; mask_len(n)];
+        for (o, &(c, r)) in picks.iter().enumerate() {
+            if c != GATHER_NULL && bit_get(self.masks[c as usize], r as usize) {
+                validity[o / 64] |= 1 << (o % 64);
+            }
+        }
+        Vector::from_parts(data, validity, n)
+    }
+}
+
+/// A validity mask with the first `len` bits set and the tail bits clear.
+fn all_valid_mask(len: usize) -> Vec<u64> {
+    let mut mask = vec![u64::MAX; mask_len(len)];
+    if !len.is_multiple_of(64)
+        && let Some(last) = mask.last_mut()
+    {
+        *last = (1u64 << (len % 64)) - 1;
+    }
+    mask
 }
 
 #[cfg(test)]

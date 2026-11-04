@@ -1,0 +1,53 @@
+# Wave 141 — the SF10 join path
+
+Planned 2026-11-04 after the quiet-machine baseline against DuckDB v2.0.0 (`pinkdb-wt/logs/cmp-16bb4b8`):
+TPC-H SF10 at 2.73× DuckDB. The worst queries are joins: Q10 5.96×, Q2 5.47×, Q7 4.92×, Q21 4.16×.
+Done directly in the stream-C session, one measured hot path at a time.
+
+## Profile (main 16bb4b8, SF10, `sample` of repeated runs, inclusive samples per query)
+
+| query | probe | output assembly | of which `gather_located` | probe_rows | hash build | other |
+|---|---|---|---|---|---|---|
+| Q10 | 14,500 (58 %) | ~12,000 | 11,444 (strings 3,440) | 1,158 | negligible | idle ~17 % per worker |
+| Q7 | 17,600 | 8,400 | 7,500 | 4,040 | small | `row_filter_pass` 2,418 |
+| Q21 | 7,600 | 3,900 | 3,800 | 977 | 1,139 | residual pairs/selection ~5,700 |
+
+The join output's gather of build-side columns dominates; the hash build does not. Column pruning
+through joins already works (wave 127): the `Project` listing every column in `EXPLAIN` is the
+binder's view. Q10's idle time is the main thread's serial work while workers sleep: dropping the
+build outputs (~240 samples), `FlatSink::merge` (~145) and `pipeline::steps` (~135).
+
+## Steps
+
+- **141a — typed gathers resolved once per join.** `GatherColumn` (`vector.rs`) resolves every build
+  chunk's payload slice and validity mask, and whether the column has a NULL, once per join
+  (`ProbePlan`). Gathering a match is then an indexed copy over the picks, with no per-row type
+  dispatch, and an all-valid mask when nothing can be NULL. The join residual (`residual_selection`)
+  uses the same columns. `StrVec::gather` maps buffers through a small map instead of a vector sized
+  to the number of build chunks. One rejected attempt is worth recording: building the typed slices
+  per call was O(build chunks) per output chunk, and made Q7 2.9× slower. The slices must be built
+  once per join.
+- **141b — buffer reuse in `ProbeChunk::new` and `Vector::take`** (next).
+- **141c — a row-layout build side** (design: `docs/wave-141c-design.md`).
+- Later, from the profile: a parallel or deferred drop of the build outputs, and a parallel
+  `FlatSink::merge`.
+
+## 141a results
+
+Interleaved A/B against main 16bb4b8 (`tools/tpch-ab.py`, same store, same machine):
+
+| | geomean | notable |
+|---|---|---|
+| SF1, 5 rounds, load 7.6–8.5 | 0.986 | — |
+| SF10, 3 rounds, load 10–15 | **0.888** | Q10 0.53, Q7 0.76, Q9 0.82, Q21 0.87, Q2 0.92, Q5 0.93, Q8 0.93 |
+
+The SF10 outliers Q6 1.33 and Q15 1.25 were rechecked at 6 rounds: Q6 0.99, Q15 1.01, Q17 0.96.
+
+`tools/tpch-vs-duckdb.py` (store mode): SF1 1.56× (baseline 1.63×). SF10 2.89× against the
+baseline's 2.73×, but that run's load was 10–15 against the baseline's 4–11, and DuckDB's own times
+were 30–60 % slower than in the baseline (Q2 17 → 28 ms, Q7 77 → 109 ms). So the A/B above is the
+landing evidence, and the quiet-machine comparison is rerun when the parent schedules one. Q10
+against DuckDB went from 5.96× to 5.16× even under that load.
+
+Gates: `cargo test -p pinkdb` (0 failures), `cargo clippy --workspace --all-targets -D warnings`
+clean, `cargo fmt`.

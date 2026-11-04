@@ -9,6 +9,13 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-11-04
+### Wave 141a — joins gather their build columns without per-row dispatch ✅
+
+A hash join's output reads each build-side column through slices resolved once per join, not by
+checking every row's type. Join-heavy TPC-H queries at SF10 run faster (interleaved against the
+previous build): Q10 1.9× faster, Q7 1.3×, Q9 1.2×, Q21 1.15×, geomean 0.888 over all 22 queries
+(SF1 0.986).
+
 ### Faster bulk loads, step 1 ✅
 
 `CREATE TABLE … AS SELECT * FROM read_parquet(…)` / `read_csv(…)` load 1.33×
