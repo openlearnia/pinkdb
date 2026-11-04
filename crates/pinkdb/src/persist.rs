@@ -4806,7 +4806,7 @@ impl PinkDb {
         let file = match opened {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.save_first_image(tmp)?;
+                self.save_first_image(tmp, target)?;
                 return Ok(CheckpointSave::Full);
             }
             Err(e) => return Err(e.into()),
@@ -5138,6 +5138,9 @@ impl PinkDb {
         Self::repoint_written(repoints, &source);
         // Every pending group is now referenced by the footer or free in it.
         *pending_guard = None;
+        // A staging file is only for a store with no image: this one has one,
+        // so a leftover is a load that never committed.
+        let _ = std::fs::remove_file(staging_path(target));
         #[cfg(test)]
         REPOINT_GENERATION.with(|g| g.set(Some(wal_generation)));
         Ok(())
@@ -6104,12 +6107,20 @@ pub(crate) fn staging_path(target: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Whether two handles name the same file (not just the same path).
+#[cfg(unix)]
 fn same_file(a: &std::fs::File, b: &std::fs::File) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (a.metadata(), b.metadata()) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
     }
+}
+
+/// Without a file identity, nothing is known to be the same file: pending
+/// groups are then copied like any stored chunk instead of referenced.
+#[cfg(not(unix))]
+fn same_file(_: &std::fs::File, _: &std::fs::File) -> bool {
+    false
 }
 
 /// A first checkpoint that publishes a load's staging file as the image: every
@@ -6275,9 +6286,13 @@ impl PinkDb {
     /// The first image of a store: publish a load's staging file when it
     /// lines up, otherwise write a fresh image to `tmp` (copying any pending
     /// group's bytes through) and drop the staging file.
-    fn save_first_image(&self, tmp: &std::path::Path) -> Result<()> {
+    fn save_first_image(&self, tmp: &std::path::Path, target: &std::path::Path) -> Result<()> {
         let mut guard = self.pending_load.lock().unwrap_or_else(|e| e.into_inner());
         let Some(load) = guard.as_ref().filter(|load| load.staging.is_some()) else {
+            // A staging file nothing names is a load that never committed
+            // (no frame names its groups): the lease rules out a load in
+            // flight, so it is garbage.
+            let _ = std::fs::remove_file(staging_path(target));
             return self.save_sync(tmp);
         };
         let staging = load.staging.clone().expect("filtered");
@@ -6346,6 +6361,9 @@ pub(crate) struct StreamedTable {
 
 const STREAMED_TABLE_VERSION: u8 = 1;
 
+// The streamed `CREATE TABLE … AS` (S2) commits through these; until then
+// only the tests and the replay do.
+#[cfg_attr(not(test), allow(dead_code))]
 impl StreamedTable {
     /// The table's name in the record.
     pub(crate) fn table(&self) -> (&str, &str, &str) {
@@ -6412,6 +6430,7 @@ impl StreamedTable {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl PinkDb {
     /// The commit record of a streamed table `ns.name` (see
     /// [`StreamedTable`]): its pending groups, which must cover every chunk
@@ -6452,6 +6471,20 @@ impl PinkDb {
             stats: t.stats.clone(),
             zones: t.zones.clone(),
         })
+    }
+
+    /// Stage a streamed table's commit record on this store's WAL, for the
+    /// frame the statement's commit appends next. The row groups must
+    /// already be durable ([`PinkDb::sync_pending_load`]): a frame never names
+    /// bytes that might not be on disk.
+    pub(crate) fn stage_streamed_table(&self, record: &StreamedTable) -> Result<()> {
+        let wal = self.durable_handle().ok_or_else(|| {
+            PinkDbError::Execution("internal: a streamed load needs a durable store".to_string())
+        })?;
+        wal.lock()
+            .map_err(|_| PinkDbError::Execution("internal lock error (poisoned)".to_string()))?
+            .stage_streamed(record.encode());
+        Ok(())
     }
 
     /// Replay a streamed table's commit record: verify every column chunk's
