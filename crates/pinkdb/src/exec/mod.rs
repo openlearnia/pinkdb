@@ -8218,6 +8218,7 @@ fn encode_key_into(v: &Vector, idx: usize, spec: SortSpec, out: &mut Vec<u8>) {
         // DECIMAL: one scale per column, so plain i128 order works (sign bit
         // flipped like the integer encodings).
         VectorData::Decimal { values, .. } => push_be_i128(out, values[idx], desc),
+        VectorData::Decimal64 { values, .. } => push_be_i128(out, i128::from(values[idx]), desc),
         // INTERVAL: encode the comparison key (months → 30 days, days →
         // micros), which is monotone in `interval_cmp`.
         VectorData::Interval(d) => {

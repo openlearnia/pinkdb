@@ -75,14 +75,7 @@ impl KeyKind {
             | (KeyKind::Int64, VectorData::Int64(_))
             | (KeyKind::Timestamp, VectorData::TimestampMicros(_))
             | (KeyKind::Varchar, VectorData::VarChar(_)) => true,
-            (
-                KeyKind::Decimal { scale, .. },
-                VectorData::Decimal {
-                    precision: p,
-                    scale: s,
-                    ..
-                },
-            ) => *s == scale && *p <= 18,
+            (KeyKind::Decimal { scale, .. }, VectorData::Decimal64 { scale: s, .. }) => *s == scale,
             _ => false,
         }
     }
@@ -302,8 +295,9 @@ fn fill_words(
         VectorData::Boolean(d) => put(&|i| u64::from(d[i])),
         VectorData::Int32(d) | VectorData::Date32(d) => put(&|i| i64::from(d[i]) as u64),
         VectorData::Int64(d) | VectorData::TimestampMicros(d) => put(&|i| d[i] as u64),
-        // DECIMAL(≤18) values fit an i64 (`KeyKind::matches`).
-        VectorData::Decimal { values, .. } => put(&|i| values[i] as i64 as u64),
+        // DECIMAL(≤18) is the 64-bit payload (`KeyKind::matches`, wave 142):
+        // the key word is the value itself.
+        VectorData::Decimal64 { values, .. } => put(&|i| values[i] as u64),
         VectorData::VarChar(d) => put(&|i| crate::strings::view_hash(d, i)),
         _ => unreachable!("KeyKind::matches admits only fixed-width payloads"),
     }
@@ -513,7 +507,7 @@ enum KeyData {
     I64(Vec<i64>),
     Timestamp(Vec<i64>),
     Decimal {
-        values: Vec<i128>,
+        values: Vec<i64>,
         precision: u8,
         scale: u8,
     },
@@ -557,7 +551,7 @@ impl KeyBuild {
             KeyData::Bool(d) => d.push(word != 0),
             KeyData::I32(d) | KeyData::Date(d) => d.push(word as i64 as i32),
             KeyData::I64(d) | KeyData::Timestamp(d) => d.push(word as i64),
-            KeyData::Decimal { values, .. } => values.push(i128::from(word as i64)),
+            KeyData::Decimal { values, .. } => values.push(word as i64),
             KeyData::Varchar { picks, slot } => picks.push((source, views + *slot as u32)),
         }
     }
@@ -578,7 +572,7 @@ impl KeyBuild {
                 values,
                 precision,
                 scale,
-            } => VectorData::Decimal {
+            } => VectorData::Decimal64 {
                 values,
                 precision,
                 scale,

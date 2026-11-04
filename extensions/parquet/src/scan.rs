@@ -1880,11 +1880,7 @@ fn decimal_chunk(
 ) -> Result<Vector> {
     let (values, validity) = flat_chunk(values, levels, n, column, 0)?;
     Ok(Vector::from_raw(
-        VectorData::Decimal {
-            values,
-            precision,
-            scale,
-        },
+        VectorData::decimal_from_i128(values, precision, scale),
         validity,
     ))
 }

@@ -114,9 +114,13 @@ fn to_array(v: &Vector, arrow: &arrow_schema::DataType) -> Result<ArrayRef> {
         (VectorData::TimestampMicros(values), ArrowType::Timestamp(_, _)) => std::sync::Arc::new(
             TimestampMicrosecondArray::new(ScalarBuffer::from(values.clone()), nulls),
         ),
-        (VectorData::Decimal { values, scale, .. }, ArrowType::Decimal128(p, s)) => {
+        (
+            data @ (VectorData::Decimal { scale, .. } | VectorData::Decimal64 { scale, .. }),
+            ArrowType::Decimal128(p, s),
+        ) => {
             debug_assert_eq!(*scale as i8, *s);
-            let arr = Decimal128Array::new(ScalarBuffer::from(values.clone()), nulls)
+            let values = data.decimal_values_i128().expect("a DECIMAL payload");
+            let arr = Decimal128Array::new(ScalarBuffer::from(values.into_owned()), nulls)
                 .with_precision_and_scale(*p, *s)
                 .map_err(|e| {
                     PinkDbError::Execution(format!("cannot write DECIMAL({p},{s}): {e}"))

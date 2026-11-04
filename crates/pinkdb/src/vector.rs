@@ -30,6 +30,15 @@ pub enum VectorData {
         precision: u8,
         scale: u8,
     },
+    /// DECIMAL of precision 18 or less (wave 142): the same unscaled values
+    /// in 64 bits, as DuckDB stores `DECIMAL(p ≤ 18)`. The precision alone
+    /// picks the payload — `DECIMAL(p ≤ 18)` is always `Decimal64`, wider is
+    /// always `Decimal` — so one type never has two payloads.
+    Decimal64 {
+        values: Vec<i64>,
+        precision: u8,
+        scale: u8,
+    },
     /// INTERVAL: DuckDB's `(months, days, micros)` triples.
     Interval(Vec<Interval>),
     /// VARIANT: one shared semi-structured tree per row (see
@@ -122,7 +131,68 @@ fn array_push_cell(
     Ok(())
 }
 
+/// The widest DECIMAL precision stored in 64 bits (wave 142): 18 digits fit
+/// an `i64`, as in DuckDB's physical-type choice.
+pub const DECIMAL64_MAX_PRECISION: u8 = 18;
+
 impl VectorData {
+    /// A DECIMAL payload from unscaled 128-bit values, stored in the width its
+    /// precision picks: `Decimal64` up to 18 digits (the values must fit,
+    /// which a `DECIMAL(p ≤ 18)` value always does), `Decimal` beyond.
+    pub fn decimal_from_i128(values: Vec<i128>, precision: u8, scale: u8) -> VectorData {
+        if precision <= DECIMAL64_MAX_PRECISION {
+            VectorData::Decimal64 {
+                values: values
+                    .into_iter()
+                    .map(|v| {
+                        debug_assert!(i64::try_from(v).is_ok(), "DECIMAL({precision}) value {v}");
+                        v as i64
+                    })
+                    .collect(),
+                precision,
+                scale,
+            }
+        } else {
+            VectorData::Decimal {
+                values,
+                precision,
+                scale,
+            }
+        }
+    }
+
+    /// Row `i` of a DECIMAL payload as its unscaled 128-bit value, whatever
+    /// its physical width (`None` for a non-DECIMAL payload).
+    #[inline]
+    pub fn decimal_at(&self, i: usize) -> Option<i128> {
+        match self {
+            VectorData::Decimal { values, .. } => Some(values[i]),
+            VectorData::Decimal64 { values, .. } => Some(i128::from(values[i])),
+            _ => None,
+        }
+    }
+
+    /// A DECIMAL payload's unscaled values as 128-bit integers (a copy for
+    /// the 64-bit form): the form the cold paths compute on.
+    pub fn decimal_values_i128(&self) -> Option<std::borrow::Cow<'_, [i128]>> {
+        match self {
+            VectorData::Decimal { values, .. } => Some(std::borrow::Cow::Borrowed(values)),
+            VectorData::Decimal64 { values, .. } => Some(std::borrow::Cow::Owned(
+                values.iter().map(|&v| i128::from(v)).collect(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// The wave-142 invariant: `Decimal64` exactly for precision ≤ 18.
+    fn decimal_width_ok(&self) -> bool {
+        match self {
+            VectorData::Decimal { precision, .. } => *precision > DECIMAL64_MAX_PRECISION,
+            VectorData::Decimal64 { precision, .. } => *precision <= DECIMAL64_MAX_PRECISION,
+            _ => true,
+        }
+    }
+
     pub(crate) fn dtype(&self) -> DataType {
         match self {
             VectorData::Boolean(_) => DataType::Boolean,
@@ -133,6 +203,9 @@ impl VectorData {
             VectorData::Date32(_) => DataType::Date,
             VectorData::TimestampMicros(_) => DataType::Timestamp,
             VectorData::Decimal {
+                precision, scale, ..
+            }
+            | VectorData::Decimal64 {
                 precision, scale, ..
             } => DataType::Decimal {
                 precision: *precision,
@@ -166,6 +239,7 @@ impl VectorData {
             VectorData::Date32(v) => v.len(),
             VectorData::TimestampMicros(v) => v.len(),
             VectorData::Decimal { values, .. } => values.len(),
+            VectorData::Decimal64 { values, .. } => values.len(),
             VectorData::Interval(v) => v.len(),
             VectorData::Variant(v) => v.len(),
             // Rows, like every other variant; `len` is never zero.
@@ -185,6 +259,13 @@ impl VectorData {
             DataType::Varchar => VectorData::VarChar(crate::strings::StrVec::with_capacity(cap)),
             DataType::Date => VectorData::Date32(Vec::with_capacity(cap)),
             DataType::Timestamp => VectorData::TimestampMicros(Vec::with_capacity(cap)),
+            DataType::Decimal { precision, scale } if precision <= DECIMAL64_MAX_PRECISION => {
+                VectorData::Decimal64 {
+                    values: Vec::with_capacity(cap),
+                    precision,
+                    scale,
+                }
+            }
             DataType::Decimal { precision, scale } => VectorData::Decimal {
                 values: Vec::with_capacity(cap),
                 precision,
@@ -220,6 +301,7 @@ impl VectorData {
             VectorData::Date32(v) => v.resize(v.len() + n, 0),
             VectorData::TimestampMicros(v) => v.resize(v.len() + n, 0),
             VectorData::Decimal { values, .. } => values.resize(values.len() + n, 0),
+            VectorData::Decimal64 { values, .. } => values.resize(values.len() + n, 0),
             VectorData::Interval(v) => v.resize(v.len() + n, Interval::default()),
             VectorData::Variant(v) => {
                 v.resize(v.len() + n, Arc::new(crate::variant::Variant::Null));
@@ -338,11 +420,7 @@ impl Vector {
                 precision,
                 scale,
             } => (
-                VectorData::Decimal {
-                    values: vec![*v; n],
-                    precision: *precision,
-                    scale: *scale,
-                },
+                VectorData::decimal_from_i128(vec![*v; n], *precision, *scale),
                 true,
             ),
             Value::Interval {
@@ -426,6 +504,10 @@ impl Vector {
     /// `mask_len(len)` words (extra words dropped, missing ones read NULL).
     pub(crate) fn from_parts(data: VectorData, mut validity: Vec<u64>, len: usize) -> Vector {
         debug_assert_eq!(data.len(), len);
+        debug_assert!(
+            data.decimal_width_ok(),
+            "a DECIMAL payload of the wrong width"
+        );
         validity.resize(mask_len(len), 0);
         Vector {
             data,
@@ -451,6 +533,7 @@ impl Vector {
             VectorData::Date32(v) => v.push(0),
             VectorData::TimestampMicros(v) => v.push(0),
             VectorData::Decimal { values, .. } => values.push(0),
+            VectorData::Decimal64 { values, .. } => values.push(0),
             VectorData::Interval(v) => v.push(Interval::default()),
             VectorData::Variant(v) => v.push(Arc::new(crate::variant::Variant::Null)),
             VectorData::Array {
@@ -537,6 +620,10 @@ impl Vector {
     /// The length is the payload's; missing words read as NULL and bits past
     /// the length are cleared.
     pub fn from_raw(data: VectorData, mut validity: Vec<u64>) -> Vector {
+        debug_assert!(
+            data.decimal_width_ok(),
+            "a DECIMAL payload of the wrong width"
+        );
         let len = data.len();
         validity.resize(mask_len(len), 0);
         if !len.is_multiple_of(64)
@@ -567,6 +654,7 @@ impl Vector {
             VectorData::Int64(v) | VectorData::TimestampMicros(v) => v.capacity() * 8,
             VectorData::Float64(v) => v.capacity() * 8,
             VectorData::Decimal { values, .. } => values.capacity() * 16,
+            VectorData::Decimal64 { values, .. } => values.capacity() * 8,
             VectorData::Interval(v) => v.capacity() * std::mem::size_of::<Interval>(),
             VectorData::Variant(v) => {
                 v.capacity() * std::mem::size_of::<Arc<crate::variant::Variant>>()
@@ -611,6 +699,15 @@ impl Vector {
                 scale,
             } => Value::Decimal {
                 value: values[idx],
+                precision: *precision,
+                scale: *scale,
+            },
+            VectorData::Decimal64 {
+                values,
+                precision,
+                scale,
+            } => Value::Decimal {
+                value: i128::from(values[idx]),
                 precision: *precision,
                 scale: *scale,
             },
@@ -694,6 +791,14 @@ impl Vector {
                 },
             ) if s == *scale => {
                 values.push(v);
+            }
+            (
+                VectorData::Decimal64 { values, scale, .. },
+                Value::Decimal {
+                    value: v, scale: s, ..
+                },
+            ) if s == *scale && i64::try_from(v).is_ok() => {
+                values.push(v as i64);
             }
             (
                 VectorData::Interval(v),
@@ -824,6 +929,9 @@ impl Vector {
             VectorData::Decimal {
                 values, scale: s, ..
             } if *s == scale => values.push(v),
+            VectorData::Decimal64 {
+                values, scale: s, ..
+            } if *s == scale && i64::try_from(v).is_ok() => values.push(v as i64),
             data => return Err(typed_push_error("a decimal", data.dtype())),
         }
         self.finish_typed_push();
@@ -913,6 +1021,9 @@ impl Vector {
                 d.extend_from_slice(&s[start..start + len]);
             }
             (VectorData::Decimal { values: d, .. }, VectorData::Decimal { values: s, .. }) => {
+                d.extend_from_slice(&s[start..start + len]);
+            }
+            (VectorData::Decimal64 { values: d, .. }, VectorData::Decimal64 { values: s, .. }) => {
                 d.extend_from_slice(&s[start..start + len]);
             }
             (VectorData::Interval(d), VectorData::Interval(s)) => {
@@ -1009,6 +1120,14 @@ impl Vector {
                 },
             ) if s == *scale => {
                 values[idx] = v;
+            }
+            (
+                VectorData::Decimal64 { values, scale, .. },
+                Value::Decimal {
+                    value: v, scale: s, ..
+                },
+            ) if s == *scale && i64::try_from(v).is_ok() => {
+                values[idx] = v as i64;
             }
             (
                 VectorData::Interval(v),
@@ -1153,6 +1272,13 @@ impl Vector {
                 buf.push(*scale);
                 buf.extend_from_slice(&values[idx].to_le_bytes());
             }
+            // The 64-bit payload encodes as its 128-bit value: one key per
+            // DECIMAL value, whatever its physical width (wave 142).
+            VectorData::Decimal64 { values, scale, .. } => {
+                buf.push(8);
+                buf.push(*scale);
+                buf.extend_from_slice(&i128::from(values[idx]).to_le_bytes());
+            }
             VectorData::Interval(v) => {
                 buf.push(9);
                 // Encode the comparison-normalized key (months → 30 days, days
@@ -1244,6 +1370,9 @@ impl Vector {
             (VectorData::Decimal { values: d, .. }, VectorData::Decimal { values: s, .. }) => {
                 copy!(d, s)
             }
+            (VectorData::Decimal64 { values: d, .. }, VectorData::Decimal64 { values: s, .. }) => {
+                copy!(d, s)
+            }
             (VectorData::Interval(d), VectorData::Interval(s)) => copy!(d, s),
             (VectorData::Uuid(d), VectorData::Uuid(s)) => copy!(d, s),
             (VectorData::Int128(d), VectorData::Int128(s)) => copy!(d, s),
@@ -1294,6 +1423,9 @@ impl Vector {
             (VectorData::Date32(d), VectorData::Date32(s)) => d.push(s[idx]),
             (VectorData::TimestampMicros(d), VectorData::TimestampMicros(s)) => d.push(s[idx]),
             (VectorData::Decimal { values: d, .. }, VectorData::Decimal { values: s, .. }) => {
+                d.push(s[idx])
+            }
+            (VectorData::Decimal64 { values: d, .. }, VectorData::Decimal64 { values: s, .. }) => {
                 d.push(s[idx])
             }
             (VectorData::Interval(d), VectorData::Interval(s)) => d.push(s[idx]),
@@ -1443,6 +1575,24 @@ impl Vector {
                 precision: *precision,
                 scale: *scale,
             },
+            VectorData::Decimal64 {
+                precision, scale, ..
+            } => VectorData::Decimal64 {
+                values: picks
+                    .iter()
+                    .map(|&(c, r)| {
+                        if c == GATHER_NULL {
+                            return 0;
+                        }
+                        match sources[c as usize].data() {
+                            VectorData::Decimal64 { values, .. } => values[r as usize],
+                            _ => unreachable!("gather sources of mixed types"),
+                        }
+                    })
+                    .collect(),
+                precision: *precision,
+                scale: *scale,
+            },
             VectorData::Interval(_) => {
                 VectorData::Interval(gather!(Interval, Interval::default(), |x: &Interval| *x))
             }
@@ -1507,6 +1657,15 @@ impl Vector {
                 precision,
                 scale,
             } => VectorData::Decimal {
+                values: selection.iter().map(|i| values[pick(i)]).collect(),
+                precision: *precision,
+                scale: *scale,
+            },
+            VectorData::Decimal64 {
+                values,
+                precision,
+                scale,
+            } => VectorData::Decimal64 {
                 values: selection.iter().map(|i| values[pick(i)]).collect(),
                 precision: *precision,
                 scale: *scale,
@@ -1747,6 +1906,7 @@ enum GatherSlices<'a> {
     Date32(Vec<&'a [i32]>),
     TimestampMicros(Vec<&'a [i64]>),
     Decimal(Vec<&'a [i128]>, u8, u8),
+    Decimal64(Vec<&'a [i64]>, u8, u8),
     Interval(Vec<&'a [Interval]>),
     Uuid(Vec<&'a [u128]>),
     Int128(Vec<&'a [i128]>),
@@ -1785,6 +1945,19 @@ impl<'a> GatherColumn<'a> {
                     .iter()
                     .map(|v| match v.data() {
                         VectorData::Decimal { values, .. } => &values[..],
+                        _ => unreachable!("gather sources of mixed types"),
+                    })
+                    .collect(),
+                *precision,
+                *scale,
+            ),
+            Some(VectorData::Decimal64 {
+                precision, scale, ..
+            }) => GatherSlices::Decimal64(
+                sources
+                    .iter()
+                    .map(|v| match v.data() {
+                        VectorData::Decimal64 { values, .. } => &values[..],
                         _ => unreachable!("gather sources of mixed types"),
                     })
                     .collect(),
@@ -1838,6 +2011,11 @@ impl<'a> GatherColumn<'a> {
             GatherSlices::Date32(s) => VectorData::Date32(copy(s, picks, 0)),
             GatherSlices::TimestampMicros(s) => VectorData::TimestampMicros(copy(s, picks, 0)),
             GatherSlices::Decimal(s, precision, scale) => VectorData::Decimal {
+                values: copy(s, picks, 0),
+                precision: *precision,
+                scale: *scale,
+            },
+            GatherSlices::Decimal64(s, precision, scale) => VectorData::Decimal64 {
                 values: copy(s, picks, 0),
                 precision: *precision,
                 scale: *scale,

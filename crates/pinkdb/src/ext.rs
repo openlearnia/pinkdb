@@ -618,7 +618,7 @@ pub(crate) fn push_ext_arg<'a>(
         },
         // Unreachable: `ext_type_of` rejects DECIMAL in the binder's
         // exact-type check before any callback can run.
-        VectorData::Decimal { .. } => {
+        VectorData::Decimal { .. } | VectorData::Decimal64 { .. } => {
             unreachable!("extensions v1 do not accept DECIMAL arguments")
         }
         VectorData::Variant(_) => {

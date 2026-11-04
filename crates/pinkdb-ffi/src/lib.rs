@@ -706,6 +706,18 @@ impl PinkVector {
             VectorData::Date32(v) => v.as_ptr().cast(),
             VectorData::TimestampMicros(v) => v.as_ptr().cast(),
             VectorData::Decimal { values, .. } => wide_data(values, &mut ints, |v| *v as u128),
+            // The C API's DECIMAL cell stays 16 bytes whatever the engine's
+            // physical width (wave 142): widen into the owned buffer.
+            VectorData::Decimal64 { values, .. } => {
+                ints.extend(values.iter().map(|&v| {
+                    let x = i128::from(v) as u128;
+                    PinkU128 {
+                        lower: x as u64,
+                        upper: (x >> 64) as u64,
+                    }
+                }));
+                ints.as_ptr().cast()
+            }
             VectorData::Interval(v) => v.as_ptr().cast(),
             VectorData::Int128(v) => wide_data(v, &mut ints, |v| *v as u128),
             VectorData::UInt128(v) => wide_data(v, &mut ints, |v| *v),
