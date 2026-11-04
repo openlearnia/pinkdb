@@ -108,6 +108,12 @@ pub trait MorselSource: std::fmt::Debug + Send + Sync {
     fn rows(&self) -> Option<usize> {
         None
     }
+    /// Whether the source visits its data out of input order (a top-N store
+    /// scan ordered by zone bounds): each decoded chunk's `ordinal` is then
+    /// its position in input order.
+    fn visits_by_zone(&self) -> bool {
+        false
+    }
     /// Whether [`MorselSource::io`] is worth a [`ScanRecord`]: a source with
     /// no object-storage reads (a store scan) has nothing to report.
     fn reports_io(&self) -> bool {

@@ -1250,6 +1250,113 @@ impl Bloom {
     }
 }
 
+/// The running cut-off of an `ORDER BY … LIMIT n` (Top-N T3): the n-th best
+/// first sort key seen so far. Workers offer the n-th key of their candidate
+/// sets; the tightest one wins, since no row ranked after any worker's n-th
+/// row can make the global first n. A scan skips a chunk whose zone map
+/// proves every row ranks strictly after the cut-off; a row equal to it is
+/// still read, so ties resolve exactly as without the filter.
+#[derive(Debug)]
+pub(crate) struct TopNThreshold {
+    desc: bool,
+    nulls_first: bool,
+    value: std::sync::RwLock<Option<Value>>,
+}
+
+impl TopNThreshold {
+    pub(crate) fn new(desc: bool, nulls_first: bool) -> Self {
+        Self {
+            desc,
+            nulls_first,
+            value: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Chunk visit order for a top-N scan: best zone bound first (DESC: the
+    /// highest maximum, ASC: the lowest minimum), so the chunks read first
+    /// hold the true leaders and the cut-off is tight almost at once. Chunks
+    /// that may hold a NULL ranked first go before all others; chunks with
+    /// no usable bound go last.
+    pub(crate) fn visit_order(&self, chunks: &mut [usize], zone: impl Fn(usize) -> (Zone, u64)) {
+        let mut keyed: Vec<(u8, Option<Value>, usize)> = chunks
+            .iter()
+            .map(|&chunk| {
+                let (z, rows) = zone(chunk);
+                if self.nulls_first && z.null_count > 0 {
+                    return (0, None, chunk);
+                }
+                let bound = if self.desc { z.max } else { z.min };
+                match bound {
+                    Some(b) if z.nan_count == 0 && z.null_count < rows => (1, Some(b), chunk),
+                    _ => (2, None, chunk),
+                }
+            })
+            .collect();
+        keyed.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| match (&a.1, &b.1) {
+                    (Some(x), Some(y)) => {
+                        let order = compare_values(x, y);
+                        if self.desc { order.reverse() } else { order }
+                    }
+                    _ => std::cmp::Ordering::Equal,
+                })
+                .then(a.2.cmp(&b.2))
+        });
+        for (slot, (_, _, chunk)) in chunks.iter_mut().zip(keyed) {
+            *slot = chunk;
+        }
+    }
+
+    /// Offer a worker's n-th best key; the tighter cut-off is kept. A NULL
+    /// key proves nothing about non-NULL rows and is ignored.
+    pub(crate) fn offer(&self, key: &Value) {
+        if matches!(key, Value::Null) {
+            return;
+        }
+        let mut current = self.value.write().unwrap_or_else(|e| e.into_inner());
+        let tighter = current.as_ref().is_none_or(|c| {
+            let order = compare_values(key, c);
+            if self.desc {
+                order.is_gt()
+            } else {
+                order.is_lt()
+            }
+        });
+        if tighter {
+            *current = Some(key.clone());
+        }
+    }
+
+    /// Whether a chunk (`rows` rows under `zone`) may hold a row that ranks at
+    /// or before the cut-off. NULLs ranked first, NaN (the largest double)
+    /// and missing bounds all keep the chunk.
+    pub(crate) fn may_qualify(&self, zone: &Zone, rows: u64) -> bool {
+        let current = self.value.read().unwrap_or_else(|e| e.into_inner());
+        let Some(cut) = current.as_ref() else {
+            return true;
+        };
+        if zone.null_count > 0 && self.nulls_first {
+            return true;
+        }
+        if zone.null_count == rows {
+            // Only NULLs, ranked after every non-NULL cut-off.
+            return false;
+        }
+        if zone.nan_count > 0 {
+            return true;
+        }
+        let (Some(min), Some(max)) = (&zone.min, &zone.max) else {
+            return true;
+        };
+        if self.desc {
+            !compare_values(max, cut).is_lt()
+        } else {
+            !compare_values(min, cut).is_gt()
+        }
+    }
+}
+
 /// The key-side filter a hash join hands to its probe scans (wave 122).
 #[derive(Debug, Clone)]
 pub(crate) struct JoinFilter {

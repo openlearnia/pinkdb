@@ -1207,6 +1207,10 @@ impl MorselSource for StoreSource<'_> {
         Some(self.scan.rows())
     }
 
+    fn visits_by_zone(&self) -> bool {
+        self.scan.visits_by_zone()
+    }
+
     fn next_morsel(&self) -> Result<Option<u64>> {
         Ok(self.cursor.claim())
     }
@@ -1380,8 +1384,9 @@ where
 
 /// `ORDER BY … LIMIT limit` over a pipeline without materializing its rows:
 /// every worker keeps one candidate set of its best rows, compacted back to
-/// `limit` whenever it holds more than twice that, and the sets merge at the
-/// end. Memory is O(workers × limit) instead of the whole input.
+/// `limit` whenever it holds more than twice that (and more than
+/// [`TOP_N_COMPACT_ROWS`]), and the sets merge at the end. Memory is
+/// O(workers × max(limit, TOP_N_COMPACT_ROWS)) instead of the whole input.
 ///
 /// Ties keep input order exactly as the full sort does: each candidate row
 /// carries its input position (morsel, chunk within the morsel, row) as a
@@ -1397,6 +1402,19 @@ pub(crate) fn top_n_streamed(
     if !cx.pipeline_execution() || limit == 0 {
         return Ok(None);
     }
+    // T3: a first sort key that is a plain column gets a running cut-off,
+    // registered on the scans that column comes from before they are built.
+    let cut = match keys.first() {
+        Some((BoundExpr::Column { index, .. }, spec)) => {
+            let cut = Arc::new(crate::stats::TopNThreshold::new(
+                spec.desc,
+                spec.nulls_first,
+            ));
+            let mark = cx.dynamic.push_threshold(plan, *index, &cut);
+            Some((*index, cut, CutMark { cx, mark }))
+        }
+        _ => None,
+    };
     let Some(compiled) = compile(cx, plan)? else {
         return Ok(None);
     };
@@ -1456,8 +1474,17 @@ pub(crate) fn top_n_streamed(
             {
                 return fail(error);
             }
+            let by_zone = source.visits_by_zone();
             let mut seq = 0u64;
             let decoded = source.decode(morsel, &mut |chunk| {
+                // Input order: the morsel and the chunk's place in it, or,
+                // for a scan visiting by zone, the chunk's own table index.
+                let origin = if by_zone {
+                    seq = 0;
+                    chunk.ordinal as u64
+                } else {
+                    morsel
+                };
                 let Some(out) = flow(cx, &steps, &TopNPass, &chunk)? else {
                     return Err(PinkDbError::Execution(
                         "internal: the top-N sink declined a chunk".to_string(),
@@ -1467,9 +1494,9 @@ pub(crate) fn top_n_streamed(
                     if chunk.num_rows() == 0 {
                         continue;
                     }
-                    // morsel (32 bits) | chunk in the morsel (21) | row (11).
+                    // origin (32 bits) | chunk within it (21) | row (11).
                     debug_assert!(chunk.num_rows() <= 1 << 11 && seq < 1 << 21);
-                    let base = (morsel << 32) | (seq << 11);
+                    let base = (origin << 32) | (seq << 11);
                     seq += 1;
                     let positions: Vec<i64> = (0..chunk.num_rows() as u64)
                         .map(|row| (base | row) as i64)
@@ -1480,9 +1507,18 @@ pub(crate) fn top_n_streamed(
                     )));
                     held += chunk.num_rows();
                     set.push(chunk);
-                    if held > limit.saturating_mul(2) {
+                    if held > limit.saturating_mul(2).max(TOP_N_COMPACT_ROWS) {
                         set = select_top(cx, &set, &keyed, limit)?;
                         held = set.iter().map(DataChunk::num_rows).sum();
+                        // The set's last row is this worker's limit-th best:
+                        // nothing ranked after it can make the result.
+                        if let Some((key, cut, _)) = &cut
+                            && held >= limit
+                            && let Some(last) = set.last()
+                            && last.num_rows() > 0
+                        {
+                            cut.offer(&last.columns[*key].get(last.num_rows() - 1));
+                        }
                     }
                 }
                 Ok(())
@@ -1514,6 +1550,25 @@ pub(crate) fn top_n_streamed(
         names,
         types,
     }))
+}
+
+/// A worker compacts its Top-N candidates once they pass twice the limit or
+/// this many rows, whichever is more: a small limit would otherwise compact
+/// after every chunk, and a compaction is a sort-key pass of its own. Memory
+/// stays O(workers × max(limit, this)).
+const TOP_N_COMPACT_ROWS: usize = 64 * 1024;
+
+/// Pops a Top-N cut-off off the scans' registry when the top-N is done,
+/// whichever way it returns.
+struct CutMark<'a> {
+    cx: &'a Cx<'a>,
+    mark: usize,
+}
+
+impl Drop for CutMark<'_> {
+    fn drop(&mut self) {
+        self.cx.dynamic.pop_thresholds(self.mark);
+    }
 }
 
 /// The top-N pipeline's sink: each folded chunk as it is (the candidate sets
