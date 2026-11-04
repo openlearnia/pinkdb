@@ -3972,6 +3972,13 @@ pub struct PinkDb {
     /// (see [`PinkDb::sweep_superseded`]). In-memory stores, which have no
     /// file to overwrite, leave this empty.
     pub(crate) superseded: Mutex<Vec<SupersededRange>>,
+    /// Row groups a bulk load already encoded and wrote into the store file
+    /// (or, before the store has an image, its staging file) ahead of the
+    /// checkpoint that publishes them (the streaming load). Shared with
+    /// snapshots and transaction copies: the bytes belong to the file, and a
+    /// checkpoint references a pending group only while the table it
+    /// checkpoints still names it.
+    pub(crate) pending_load: Arc<Mutex<Option<crate::persist::PendingLoad>>>,
 }
 
 /// A file range that a checkpoint superseded but whose bytes a live handle may
@@ -4160,6 +4167,7 @@ impl Clone for PinkDb {
             // A snapshot's chunks hold their own references; the wait list is
             // the store's (the store that takes the checkpoint).
             superseded: Mutex::new(Vec::new()),
+            pending_load: Arc::clone(&self.pending_load),
         }
     }
 }
@@ -4257,6 +4265,7 @@ impl PinkDb {
             scan_records: std::sync::Mutex::new(Vec::new()),
             finished_scans: std::sync::Mutex::new(Vec::new()),
             superseded: Mutex::new(Vec::new()),
+            pending_load: Arc::new(Mutex::new(None)),
         }
     }
 
