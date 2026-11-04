@@ -1123,6 +1123,24 @@ impl Column {
             .count()
     }
 
+    /// The bytes this column's chunks charge to the decoded cache, and to the
+    /// operator pool (a test hook: unlike the process-wide counters, tests
+    /// running alongside cannot move it).
+    #[cfg(test)]
+    pub(crate) fn charged(&self) -> (usize, usize) {
+        let (mut cache, mut operator) = (0, 0);
+        for chunk in &self.chunks {
+            if let Some(payload) = chunk.lock().payload.as_ref() {
+                if payload.charge.is_cache() {
+                    cache += payload.charge.bytes();
+                } else {
+                    operator += payload.charge.bytes();
+                }
+            }
+        }
+        (cache, operator)
+    }
+
     /// How many times this column's chunks were decoded from stored bytes,
     /// whether or not the decoded cache kept them (a test hook: unlike
     /// [`Column::decoded_chunks`], no other statement's budget changes it).
