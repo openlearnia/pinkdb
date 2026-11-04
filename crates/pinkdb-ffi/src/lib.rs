@@ -1,4 +1,4 @@
-//! pinkdb C ABI v1.2 — `pinkdb-ffi`.
+//! pinkdb C ABI v1.3 — `pinkdb-ffi`.
 //!
 //! Exposes the `pinkdb` embedding API over a C ABI (`cdylib` + `staticlib`)
 //! for foreign bindings (Python `cffi`, Go `cgo`, ...). This crate is the
@@ -48,10 +48,13 @@ use pinkdb::{
     Vector, VectorData,
 };
 
+mod arrow;
+pub use arrow::{ArrowArray, ArrowSchema};
+
 /// ABI version reported by [`pinkdb_abi_version`]: `major << 16 | minor`.
 ///
 /// Additions bump the minor; removals or layout changes bump the major.
-pub const PINKDB_ABI_VERSION: u32 = (1 << 16) | 2;
+pub const PINKDB_ABI_VERSION: u32 = (1 << 16) | 3;
 
 // ----- statement kind tags (`pinkdb_result_kind`) -----
 pub const PINKDB_STMT_SELECTED: i32 = 0;
@@ -2454,6 +2457,107 @@ pub extern "C" fn pinkdb_destroy_chunk(chunk: *mut PinkChunk) {
     drop(unsafe { Box::from_raw(chunk) });
 }
 
+/// Fill a struct-typed Arrow schema for a SELECT result.
+///
+/// The schema has one child per result column and owns its format/name strings
+/// and children; call its `release` callback when done. Returns 1 on success,
+/// 0 on error (read the result's error for a failed result, otherwise
+/// `pinkdb_last_error`).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_arrow_schema(
+    result: *const PinkResult,
+    statement: usize,
+    out: *mut ArrowSchema,
+) -> i32 {
+    match arrow::result_schema(result, statement, out) {
+        Ok(()) => 1,
+        Err(error) => {
+            error.report();
+            0
+        }
+    }
+}
+
+/// Export one chunk as a struct-typed Arrow array.
+///
+/// The array owns an `Arc` of the chunk's vectors, so it stays valid after the
+/// chunk and result are freed. Returns 1 on success, 0 on error (see
+/// `pinkdb_last_error`).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_chunk_to_arrow(chunk: *const PinkChunk, out: *mut ArrowArray) -> i32 {
+    if out.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null ArrowArray output");
+        return 0;
+    }
+    // SAFETY: out is non-null and writable per the C contract.
+    unsafe { ptr::write(out, ArrowArray::empty()) };
+    if chunk.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null chunk");
+        return 0;
+    }
+    // SAFETY: non-null, valid for the call.
+    match arrow::chunk_to_arrow(&unsafe { &*chunk }._chunk, out) {
+        Ok(()) => 1,
+        Err(error) => {
+            error.report();
+            0
+        }
+    }
+}
+
+/// Fetch the next chunk of a SELECT result and export it as an Arrow array.
+///
+/// At the end of the result (and forever after) this leaves `out->release`
+/// NULL and returns 1. Returns 0 on a null argument, a failed/non-SELECT
+/// result, or an export error; the message is in the result's error for a
+/// failed result, otherwise in `pinkdb_last_error`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_fetch_arrow(
+    result: *mut PinkResult,
+    statement: usize,
+    out: *mut ArrowArray,
+) -> i32 {
+    if out.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null ArrowArray output");
+        return 0;
+    }
+    // SAFETY: out is non-null and writable per the C contract.
+    unsafe { ptr::write(out, ArrowArray::empty()) };
+    if result.is_null() {
+        set_error(CLASS_INVALID_ARGUMENT, "null result");
+        return 0;
+    }
+    // SAFETY: non-null, valid for the call.
+    let result_ref = unsafe { &*result };
+    if let Some(message) = &result_ref.error {
+        set_error(
+            result_ref.error_class.unwrap_or(CLASS_INTERNAL),
+            &message.to_string_lossy(),
+        );
+        return 0;
+    }
+    let Some(StmtData::Sel(sel)) = stmt_at_mut(result, statement) else {
+        set_error(
+            CLASS_INVALID_ARGUMENT,
+            &format!("statement {statement} is not a SELECT"),
+        );
+        return 0;
+    };
+    let Some(chunk) = sel.chunks.get(sel.next_chunk).cloned() else {
+        return 1;
+    };
+    match arrow::chunk_to_arrow(&chunk, out) {
+        Ok(()) => {
+            sel.next_chunk += 1;
+            1
+        }
+        Err(error) => {
+            error.report();
+            0
+        }
+    }
+}
+
 /// Rows in a chunk.
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_chunk_size(chunk: *const PinkChunk) -> usize {
@@ -2682,8 +2786,8 @@ mod tests {
     }
 
     #[test]
-    fn abi_version_is_one_two() {
-        assert_eq!(pinkdb_abi_version(), (1 << 16) | 2);
+    fn abi_version_is_one_three() {
+        assert_eq!(pinkdb_abi_version(), (1 << 16) | 3);
     }
 
     #[test]

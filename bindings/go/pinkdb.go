@@ -131,7 +131,7 @@ import (
 
 // SupportedABI is the C ABI version this binding speaks. Open and OpenMemory
 // refuse a linked library that reports a different version.
-const SupportedABI = (1 << 16) | 2
+const SupportedABI = (1 << 16) | 3
 
 // Errors returned by this package in addition to the native error messages
 // from pinkdb_last_error.

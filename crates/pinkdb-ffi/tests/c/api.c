@@ -1,6 +1,6 @@
-/* C-level acceptance suite for ABI 1.2: database/connection split, config,
- * per-result errors, interrupt, chunk fetch and typed vectors. Built and run
- * by tests/c_api.rs. Keep it dependency-free (libc + pthreads). */
+/* C-level acceptance suite for ABI 1.3: database/connection split, config,
+ * per-result errors, interrupt, chunk fetch, typed vectors and Arrow export.
+ * Built and run by tests/c_api.rs. Keep it dependency-free (libc + pthreads). */
 
 #include "pinkdb.h"
 
@@ -531,10 +531,150 @@ static void test_chunk_errors_and_arrays(void) {
     close_conn(conn);
 }
 
+static int metadata_has(const char *metadata, const char *key,
+                        const char *value) {
+    if (!metadata) return 0;
+    int32_t count;
+    memcpy(&count, metadata, sizeof(count));
+    metadata += sizeof(count);
+    size_t key_len = strlen(key);
+    size_t value_len = strlen(value);
+    for (int32_t i = 0; i < count; i++) {
+        int32_t len;
+        memcpy(&len, metadata, sizeof(len));
+        metadata += sizeof(len);
+        int key_match = len >= 0 && (size_t)len == key_len &&
+                        memcmp(metadata, key, key_len) == 0;
+        metadata += len;
+        memcpy(&len, metadata, sizeof(len));
+        metadata += sizeof(len);
+        int value_match = len >= 0 && (size_t)len == value_len &&
+                          memcmp(metadata, value, value_len) == 0;
+        metadata += len;
+        if (key_match && value_match) return 1;
+    }
+    return 0;
+}
+
+static void test_arrow_schema_and_array(void) {
+    pinkdb_connection *conn = open_conn();
+    static const char sql[] =
+        "SELECT true AS b, 1::INTEGER AS i, 9007199254740993::BIGINT AS l,"
+        " 1.5::DOUBLE AS g, 'hé' AS s, DATE '2020-01-02' AS dt,"
+        " TIMESTAMP '2020-01-02 03:04:05.123456' AS ts,"
+        " INTERVAL '1 month 2 days 03:04:05.000006' AS iv,"
+        " '-99999999999999999999999999999999999999'::HUGEINT AS hi,"
+        " '99999999999999999999999999999999999999'::UHUGEINT AS uhi,"
+        " CAST('123.456' AS DECIMAL(18,3)) AS dec,"
+        " '12345678-1234-5678-9abc-def012345678'::UUID AS u,"
+        " [1.5, 2.5]::DOUBLE[2] AS arr, [3.5, 4.5]::FLOAT[2] AS af,"
+        " CAST('{\"a\":1}' AS VARIANT) AS v";
+    pinkdb_result *result = query_ok(conn, sql);
+
+    struct ArrowSchema schema;
+    CHECK(pinkdb_result_arrow_schema(result, 0, &schema) == 1);
+    CHECK(schema.release != NULL);
+    CHECK(strcmp(schema.format, "+s") == 0);
+    CHECK(schema.n_children == 15);
+    CHECK(schema.children != NULL);
+    static const char *formats[15] = {
+        "b", "i", "l", "g", "u", "tdD", "tsu:", "tin", "d:38,0",
+        "d:38,0", "d:18,3", "w:16", "+w:2", "+w:2", "u",
+    };
+    for (int i = 0; i < 15; i++) {
+        CHECK(strcmp(schema.children[i]->format, formats[i]) == 0);
+        CHECK(schema.children[i]->flags == ARROW_FLAG_NULLABLE);
+    }
+    CHECK(metadata_has(schema.children[11]->metadata,
+                       "ARROW:extension:name", "arrow.uuid"));
+    CHECK(metadata_has(schema.children[14]->metadata,
+                       "ARROW:extension:name", "pinkdb.variant"));
+    CHECK(schema.children[12]->n_children == 1);
+    CHECK(strcmp(schema.children[12]->children[0]->format, "g") == 0);
+    CHECK(strcmp(schema.children[13]->children[0]->format, "f") == 0);
+    schema.release(&schema);
+    CHECK(schema.release == NULL);
+
+    struct ArrowArray array;
+    CHECK(pinkdb_result_fetch_arrow(result, 0, &array) == 1);
+    CHECK(array.release != NULL);
+    CHECK(array.length == 1);
+    CHECK(array.offset == 0);
+    CHECK(array.n_buffers == 1);
+    CHECK(array.n_children == 15);
+    struct ArrowArray **kids = array.children;
+    CHECK(kids[0]->buffers[0] == NULL);
+    CHECK((((const uint8_t *)kids[0]->buffers[1])[0] & 1) == 1);
+    CHECK(((const int32_t *)kids[1]->buffers[1])[0] == 1);
+    CHECK(((const int64_t *)kids[2]->buffers[1])[0] == 9007199254740993LL);
+    CHECK(((const double *)kids[3]->buffers[1])[0] == 1.5);
+    const int32_t *offsets = kids[4]->buffers[1];
+    CHECK(offsets[0] == 0 && offsets[1] == 3);
+    CHECK(memcmp(kids[4]->buffers[2], "h\xc3\xa9", 3) == 0);
+    const int32_t *interval = kids[7]->buffers[1];
+    CHECK(interval[0] == 1 && interval[1] == 2);
+    CHECK(*(const int64_t *)(interval + 2) == 11045000006000LL);
+    /* 10^38 - 1 as little-endian {lower, upper} words, and its negation. */
+    const uint64_t *hi = kids[8]->buffers[1];
+    const uint64_t *uhi = kids[9]->buffers[1];
+    CHECK(uhi[0] == 0x098a223fffffffffULL && uhi[1] == 0x4b3b4ca85a86c47aULL);
+    CHECK(hi[0] == ~uhi[0] + 1 && hi[1] == ~uhi[1]);
+    const uint64_t *decimal = kids[10]->buffers[1];
+    CHECK(decimal[0] == 123456 && decimal[1] == 0);
+    static const uint8_t uuid[16] = {
+        0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78,
+        0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78,
+    };
+    CHECK(memcmp(kids[11]->buffers[1], uuid, sizeof(uuid)) == 0);
+
+    CHECK(kids[12]->n_buffers == 1 && kids[12]->n_children == 1);
+    CHECK(kids[12]->children[0]->length == 2);
+    const double *arr = kids[12]->children[0]->buffers[1];
+    CHECK(arr[0] == 1.5 && arr[1] == 2.5);
+    const float *af = kids[13]->children[0]->buffers[1];
+    CHECK(af[0] == 3.5f && af[1] == 4.5f);
+    const int32_t *variant_offsets = kids[14]->buffers[1];
+    CHECK(variant_offsets[1] > variant_offsets[0]);
+
+    struct ArrowArray trailing;
+    CHECK(pinkdb_result_fetch_arrow(result, 0, &trailing) == 1);
+    CHECK(trailing.release == NULL);
+    array.release(&array);
+    CHECK(array.release == NULL);
+    pinkdb_result_free(result);
+
+    /* A schema and an array keep their own data after the result/chunk dies. */
+    result = query_ok(conn, "SELECT 42::BIGINT AS x");
+    struct ArrowSchema kept_schema;
+    CHECK(pinkdb_result_arrow_schema(result, 0, &kept_schema) == 1);
+    pinkdb_result_free(result);
+    CHECK(strcmp(kept_schema.format, "+s") == 0);
+    kept_schema.release(&kept_schema);
+
+    result = query_ok(conn, "SELECT 42::BIGINT AS x");
+    pinkdb_data_chunk *chunk = one_chunk(result);
+    struct ArrowArray kept_array;
+    CHECK(pinkdb_chunk_to_arrow(chunk, &kept_array) == 1);
+    pinkdb_destroy_chunk(chunk);
+    pinkdb_result_free(result);
+    CHECK(kept_array.children[0]->length == 1);
+    CHECK(((const int64_t *)kept_array.children[0]->buffers[1])[0] == 42);
+    kept_array.release(&kept_array);
+    CHECK(kept_array.release == NULL);
+
+    result = query_ok(conn, "SELECT 1 WHERE false");
+    struct ArrowArray empty;
+    CHECK(pinkdb_result_fetch_arrow(result, 0, &empty) == 1);
+    CHECK(empty.release == NULL);
+    pinkdb_result_free(result);
+
+    close_conn(conn);
+}
+
 static void test_version(void) {
     CHECK(PINKDB_ABI_VERSION_MAJOR == 1);
-    CHECK(PINKDB_ABI_VERSION_MINOR == 2);
-    CHECK(PINKDB_ABI_VERSION == ((1u << 16) | 2u));
+    CHECK(PINKDB_ABI_VERSION_MINOR == 3);
+    CHECK(PINKDB_ABI_VERSION == ((1u << 16) | 3u));
     CHECK(pinkdb_abi_version() == PINKDB_ABI_VERSION);
     CHECK((pinkdb_abi_version() >> 16) == PINKDB_ABI_VERSION_MAJOR);
 }
@@ -547,6 +687,7 @@ int main(void) {
     test_chunk_many_rows();
     test_chunk_empty_and_multi_statement();
     test_chunk_errors_and_arrays();
+    test_arrow_schema_and_array();
     test_connections_across_threads();
     test_interrupt();
     test_version();

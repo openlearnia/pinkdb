@@ -1,5 +1,5 @@
 /*
- * pinkdb C ABI v1.2 — https://github.com/openlearnia/pinkdb
+ * pinkdb C ABI v1.3 — https://github.com/openlearnia/pinkdb
  *
  * Built as `libpinkdb_ffi.dylib` (cdylib) and `libpinkdb_ffi.a` (staticlib)
  * from the `pinkdb-ffi` crate. Link with `-lpinkdb_ffi`.
@@ -56,8 +56,51 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/*
+ * Arrow C Data Interface
+ * ----------------------
+ * These are the standard ABI-stable structs from the Arrow C Data Interface
+ * specification. The include guard is the specification's own, so this header
+ * can be included next to arrow/c/abi.h (or arrow's Rust/Python headers)
+ * without redefining the structs. The plugin-interface structs are not
+ * declared here.
+ */
+#ifndef ARROW_C_DATA_INTERFACE
+#define ARROW_C_DATA_INTERFACE
+
+#define ARROW_FLAG_DICTIONARY_ORDERED 1
+#define ARROW_FLAG_NULLABLE 2
+#define ARROW_FLAG_MAP_KEYS_SORTED 4
+
+struct ArrowSchema {
+    const char *format;
+    const char *name;
+    const char *metadata;
+    int64_t flags;
+    int64_t n_children;
+    struct ArrowSchema **children;
+    struct ArrowSchema *dictionary;
+    void (*release)(struct ArrowSchema *);
+    void *private_data;
+};
+
+struct ArrowArray {
+    int64_t length;
+    int64_t null_count;
+    int64_t offset;
+    int64_t n_buffers;
+    int64_t n_children;
+    const void **buffers;
+    struct ArrowArray **children;
+    struct ArrowArray *dictionary;
+    void (*release)(struct ArrowArray *);
+    void *private_data;
+};
+
+#endif /* ARROW_C_DATA_INTERFACE */
+
 #define PINKDB_ABI_VERSION_MAJOR 1
-#define PINKDB_ABI_VERSION_MINOR 2
+#define PINKDB_ABI_VERSION_MINOR 3
 #define PINKDB_ABI_VERSION ((PINKDB_ABI_VERSION_MAJOR << 16) | PINKDB_ABI_VERSION_MINOR)
 
 /* Library (not ABI) version, from the Cargo package version. */
@@ -216,8 +259,8 @@ typedef struct pink_value {
     size_t text_len;
 } pink_value;
 
-/* ABI version of the linked library, `major << 16 | minor` (1.2 is
- * 0x00010002). Compare it with PINKDB_ABI_VERSION; a same-major version is
+/* ABI version of the linked library, `major << 16 | minor` (1.3 is
+ * 0x00010003). Compare it with PINKDB_ABI_VERSION; a same-major version is
  * forward compatible. */
 uint32_t pinkdb_abi_version(void);
 
@@ -434,6 +477,79 @@ const uint64_t *pinkdb_vector_validity(const pinkdb_vector *vector);
 /* 1 when `row` is valid, 0 otherwise. A NULL mask means every row is valid,
  * so this returns 1. */
 int32_t pinkdb_validity_row_is_valid(const uint64_t *validity, size_t row);
+
+/*
+ * Arrow export (ABI 1.3)
+ * ----------------------
+ * A result exports as one struct-typed Arrow schema/array: the root format is
+ * "+s" and each child is one result column, in result-column order. Use
+ * pinkdb_result_arrow_schema once, then pinkdb_result_fetch_arrow for each
+ * chunk. At the end of the result pinkdb_result_fetch_arrow leaves
+ * out->release NULL and returns 1, so a normal loop is:
+ *
+ *     struct ArrowSchema schema;
+ *     struct ArrowArray array;
+ *     pinkdb_result_arrow_schema(result, statement, &schema);
+ *     while (pinkdb_result_fetch_arrow(result, statement, &array)) {
+ *         if (array.release == NULL) break;
+ *         ... consume array ...
+ *         array.release(&array);
+ *     }
+ *     schema.release(&schema);
+ *
+ * pinkdb_chunk_to_arrow exports a chunk already fetched with
+ * pinkdb_result_fetch_chunk; it does not consume the chunk.
+ *
+ * All three calls return 1 on success and 0 on error. A failed result reports
+ * through pinkdb_result_error/pinkdb_result_error_class; other errors go to
+ * pinkdb_last_error/pinkdb_last_error_class. A NULL output pointer or NULL
+ * input is an error, except that fetching at the end of a result is success.
+ *
+ * Formats and copies (validity is shared in every case):
+ *
+ *   BOOLEAN       b       data is a bit-packed copy
+ *   INTEGER       i       zero-copy int32 payload
+ *   BIGINT        l       zero-copy int64 payload
+ *   DOUBLE        g       zero-copy f64 payload
+ *   DATE          tdD     zero-copy int32 days
+ *   TIMESTAMP     tsu:    zero-copy int64 microseconds (no time zone)
+ *   DECIMAL(p,s)  d:p,s   zero-copy int128 decimal128
+ *   INTERVAL      tin     copy: months, days, micros * 1000 as nanoseconds
+ *   VARCHAR       u       copy: int32 offsets + UTF-8 bytes
+ *   VARIANT       u       copy: JSON text; provisional extension name
+ *                         "pinkdb.variant"
+ *   HUGEINT       d:38,0  zero-copy int128 decimal128; a value with more
+ *                         than 38 digits fails the export
+ *   UHUGEINT      d:38,0  zero-copy; same 38-digit limit
+ *   UUID          w:16    copy: 16 big-endian bytes; extension name
+ *                         "arrow.uuid"
+ *   ARRAY         +w:N    parent shares row validity; fixed-size-list child
+ *                         is i/l/f/g. BIGINT/FLOAT/DOUBLE child payloads are
+ *                         zero-copy; INTEGER children are copied to int32.
+ *
+ * A NULL validity buffer means every row is valid. NULL rows still occupy
+ * their slot in fixed-width and text payloads; only validity says they are
+ * NULL. VARCHAR text is UTF-8. HUGEINT/UHUGEINT export as
+ * decimal128(38,0) so integer SUMs stay numeric; the few values at or beyond
+ * 10^38 make that chunk's export fail with a type error naming the row.
+ *
+ * Ownership: a schema/array owns everything reachable through private_data.
+ * Call its release callback exactly once; release sets release to NULL, so a
+ * second release call is not needed and must not be made. An exported array
+ * holds its own references to the chunk's vectors and stays valid after the
+ * result and chunk are freed. Each child has its own release callback; to move
+ * a child out, copy its struct and set the original child's release to NULL
+ * before releasing the parent, per the Arrow specification.
+ */
+int32_t pinkdb_result_arrow_schema(const pinkdb_result *result,
+                                   size_t statement,
+                                   struct ArrowSchema *out);
+
+int32_t pinkdb_chunk_to_arrow(const pinkdb_data_chunk *chunk,
+                              struct ArrowArray *out);
+
+int32_t pinkdb_result_fetch_arrow(pinkdb_result *result, size_t statement,
+                                  struct ArrowArray *out);
 
 /* INSERT/UPDATE/DELETE results: affected row count, else 0. */
 size_t pinkdb_result_affected(const pinkdb_result *result, size_t statement);

@@ -1,5 +1,6 @@
-/* Interleaved A/B: the v1 cell API vs 1.2 chunk fetch over every column of a
- * store's `lineitem` table. Build and run through tests/chunk_bench.rs:
+/* Interleaved A/B/C: the v1 cell API, 1.2 chunk fetch, and 1.3 Arrow export
+ * over every column of a store's `lineitem` table. Build and run through
+ * tests/chunk_bench.rs:
  *
  *   PINKDB_BENCH_STORE=/tmp/store.pink \
  *   cargo test -q -p pinkdb-ffi --test chunk_bench -- --ignored --nocapture
@@ -104,6 +105,107 @@ static uint64_t scan_chunks(pinkdb_handle *db) {
     return sum;
 }
 
+/* Sum one Arrow column (including nested fixed-size lists) and check its
+ * validity bitmap, so the compiler cannot elide the buffer walk. */
+static uint64_t scan_column(const struct ArrowArray *array,
+                            const struct ArrowSchema *schema) {
+    size_t rows = (size_t)array->length;
+    const uint8_t *valid =
+        array->n_buffers > 0 ? (const uint8_t *)array->buffers[0] : NULL;
+    uint64_t sum = 0;
+    const char *format = schema->format;
+    if (format[0] == '+') {
+        for (size_t row = 0; row < rows; row++) {
+            size_t index = (size_t)array->offset + row;
+            if (valid && !(valid[index / 8] & (1u << (index % 8)))) continue;
+            sum += 1;
+        }
+        if (array->n_children > 0) {
+            uint64_t child = scan_column(array->children[0], schema->children[0]);
+            sum += child;
+        }
+        return sum;
+    }
+    for (size_t row = 0; row < rows; row++) {
+        size_t index = (size_t)array->offset + row;
+        if (valid && !(valid[index / 8] & (1u << (index % 8)))) continue;
+        switch (format[0]) {
+        case 'b':
+            sum += (((const uint8_t *)array->buffers[1])[index / 8] >> (index % 8)) & 1u;
+            break;
+        case 'i':
+        case 'f':
+            sum += (uint64_t)((const int32_t *)array->buffers[1])[index];
+            break;
+        case 'l':
+        case 'g':
+            sum += (uint64_t)((const int64_t *)array->buffers[1])[index];
+            break;
+        case 't':
+            /* DATE (tdD) is i32, TIMESTAMP (tsu:) is i64, INTERVAL (tin) is 16 bytes. */
+            if (strcmp(format, "tdD") == 0) {
+                sum += (uint64_t)((const int32_t *)array->buffers[1])[index];
+            } else if (strcmp(format, "tin") == 0) {
+                const int32_t *interval = (const int32_t *)array->buffers[1] + index * 4;
+                sum += (uint64_t)interval[0] + (uint64_t)interval[1];
+                sum += *(const int64_t *)(interval + 2);
+            } else {
+                sum += (uint64_t)((const int64_t *)array->buffers[1])[index];
+            }
+            break;
+        case 'u': {
+            const int32_t *offsets = (const int32_t *)array->buffers[1];
+            sum += (uint64_t)(offsets[index + 1] - offsets[index]);
+            sum += (uintptr_t)((const uint8_t *)array->buffers[2] + offsets[index]);
+            break;
+        }
+        case 'd': {
+            const uint64_t *wide = (const uint64_t *)array->buffers[1] + index * 2;
+            sum += wide[0] + wide[1];
+            break;
+        }
+        case 'w': {
+            const uint8_t *bytes = (const uint8_t *)array->buffers[1] + index * 16;
+            for (int byte = 0; byte < 16; byte++) sum += bytes[byte];
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    return sum;
+}
+
+static uint64_t scan_arrow(pinkdb_handle *db) {
+    static const char sql[] = "SELECT * FROM lineitem";
+    pinkdb_result *result = pinkdb_execute(db, sql, sizeof(sql) - 1);
+    if (!result) {
+        fprintf(stderr, "arrow query failed: %s\n", pinkdb_last_error());
+        exit(1);
+    }
+    struct ArrowSchema schema;
+    if (!pinkdb_result_arrow_schema(result, 0, &schema)) {
+        fprintf(stderr, "arrow schema failed: %s\n", pinkdb_last_error());
+        exit(1);
+    }
+    uint64_t sum = 0;
+    for (;;) {
+        struct ArrowArray array;
+        if (!pinkdb_result_fetch_arrow(result, 0, &array)) {
+            fprintf(stderr, "arrow fetch failed: %s\n", pinkdb_last_error());
+            exit(1);
+        }
+        if (!array.release) break;
+        sum += (uint64_t)array.length;
+        for (int64_t column = 0; column < array.n_children; column++)
+            sum += scan_column(array.children[column], schema.children[column]);
+        array.release(&array);
+    }
+    schema.release(&schema);
+    pinkdb_result_free(result);
+    return sum;
+}
+
 static int compare_double(const void *a, const void *b) {
     double x = *(const double *)a;
     double y = *(const double *)b;
@@ -130,31 +232,32 @@ int main(int argc, char **argv) {
         return 1;
     }
     printf("abi=%u\n", pinkdb_abi_version());
-    /* Warm both paths once, so page cache and the executor's caches are hot. */
-    sink += scan_v1(db) + scan_chunks(db);
+    /* Warm every path once, so page cache and the executor's caches are hot. */
+    sink += scan_v1(db) + scan_chunks(db) + scan_arrow(db);
 
-    double v1[5], chunks[5];
+    double v1[5], chunks[5], arrows[5];
     for (int i = 0; i < 5; i++) {
-        if (i % 2 == 0) {
-            double t = now_ms();
-            sink += scan_v1(db);
-            v1[i] = now_ms() - t;
-            t = now_ms();
-            sink += scan_chunks(db);
-            chunks[i] = now_ms() - t;
-        } else {
-            double t = now_ms();
-            sink += scan_chunks(db);
-            chunks[i] = now_ms() - t;
-            t = now_ms();
-            sink += scan_v1(db);
-            v1[i] = now_ms() - t;
+        for (int turn = 0; turn < 3; turn++) {
+            int which = (i + turn) % 3;
+            double start = now_ms();
+            if (which == 0) {
+                sink += scan_v1(db);
+                v1[i] = now_ms() - start;
+            } else if (which == 1) {
+                sink += scan_chunks(db);
+                chunks[i] = now_ms() - start;
+            } else {
+                sink += scan_arrow(db);
+                arrows[i] = now_ms() - start;
+            }
         }
-        printf("run=%d v1_ms=%.1f chunk_ms=%.1f\n", i, v1[i], chunks[i]);
+        printf("run=%d v1_ms=%.1f chunk_ms=%.1f arrow_ms=%.1f\n", i, v1[i],
+               chunks[i], arrows[i]);
         fflush(stdout);
     }
     report("v1", v1, 5);
     report("chunk", chunks, 5);
+    report("arrow", arrows, 5);
     printf("checksum=%" PRIu64 "\n", sink);
     pinkdb_close(db);
     return 0;

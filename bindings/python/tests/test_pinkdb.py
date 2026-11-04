@@ -57,8 +57,8 @@ def _run_child(code, **env_overrides):
 
 
 class AbiTests(unittest.TestCase):
-    def test_abi_version_is_one_one(self):
-        self.assertEqual(pinkdb.abi_version(), (1 << 16) | 2)
+    def test_abi_version_is_one_three(self):
+        self.assertEqual(pinkdb.abi_version(), (1 << 16) | 3)
 
     def test_library_path_is_absolute_and_exists(self):
         self.assertTrue(os.path.isabs(pinkdb.library_path), pinkdb.library_path)

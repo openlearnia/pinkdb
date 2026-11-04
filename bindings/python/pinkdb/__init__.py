@@ -172,7 +172,7 @@ _EPOCH_DATE = _datetime.date(1970, 1, 1)
 _EPOCH_DATETIME = _datetime.datetime(1970, 1, 1)
 
 #: ABI version this binding targets (``pinkdb_abi_version``).
-_ABI_VERSION = (1 << 16) | 2
+_ABI_VERSION = (1 << 16) | 3
 
 
 class Warning(Exception):  # noqa: A001 - the name PEP 249 requires

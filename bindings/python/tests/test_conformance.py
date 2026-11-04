@@ -89,7 +89,7 @@ class ConformanceTest(unittest.TestCase):
 
     def test_corpus_metadata(self):
         self.assertEqual(CORPUS["corpus_version"], 1)
-        self.assertEqual(CORPUS["abi_version"], (1 << 16) | 2)
+        self.assertEqual(CORPUS["abi_version"], (1 << 16) | 3)
         self.assertEqual(
             CORPUS["abi_version"],
             pinkdb.abi_version(),
