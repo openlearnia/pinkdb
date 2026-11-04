@@ -5405,10 +5405,30 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             // sort. Only worth it when the limit is much smaller than the row
             // count; otherwise — or when the byte encoding is unavailable —
             // fall back to the full sort + truncate.
+            //
+            // Projections of plain columns between the LIMIT and the SORT
+            // (`ORDER BY` a column the SELECT list leaves out) only drop and
+            // reorder columns, so the top-N runs under them and they project
+            // its rows afterwards. Any other projection keeps the generic
+            // path: it would evaluate an expression on fewer rows.
+            let mut over_sort: &LogicalPlan = input;
+            let mut projections: Vec<&LogicalPlan> = Vec::new();
+            while let LogicalPlan::Project {
+                input: below,
+                exprs,
+                ..
+            } = over_sort
+                && exprs
+                    .iter()
+                    .all(|e| matches!(e, BoundExpr::Column { .. } | BoundExpr::Literal(_)))
+            {
+                projections.push(over_sort);
+                over_sort = below;
+            }
             if let LogicalPlan::Sort {
                 input: sort_in,
                 keys,
-            } = &**input
+            } = over_sort
             {
                 // Evaluate the sort input once: the top-N path and the
                 // fallback full sort below both consume these chunks
@@ -5431,7 +5451,11 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     names: inner.names,
                     types: inner.types,
                 };
-                return Ok(truncate_output(out, *limit));
+                let mut out = truncate_output(out, *limit);
+                for projection in projections.iter().rev() {
+                    out = project_output(cx, projection, out)?;
+                }
+                return Ok(out);
             }
             // Streaming short-circuit: over a plan the executor can stream
             // (scan/filter/project/UNION ALL), stop pulling the input as
@@ -8540,6 +8564,27 @@ fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, SortSpec)]) -> Result
     let out = rebuild_sorted(chunks, &rows)?;
     held.resize(chunks_approx_bytes(&out) + arena.bytes.len() + n * 12)?;
     Ok(out)
+}
+
+/// Apply a `Project` node to an already evaluated input (the few rows a
+/// top-N kept; see the `LIMIT` arm).
+fn project_output(cx: &Cx, projection: &LogicalPlan, input: Output) -> Result<Output> {
+    let LogicalPlan::Project { exprs, names, .. } = projection else {
+        return Err(PinkDbError::Execution(
+            "internal: project_output needs a Project node".to_string(),
+        ));
+    };
+    expr::prime(cx, exprs)?;
+    let chunks = input
+        .chunks
+        .iter()
+        .map(|chunk| project_chunk(cx, exprs, chunk, None))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Output {
+        chunks,
+        names: names.clone(),
+        types: exprs.iter().map(|e| e.dtype()).collect(),
+    })
 }
 
 /// Top-N selection for `LIMIT` directly over `SORT`: every rayon partition
@@ -14780,6 +14825,87 @@ mod tests {
         // the permuted ids prove the tiebreak is input order, not id order.
         assert_eq!(topn[0][3], V::Integer(0));
         assert_eq!(topn[1][3], V::Integer(((60 * 37) % N) as i32));
+    }
+
+    /// Top-N under projections (`ORDER BY` a column the SELECT list leaves
+    /// out, an alias, an expression, DISTINCT, OFFSET): every shape must
+    /// return exactly the full sort's rows, ties in input order.
+    #[test]
+    fn order_limit_under_projections_matches_full_sort() {
+        const N: usize = 5000;
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER, b INTEGER, c VARCHAR, id INTEGER);")
+            .unwrap();
+        insert_rows(&mut db, "t", N, |i| {
+            let a = (i % 7) as i32;
+            let b = ((i / 7) % 11) as i32;
+            let c = if i % 5 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("'c{}'", i % 13)
+            };
+            let id = ((i * 37) % N) as i32;
+            format!("({a}, {b}, {c}, {id})")
+        });
+        let check = |db: &mut PinkDb, limited: &str, full: &str, skip: usize, take: usize| {
+            let got = select(db, limited);
+            let all = select(db, full);
+            assert_eq!(got, all[skip..skip + take].to_vec(), "{limited}");
+        };
+        // A sort key the SELECT list leaves out (Limit → Project → Sort).
+        check(
+            &mut db,
+            "SELECT id FROM t ORDER BY a DESC, b LIMIT 3;",
+            "SELECT id FROM t ORDER BY a DESC, b;",
+            0,
+            3,
+        );
+        // Ties on the only key: input order decides.
+        check(
+            &mut db,
+            "SELECT id, c FROM t ORDER BY a LIMIT 5;",
+            "SELECT id, c FROM t ORDER BY a;",
+            0,
+            5,
+        );
+        // A projected alias, and a NULL-bearing key.
+        check(
+            &mut db,
+            "SELECT a * 2 AS x, id FROM t ORDER BY x DESC, id LIMIT 4;",
+            "SELECT a * 2 AS x, id FROM t ORDER BY x DESC, id;",
+            0,
+            4,
+        );
+        check(
+            &mut db,
+            "SELECT id FROM t ORDER BY c DESC, id LIMIT 6;",
+            "SELECT id FROM t ORDER BY c DESC, id;",
+            0,
+            6,
+        );
+        // An expression in the SELECT list (not a plain column) over the sort.
+        check(
+            &mut db,
+            "SELECT id + 1 FROM t ORDER BY b, a LIMIT 3;",
+            "SELECT id + 1 FROM t ORDER BY b, a;",
+            0,
+            3,
+        );
+        // OFFSET and DISTINCT keep their own semantics.
+        check(
+            &mut db,
+            "SELECT id FROM t ORDER BY b, a LIMIT 3 OFFSET 5;",
+            "SELECT id FROM t ORDER BY b, a;",
+            5,
+            3,
+        );
+        check(
+            &mut db,
+            "SELECT DISTINCT a FROM t ORDER BY a DESC LIMIT 2;",
+            "SELECT DISTINCT a FROM t ORDER BY a DESC;",
+            0,
+            2,
+        );
     }
 
     /// Multi-key mixed ASC/DESC top-N (byte arena) must equal the full sort
