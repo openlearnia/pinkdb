@@ -9885,10 +9885,45 @@ struct Stream<'p> {
     pending: std::collections::VecDeque<DataChunk>,
 }
 
-/// A started scan: materialized chunks, or a table function's push scan.
+/// A started scan: materialized chunks, a table function's push scan, or a
+/// store table read chunk by chunk.
 enum ScanChunks {
     Done(std::vec::IntoIter<DataChunk>),
     Source(SourceStream),
+    /// A store table, decoded one chunk per pull and dropped by the consumer
+    /// (the decoded cache keeps what its own budget allows), so a scan of a
+    /// large table never holds the table. Only owned indices live here: each
+    /// pull looks the table up in the context's store, so the stream never
+    /// borrows it (see [`StreamKind`]).
+    Store {
+        lookup: crate::storage::SchemaPath,
+        /// The chunks zone pruning left, in scan order.
+        keep: Vec<usize>,
+        next: usize,
+        emitted: usize,
+    },
+}
+
+impl ScanChunks {
+    /// A store-table scan read chunk by chunk, or `None` for any other scan
+    /// (a CTE, a time-travel read, an attached lake table), which
+    /// materializes as before.
+    fn store(cx: &Cx, plan: &LogicalPlan) -> Result<Option<ScanChunks>> {
+        let Some(scan) = store_scan(cx, plan)? else {
+            return Ok(None);
+        };
+        let LogicalPlan::Scan { ns, .. } = plan else {
+            return Ok(None);
+        };
+        let lookup = ns.clone().unwrap_or_else(|| cx.db.current_ns().clone());
+        let keep = (0..scan.len()).map(|i| scan.chunk_index(i)).collect();
+        Ok(Some(ScanChunks::Store {
+            lookup,
+            keep,
+            next: 0,
+            emitted: 0,
+        }))
+    }
 }
 
 /// A table function's push scan ([`TableSource::scan_stream`]) on a thread
@@ -9989,6 +10024,13 @@ impl SourceStream {
 /// while bounding the work wasted when the limit is reached mid-batch.
 const STREAM_BATCH: usize = 4;
 
+/// The cursor's contract (`exec::cursor`): a `StreamKind` may borrow only
+/// from the plan (`&'p LogicalPlan`, `&'p BoundExpr`, `&'p [DataType]`).
+/// Everything else it holds must be owned: never a `&Cx`, a `&PinkDb`, a
+/// `&DataTable` or anything else borrowed from the store, because a result
+/// cursor moves a running stream to another thread and another view of the
+/// same data (see `QueryCursor::start`). A scan that needs the store looks
+/// it up in the `Cx` each `next` is given.
 enum StreamKind<'p> {
     /// A scan, started on first pull so a limit satisfied by an earlier
     /// branch never touches the table (an attached lake would otherwise
@@ -10129,15 +10171,40 @@ impl<'p> Stream<'p> {
                     if chunks.is_none() {
                         *chunks = Some(match SourceStream::start(cx, plan)? {
                             Some(source) => ScanChunks::Source(source),
-                            // `eval` dispatches a plain scan to `scan_output`
-                            // and a table-function scan to
-                            // `table_function_output`.
-                            None => ScanChunks::Done(eval(cx, plan)?.chunks.into_iter()),
+                            None => match ScanChunks::store(cx, plan)? {
+                                Some(store) => store,
+                                // `eval` dispatches any other scan to
+                                // `scan_output` or `table_function_output`.
+                                None => ScanChunks::Done(eval(cx, plan)?.chunks.into_iter()),
+                            },
                         });
                     }
                     return match chunks.as_mut().expect("scan started") {
                         ScanChunks::Done(it) => Ok(it.next()),
                         ScanChunks::Source(source) => source.next(cx),
+                        ScanChunks::Store {
+                            lookup,
+                            keep,
+                            next,
+                            emitted,
+                        } => {
+                            let LogicalPlan::Scan { table, .. } = plan else {
+                                unreachable!("a store scan streams a Scan node");
+                            };
+                            while let Some(&index) = keep.get(*next) {
+                                *next += 1;
+                                cx.check_deadline()?;
+                                let t = cx.db.table_in(&*lookup, table)?;
+                                let scan =
+                                    StoreScan::new(t, cx.projections.for_scan(plan), None, true);
+                                if let Some(mut chunk) = scan.chunk(index)? {
+                                    chunk.ordinal = *emitted;
+                                    *emitted += 1;
+                                    return Ok(Some(chunk));
+                                }
+                            }
+                            Ok(None)
+                        }
                     };
                 }
                 StreamKind::SingleRow(emitted) => {
