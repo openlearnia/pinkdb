@@ -8,6 +8,20 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-11-04
+### Faster bulk loads, step 1 ✅
+
+`CREATE TABLE … AS SELECT * FROM read_parquet(…)` / `read_csv(…)` load 1.33×
+faster before the final checkpoint (TPC-H SF 1 `lineitem`, against the previous
+build), with the same table statistics as before.
+
+- **Statistics in one pass**: a load computes each chunk's min/max and
+  distinct-count sketch on the worker pool together with the data, instead of
+  a second pass over the whole table afterwards.
+- **No shared lock per chunk** when query results are collected.
+- **CSV** fields are checked for UTF-8 once per batch and stored as typed
+  values directly.
+
 ## 2026-11-03
 ### Wave 133d — lake text columns decode once, filters skip rows early ✅
 
