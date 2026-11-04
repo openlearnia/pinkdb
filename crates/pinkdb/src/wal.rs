@@ -3765,10 +3765,7 @@ fn decode_fixed<const N: usize, T>(
     f: impl Fn([u8; N]) -> T,
 ) -> std::result::Result<Vec<T>, String> {
     let bytes = r.take(rows.checked_mul(N).ok_or("implausible WAL chunk size")?)?;
-    Ok(bytes
-        .chunks_exact(N)
-        .map(|b| f(b.try_into().expect("N bytes")))
-        .collect())
+    Ok(bytes.as_chunks::<N>().0.iter().map(|b| f(*b)).collect())
 }
 
 fn decode_column(
