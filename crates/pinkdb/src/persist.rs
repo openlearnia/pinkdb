@@ -691,7 +691,56 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
 /// Continue a CRC32C over `bytes` from `crc`, the state [`crc32c`] left behind
 /// for the preceding bytes. A streamed check seeds with `!0` and inverts the
 /// final state, exactly like [`crc32c`].
-pub(crate) fn crc32c_update(mut crc: u32, bytes: &[u8]) -> u32 {
+pub(crate) fn crc32c_update(crc: u32, bytes: &[u8]) -> u32 {
+    // The CPU's CRC32C instructions compute the same Castagnoli checksum an
+    // order of magnitude faster than the tables (the checkpoint checksums every
+    // byte it writes); the tables remain the portable path.
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        // SAFETY: the `crc` feature was detected at run time.
+        return unsafe { crc32c_update_aarch64(crc, bytes) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("sse4.2") {
+        // SAFETY: SSE4.2 was detected at run time.
+        return unsafe { crc32c_update_x86_64(crc, bytes) };
+    }
+    crc32c_update_tables(crc, bytes)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn crc32c_update_aarch64(mut crc: u32, bytes: &[u8]) -> u32 {
+    use std::arch::aarch64::{__crc32cb, __crc32cd};
+    let (words, rest) = bytes.as_chunks::<8>();
+    for w in words {
+        crc = __crc32cd(crc, u64::from_le_bytes(*w));
+    }
+    for &b in rest {
+        crc = __crc32cb(crc, b);
+    }
+    crc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn crc32c_update_x86_64(crc: u32, bytes: &[u8]) -> u32 {
+    use std::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
+    let (words, rest) = bytes.as_chunks::<8>();
+    let mut wide = crc as u64;
+    for w in words {
+        wide = _mm_crc32_u64(wide, u64::from_le_bytes(*w));
+    }
+    let mut crc = wide as u32;
+    for &b in rest {
+        crc = _mm_crc32_u8(crc, b);
+    }
+    crc
+}
+
+/// [`crc32c_update`] from the slicing-by-8 tables: the portable path and the
+/// reference the instruction paths are tested against.
+fn crc32c_update_tables(mut crc: u32, bytes: &[u8]) -> u32 {
     let (chunks, remainder) = bytes.as_chunks::<8>();
     for c in chunks {
         let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
@@ -9253,6 +9302,37 @@ mod tests {
                     varchar_zone(&v, &dict, &codes),
                     crate::stats::Zone::of_vector(&v),
                     "{sql} chunk {i}"
+                );
+            }
+        }
+    }
+
+    /// The CPU's CRC32C instructions and the tables agree on every length and
+    /// alignment, chained updates included (the WAL streams its checksums).
+    #[test]
+    fn crc32c_instructions_match_the_tables() {
+        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let data: Vec<u8> = (0..70_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        for start in 0..9 {
+            for len in [0usize, 1, 3, 7, 8, 9, 15, 16, 17, 63, 64, 65, 1000, 65_536] {
+                let slice = &data[start..start + len];
+                assert_eq!(
+                    crc32c_update(!0, slice),
+                    crc32c_update_tables(!0, slice),
+                    "start {start} len {len}"
+                );
+                let (a, b) = slice.split_at(len / 3);
+                assert_eq!(
+                    crc32c_update(crc32c_update(!0, a), b),
+                    crc32c_update_tables(!0, slice)
                 );
             }
         }
