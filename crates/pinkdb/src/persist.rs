@@ -691,7 +691,56 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
 /// Continue a CRC32C over `bytes` from `crc`, the state [`crc32c`] left behind
 /// for the preceding bytes. A streamed check seeds with `!0` and inverts the
 /// final state, exactly like [`crc32c`].
-pub(crate) fn crc32c_update(mut crc: u32, bytes: &[u8]) -> u32 {
+pub(crate) fn crc32c_update(crc: u32, bytes: &[u8]) -> u32 {
+    // The CPU's CRC32C instructions compute the same Castagnoli checksum an
+    // order of magnitude faster than the tables (the checkpoint checksums every
+    // byte it writes); the tables remain the portable path.
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        // SAFETY: the `crc` feature was detected at run time.
+        return unsafe { crc32c_update_aarch64(crc, bytes) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("sse4.2") {
+        // SAFETY: SSE4.2 was detected at run time.
+        return unsafe { crc32c_update_x86_64(crc, bytes) };
+    }
+    crc32c_update_tables(crc, bytes)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn crc32c_update_aarch64(mut crc: u32, bytes: &[u8]) -> u32 {
+    use std::arch::aarch64::{__crc32cb, __crc32cd};
+    let (words, rest) = bytes.as_chunks::<8>();
+    for w in words {
+        crc = __crc32cd(crc, u64::from_le_bytes(*w));
+    }
+    for &b in rest {
+        crc = __crc32cb(crc, b);
+    }
+    crc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn crc32c_update_x86_64(crc: u32, bytes: &[u8]) -> u32 {
+    use std::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
+    let (words, rest) = bytes.as_chunks::<8>();
+    let mut wide = crc as u64;
+    for w in words {
+        wide = _mm_crc32_u64(wide, u64::from_le_bytes(*w));
+    }
+    let mut crc = wide as u32;
+    for &b in rest {
+        crc = _mm_crc32_u8(crc, b);
+    }
+    crc
+}
+
+/// [`crc32c_update`] from the slicing-by-8 tables: the portable path and the
+/// reference the instruction paths are tested against.
+fn crc32c_update_tables(mut crc: u32, bytes: &[u8]) -> u32 {
     let (chunks, remainder) = bytes.as_chunks::<8>();
     for c in chunks {
         let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
@@ -760,7 +809,7 @@ impl Writer {
 /// The data region is written through this one path, so a `save`'s file and
 /// the lake's in-memory `to_pink_bytes*` images are byte-identical by
 /// construction.
-trait Sink {
+trait Sink: Send {
     fn bytes(&mut self, b: &[u8]) -> Result<()>;
 
     /// The offset the next byte lands at: the row-group directory records
@@ -1556,10 +1605,10 @@ fn varchar_offsets_fit(total: u64) -> bool {
 fn dict_and_codes<T: AsRef<str>>(strs: &[T]) -> (Vec<&str>, Vec<u32>) {
     let mut dict: Vec<&str> = Vec::new();
     let mut index: HashMap<&str, u32, foldhash::fast::FixedState> =
-        HashMap::with_capacity_and_hasher(
-            strs.len().min(256),
-            foldhash::fast::FixedState::default(),
-        );
+        // Sized for a chunk of distinct strings: a growing table rehashes
+        // every key it holds, and the first-occurrence order never depends on
+        // the capacity.
+        HashMap::with_capacity_and_hasher(strs.len(), foldhash::fast::FixedState::default());
     let mut codes = Vec::with_capacity(strs.len());
     for s in strs {
         let s = s.as_ref();
@@ -2313,19 +2362,31 @@ fn encode_double_chunk(values: &[f64]) -> (u8, Vec<u8>) {
 /// frame/FSST candidates on the plain bytes only when they can pay for
 /// themselves (the same gates as before), then build the winner.
 fn encode_varchar_chunk(strs: &[&str]) -> (u8, Vec<u8>) {
+    let (dict, codes) = dict_and_codes(strs);
+    encode_varchar_chunk_with(strs, &dict, &codes)
+}
+
+/// [`encode_varchar_chunk`] over the chunk's already built dictionary (the
+/// page writer builds it once for the encoding and the page statistics).
+fn encode_varchar_chunk_with(strs: &[&str], dict: &[&str], codes: &[u32]) -> (u8, Vec<u8>) {
     let n = strs.len();
+    // Equal strings share a code, so runs are counted on the codes: one
+    // integer compare per row instead of a string compare.
+    let lens: Vec<usize> = dict.iter().map(|s| s.len()).collect();
     let mut total_bytes = 0usize;
     let mut run_bytes = 0usize;
     let mut runs = 0usize;
-    for (i, s) in strs.iter().enumerate() {
-        total_bytes += s.len();
-        if i == 0 || strs[i - 1] != *s {
+    let mut prev = u32::MAX;
+    for &c in codes {
+        let len = lens[c as usize];
+        total_bytes += len;
+        if c != prev {
             runs += 1;
-            run_bytes += s.len();
+            run_bytes += len;
+            prev = c;
         }
     }
-    let (dict, codes) = dict_and_codes(strs);
-    let dict_bytes: usize = dict.iter().map(|s| s.len()).sum();
+    let dict_bytes: usize = lens.iter().sum();
 
     let plain = 4 + 4 * (n + 1) + total_bytes;
     let dict_size = 4 + 4 + 4 * (dict.len() + 1) + dict_bytes + 4 * n;
@@ -2381,9 +2442,9 @@ fn encode_varchar_chunk(strs: &[&str]) -> (u8, Vec<u8>) {
         Some(payload) => payload,
         None => match best {
             0 => plain_payload.unwrap_or_else(|| enc_strs_plain(strs)),
-            1 => enc_strs_dict_from(&dict, &codes, n),
+            1 => enc_strs_dict_from(dict, codes, n),
             2 => enc_strs_rle(strs),
-            _ => enc_strs_dict_bitpack_from(&dict, &codes, n),
+            _ => enc_strs_dict_bitpack_from(dict, codes, n),
         },
     };
     (tag, payload)
@@ -3535,7 +3596,21 @@ struct EncodedPage {
 
 /// Encode one page (one engine chunk) from its [`Vector`].
 fn encode_page(v: &Vector) -> EncodedPage {
-    let (tag, payload) = encode_chunk_typed(v);
+    let (tag, payload, stats) = match v.data() {
+        // A VARCHAR chunk's dictionary serves the encoding and the page's
+        // min/max: every distinct value is compared once, not every row.
+        VectorData::VarChar(_) => {
+            let strs = varchar_payload(v);
+            let (dict, codes) = dict_and_codes(&strs);
+            let stats = varchar_zone(v, &dict, &codes);
+            let (tag, payload) = encode_varchar_chunk_with(&strs, &dict, &codes);
+            (tag, payload, stats)
+        }
+        _ => {
+            let (tag, payload) = encode_chunk_typed(v);
+            (tag, payload, crate::stats::Zone::of_vector(v))
+        }
+    };
     let validity = encode_validity(v);
     let mut w = Writer::new();
     w.u8(tag);
@@ -3544,7 +3619,47 @@ fn encode_page(v: &Vector) -> EncodedPage {
     w.bytes(&payload);
     EncodedPage {
         frame: w.buf,
-        stats: crate::stats::Zone::of_vector(v),
+        stats,
+    }
+}
+
+/// [`crate::stats::Zone::of_vector`] of a VARCHAR chunk, from its dictionary:
+/// the NULL count from the validity bits, and min/max over the dictionary
+/// entries some valid row uses (a NULL row's `""` placeholder is in the
+/// dictionary too, and must not count). Strings compare as `str` (bytes), as
+/// the row fold does, so the zone is identical.
+fn varchar_zone(v: &Vector, dict: &[&str], codes: &[u32]) -> crate::stats::Zone {
+    let mut used = vec![false; dict.len()];
+    let mut null_count = 0u64;
+    if v.has_nulls() {
+        let words = v.validity_words();
+        for (row, &code) in codes.iter().enumerate() {
+            if valid_at(words, row) {
+                used[code as usize] = true;
+            } else {
+                null_count += 1;
+            }
+        }
+    } else {
+        used.iter_mut().for_each(|u| *u = true);
+    }
+    let (mut min, mut max): (Option<&str>, Option<&str>) = (None, None);
+    for (entry, &s) in dict.iter().enumerate() {
+        if !used[entry] {
+            continue;
+        }
+        if min.is_none_or(|m| s < m) {
+            min = Some(s);
+        }
+        if max.is_none_or(|m| s > m) {
+            max = Some(s);
+        }
+    }
+    crate::stats::Zone {
+        null_count,
+        min: min.map(|s| Value::Varchar(s.to_string())),
+        max: max.map(|s| Value::Varchar(s.to_string())),
+        nan_count: 0,
     }
 }
 
@@ -4690,38 +4805,54 @@ impl PinkDb {
             let n_chunks = t.num_chunks();
             let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
             let mut reused = vec![false; old.map_or(0, |o| o.row_groups.len()).max(n_groups)];
-            for (g, reused_group) in reused.iter_mut().enumerate().take(n_groups) {
-                let first = g * CHUNKS_PER_ROW_GROUP;
-                let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
-                if let Some(old) = old
-                    && let Some(old_group) = old.row_groups.get(g)
-                    && old.schema == schema
-                    && reusable_group(t, old_group, first, last)
-                {
-                    *reused_group = true;
-                    for (ci, column) in old_group.columns.iter().enumerate() {
-                        let mut acc = ChunkColumnStats::empty();
-                        acc.null_count = column.null_count;
-                        acc.nan_count = column.nan_count;
-                        acc.min = column.min.clone();
-                        acc.max = column.max.clone();
-                        accs[ci].merge(&acc);
+            // A group whose stored bytes still match stays where it is; the
+            // others are encoded here and written by `write_group` in order.
+            let steps = reused
+                .iter_mut()
+                .enumerate()
+                .take(n_groups)
+                .map(|(g, reused_group)| {
+                    let first = g * CHUNKS_PER_ROW_GROUP;
+                    let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
+                    if let Some(old) = old
+                        && let Some(old_group) = old.row_groups.get(g)
+                        && old.schema == schema
+                        && reusable_group(t, old_group, first, last)
+                    {
+                        *reused_group = true;
+                        return Ok(GroupStep::Reused(old_group));
                     }
-                    row_groups.push(old_group.clone());
-                    continue;
-                }
-                let group = encode_row_group(ns, name, t, first, last, true)?;
-                let (group, table_carry) = write_group(&mut writer, group)?;
-                for (ci, acc) in group.accs.iter().enumerate() {
-                    accs[ci].merge(acc);
-                }
-                row_groups.push(RowGroupDir {
-                    rows: group.rows,
-                    chunk_rows: group.chunk_rows,
-                    columns: group.columns,
+                    encode_row_group(ns, name, t, first, last, true).map(GroupStep::Encoded)
                 });
-                repoints.push((t, table_carry));
-            }
+            let write = |step: GroupStep<'_>| -> Result<()> {
+                match step {
+                    GroupStep::Reused(old_group) => {
+                        for (ci, column) in old_group.columns.iter().enumerate() {
+                            let mut acc = ChunkColumnStats::empty();
+                            acc.null_count = column.null_count;
+                            acc.nan_count = column.nan_count;
+                            acc.min = column.min.clone();
+                            acc.max = column.max.clone();
+                            accs[ci].merge(&acc);
+                        }
+                        row_groups.push(old_group.clone());
+                    }
+                    GroupStep::Encoded(group) => {
+                        let (group, table_carry) = write_group(&mut writer, group)?;
+                        for (ci, acc) in group.accs.iter().enumerate() {
+                            accs[ci].merge(acc);
+                        }
+                        row_groups.push(RowGroupDir {
+                            rows: group.rows,
+                            chunk_rows: group.chunk_rows,
+                            columns: group.columns,
+                        });
+                        repoints.push((t, table_carry));
+                    }
+                }
+                Ok(())
+            };
+            encode_then_write(steps, write, n_groups > 1)?;
             if let Some(old) = old {
                 for (g, group) in old.row_groups.iter().enumerate() {
                     if reused.get(g).copied().unwrap_or(false) {
@@ -5277,7 +5408,33 @@ fn encode_row_group(
             .map(|&(ci, i)| encode(ci, i))
             .collect::<Result<Vec<_>>>()?
     };
+    // The encoded pages come in column order: split them by column, then
+    // assemble each column chunk (page index, pages, checksum, statistics) on
+    // the pool too. Only the offsets are a running sum, set in order below.
     let mut encoded = encoded.into_iter();
+    let column_pages: Vec<Option<Vec<EncodedPage>>> = copies
+        .iter()
+        .map(|copy| {
+            copy.is_none().then(|| {
+                let pages: Vec<EncodedPage> = encoded.by_ref().take(last - first).collect();
+                debug_assert_eq!(pages.len(), last - first);
+                pages
+            })
+        })
+        .collect();
+    let assembled: Vec<Option<AssembledColumn>> =
+        if parallel && work.len() >= PARALLEL_SAVE_MIN_CHUNKS {
+            column_pages
+                .par_iter()
+                .map(|pages| pages.as_deref().map(assemble_column))
+                .collect()
+        } else {
+            column_pages
+                .iter()
+                .map(|pages| pages.as_deref().map(assemble_column))
+                .collect()
+        };
+    drop(column_pages);
     let mut columns: Vec<ColumnChunkDir> = Vec::with_capacity(t.columns.len());
     let mut pieces = Vec::with_capacity(t.columns.len());
     let mut carry: Vec<Vec<CarriedColumnChunk>> = Vec::with_capacity(t.columns.len());
@@ -5287,55 +5444,25 @@ fn encode_row_group(
         .map(|_| ChunkColumnStats::empty())
         .collect();
     let mut running = 0u64;
-    for (ci, copy) in copies.into_iter().enumerate() {
+    for (ci, (copy, assembled)) in copies.into_iter().zip(assembled).enumerate() {
         let Some(copy) = copy else {
-            let pages: Vec<EncodedPage> = encoded.by_ref().take(last - first).collect();
-            debug_assert_eq!(pages.len(), last - first);
-            // The column chunk: the page index, then the pages.
-            let page_count = pages.len() as u32;
-            let index_len = 4 + page_count as usize * 8;
-            let mut chunk = Writer::new();
-            chunk.u32(page_count);
-            let mut rel = index_len as u32;
-            for page in &pages {
-                let len = page.frame.len() as u32;
-                chunk.u32(rel);
-                chunk.u32(len);
-                rel += len;
-            }
-            for page in &pages {
-                chunk.bytes(&page.frame);
-            }
-            let bytes = chunk.buf;
-            let length = bytes.len() as u64;
-            // The column chunk's exact statistics and encoding summary.
-            let mut acc = ChunkColumnStats::empty();
-            let mut encodings = 0u32;
-            for page in &pages {
-                acc.merge(&page.stats);
-                encodings |= 1u32 << page.frame[0];
-            }
+            let AssembledColumn {
+                bytes,
+                mut dir,
+                acc,
+            } = assembled.expect("a column without a copy-through was encoded");
             accs[ci].merge(&acc);
-            columns.push(ColumnChunkDir {
-                offset: running,
-                length,
-                page_count,
-                encodings,
-                crc32c: crc32c(&bytes),
-                null_count: acc.null_count,
-                nan_count: acc.nan_count,
-                min: acc.min,
-                max: acc.max,
-            });
-            running += length;
+            dir.offset = running;
+            running += dir.length;
             // The save repoints this column chunk's handles at the bytes it
             // writes, so the record carries the group-relative directory
             // entry the footer will get.
             carry.push(vec![CarriedColumnChunk {
                 first,
                 rows: Arc::clone(&rows_arc),
-                dir: columns.last().expect("just pushed").clone(),
+                dir: dir.clone(),
             }]);
+            columns.push(dir);
             pieces.push(GroupPiece { bytes });
             continue;
         };
@@ -5380,6 +5507,53 @@ fn encode_row_group(
     })
 }
 
+/// One encoded column chunk of a row group: its bytes, its directory entry
+/// (offset 0 until the group places it) and its exact statistics.
+struct AssembledColumn {
+    bytes: Vec<u8>,
+    dir: ColumnChunkDir,
+    acc: ChunkColumnStats,
+}
+
+/// Lay out one column chunk from its encoded pages: the page index (count,
+/// then each page's chunk-relative offset and length), then the pages.
+fn assemble_column(pages: &[EncodedPage]) -> AssembledColumn {
+    let page_count = pages.len() as u32;
+    let index_len = 4 + page_count as usize * 8;
+    let mut chunk = Writer::new();
+    chunk.u32(page_count);
+    let mut rel = index_len as u32;
+    for page in pages {
+        let len = page.frame.len() as u32;
+        chunk.u32(rel);
+        chunk.u32(len);
+        rel += len;
+    }
+    for page in pages {
+        chunk.bytes(&page.frame);
+    }
+    let bytes = chunk.buf;
+    // The column chunk's exact statistics and encoding summary.
+    let mut acc = ChunkColumnStats::empty();
+    let mut encodings = 0u32;
+    for page in pages {
+        acc.merge(&page.stats);
+        encodings |= 1u32 << page.frame[0];
+    }
+    let dir = ColumnChunkDir {
+        offset: 0,
+        length: bytes.len() as u64,
+        page_count,
+        encodings,
+        crc32c: crc32c(&bytes),
+        null_count: acc.null_count,
+        nan_count: acc.nan_count,
+        min: acc.min.clone(),
+        max: acc.max.clone(),
+    };
+    AssembledColumn { bytes, dir, acc }
+}
+
 /// Write one table's data region (its column chunks) and collect its footer
 /// entry.
 ///
@@ -5412,10 +5586,12 @@ fn write_table<S: Sink>(
     let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
     let mut row_groups: Vec<RowGroupDir> = Vec::with_capacity(n_groups);
     let mut table_carry: TableCarry = (0..schema.len()).map(|_| Vec::new()).collect();
-    for g in 0..n_groups {
+    let groups = (0..n_groups).map(|g| {
         let first = g * CHUNKS_PER_ROW_GROUP;
         let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
-        let group = encode_row_group(ns, name, t, first, last, parallel)?;
+        encode_row_group(ns, name, t, first, last, parallel)
+    });
+    let write = |group: GroupBuild| -> Result<()> {
         let GroupBuild {
             rows,
             chunk_rows,
@@ -5448,7 +5624,9 @@ fn write_table<S: Sink>(
             chunk_rows,
             columns,
         });
-    }
+        Ok(())
+    };
+    encode_then_write(groups, write, parallel && n_groups > 1)?;
     Ok((
         finish_table_dir(ns, name, t, row_groups, &accs, collect_stats, saved)?,
         table_carry,
@@ -5626,6 +5804,68 @@ impl CheckpointWriter {
     }
 }
 
+/// One row group of an incremental checkpoint, in table order: kept in place,
+/// or encoded for [`write_group`].
+enum GroupStep<'a> {
+    Reused(&'a RowGroupDir),
+    Encoded(GroupBuild),
+}
+
+/// Run `write` over `groups` in order. With `overlap`, a writer thread stores
+/// group `g` while this thread encodes group `g + 1` (its pages on the pool),
+/// so the file write no longer leaves the pool idle. The writes keep their
+/// order, so every offset and byte is that of the serial loop; the first
+/// error in serial order wins (a write fails before the next encode).
+fn encode_then_write<T: Send>(
+    groups: impl Iterator<Item = Result<T>>,
+    mut write: impl FnMut(T) -> Result<()> + Send,
+    overlap: bool,
+) -> Result<()> {
+    if !overlap {
+        for group in groups {
+            write(group?)?;
+        }
+        return Ok(());
+    }
+    std::thread::scope(|scope| {
+        // Room for one finished group while the writer holds another.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
+        let writer = scope.spawn(move || {
+            let written = rx.into_iter().try_for_each(&mut write);
+            // The reuse counter is per thread: hand the writer's back.
+            #[cfg(test)]
+            let written = (written, first_fits());
+            written
+        });
+        let mut encoded = Ok(());
+        for group in groups {
+            match group {
+                Ok(group) => {
+                    // A closed channel means the writer failed; its error is
+                    // returned below.
+                    if tx.send(group).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    encoded = Err(e);
+                    break;
+                }
+            }
+        }
+        drop(tx);
+        let written = writer
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        #[cfg(test)]
+        let written = {
+            FIRST_FITS.with(|fits| fits.set(fits.get() + written.1));
+            written.0
+        };
+        written.and(encoded)
+    })
+}
+
 /// Write an encoded row group at its allocated offset and remember where its
 /// image-backed chunks landed, so their handles can be repointed on success.
 fn write_group(
@@ -5729,7 +5969,7 @@ fn first_fit(free: &mut Vec<(u64, u64)>, len: u64, min_offset: u64) -> Option<u6
 }
 
 // A test hook: how many times this thread's incremental checkpoint reused a
-// freed range for a row group.
+// freed range for a row group (`encode_then_write` adds its writer thread's).
 #[cfg(test)]
 thread_local! {
     static FIRST_FITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -9121,6 +9361,178 @@ mod tests {
     /// The sized-selection encoder must choose and write exactly what the
     /// trial encoder (build every candidate, keep the smallest, ties to the
     /// earlier candidate) chose; the corpus exercises every reachable tag.
+    /// A VARCHAR page's statistics from its dictionary equal the row fold
+    /// (`Zone::of_vector`) for every shape the strings can take: NULLs whose
+    /// `""` placeholder sits in the dictionary, real empty strings, all-NULL
+    /// and single-row chunks, prefixes and multi-byte UTF-8 (byte order),
+    /// low and high cardinality, partial chunks.
+    #[test]
+    fn varchar_page_zone_from_the_dictionary_matches_the_row_fold() {
+        let words = [
+            "", "a", "ab", "abc", "b", "z", "é", "zé", "ü", "A", " ", "ab\u{0}",
+        ];
+        let mut cases: Vec<Vec<Value>> = vec![
+            vec![],
+            vec![Value::Null],
+            vec![Value::Null, Value::Null],
+            vec![Value::Varchar(String::new())],
+            vec![Value::Null, Value::Varchar(String::new())],
+            vec![Value::Null, Value::Varchar("b".into()), Value::Null],
+        ];
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        for n in [1usize, 7, 8, 9, 100, 1023, 1024, 1025, 2047, 2048] {
+            for null_every in [0usize, 2, 3, 7] {
+                for distinct in [1usize, 3, words.len(), 5000] {
+                    cases.push(
+                        (0..n)
+                            .map(|i| {
+                                x ^= x << 13;
+                                x ^= x >> 7;
+                                x ^= x << 17;
+                                if null_every > 0 && i % null_every == 0 {
+                                    Value::Null
+                                } else if distinct <= words.len() {
+                                    Value::Varchar(words[(x as usize) % distinct].to_string())
+                                } else {
+                                    Value::Varchar(format!(
+                                        "{}{}",
+                                        words[(x as usize) % words.len()],
+                                        x % 5000
+                                    ))
+                                }
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+        for values in cases {
+            let v = vector_from_values(DataType::Varchar, &values);
+            let strs = varchar_payload(&v);
+            let (dict, codes) = dict_and_codes(&strs);
+            assert_eq!(
+                varchar_zone(&v, &dict, &codes),
+                crate::stats::Zone::of_vector(&v),
+                "{} rows",
+                values.len()
+            );
+            assert_eq!(encode_page(&v).stats, crate::stats::Zone::of_vector(&v));
+        }
+    }
+
+    /// The same equality on chunks shaped by UPDATE and DELETE (values
+    /// replaced, set to NULL and to `''`, rows removed): the page zone is
+    /// always derived from the chunk's current rows, never from the stored
+    /// (widened) zones.
+    #[test]
+    fn varchar_page_zone_matches_after_update_and_delete() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (k INTEGER, s VARCHAR);")
+            .unwrap();
+        let rows: Vec<String> = (0..5000)
+            .map(|i| format!("({i}, '{}')", ["m", "q", "c", "x"][i % 4].repeat(1 + i % 3)))
+            .collect();
+        db.execute(&format!("INSERT INTO t VALUES {};", rows.join(", ")))
+            .unwrap();
+        for sql in [
+            "UPDATE t SET s = 'zzz' WHERE k % 97 = 0;",
+            "UPDATE t SET s = NULL WHERE k % 13 = 0;",
+            "UPDATE t SET s = '' WHERE k % 31 = 0;",
+            "DELETE FROM t WHERE k % 7 = 0;",
+            "DELETE FROM t WHERE k BETWEEN 2100 AND 2300;",
+            "UPDATE t SET s = 'a' WHERE k = 4999;",
+        ] {
+            db.execute(sql).unwrap();
+            let t = db.table("t").unwrap();
+            let col = &t.columns[1];
+            assert!(col.num_chunks() >= 2, "the table spans several chunks");
+            for i in 0..col.num_chunks() {
+                let v = col.chunk(i).unwrap();
+                let strs = varchar_payload(&v);
+                let (dict, codes) = dict_and_codes(&strs);
+                assert_eq!(
+                    varchar_zone(&v, &dict, &codes),
+                    crate::stats::Zone::of_vector(&v),
+                    "{sql} chunk {i}"
+                );
+            }
+        }
+    }
+
+    /// The pipelined checkpoint loop writes in order and reports the first
+    /// error in serial order, as the serial loop does.
+    #[test]
+    fn encode_then_write_keeps_order_and_the_first_error() {
+        let fail = |msg: &str| PinkDbError::Execution(msg.to_string());
+        for overlap in [false, true] {
+            let mut seen = Vec::new();
+            encode_then_write(
+                (0..50).map(Ok),
+                |g| {
+                    seen.push(g);
+                    Ok(())
+                },
+                overlap,
+            )
+            .unwrap();
+            assert_eq!(seen, (0..50).collect::<Vec<_>>());
+
+            // An encode error after three groups: those three are written.
+            let mut seen = Vec::new();
+            let groups = (0..10).map(|g| if g == 3 { Err(fail("encode")) } else { Ok(g) });
+            let err = encode_then_write(
+                groups,
+                |g| {
+                    seen.push(g);
+                    Ok(())
+                },
+                overlap,
+            );
+            assert!(matches!(err, Err(PinkDbError::Execution(m)) if m == "encode"));
+            assert_eq!(seen, vec![0, 1, 2]);
+
+            // A write error stops the loop, and wins over a later encode error.
+            let groups = (0..10).map(|g| if g == 2 { Err(fail("encode")) } else { Ok(g) });
+            let err = encode_then_write(
+                groups,
+                |g| if g == 1 { Err(fail("write")) } else { Ok(()) },
+                overlap,
+            );
+            assert!(matches!(err, Err(PinkDbError::Execution(m)) if m == "write"));
+        }
+    }
+
+    /// The CPU's CRC32C instructions and the tables agree on every length and
+    /// alignment, chained updates included (the WAL streams its checksums).
+    #[test]
+    fn crc32c_instructions_match_the_tables() {
+        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let data: Vec<u8> = (0..70_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        for start in 0..9 {
+            for len in [0usize, 1, 3, 7, 8, 9, 15, 16, 17, 63, 64, 65, 1000, 65_536] {
+                let slice = &data[start..start + len];
+                assert_eq!(
+                    crc32c_update(!0, slice),
+                    crc32c_update_tables(!0, slice),
+                    "start {start} len {len}"
+                );
+                let (a, b) = slice.split_at(len / 3);
+                assert_eq!(
+                    crc32c_update(crc32c_update(!0, a), b),
+                    crc32c_update_tables(!0, slice)
+                );
+            }
+        }
+    }
+
     #[test]
     fn selection_matches_trial_encoding() {
         let mut seen = [false; 12];
