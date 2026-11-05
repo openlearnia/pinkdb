@@ -392,6 +392,14 @@ impl Reservation {
         }
     }
 
+    /// Whether this charges the decoded cache rather than the operator pool
+    /// (a test hook: per-entry accounting, which tests running alongside
+    /// cannot move).
+    #[cfg(test)]
+    pub(crate) fn is_cache(&self) -> bool {
+        matches!(self.pool, Pool::Cache)
+    }
+
     pub fn bytes(&self) -> usize {
         self.bytes
     }

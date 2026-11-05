@@ -283,6 +283,35 @@ fn concurrent_writes_while_a_large_cursor_streams_change_nothing_it_returns() {
     }));
 }
 
+/// The table a large cursor is streaming is dropped, and then recreated
+/// with other rows, by another connection while the cursor is on its
+/// producer: the cursor still returns its snapshot's rows.
+#[test]
+fn a_large_cursor_survives_its_table_being_dropped_and_recreated() {
+    let database = big_table(1_500_000);
+    let mut reader = database.connect();
+    let mut writer = database.connect();
+    let mut cursor = reader.query_cursor("SELECT a, s FROM t").unwrap();
+    let mut rows = Vec::new();
+    let chunk = cursor.next_chunk().unwrap().unwrap();
+    for i in 0..chunk.num_rows() {
+        rows.push(chunk.columns.iter().map(|c| c.get(i)).collect());
+    }
+    writer
+        .execute("DROP TABLE t; CREATE TABLE t (a BIGINT, s VARCHAR); INSERT INTO t VALUES (-1, 'other');")
+        .unwrap();
+    while let Some(chunk) = cursor.next_chunk().unwrap() {
+        for i in 0..chunk.num_rows() {
+            rows.push(chunk.columns.iter().map(|c| c.get(i)).collect());
+        }
+    }
+    assert_eq!(sorted_ints(&rows), (0..1_500_000).collect::<Vec<_>>());
+    assert_eq!(
+        selected(writer.execute("SELECT count(*) FROM t").unwrap()),
+        vec![vec![Value::Bigint(1)]]
+    );
+}
+
 /// A parallel filter/projection over a large table returns exactly the
 /// multiset the materialized query does, and a `UNION ALL` of two such scans
 /// both halves.

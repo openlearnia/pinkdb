@@ -899,6 +899,9 @@ type ScanFilterEntry = (usize, usize, std::sync::Arc<crate::stats::JoinFilter>);
 #[derive(Default)]
 pub(crate) struct DynamicFilters {
     frames: std::sync::Mutex<Vec<Vec<ScanFilterEntry>>>,
+    /// Top-N cut-offs (T3), `(scan node address, scan column, cut-off)`:
+    /// one-sided bounds that tighten while the scan runs.
+    thresholds: std::sync::Mutex<Vec<(usize, usize, std::sync::Arc<crate::stats::TopNThreshold>)>>,
 }
 
 impl DynamicFilters {
@@ -946,6 +949,47 @@ impl DynamicFilters {
 
     fn pop(&self, frame: usize) {
         self.frames.lock().expect("dynamic filters").truncate(frame);
+    }
+
+    /// Register a Top-N cut-off on column `col` of `plan`'s output, on every
+    /// scan that column passes through unchanged; returns the mark to
+    /// [`pop_thresholds`](Self::pop_thresholds) to.
+    pub(crate) fn push_threshold(
+        &self,
+        plan: &LogicalPlan,
+        col: usize,
+        threshold: &std::sync::Arc<crate::stats::TopNThreshold>,
+    ) -> usize {
+        let mut targets = Vec::new();
+        scan_targets(plan, col, &mut targets);
+        let mut thresholds = self.thresholds.lock().expect("dynamic filters");
+        let mark = thresholds.len();
+        for (node, column) in targets {
+            thresholds.push((node, column, threshold.clone()));
+        }
+        mark
+    }
+
+    pub(crate) fn pop_thresholds(&self, mark: usize) {
+        self.thresholds
+            .lock()
+            .expect("dynamic filters")
+            .truncate(mark);
+    }
+
+    /// The cut-offs registered for one scan: `(column, cut-off)` pairs.
+    fn thresholds_for_scan(
+        &self,
+        scan: &LogicalPlan,
+    ) -> Vec<(usize, std::sync::Arc<crate::stats::TopNThreshold>)> {
+        let addr = crate::plan::node_addr(scan);
+        self.thresholds
+            .lock()
+            .expect("dynamic filters")
+            .iter()
+            .filter(|(node, _, _)| *node == addr)
+            .map(|(_, col, threshold)| (*col, threshold.clone()))
+            .collect()
     }
 
     /// The filters registered for one scan: `(column, filter)` pairs.
@@ -3315,6 +3359,9 @@ pub(crate) struct StoreScan<'a> {
     keep: Option<Vec<usize>>,
     present: Option<Vec<bool>>,
     cache: bool,
+    /// Top-N cut-offs (T3) checked against each chunk's zone map before the
+    /// chunk is decoded.
+    thresholds: Vec<(usize, std::sync::Arc<crate::stats::TopNThreshold>)>,
 }
 
 impl<'a> StoreScan<'a> {
@@ -3329,7 +3376,19 @@ impl<'a> StoreScan<'a> {
             keep,
             present: cols.and_then(|cols| present_columns(t, cols)),
             cache,
+            thresholds: Vec::new(),
         }
+    }
+
+    fn with_thresholds(
+        mut self,
+        thresholds: Vec<(usize, std::sync::Arc<crate::stats::TopNThreshold>)>,
+    ) -> Self {
+        self.thresholds = thresholds
+            .into_iter()
+            .filter(|(col, _)| *col < self.table.num_cols())
+            .collect();
+        self
     }
 
     /// The columns the scan outputs, in table order.
@@ -3355,6 +3414,18 @@ impl<'a> StoreScan<'a> {
     /// Chunk `i` of the scan, or `None` when a column has fewer chunks.
     pub(crate) fn chunk(&self, i: usize) -> Result<Option<DataChunk>> {
         let index = self.chunk_index(i);
+        // A chunk no row of which can still make a running Top-N is skipped
+        // before it is decoded.
+        if !self.thresholds.is_empty() {
+            let rows = self.table.chunk_rows(index) as u64;
+            if !self
+                .thresholds
+                .iter()
+                .all(|(col, cut)| cut.may_qualify(self.table.zone(*col, index), rows))
+            {
+                return Ok(None);
+            }
+        }
         match (&self.present, self.cache) {
             (Some(present), true) => self.table.scan_chunk_projected(index, present),
             (Some(present), false) => self.table.scan_chunk_projected_uncached(index, present),
@@ -3364,15 +3435,14 @@ impl<'a> StoreScan<'a> {
     }
 
     /// Every chunk of the scan, in scan order: for a consumer that cannot work
-    /// from one chunk at a time.
+    /// from one chunk at a time. Read in parallel, so a cold chunk decodes on
+    /// the worker that reads it.
     pub(crate) fn materialize(&self) -> Result<Vec<DataChunk>> {
-        let mut chunks = Vec::with_capacity(self.len());
-        for i in 0..self.len() {
-            if let Some(chunk) = self.chunk(i)? {
-                chunks.push(chunk);
-            }
-        }
-        Ok(chunks)
+        Ok(self
+            .par_chunks(|_, chunk| Ok(chunk))?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     /// Fold every chunk of the scan, decoding each chunk when its turn comes
@@ -3463,12 +3533,10 @@ pub(crate) fn store_scan<'a>(cx: &'a Cx, plan: &LogicalPlan) -> Result<Option<St
     // scan admits into the decoded cache, which has its own budget and evicts
     // clean chunks under pressure. The uncached decode stays available for a
     // caller that must charge nothing (`Column::chunk_uncached`).
-    Ok(Some(StoreScan::new(
-        t,
-        cx.projections.for_scan(plan),
-        keep,
-        true,
-    )))
+    Ok(Some(
+        StoreScan::new(t, cx.projections.for_scan(plan), keep, true)
+            .with_thresholds(cx.dynamic.thresholds_for_scan(plan)),
+    ))
 }
 
 fn scan_chunks_of(t: &DataTable, keep: Option<&[usize]>) -> Result<Vec<DataChunk>> {
@@ -5520,33 +5588,64 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             // reorder columns, so the top-N runs under them and they project
             // its rows afterwards. Any other projection keeps the generic
             // path: it would evaluate an expression on fewer rows.
+            //
+            // One OFFSET below the LIMIT (`LIMIT n OFFSET k`) selects the
+            // first n + k rows and skips k: column projections and the skip
+            // commute, since neither changes a row.
             let mut over_sort: &LogicalPlan = input;
             let mut projections: Vec<&LogicalPlan> = Vec::new();
-            while let LogicalPlan::Project {
-                input: below,
-                exprs,
-                ..
-            } = over_sort
-                && exprs
-                    .iter()
-                    .all(|e| matches!(e, BoundExpr::Column { .. } | BoundExpr::Literal(_)))
-            {
-                projections.push(over_sort);
-                over_sort = below;
+            let mut skip: Option<usize> = None;
+            loop {
+                match over_sort {
+                    LogicalPlan::Project {
+                        input: below,
+                        exprs,
+                        ..
+                    } if exprs
+                        .iter()
+                        .all(|e| matches!(e, BoundExpr::Column { .. } | BoundExpr::Literal(_))) =>
+                    {
+                        projections.push(over_sort);
+                        over_sort = below;
+                    }
+                    LogicalPlan::Offset {
+                        input: below,
+                        offset,
+                    } if skip.is_none() => {
+                        skip = Some(*offset);
+                        over_sort = below;
+                    }
+                    _ => break,
+                }
             }
+            let skip = skip.unwrap_or(0);
+            let take = limit.saturating_add(skip);
             if let LogicalPlan::Sort {
                 input: sort_in,
                 keys,
             } = over_sort
             {
+                // A pipeline input streams into per-worker candidate sets
+                // instead of materializing every row first.
+                expr::prime(cx, keys.iter().map(|(e, _)| e))?;
+                let finish = |out: Output| -> Result<Output> {
+                    let mut out = truncate_output(skip_output(out, skip), *limit);
+                    for projection in projections.iter().rev() {
+                        out = project_output(cx, projection, out)?;
+                    }
+                    Ok(out)
+                };
+                if let Some(out) = pipeline::top_n_streamed(cx, sort_in, keys, take)? {
+                    return finish(out);
+                }
                 // Evaluate the sort input once: the top-N path and the
                 // fallback full sort below both consume these chunks
                 // (re-evaluating `sort_in` here would run the whole
                 // subtree twice).
                 let inner = eval(cx, sort_in)?;
                 let n: usize = inner.chunks.iter().map(|c| c.num_rows()).sum();
-                let chunks = if limit.saturating_mul(16) <= n {
-                    match top_n(cx, &inner.chunks, keys, *limit)? {
+                let chunks = if take.saturating_mul(16) <= n {
+                    match top_n(cx, &inner.chunks, keys, take)? {
                         Some(chunks) => chunks,
                         // No byte encoding: full sort with the legacy comparator.
                         None => sort(cx, &inner.chunks, keys)?,
@@ -5555,16 +5654,11 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     // Limit too large for top-N: full sort + truncate.
                     sort(cx, &inner.chunks, keys)?
                 };
-                let out = Output {
+                return finish(Output {
                     chunks,
                     names: inner.names,
                     types: inner.types,
-                };
-                let mut out = truncate_output(out, *limit);
-                for projection in projections.iter().rev() {
-                    out = project_output(cx, projection, out)?;
-                }
-                return Ok(out);
+                });
             }
             // Streaming short-circuit: over a plan the executor can stream
             // (scan/filter/project/UNION ALL), stop pulling the input as
@@ -8675,6 +8769,42 @@ fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, SortSpec)]) -> Result
     Ok(out)
 }
 
+/// The first `limit` rows of `chunks` under `keys`, in order, ties in input
+/// order: the top-N heaps when the limit is small against the rows, a full
+/// sort otherwise. What the `LIMIT` arm returns for the same chunks.
+fn select_top(
+    cx: &Cx,
+    chunks: &[DataChunk],
+    keys: &[(BoundExpr, SortSpec)],
+    limit: usize,
+) -> Result<Vec<DataChunk>> {
+    let n: usize = chunks.iter().map(DataChunk::num_rows).sum();
+    let sorted = if n > limit && limit.saturating_mul(16) <= n {
+        match top_n(cx, chunks, keys, limit)? {
+            Some(chunks) => chunks,
+            None => sort(cx, chunks, keys)?,
+        }
+    } else {
+        sort(cx, chunks, keys)?
+    };
+    let mut out = Vec::new();
+    let mut left = limit;
+    for chunk in sorted {
+        if left == 0 {
+            break;
+        }
+        if chunk.num_rows() <= left {
+            left -= chunk.num_rows();
+            out.push(chunk);
+        } else {
+            let sel: Vec<usize> = (0..left).collect();
+            out.push(chunk.gather(&sel));
+            left = 0;
+        }
+    }
+    Ok(out)
+}
+
 /// Apply a `Project` node to an already evaluated input (the few rows a
 /// top-N kept; see the `LIMIT` arm).
 fn project_output(cx: &Cx, projection: &LogicalPlan, input: Output) -> Result<Output> {
@@ -9917,10 +10047,45 @@ struct Stream<'p> {
     pending: std::collections::VecDeque<DataChunk>,
 }
 
-/// A started scan: materialized chunks, or a table function's push scan.
+/// A started scan: materialized chunks, a table function's push scan, or a
+/// store table read chunk by chunk.
 enum ScanChunks {
     Done(std::vec::IntoIter<DataChunk>),
     Source(SourceStream),
+    /// A store table, decoded one chunk per pull and dropped by the consumer
+    /// (the decoded cache keeps what its own budget allows), so a scan of a
+    /// large table never holds the table. Only owned indices live here: each
+    /// pull looks the table up in the context's store, so the stream never
+    /// borrows it (see [`StreamKind`]).
+    Store {
+        lookup: crate::storage::SchemaPath,
+        /// The chunks zone pruning left, in scan order.
+        keep: Vec<usize>,
+        next: usize,
+        emitted: usize,
+    },
+}
+
+impl ScanChunks {
+    /// A store-table scan read chunk by chunk, or `None` for any other scan
+    /// (a CTE, a time-travel read, an attached lake table), which
+    /// materializes as before.
+    fn store(cx: &Cx, plan: &LogicalPlan) -> Result<Option<ScanChunks>> {
+        let Some(scan) = store_scan(cx, plan)? else {
+            return Ok(None);
+        };
+        let LogicalPlan::Scan { ns, .. } = plan else {
+            return Ok(None);
+        };
+        let lookup = ns.clone().unwrap_or_else(|| cx.db.current_ns().clone());
+        let keep = (0..scan.len()).map(|i| scan.chunk_index(i)).collect();
+        Ok(Some(ScanChunks::Store {
+            lookup,
+            keep,
+            next: 0,
+            emitted: 0,
+        }))
+    }
 }
 
 /// A table function's push scan ([`TableSource::scan_stream`]) on a thread
@@ -10021,6 +10186,13 @@ impl SourceStream {
 /// while bounding the work wasted when the limit is reached mid-batch.
 const STREAM_BATCH: usize = 4;
 
+/// The cursor's contract (`exec::cursor`): a `StreamKind` may borrow only
+/// from the plan (`&'p LogicalPlan`, `&'p BoundExpr`, `&'p [DataType]`).
+/// Everything else it holds must be owned: never a `&Cx`, a `&PinkDb`, a
+/// `&DataTable` or anything else borrowed from the store, because a result
+/// cursor moves a running stream to another thread and another view of the
+/// same data (see `QueryCursor::start`). A scan that needs the store looks
+/// it up in the `Cx` each `next` is given.
 enum StreamKind<'p> {
     /// A scan, started on first pull so a limit satisfied by an earlier
     /// branch never touches the table (an attached lake would otherwise
@@ -10161,15 +10333,40 @@ impl<'p> Stream<'p> {
                     if chunks.is_none() {
                         *chunks = Some(match SourceStream::start(cx, plan)? {
                             Some(source) => ScanChunks::Source(source),
-                            // `eval` dispatches a plain scan to `scan_output`
-                            // and a table-function scan to
-                            // `table_function_output`.
-                            None => ScanChunks::Done(eval(cx, plan)?.chunks.into_iter()),
+                            None => match ScanChunks::store(cx, plan)? {
+                                Some(store) => store,
+                                // `eval` dispatches any other scan to
+                                // `scan_output` or `table_function_output`.
+                                None => ScanChunks::Done(eval(cx, plan)?.chunks.into_iter()),
+                            },
                         });
                     }
                     return match chunks.as_mut().expect("scan started") {
                         ScanChunks::Done(it) => Ok(it.next()),
                         ScanChunks::Source(source) => source.next(cx),
+                        ScanChunks::Store {
+                            lookup,
+                            keep,
+                            next,
+                            emitted,
+                        } => {
+                            let LogicalPlan::Scan { table, .. } = plan else {
+                                unreachable!("a store scan streams a Scan node");
+                            };
+                            while let Some(&index) = keep.get(*next) {
+                                *next += 1;
+                                cx.check_deadline()?;
+                                let t = cx.db.table_in(&*lookup, table)?;
+                                let scan =
+                                    StoreScan::new(t, cx.projections.for_scan(plan), None, true);
+                                if let Some(mut chunk) = scan.chunk(index)? {
+                                    chunk.ordinal = *emitted;
+                                    *emitted += 1;
+                                    return Ok(Some(chunk));
+                                }
+                            }
+                            Ok(None)
+                        }
                     };
                 }
                 StreamKind::SingleRow(emitted) => {
@@ -15042,6 +15239,78 @@ mod tests {
         // the permuted ids prove the tiebreak is input order, not id order.
         assert_eq!(topn[0][3], V::Integer(0));
         assert_eq!(topn[1][3], V::Integer(((60 * 37) % N) as i32));
+    }
+
+    /// The Top-N cut-off and zone-ordered visiting (T3) skip chunks by their
+    /// zone maps: on narrow zones (pruning bites), wide ones (it cannot),
+    /// NULLs first and last, and with OFFSET, every result is the full
+    /// sort's rows with ties in table order.
+    #[test]
+    fn top_n_cut_off_prunes_without_changing_results() {
+        const N: usize = 200_000;
+        let mut db = PinkDb::new();
+        db.execute(&format!(
+            "CREATE TABLE t AS SELECT i AS id, i - i % 1000 AS narrow, i % 50 AS wide, \
+             CASE WHEN i % 997 = 0 THEN NULL ELSE (i * 7) % 5000 END AS holes \
+             FROM range({N}) r(i);"
+        ))
+        .unwrap();
+        for (order, take, skip) in [
+            ("narrow DESC", 5, 0),
+            ("narrow", 5, 0),
+            ("narrow DESC", 5, 2000),
+            ("wide DESC", 7, 0),
+            ("wide", 3, 100),
+            ("holes DESC", 4, 0),
+            ("holes DESC NULLS FIRST", 4, 0),
+            ("holes NULLS FIRST", 250, 0),
+            ("holes", 6, 3),
+            ("narrow DESC, id DESC", 3, 0),
+        ] {
+            let limited = if skip == 0 {
+                format!("SELECT id FROM t ORDER BY {order} LIMIT {take};")
+            } else {
+                format!("SELECT id FROM t ORDER BY {order} LIMIT {take} OFFSET {skip};")
+            };
+            let got = select(&mut db, &limited);
+            let all = select(&mut db, &format!("SELECT id FROM t ORDER BY {order};"));
+            assert_eq!(got, all[skip..skip + take].to_vec(), "{limited}");
+        }
+    }
+
+    /// The streamed top-N compacts each worker's candidates many times over
+    /// heavy ties: the result must still be the full sort's rows, ties in
+    /// input order, for a limit inside one chunk and one spanning several.
+    #[test]
+    fn streamed_top_n_keeps_input_order_through_compaction() {
+        const N: usize = 60_000;
+        let mut db = PinkDb::new();
+        db.execute(&format!(
+            "CREATE TABLE t AS SELECT i AS id, i % 3 AS k, (i * 7919) % 1000 AS w \
+             FROM range({N}) r(i);"
+        ))
+        .unwrap();
+        for (limited, full, take) in [
+            (
+                "SELECT id FROM t ORDER BY k LIMIT 7;",
+                "SELECT id FROM t ORDER BY k;",
+                7,
+            ),
+            (
+                "SELECT id, w FROM t ORDER BY k DESC LIMIT 3000;",
+                "SELECT id, w FROM t ORDER BY k DESC;",
+                3000,
+            ),
+            (
+                "SELECT id FROM t ORDER BY w, k DESC LIMIT 150;",
+                "SELECT id FROM t ORDER BY w, k DESC;",
+                150,
+            ),
+        ] {
+            let got = select(&mut db, limited);
+            let all = select(&mut db, full);
+            assert_eq!(got, all[..take].to_vec(), "{limited}");
+        }
     }
 
     /// Top-N under projections (`ORDER BY` a column the SELECT list leaves

@@ -65,7 +65,7 @@ use super::group_table::{FlatPartial, FlatSink};
 use super::{
     CHUNKS_PER_TASK, Cx, MARK_NAME, MarkJoin, Output, ProbePlan, build_on_left, chunk_approx_bytes,
     derive_join_filters, estimate_rows, eval, expr, filter_pays, mark_probe_chunk, project_chunk,
-    project_mask, scan_targets, selection, swap_join_space,
+    project_mask, scan_targets, select_top, selection, swap_join_space,
 };
 use crate::morsel::{MorselCursor, MorselSource, ScanIo};
 use crate::plan::LogicalPlan;
@@ -1376,6 +1376,222 @@ where
         }
     }
     Ok(Some(items))
+}
+
+/// `ORDER BY … LIMIT limit` over a pipeline without materializing its rows:
+/// every worker keeps one candidate set of its best rows, compacted back to
+/// `limit` whenever it holds more than twice that (and more than
+/// [`TOP_N_COMPACT_ROWS`]), and the sets merge at the end. Memory is
+/// O(workers × max(limit, TOP_N_COMPACT_ROWS)) instead of the whole input.
+///
+/// Ties keep input order exactly as the full sort does: each candidate row
+/// carries its input position (morsel, chunk within the morsel, row) as a
+/// hidden last sort key, so a compaction never forgets which tied row came
+/// first. Returns the first `limit` rows, sorted; `Ok(None)` when the plan is
+/// not a pipeline this module compiles.
+pub(crate) fn top_n_streamed(
+    cx: &Cx,
+    plan: &LogicalPlan,
+    keys: &[(BoundExpr, crate::sql::ast::SortSpec)],
+    limit: usize,
+) -> Result<Option<Output>> {
+    if !cx.pipeline_execution() || limit == 0 {
+        return Ok(None);
+    }
+    // T3: a first sort key that is a plain column gets a running cut-off,
+    // registered on the scans that column comes from before they are built.
+    let cut = match keys.first() {
+        Some((BoundExpr::Column { index, .. }, spec)) => {
+            let cut = Arc::new(crate::stats::TopNThreshold::new(
+                spec.desc,
+                spec.nulls_first,
+            ));
+            let mark = cx.dynamic.push_threshold(plan, *index, &cut);
+            Some((*index, cut, CutMark { cx, mark }))
+        }
+        _ => None,
+    };
+    let Some(compiled) = compile(cx, plan)? else {
+        return Ok(None);
+    };
+    let steps = steps(cx, &compiled.builds, &compiled.ops)?;
+    let names = compiled.names.clone();
+    let types = compiled.types.clone();
+    let source = match &compiled.source {
+        // A materialized input is already in memory: select from it.
+        Source::Chunks(output) => {
+            let Some(chunks) = run_chunks(cx, &steps, &TopNPass, &output.chunks)? else {
+                return Ok(None);
+            };
+            let chunks = select_top(cx, &chunks, keys, limit)?;
+            return Ok(Some(Output {
+                chunks,
+                names,
+                types,
+            }));
+        }
+        Source::Streamed(source) => source.as_ref(),
+    };
+    // The hidden position column and the keys that end with it.
+    let position = types.len();
+    let mut keyed: Vec<(BoundExpr, crate::sql::ast::SortSpec)> = keys.to_vec();
+    keyed.push((
+        BoundExpr::Column {
+            index: position,
+            dtype: DataType::Bigint,
+        },
+        crate::sql::ast::SortSpec {
+            desc: false,
+            nulls_first: false,
+        },
+    ));
+    let workers = rayon::current_num_threads().max(1);
+    let stop = AtomicBool::new(false);
+    // The same in-flight accounting `run_streamed` reports for a scan.
+    let in_flight = AtomicU64::new(0);
+    let peak = AtomicU64::new(0);
+    let sets: Mutex<Vec<Vec<DataChunk>>> = Mutex::new(Vec::new());
+    let failed: Mutex<Option<PinkDbError>> = Mutex::new(None);
+    let fail = |error: PinkDbError| {
+        stop.store(true, Ordering::Relaxed);
+        failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(error);
+    };
+    (0..workers).into_par_iter().for_each(|_| {
+        let mut set: Vec<DataChunk> = Vec::new();
+        let mut held = 0usize;
+        while !stop.load(Ordering::Relaxed) {
+            let morsel = match source.next_morsel() {
+                Ok(Some(morsel)) => morsel,
+                Ok(None) => break,
+                Err(error) => return fail(error),
+            };
+            if morsel % CHECK_DEADLINE_EVERY as u64 == 0
+                && let Err(error) = cx.check_deadline()
+            {
+                return fail(error);
+            }
+            let now = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+            peak.fetch_max(now, Ordering::Relaxed);
+            let mut seq = 0u64;
+            let decoded = source.decode(morsel, &mut |chunk| {
+                let Some(out) = flow(cx, &steps, &TopNPass, &chunk)? else {
+                    return Err(PinkDbError::Execution(
+                        "internal: the top-N sink declined a chunk".to_string(),
+                    ));
+                };
+                for mut chunk in out {
+                    if chunk.num_rows() == 0 {
+                        continue;
+                    }
+                    // morsel (32 bits) | chunk in the morsel (21) | row (11).
+                    debug_assert!(chunk.num_rows() <= 1 << 11 && seq < 1 << 21);
+                    let base = (morsel << 32) | (seq << 11);
+                    seq += 1;
+                    let positions: Vec<i64> = (0..chunk.num_rows() as u64)
+                        .map(|row| (base | row) as i64)
+                        .collect();
+                    chunk.columns.push(Arc::new(crate::vector::Vector::from_raw(
+                        crate::vector::VectorData::Int64(positions),
+                        vec![u64::MAX; chunk.num_rows().div_ceil(64)],
+                    )));
+                    held += chunk.num_rows();
+                    set.push(chunk);
+                    if held > limit.saturating_mul(2).max(TOP_N_COMPACT_ROWS) {
+                        set = select_top(cx, &set, &keyed, limit)?;
+                        held = set.iter().map(DataChunk::num_rows).sum();
+                        // The set's last row is this worker's limit-th best:
+                        // nothing ranked after it can make the result.
+                        if let Some((key, cut, _)) = &cut
+                            && held >= limit
+                            && let Some(last) = set.last()
+                            && last.num_rows() > 0
+                        {
+                            cut.offer(&last.columns[*key].get(last.num_rows() - 1));
+                        }
+                    }
+                }
+                Ok(())
+            });
+            in_flight.fetch_sub(1, Ordering::Relaxed);
+            if let Err(error) = decoded {
+                return fail(error);
+            }
+        }
+        sets.lock().unwrap_or_else(|e| e.into_inner()).push(set);
+    });
+    if source.reports_io() {
+        let mut io = source.io();
+        io.in_flight_peak = peak.load(Ordering::Relaxed);
+        cx.db.record_scan(source.label(), io);
+    }
+    if let Some(error) = failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        return Err(error);
+    }
+    let candidates: Vec<DataChunk> = sets
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner())
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut chunks = select_top(cx, &candidates, &keyed, limit)?;
+    for chunk in &mut chunks {
+        chunk.columns.truncate(position);
+    }
+    Ok(Some(Output {
+        chunks,
+        names,
+        types,
+    }))
+}
+
+/// A worker compacts its Top-N candidates once they pass twice the limit or
+/// this many rows, whichever is more: a small limit would otherwise compact
+/// after every chunk, and a compaction is a sort-key pass of its own. Memory
+/// stays O(workers × max(limit, this)).
+const TOP_N_COMPACT_ROWS: usize = 64 * 1024;
+
+/// Pops a Top-N cut-off off the scans' registry when the top-N is done,
+/// whichever way it returns.
+struct CutMark<'a> {
+    cx: &'a Cx<'a>,
+    mark: usize,
+}
+
+impl Drop for CutMark<'_> {
+    fn drop(&mut self) {
+        self.cx.dynamic.pop_thresholds(self.mark);
+    }
+}
+
+/// The top-N pipeline's sink: each folded chunk as it is (the candidate sets
+/// charge nothing per chunk; they stay O(workers × limit)).
+struct TopNPass;
+
+impl Sink for TopNPass {
+    type Partial = DataChunk;
+
+    fn fold_into(
+        &self,
+        _cx: &Cx,
+        chunk: &DataChunk,
+        sel: Option<&[u32]>,
+    ) -> Result<Option<DataChunk>> {
+        Ok(Some(match sel {
+            None => chunk.clone(),
+            Some(sel) => chunk.take(sel),
+        }))
+    }
+
+    fn finish(self, items: Vec<DataChunk>, _cx: &Cx) -> Result<Vec<DataChunk>> {
+        Ok(items)
+    }
+
+    fn state(part: &DataChunk) -> usize {
+        chunk_approx_bytes(part)
+    }
 }
 
 /// The morsels one source chunk becomes after the operators above it: the chunk

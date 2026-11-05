@@ -334,7 +334,7 @@ The statistics feed two things:
   `ANTI`/`MARK` (which need the absence of a match) are excluded, and the
   filter is only a pre-filter: the join still decides every row.
 
-Statistics travel with the store: `.pink` footer version 2 stores the sketch and
+Statistics travel with the store: the `.pink` footer stores the sketch and
 the zone maps per table, so reopening a file does not rescan it. There is no
 legacy format — an older `.pink` fails with "written by an older pinkdb". One
 session switch exists, for debugging and for the differential tests:
@@ -666,13 +666,42 @@ SQL exactly like `execute` and also return one `QueryProfile` per statement:
 `parse` (shared by the statements of one call), `bind` (which also builds
 the plan), `optimize`, `execute` (including lease waits and conflict
 retries), `log` (WAL append + auto-checkpoint), `total`, plus `rows`,
-`columns`, the result `kind`, `in_transaction` and `engine_version`.
+`columns`, the result `kind`, `in_transaction`, `engine_version`, the
+process-wide `memory_limit` and the statement's peak memory-pool usage
+(protocol v16).
 Profiling only reads clocks: results and WAL bytes are identical, and plain
 `execute` is unchanged (measured equal before/after; profiling itself costs
 ~2% on tiny statements). The `Connection` path has no optimizer step, so its
 `optimize` is always 0. Remote clients enable it per connection
 (`Client::set_profiling`, protocol v10); C callers use
 `pinkdb_set_profiling` and the `pinkdb_result_profile_*` accessors.
+
+### Settings and the memory budget
+
+`SET name = value` (also `:=`), `RESET name` and `current_setting('name')` use
+DuckDB's setting names; an unknown name keeps DuckDB's `Catalog Error`. The
+process-wide memory budget (wave 136a):
+
+```sql
+SET memory_limit = '2GB';           -- alias max_memory; '-1' = no limit
+RESET memory_limit;                 -- back to the default
+SET decoded_cache_limit = '256MB';  -- cap clean decoded chunks; '0' = no cache
+RESET decoded_cache_limit;          -- whatever memory_limit leaves free
+SET wal_sync_method = 'fsync';      -- full (default) | fsync | fdatasync
+```
+
+The default limit is 80% of the memory the process may use — physical RAM, or
+the tighter cgroup limit a container imposed — and there is no limit on wasm32.
+Hash-join builds, hash aggregates, sorts and the other large operators reserve
+the chunks they hold against it and release them on drop; a statement that
+exceeds it fails with DuckDB's out-of-memory error. A profile reports the limit
+and the statement's peak (protocol v16). The decoded chunk cache is a cache,
+not a pin: clean chunks use the room the operators leave free and are evicted
+before an operator reservation fails; dirty chunks are never evicted. `SET
+wal_sync_method` picks the sync call a durable commit uses (`full` is
+`F_FULLFSYNC` on macOS and `fsync` elsewhere); it is per process and not
+persisted. Debugging switches: `SET join_filter_pushdown = false`, `SET
+pipeline_execution = false`, `SET hnsw_exact = true`, `SET hnsw_ef_search = 128`.
 
 ### Stored procedures
 
@@ -856,9 +885,9 @@ after it, `ROW` triggers row by row and `STATEMENT` triggers once.
   left behind, not the one the statement proposed.
 * Unsupported in v1, refused with a clear error: triggers on views and on
   attached lake tables (`REFERENCING` there), and `INSTEAD OF` / row-skipping
-  before-triggers. `.lake commit` of a writable attachment publishes a
-  trigger's data effects, but trigger definitions are session-local and are not
-  written into a lake.
+  before-triggers. Committing a writable lake database publishes a trigger's
+  data effects, but trigger definitions are session-local and are not written
+  into a lake.
 
 ### Databases
 
@@ -924,7 +953,10 @@ database). `CREATE`/`DROP DATABASE` are refused inside a transaction.
   data-modifying CTEs (`WITH x AS (INSERT/UPDATE/DELETE ... RETURNING ...)`);
   primary keys and unique constraints are enforced per statement (a duplicate
   or a NULL primary key aborts it whole), foreign keys stay declarations;
-  `CREATE/DROP DATABASE [IF [NOT] EXISTS]`
+  `CREATE/DROP DATABASE [IF [NOT] EXISTS]`; a database may instead be a
+  lake database — `CREATE DATABASE db (TYPE LAKE[, CATALOG '…', DATA '…'])` or
+  `ATTACH 'lake:…' AS db (READ_ONLY[, VERSION n])`, with `DETACH db` (see the
+  Network server section)
 - Utilities: `EXPLAIN <select>` (stable plan tree), `SHOW TABLES`,
   `SHOW DATABASES`, `DESCRIBE t` (DuckDB's column shape)
 - Types: `BOOLEAN`, `INTEGER` (i32), `BIGINT` (i64), `DOUBLE` (f64), `VARCHAR`,
@@ -1171,7 +1203,7 @@ fails `COMMIT` with a write conflict instead of logging an unreplayable
 record. `SyncPolicy::Sync` fsyncs every record; `Batch` fsyncs on
 `flush_wal`/checkpoint.
 
-The WAL format is `PINKWAL1` + version `5`: a generation number, a 16-byte
+The WAL format is `PINKWAL1` + version `9`: a generation number, a 16-byte
 `wal_id` (a fresh incarnation id per file creation, so a replaced file is
 never mistaken for the old one), a header CRC, two 24-byte commit slots and,
 per record, the payload's **touched set** — the tables its statements read or
@@ -1186,16 +1218,25 @@ calling out (see Embeddings). Rolled generations are named
 CRC make a torn or lost update harmless — and bumps the epoch in
 `<file>.pink.lock`, so another process can detect that something was
 published with one `pread` of the lock file's first 48 bytes (two epoch
-slots + CRC; wave 45m). Version-2 and version-3 WALs are accepted: a durable open upgrades
-them in place under the write lease (records are re-encoded with an unknown
-touched set), and older builds refuse a v4 WAL cleanly through the shared
-unsupported-version path. Encrypted WALs are `PINKENC1` container version 3
-(the record payload gained the touched set, so older builds must refuse the
-file; the publish block's CRC domain binds the version) — a fixed 88-byte
-plaintext publish block (`wal_id`, CRC, the dual slots) before the
-AEAD-sealed records; encrypted checkpoints stay container version 2, so
-`.pink` bytes are unchanged; version-1 files stay readable, and a keyed open
-rebuilds a WAL at the current version. A checkpoint
+slots + CRC; wave 45m). The version history is additive: v4 introduced the
+touched set, v5 the replay memo, v6 the persistent-secret snapshot, v7 the
+optional binary appender-chunk section (a flush of materialized rows commits
+without rendering and re-parsing SQL text), v8 writes that section column
+by column and replays it as the flush's own `INSERT … SELECT`, and v9 commits a
+streamed `CREATE TABLE … AS` by the row groups it already wrote into the store
+file (replay re-attaches the table to those bytes). Version-2 and
+version-3 WALs are accepted and upgraded in place under the write lease
+(records are re-encoded with an unknown touched set and an empty memo). A WAL
+an older build created in the current header layout (formats 4 up to the
+current one) that holds no records is recreated, like a torn creation; one
+that holds records is refused with the instruction to open the store with
+that version and run `CHECKPOINT` (or regenerate the store). Older builds
+refuse a v9 WAL cleanly through the shared unsupported-version path.
+Encrypted WAL and checkpoint containers are `PINKENC1` version `4`: the WAL
+carries a fixed 144-byte **authenticated** publish block (`wal_id`,
+generation and the dual commit slots) before the AEAD-sealed records, and
+container versions 1–3 stay readable (a keyed open rebuilds a WAL at the
+current version; checkpoints are re-sealed on their next save). A checkpoint
 writes `.pink.tmp` (fsynced, directory fsynced), renames the live WAL to
 `.wal.<gen>.roll` and starts a fresh WAL of generation `gen + 1`, publishes
 `.pink.tmp` with an atomic rename, then removes the roll. Recovery never
@@ -1277,7 +1318,7 @@ design): `BEGIN` captures the current position (WAL `wal_id`, generation,
 applied LSN, checkpoint identity) and takes no lease; statements run on that
 private snapshot, and `COMMIT` takes the lease only for `[refresh → validate
 → append → publish]`. Validation is table-granularity against the touched
-sets every WAL v5 record carries: a frame committed after the base that
+sets every WAL record carries: a frame committed after the base that
 touched a table the unit **read or wrote** is a typed `write conflict on
 table "db.name" (… lsn N …)` naming the object and the frame's LSN —
 read-set validation is also what prevents write skew across processes. The
@@ -1316,21 +1357,24 @@ containers; `open_durable_with_key` (and the multi-writer
 `Database::open_with_key`) apply the same key to the sidecar WAL, and a keyed
 store's checkpoints and snapshots encrypt as well.
 
-The container is a plaintext header (magic `PINKENC1`, container version 2,
-cipher id, KDF id + parameters + salt, a random per-container nonce prefix,
-and an AEAD key-check block) followed by AEAD-sealed payloads: 1 MiB
-segments for a checkpoint, one unit per WAL record (with the LSN bound into
-the AAD). The container is version 2 since wave 45m (version-1 files stay
-readable: checkpoints as-is, WALs rebuilt as v2 on the next keyed open);
-WAL containers additionally carry a fixed 88-byte plaintext publish block
-(`wal_id`, CRC and the dual commit slots the multi-process epoch refresh
-reads) before the records. The
-nonce is `prefix || counter`, counters are unique per container. A keyed open
-rebuilds the WAL with a fresh random prefix on **every** open (re-sealing the
+The container is a plaintext header (magic `PINKENC1`, container version 4,
+cipher id, KDF id + parameters + salt, a fresh 128-bit random nonce base, and
+an AEAD key-check block) followed by AEAD-sealed payloads: 1 MiB segments for
+a checkpoint, one unit per WAL record (with the LSN bound into the AAD).
+Containers written by versions 1–3 use the legacy 64-bit nonce prefix; they
+are read and rewritten in the current format (WALs at open, checkpoints on
+their next save). WAL containers additionally carry a fixed 144-byte
+**authenticated** publish block (`wal_id`, generation and the dual commit
+slots the multi-process epoch refresh reads) before the records; the pre-v4
+block was 88 bytes and plaintext. Each container mints a fresh `nonce_base`;
+every AEAD unit derives
+`truncate96(SHA-256("pinkdb-nonce-v4" || domain || nonce_base || counter))`,
+with counter 0 for the key-check and 1, 2, … per segment or record. A keyed
+open rebuilds the WAL with a fresh nonce base on **every** open (re-sealing the
 intact records atomically), not only after a torn-tail truncation: a file cut
 exactly at a record boundary — a `Batch`-mode tail lost at a boundary, or a
 restored older backup — is byte-identical to a cleanly shorter WAL, so only a
-fresh prefix guarantees the discarded record's `(key, nonce, AAD)` is never
+fresh nonce base guarantees the discarded record's `(key, nonce, AAD)` is never
 handed out again. Checkpoint containers end with a terminal zero-length
 segment, so a container cut at a segment boundary is rejected instead of
 loading a silently shorter database. Encrypted WAL records always frame
@@ -1692,14 +1736,20 @@ NULL/BOOL/I32/I64/F64/VARCHAR/DATE/TIMESTAMP; `DataType` tag byte), then
 { user }` answers `Login`; so neither side parses SQL just to count
 statements. A failing statement ends the batch with a single
 `Error { message }` instead; SQL errors arrive as `Error` frames and the
-connection stays open. The protocol version is **11** (v2 added the
-`BatchDone` terminator, v3 `LoadedExtension`, v4 `Checkpointed`, v5
-prepared statements, v6 DECIMAL/INTERVAL, v7 `AlteredTable`, v8 `Called`,
-v9 the `Login`/`LoggedIn` frames and the RBAC `Done` kinds, v10 query
-profiles: `SetProfiling { enabled }` → `ProfilingSet`, after which every
-statement's `Done` is followed by one `Profile` frame, v11 `VARIANT`: dtype
-tag 9 and value tag 10 carrying the binary value as `u32 length | bytes`, so a
-client that predates it reports an unknown tag instead of mis-reading one).
+connection stays open. The protocol version is **17** (v2 added the
+`BatchDone` terminator, v3 `LoadedExtension`, v4 `Checkpointed`, v5 prepared
+statements, v6 DECIMAL/INTERVAL, v7 `AlteredTable`, v8 `Called`, v9 the
+`Login`/`LoggedIn` frames and the RBAC `Done` kinds, v10 query profiles:
+`SetProfiling { enabled }` → `ProfilingSet`, after which every statement's
+`Done` is followed by one `Profile` frame, v11 `VARIANT`: dtype tag 9 and
+value tag 10 carrying the binary value as `u32 length | bytes`, v12 the
+`SetVariable` `Done` kind (tag 26), v13 `ARRAY` value tag 11 and dtype tag
+10, v14 the `CREATE`/`DROP SCHEMA` `Done` kinds (tags 27–28) and `Used`'s
+`name` as `db\0schema`, v15 `UUID` value tag 12 and dtype tag 11, v16 the
+`Profile` frame carries the process-wide memory limit and the statement's
+peak pool usage, v17 `HUGEINT`/`UHUGEINT` value tags 13/14 and dtype tags
+12/13 as 16-byte little-endian — a client that predates a tag reports an
+unknown tag instead of mis-reading one).
 
 The client (`pinkdb_server::Client`) reconstructs pinkdb's public
 `QueryResult`/`Value`/`DataType`, so the CLI renders remote results with the
@@ -1885,8 +1935,9 @@ the wave-99 cost hint) and the lake readers `lake_tables`, `lake_versions`,
 refuses DML/DDL, `COPY … TO`, `LOAD EXTENSION` and every other statement
 outside its query allowlist, and the lake tools refuse commit/maintenance,
 unless the session was started with `allow-writes`; with it, writes still run
-under the engine's grants and limits. (The engine has no `SET` statement, and
-`ATTACH` is a `.lake` command, not SQL.) The HTTP transport binds loopback
+under the engine's grants and limits. (The allowlist is queries only: `SET`,
+`ATTACH`/`DETACH`, transaction control and the RBAC statements are refused by
+default.) The HTTP transport binds loopback
 only and refuses any other address.
 
 **No external data either.** A `SELECT` is not harmless on its own: table
@@ -2475,8 +2526,11 @@ unchanged (1.004×) and Q6 is 1.7% slower (1.017×) against the base commit.
 
 The `pinkdb-ffi` crate exposes the engine over a small C ABI as
 `libpinkdb_ffi.dylib` / `libpinkdb_ffi.a` for foreign bindings (Python `cffi`,
-Go `cgo`, ...). It is the only crate in the repo that contains `unsafe`; the
-core stays zero-unsafe.
+Go `cgo`, ...). Its `unsafe` is the C boundary itself; the core keeps
+`unsafe` to a few narrow spots (CRC32C intrinsics, `flock` and the data-sync
+call, zeroing key bytes, validated UTF-8 views and the result cursor's
+pipeline hand-off), and `pinkdb-ext-loader` owns
+the extension loader's.
 
 ```sh
 cargo build --release -p pinkdb-ffi
@@ -2484,12 +2538,30 @@ make -C crates/pinkdb-ffi hello   # compiles and runs the C example
 ```
 
 - Header: `crates/pinkdb-ffi/include/pinkdb.h` (ABI 1.4; `pinkdb_abi_version()` returns `major << 16 | minor`, and a newer minor only adds calls).
+- ABI history, all additive: **1.1** the database/connection split (a database
+owning the store, connections owning sessions) with `pinkdb_config`, per-result
+errors and `pinkdb_interrupt`; **1.2** the chunk API and typed vectors; **1.3**
+the Arrow C Data Interface export; **1.4** the appender and typed parameter
+binding.
 - Handles (`pinkdb_open` for durable files, `pinkdb_open_memory`) are not
   thread-safe — use one per thread. Errors are thread-local
   (`pinkdb_last_error`), with a stable class in `pinkdb_last_error_class`.
 - `pinkdb_execute(handle, sql, len)` takes UTF-8 bytes (embedded NULs allowed)
   and returns a result that round-trips every statement kind and value type:
   typed `pink_value` by value, with VARCHAR text borrowed from the result.
+- **Appender (1.4):** `pinkdb_appender_create`, the `pinkdb_append_*` value
+  calls, `pinkdb_appender_end_row`, `pinkdb_appender_append_chunk` and
+  `pinkdb_appender_flush`/`close`/`destroy`/`error`. A flush is one statement
+  through the INSERT executor, so coercion, constraints, triggers, indexes, the
+  write lease and transaction visibility behave exactly as for `INSERT`;
+  auto-flush runs at 204,800 rows (100 chunks); a failed flush invalidates the
+  appender. On a durable store an autocommit flush logs the binary
+  appender-chunk section (WAL format 7/8) instead of SQL text; inside an open
+  transaction it still logs text.
+- **Typed parameters (1.4):** `pinkdb_bind_*` for bool, int32/int64, double,
+  varchar, date, timestamp, interval, hugeint/uhugeint, decimal, uuid and null,
+  plus `pinkdb_clear_bindings` and `pinkdb_execute_bound`; `pinkdb_bind_blob`
+  reports the engine's missing BLOB type.
 - Ownership: free results with `pinkdb_result_free`, handles with
   `pinkdb_close`; the full contract (pointers, threading, text lifetimes) is in
   the header.
@@ -2505,8 +2577,8 @@ runtime — no recompilation of the engine. This is the repo's second versioned
 C ABI: it is **separate** from the `pinkdb-ffi` embedding ABI above (which is
 host→foreign-binding); an extension is a foreign library→host callback ABI.
 
-- Header: `crates/pinkdb-ext-loader/include/pinkdb_extension.h` (ABI v1;
-  plain C99, no pinkdb libraries needed to build an extension).
+- Header: `crates/pinkdb-ext-loader/include/pinkdb_extension.h` (ABI v1,
+  current minor 6; plain C99, no pinkdb libraries needed to build an extension).
 - Loader crate: `pinkdb-ext-loader` (owns every `unsafe` here: `dlopen`,
   symbol lookup, callback invocation, result-text ownership).
 - Engine API: `PinkDb::load_extension(path) -> name`; the SQL statement is
@@ -3356,8 +3428,8 @@ to the old semantics (duckdiff 60/60 + the 1M battery 64/64).
   `flock` is assumed to be honored: unsupported locking fails closed unless
   the `LockMode::UnsafeSingleProcess` opt-out is used, network filesystems
   are not detected, and Windows is untested; `.open` replaces the whole
-  store; `.lake save`/`.lake open`/`.lake attach` are refused inside a
-  transaction and `.lake open` refuses to detach a durable session
+  store; `.lake save`/`.lake open` and SQL `ATTACH`/`DETACH` are refused
+  inside a transaction and `.lake open` refuses to detach a durable session
 - `CREATE DATABASE` / `DROP DATABASE` / `LOAD EXTENSION` are refused inside a
   transaction; the last database cannot be dropped; `DROP DATABASE` does not
   remove views from other databases (views are per-database and session-local)
@@ -3404,22 +3476,28 @@ to the old semantics (duckdiff 60/60 + the 1M battery 64/64).
   (limit 64)` — the AST is freed iteratively, so even a multi-megabyte chain
   cannot overflow the stack during rejection
 
-- Lake (`pinklake`/`s3` features): every `.lake save` writes a full snapshot of
-  every table; old versions and orphaned data files are never garbage
-  collected; the lake is reached through `.lake open` (whole store into memory)
-  or `.lake attach` (read-only, one version pinned, statistics-only: exact
-  COUNT/MIN/MAX from the catalog's blocks, anything else lazily decodes the
-  one table it touches — no time travel within a session; projections decode
-  only referenced columns, and row-group statistics prune chunks inside a
-  file); attached tables are session-local, not saved, and mutations over
-  them are refused (mutating SQL over them on a durable store is refused too,
-  since the log could not replay them); lake data files are plaintext unless
-  the lake is keyed; one S3 object is capped at 5 GiB (no multipart uploads)
-  and credentials come only from the environment or explicit config (no
-  profiles/IMDS/SSO); the lake writes and reads `.pink` (`PINKDB07`) data
-  files and supports `.lake attach … write` + `.lake commit`
-- Extensions repository: artifacts are verified by SHA-256 from the catalog
-  (no signatures yet), and only `darwin-arm64` builds are published
+- Lake (`pinklake`/`s3` features): a lake is a catalog database plus immutable
+  data files. `.lake save` writes a full snapshot of every table; `.lake open`
+  loads a lake into memory. A database may use local or lake storage (wave
+  124): `CREATE DATABASE … (TYPE LAKE[, CATALOG '…', DATA '…'])` and
+  `ATTACH 'lake:…' AS name (READ_ONLY[, VERSION n])` are persisted in the
+  store, with one writer per lake (a catalog lease) and time travel through
+  `AT (VERSION => n)` / `AT (TIMESTAMP => …)`. Maintenance
+  (`CALL ducklake_expire_snapshots(…)`, `CALL ducklake_cleanup_old_files(…)`,
+  `CALL ducklake_merge_adjacent_files(…)`, `.lake rewrite`) is explicit —
+  nothing is garbage-collected automatically. A read-only attachment is
+  query-only (statistics-only for exact `COUNT`/`MIN`/`MAX`; anything else
+  lazily decodes the table it touches); a writable lake database publishes
+  every committed unit as one lake version. Lake data files are plaintext
+  unless the lake is keyed; one S3 object is capped at 5 GiB (no multipart
+  uploads) and credentials come only from the environment or explicit config
+  (no profiles/IMDS/SSO). Data files are `.pink` (`PINKDB07`) or Parquet
+  (`parquetlake`), and the DuckLake SQL functions (`.lake changes`,
+  `.lake replicate`, `CALL ducklake_*`) read the same typed catalog
+- Extensions repository: artifacts are verified by SHA-256 and the catalog by
+  an Ed25519 signature (no unsigned fallback); `linux-x64`, `linux-arm64`,
+  `darwin-arm64` and `darwin-x64` builds are published (`windows-x64` is
+  refused by name)
 - Stored procedures (wave 44): a body's expressions bind at `CALL` time (the
   catalog may change between calls), so a mistyped condition is a call-time
   error, not a create-time one; a body cannot `USE`, `CHECKPOINT`,
@@ -3447,13 +3525,14 @@ compatibility tests are gone. Wave 136 replaced the trailer with two header
 slots (**`PINKDB07`**), so an append-only checkpoint can commit a new footer
 without rewriting the file.
 
-Post-v1 roadmap: C/Python/Go language bindings, Parquet reader (see
-PLAN.md). At-rest encryption shipped in wave 25 behind the `encryption`
-feature; the network server (`pinkdb-server`) shipped in wave 24; the lake
+The v1-era roadmap (see PLAN.md) listed C/Python/Go language bindings and a
+Parquet reader; both shipped, as did Arrow and Iceberg readers. At-rest
+encryption shipped in wave 25 behind the `encryption` feature; the network server (`pinkdb-server`) shipped in wave 24; the lake
 layer (`pink-lake`, CLI `pinklake` feature) shipped in wave 34 and gained S3/R2
 object storage in wave 36 (`s3` feature; `s3://` locations, conditional-write
 conflict detection), read-only `.lake attach` (statistics-only; exact
-`COUNT`/`MIN`/`MAX` from stored statistics; lazy materialize) in wave 45d and
+`COUNT`/`MIN`/`MAX` from stored statistics; lazy materialize; now SQL
+`ATTACH … (READ_ONLY)`) in wave 45d and
 projection pushdown for attached scans in wave 45e; `.pink` v4 (wave 45h)
 brought single-file saves to roughly the size of a Parquet lake, and wave 45j
 added LZ frames (tag 8) that shrink text corpora 3–5×. Wave 45k gave attach
@@ -3464,7 +3543,8 @@ widths > 56). Durable `.pink` databases became multi-process in wave 45m — a
 per-operation write lease, lock-free epoch refresh, WAL v3 and encrypted
 container v2 — with stage 5 (optimistic disjoint-table commits) deferred and
 the stability-hardening round shipped as wave 45n (chaos soak, lock-file
-identity, WAL fuzz). Authentication and TLS are deferred.
+identity, WAL fuzz). Authentication and TLS shipped in waves 48 and 46. The
+current formats are `PINKDB07` and WAL v9 (see Persistence).
 
 ## Development
 
