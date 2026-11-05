@@ -1,6 +1,6 @@
 # pinkdb Go binding (`bindings/go`)
 
-A thin [cgo](https://pkg.go.dev/cmd/cgo) wrapper over pinkdb's C ABI v1
+A thin [cgo](https://pkg.go.dev/cmd/cgo) wrapper over pinkdb's C ABI v1 (1.4)
 (`crates/pinkdb-ffi`, header `crates/pinkdb-ffi/include/pinkdb.h`). No
 third-party dependencies — just the Go standard library.
 

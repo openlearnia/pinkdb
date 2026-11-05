@@ -140,10 +140,17 @@ DuckDB.
 `SET`/`SET SESSION`/`SET GLOBAL`/`SET LOCAL`, `RESET`, `RESET ALL` and
 `current_setting('…')`.
 
-Implemented: `threads` (the machine's core count by default; a statement runs
-on one thread, so the value is reported and unused), `default_null_order`,
-`default_order`, `memory_limit` (stored, not enforced — pinkdb has no
-configured cap).
+Implemented: `threads` (the machine's core count by default; the value is
+reported and unused — execution uses the process's rayon pool, size it with
+`RAYON_NUM_THREADS`), `default_null_order`,
+`default_order`, `memory_limit`/`max_memory` (enforced process-wide, wave
+136a: the default is 80% of the memory the process may use — physical RAM, or
+a tighter cgroup limit; `'-1'` means no limit, `RESET` restores the default,
+and an operator that would pass the limit fails with DuckDB's `Out of Memory
+Error: failed to allocate data of size …`), `decoded_cache_limit` (a
+process-wide cap on clean decoded chunks; `'0'` keeps no cache, `RESET`
+returns to whatever room `memory_limit` leaves free) and `wal_sync_method`
+(`full`, `fsync` or `fdatasync`; per process, on durable stores).
 
 Accepted and stored with no engine effect: every other name
 `duckdb_settings()` returns (the display and tuning knobs, `timezone`,
@@ -152,16 +159,19 @@ Accepted and stored with no engine effect: every other name
 (`profile_output`, `profiling_mode`) and the knobs it registers only in debug
 and extension builds (`debug_*`, `force_variant_shredding`,
 `enable_caching_operators`, … — the corpus files that set them are written for
-those builds). Three more names are pinkdb's own switches, not DuckDB's:
-`join_filter_pushdown`, `hnsw_exact` and `hnsw_ef_search`. A name outside the
+those builds). Six more names are pinkdb's own switches, not DuckDB's:
+`decoded_cache_limit`, `hnsw_ef_search`, `hnsw_exact`, `join_filter_pushdown`,
+`pipeline_execution` and `wal_sync_method`. A name outside the
 list keeps DuckDB's `Catalog Error: unrecognized configuration parameter
 "…"`, and so does
 `current_setting` of one. Settings are separate from `SET VARIABLE` variables
 (`$x`, `getvariable`), which are unchanged.
 
-Every scope spelling is accepted and means the session: `SET LOCAL`/`SESSION`
-of a global-only setting (`threads`, `memory_limit`) is an error in DuckDB
+Every scope spelling is accepted: `SET LOCAL`/`SESSION` of a global-only
+setting (`threads`, `memory_limit`, `max_memory`) is an error in DuckDB
 (`cannot be set locally`), and a session value there is accepted here.
+`threads` is session-wide, but `memory_limit`/`max_memory` still apply
+process-wide whatever the scope spelling: any `SET` of it moves the pool.
 
 `default_null_order` accepts `NULLS_FIRST`, `NULLS_LAST`,
 `NULLS_FIRST_ON_ASC_LAST_ON_DESC`, `NULLS_LAST_ON_ASC_FIRST_ON_DESC` and
@@ -222,7 +232,7 @@ not planned to change.
 | `'{"a":1}'::VARIANT` | the **object** (VARCHAR→VARIANT parses JSON, which gives the type a literal form the parser/WAL/prepared statements carry) | the **string**; `json(...)::VARIANT` is needed for an object |
 | `1.e2`, `5.` (a point with no digits after it) | parse error, `a number with an exponent needs digits after the dot (write 1.0e2)` | `5.` is `DECIMAL(1,0)`, `1.e2` is DOUBLE |
 | an unaliased decimal literal written `1_000.5` or `00.5` | the column is named from the folded value (`1000.5`, `0.5`); the written *scale* survives, so `1.50` stays `1.50` | the source text (`1_000.5`, `00.5`) |
-| `SET LOCAL`/`SET SESSION` of a global-only setting (`threads`, `memory_limit`) | accepted, session-wide | `Catalog Error: option "threads" cannot be set locally` |
+| `SET LOCAL`/`SET SESSION` of a global-only setting (`threads`, `memory_limit`) | accepted: `threads` is session-wide, `memory_limit`/`max_memory` still apply process-wide | `Catalog Error: option "threads" cannot be set locally` |
 | `ATTACH 'x.db' AS x` | Catalog Error naming `:memory:` and lakes as the supported forms | attaches `x.db` as its own durable database |
 | `[1.5, 2.5]` (an ARRAY of decimal literals) | `DOUBLE[2]`: the fixed-size `ARRAY` has no DECIMAL element kind, so a decimal element types as DOUBLE (wave 126a) | `DECIMAL(2,1)[2]`; a column of that ARRAY must be `DOUBLE[]` in pinkdb |
 | `v.js.a` (database-qualified three-part column vs a VARIANT chain) | `database "v" not found` — wave 94 keeps `db.table.column` authoritative; write `js.a['b']` for nested VARIANT access | a VARIANT path |

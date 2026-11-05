@@ -20,6 +20,78 @@ at SF10), so the step waits on its branch for the faster decoders.
 
 ## 2026-11-04
 
+### WAL format 8 — appender flushes are logged column by column ✅
+
+A durable appender flush no longer records its values one tagged row at a
+time: the chunk the appender built goes into the log as typed columns, and
+replay rebuilds the vectors instead of re-reading a value stream.
+
+- **The record** shares the flush's chunk instead of copying it, and writes
+  that chunk's validity words plus each column's typed payload. VARIANT and
+  ARRAY columns fall back to tagged values, because they have no column-wise
+  encoding yet.
+- **Replay** rebuilds the chunk's vectors and runs them through the flush's
+  `INSERT … SELECT` path; no SQL is rendered or parsed to log an appender
+  flush.
+- **Speed**, TPC-H SF 1 `lineitem` at 204,800 rows per flush, interleaved
+  A/B against the previous build: row-at-a-time inserts 8.59 s → 6.79 s
+  (699k → 883k rows/s), chunk-wise appends 6.68 s → 4.91 s (899k → 1.22M
+  rows/s).
+- **Compatibility**: a v2 or v3 WAL is upgraded in place; a header-only v4–v7
+  WAL is recreated; a v4–v7 WAL that holds records is refused ("open the store
+  with that version and run CHECKPOINT, or regenerate"), and an older build
+  refuses a v8 WAL cleanly.
+
+### C ABI 1.4 — an appender and typed parameter binding ✅
+
+The C API gains a bulk appender and typed statement parameters. Version 1.4 is
+additive over 1.3, so a client built against an earlier 1.x header keeps
+working.
+
+- **Appender**: `pinkdb_appender_create`, the typed `append_*` calls,
+  `end_row`, `append_chunk`, `flush`, `close`, `destroy` and `error`.
+- **Typed binding**: `pinkdb_bind_*` with `pinkdb_clear_bindings` and
+  `pinkdb_execute_bound`.
+- **One write path**: a flush is one statement through the `INSERT` executor,
+  so assignment coercion, constraints, triggers, indexes, the store's lease and
+  visibility behave exactly as for an `INSERT`; the appender auto-flushes at
+  204,800 rows, and a failed flush invalidates it (the rejected batch is not
+  retried). An autocommit durable flush records the chunk section (WAL v7/v8);
+  inside an open transaction it still logs text.
+- The **Go driver** now binds typed parameters through 1.4.
+
+### Top-N under projections — `ORDER BY … LIMIT` stops full-sorting ✅
+
+`ORDER BY … LIMIT n` now runs a top-N operator when a projection sits between
+the `LIMIT` and the sort and that projection only selects columns and
+literals, so the sort never materializes the whole input.
+
+- **Plan**: `Limit → Project → Sort` becomes top-N when the projection chain
+  reads only column references and literals; any other projection (an
+  expression, a cast, an aggregate) keeps the generic path, results unchanged.
+- **Speed**, TPC-H: SF 1 `ORDER BY l_shipdate DESC LIMIT 3` 218 → 12 ms,
+  SF 10 3,748 → 132 ms.
+- **Equal results**: a non-selected sort key, ties, an alias, a NULL key, an
+  expression key, `OFFSET` and `DISTINCT` each return what the full sort
+  returned and are pinned by tests. `QUALIFY`'s top-3-per-key plan is
+  unchanged.
+
+### Streaming bulk load, step 1 — row groups written ahead of the checkpoint ✅
+
+A bulk load can now write its row groups before any checkpoint has placed
+them, so the load no longer waits for a checkpoint to own its space.
+
+- **`PinkDb::write_pending_group`** writes a chunk as one row group past the
+  store's logical end (`PendingLoad`) or into a staging file
+  `<image>.load`.
+- **Checkpoint**: it allocates past the pending groups and references them in
+  place. The first checkpoint publishes the staging file as the image when
+  every table that has rows is pending, in image order; otherwise it writes a
+  fresh image, copies those rows through and removes the staging file.
+- **Witness**: `CkptMeta` identifies the image by `(dev, ino)` plus the
+  header slot's CRC32C instead of its length and mtime.
+- There is **no SQL caller yet**; the load-path steps (S0, S2) follow.
+
 ### Wave 136 (step c-2) — the decoded cache lives inside `memory_limit` ✅
 
 Decoded chunks are a cache, not a pin: they use whatever room `memory_limit`
