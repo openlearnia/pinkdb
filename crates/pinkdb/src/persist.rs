@@ -13394,7 +13394,7 @@ mod tests {
         assert_eq!(table.columns[1].decoded_chunks(), 0);
         assert_eq!(table.columns[2].decoded_chunks(), 0);
         assert!(
-            crate::memory::cache_used() > 0,
+            table.columns[0].charged().0 > 0,
             "the scan's chunks are cache entries"
         );
         let _ = std::fs::remove_file(&path);
@@ -13462,18 +13462,19 @@ mod tests {
         wide_db(5000).save(p.to_str().unwrap()).unwrap();
         let mut db = PinkDb::open(p.to_str().unwrap()).unwrap();
         let table = db.table("w").unwrap();
-        let before = crate::memory::cache_used();
         for i in 0..table.num_chunks() {
             assert!(table.scan_chunk_uncached(i).unwrap().is_some());
         }
+        // No payload on any handle is what keeps the cache uncharged; the
+        // process-wide counter itself moves with tests running alongside.
         for column in &table.columns {
             assert_eq!(
                 column.decoded_chunks(),
                 0,
                 "an uncached decode leaves no payload on the handle"
             );
+            assert_eq!(column.decodes(), table.num_chunks(), "one decode per chunk");
         }
-        assert_eq!(crate::memory::cache_used(), before);
         // One MiB of cache: the first chunks fit, the rest are decoded for the
         // scan alone. Either way the query answers, and the cache stays within
         // its budget.
@@ -13482,7 +13483,14 @@ mod tests {
             select(&mut db, "SELECT count(*) FROM w"),
             vec![vec![Value::Bigint(5000)]]
         );
-        assert!(crate::memory::cache_used() <= crate::memory::cache_limit());
+        let charged: usize = db
+            .table("w")
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| c.charged().0)
+            .sum();
+        assert!(charged <= 1024 * 1024, "the cache kept {charged} bytes");
         crate::memory::reset_cache_limit();
         let _ = std::fs::remove_file(&p);
     }
@@ -13495,11 +13503,14 @@ mod tests {
         crate::memory::reset_cache_limit();
         crate::memory::set_cache_limit(1);
         let db = wide_db(5000);
-        let used = crate::memory::used();
         let table = db.table("w").unwrap();
         let chunk = table.columns[0].chunk(0).unwrap();
-        assert_eq!(crate::memory::cache_used(), 0);
-        assert!(crate::memory::used() >= used);
+        let (cache, operator) = table.columns[0].charged();
+        assert_eq!(cache, 0, "a dirty chunk is not a cache entry");
+        assert!(
+            operator > 0,
+            "a dirty chunk is charged to the operator pool"
+        );
         drop(chunk);
         crate::memory::reset_cache_limit();
     }

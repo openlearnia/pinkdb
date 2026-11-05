@@ -3406,15 +3406,14 @@ impl<'a> StoreScan<'a> {
     }
 
     /// Every chunk of the scan, in scan order: for a consumer that cannot work
-    /// from one chunk at a time.
+    /// from one chunk at a time. Read in parallel, so a cold chunk decodes on
+    /// the worker that reads it.
     pub(crate) fn materialize(&self) -> Result<Vec<DataChunk>> {
-        let mut chunks = Vec::with_capacity(self.len());
-        for i in 0..self.len() {
-            if let Some(chunk) = self.chunk(i)? {
-                chunks.push(chunk);
-            }
-        }
-        Ok(chunks)
+        Ok(self
+            .par_chunks(|_, chunk| Ok(chunk))?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     /// Fold every chunk of the scan, decoding each chunk when its turn comes
