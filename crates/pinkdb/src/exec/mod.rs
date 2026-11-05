@@ -4299,6 +4299,13 @@ fn count_selected(cx: &Cx, plan: &LogicalPlan) -> Result<Option<i64>> {
         return Ok(None);
     };
     expr::prime(cx, [predicate])?;
+    // T4: a QUALIFY row_number() <= N keeps N rows per partition; count those
+    // instead of numbering every row (the Filter arm's route, here for COUNT(*)).
+    if let Some(shape) = top_n::grouped_shape(plan)
+        && let Some(kept) = pipeline::grouped_top_n(cx, &shape)?
+    {
+        return Ok(Some(count_in(cx, predicate, &kept.chunks)?));
+    }
     // A store table is counted chunk by chunk: `eval` would decode the whole
     // table before the count starts.
     if let Some(scan) = store_scan(cx, input)? {
@@ -4336,8 +4343,11 @@ fn probe_through_selection(
     plan: &LogicalPlan,
     keys: &[BoundExpr],
 ) -> Result<(Output, Option<Vec<selection::Selection>>)> {
+    // A grouped Top-N (T4) keeps few rows: the Filter arm beats a selection
+    // over every numbered row.
     if !keys.iter().all(|k| matches!(k, BoundExpr::Column { .. }))
         || !matches!(plan, LogicalPlan::Filter { .. })
+        || top_n::grouped_shape(plan).is_some()
     {
         return eval(cx, plan).map(|out| (out, None));
     }
@@ -14965,6 +14975,40 @@ mod tests {
             let got = select(&mut db, &limited);
             let all = select(&mut db, &format!("SELECT id FROM t ORDER BY {order};"));
             assert_eq!(got, all[skip..skip + take].to_vec(), "{limited}");
+        }
+    }
+
+    /// T4: the shortcuts that read a Filter's input directly (COUNT(*) over a
+    /// filter, a join probe through the filter's selection) must still run a
+    /// QUALIFY row_number() <= N as a grouped Top-N, with the window path's
+    /// answers.
+    #[test]
+    fn grouped_top_n_fires_under_count_and_join_shortcuts() {
+        use std::sync::atomic::Ordering;
+        let mut db = PinkDb::new();
+        db.execute(
+            "CREATE TABLE t AS SELECT i AS id, i % 50 AS p, (i * 7919) % 101 AS o \
+             FROM range(20000) r(i); \
+             CREATE TABLE u AS SELECT i AS id FROM range(0, 20000, 3) r(i);",
+        )
+        .unwrap();
+        let window = "row_number() OVER (PARTITION BY p ORDER BY o DESC)";
+        let reference = format!("CAST({window} AS DOUBLE)");
+        let queries = [
+            "SELECT count(*) FROM (SELECT * FROM t QUALIFY {w} <= 4)",
+            "SELECT count(*), sum(x.id) FROM (SELECT * FROM t QUALIFY {w} <= 4) x \
+             JOIN u ON x.id = u.id",
+            "SELECT count(*), sum(x.id) FROM u JOIN (SELECT * FROM t QUALIFY {w} = 1) x \
+             ON u.id = x.id",
+        ];
+        for q in queries {
+            let before = top_n::GROUPED_RUNS.load(Ordering::Relaxed);
+            let got = select(&mut db, &q.replace("{w}", window));
+            assert!(
+                top_n::GROUPED_RUNS.load(Ordering::Relaxed) > before,
+                "not rewritten: {q}"
+            );
+            assert_eq!(got, select(&mut db, &q.replace("{w}", &reference)), "{q}");
         }
     }
 

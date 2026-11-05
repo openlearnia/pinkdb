@@ -810,11 +810,19 @@ pub(crate) fn grouped_chunks<'a>(
 /// (key, position) order, and return them in input order with the row number
 /// appended: the rows and order the window path then the filter's
 /// `rn <= N` conjunct would produce.
+/// Grouped Top-N runs so far, so tests can tell the rewrite fired (equal
+/// results alone cannot: the window path returns the same rows).
+#[cfg(test)]
+pub(crate) static GROUPED_RUNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) fn grouped_finish(
     cx: &Cx,
     types: &[DataType],
     workers: Vec<GroupedWorker<'_>>,
 ) -> Result<Vec<DataChunk>> {
+    #[cfg(test)]
+    GROUPED_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let held: usize = workers.iter().map(|w| chunks_approx_bytes(&w.rows)).sum();
     let _held = cx.budget.memory().reserve(held)?;
     let mut by_shard: Vec<Vec<(u32, Partitions<u32>)>> = (0..SHARDS).map(|_| Vec::new()).collect();
