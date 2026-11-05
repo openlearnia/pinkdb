@@ -3,7 +3,7 @@
 //! For `<path>.pink` the log is a sidecar `<path>.pink.wal`:
 //!
 //! ```text
-//! header:  magic "PINKWAL1" (8 bytes) + format version u32 (=7)
+//! header:  magic "PINKWAL1" (8 bytes) + format version u32 (=9)
 //!          + generation u64 + wal_id [16] + crc32(0..36) u32
 //!          + commit slot A (24 bytes) + commit slot B (24 bytes)
 //!          + reserved zero u32×2
@@ -29,11 +29,17 @@
 //! snapshot. Version 7 (wave 112d) adds the optional binary appender-chunk
 //! section, so a flush of materialized rows commits without rendering and
 //! re-parsing SQL text; version 8 writes that section column by column and
-//! replays it as the flush's own `INSERT … SELECT`. Version 2/3 WALs are accepted and upgraded in place
-//! under the write lease (records are re-encoded with unknown sets and an
-//! empty memo); older builds refuse version 8 cleanly through the
-//! `BadVersion` path before reading any record. Encrypted **WAL** containers are version 3; encrypted checkpoints
-//! stay at container version 2, so `.pink` bytes are unchanged by this wave.
+//! replays it as the flush's own `INSERT … SELECT`; version 9 (the streaming
+//! load) commits a streamed `CREATE TABLE … AS` by the row groups it wrote
+//! into the store file. Version 2/3 WALs are accepted and upgraded in place under the write lease (records are
+//! re-encoded with unknown sets and an empty memo); a WAL an older build
+//! created in the current header layout (formats 4 up to the current one) that
+//! holds no records is recreated, while one with records is refused with the
+//! instruction to open the store with that version and CHECKPOINT; older
+//! builds refuse version 9 cleanly through the `BadVersion` path before
+//! reading any record. Encrypted **WAL** and checkpoint containers are version
+//! 4 (the WAL's publish block is authenticated); an older container is rebuilt
+//! at open / re-sealed on its next save.
 //!
 //! # Multi-process access (wave 45m) and optimistic commits (wave 45o)
 //!

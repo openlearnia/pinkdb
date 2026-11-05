@@ -41,6 +41,26 @@ and decimal arithmetic on i128 vectors. Next structural steps, in payoff
 order: late materialization of join payload columns, dictionary vectors for
 low-cardinality strings (Q1's grouping), then push-based pipelines (123b).
 
+## Status, 2026-11-04
+
+After the waves since then (136, 141 and 142), the parts of this review marked
+"today" have moved:
+
+- **§6's "decodes every column chunk into memory at open" no longer holds.**
+  Since wave 136c-1, opening a store reads the two header slots and the
+  footer, not the data: a chunk's bytes are read and CRC-checked on first use,
+  and the decoded cache those reads populate is charged to `memory_limit`
+  (136c-2). The dated comparison in §6 is kept as the pre-136c baseline.
+- **`memory_limit` is enforced** process-wide since 136a (the default is 80%
+  of the memory the process may use, physical RAM or a tighter cgroup limit;
+  an operator past it fails with DuckDB's out-of-memory wording). Operators
+  still do not spill (row 124), so a statement over the limit fails rather
+  than degrading.
+- **Joins and decimals:** 141a/141b improved join output assembly and 142 the
+  decimal arithmetic, the two costs the 2026-10-30 profile named.
+- **Top-N (T1)** now looks through column-only projections for
+  `ORDER BY … LIMIT`, instead of materializing the projected columns first.
+
 ## Is C++ faster than Rust?
 
 Not in any way that matters here. Both compile through LLVM to native code
@@ -155,11 +175,13 @@ Single-table scans are now within 3.5–5×. Joins and large aggregations are
 
 ### 6. Storage: decode-everything-on-open vs buffer-managed compressed row groups
 
-- **pinkdb:** the `.pink` format compresses well (bitpack, RLE, delta, ALP,
-  dictionary, FSST, a second LZ4 stage; see the persist.rs header), but
-  `load_table_data` **decodes every column chunk into memory at open**, and
-  execution sees only decompressed flat vectors. Memory equals the decoded
-  dataset; opening a large store costs a full decode.
+- **pinkdb (before 136c):** the `.pink` format compresses well (bitpack, RLE,
+  delta, ALP, dictionary, FSST, a second LZ4 stage; see the persist.rs header),
+  but `load_table_data` **decoded every column chunk into memory at open**, and
+  execution saw only decompressed flat vectors. Memory equalled the decoded
+  dataset; opening a large store cost a full decode. Since wave 136c-1 open
+  reads the header slots and footer and a chunk is decoded on first use (see
+  the 2026-11-04 status above).
 - **DuckDB:** blocks are loaded on demand by the buffer manager
   (`storage/buffer_manager.cpp`), row groups are 122,880 rows
   (`DEFAULT_ROW_GROUP_SIZE`), segments stay compressed until scanned and are

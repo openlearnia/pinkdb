@@ -630,8 +630,9 @@ fn dtype_from_tag(b: u8) -> Result<DataType> {
         11 => Ok(DataType::Uuid),
         12 => Ok(DataType::Hugeint),
         13 => Ok(DataType::Uhugeint),
-        // A tag this build does not know comes from a newer writer (the
-        // format version stays 6, so there is no version to point at).
+        // A tag this build does not know comes from a newer writer (dtype
+        // tags are additive and carry no version of their own, so there is no
+        // version to point at).
         _ => Err(PinkDbError::Execution(format!(
             "unsupported .pink dtype tag {b}; upgrade pinkdb"
         ))),
