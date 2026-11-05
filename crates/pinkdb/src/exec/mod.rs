@@ -3588,7 +3588,69 @@ pub(crate) fn lake_source(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Box<dyn 
         None => lake.scan_source(lookup.db(), table, columns, &prunes)?,
         Some(at) => lake.scan_source_at(lookup.db(), table, *at, columns, &prunes)?,
     };
+    // A running Top-N's cut-off skips morsels by their statistics (T3).
+    let cuts = cx.dynamic.thresholds_for_scan(plan);
+    if !cuts.is_empty() {
+        return Ok(Some(Box::new(CutSource {
+            inner: source,
+            cuts,
+        })));
+    }
     Ok(Some(source))
+}
+
+/// A lake source under a running Top-N cut-off: a morsel whose statistics
+/// prove no row can still make the result is skipped instead of decoded.
+#[derive(Debug)]
+struct CutSource {
+    inner: Box<dyn MorselSource>,
+    cuts: Vec<(usize, std::sync::Arc<crate::stats::TopNThreshold>)>,
+}
+
+impl MorselSource for CutSource {
+    fn names(&self) -> &[String] {
+        self.inner.names()
+    }
+
+    fn types(&self) -> &[DataType] {
+        self.inner.types()
+    }
+
+    fn label(&self) -> &str {
+        self.inner.label()
+    }
+
+    fn rows(&self) -> Option<usize> {
+        self.inner.rows()
+    }
+
+    fn next_morsel(&self) -> Result<Option<u64>> {
+        self.inner.next_morsel()
+    }
+
+    fn decode(&self, morsel: u64, sink: &mut dyn FnMut(DataChunk) -> Result<()>) -> Result<()> {
+        for (column, cut) in &self.cuts {
+            if let Some((stats, rows)) = self.inner.morsel_stats(morsel, *column) {
+                let float = self.inner.types().get(*column) == Some(&DataType::Double);
+                if !cut.may_qualify_stats(&stats, rows, float) {
+                    return Ok(());
+                }
+            }
+        }
+        self.inner.decode(morsel, sink)
+    }
+
+    fn morsel_stats(&self, morsel: u64, column: usize) -> Option<(crate::ColumnStats, u64)> {
+        self.inner.morsel_stats(morsel, column)
+    }
+
+    fn io(&self) -> crate::morsel::ScanIo {
+        self.inner.io()
+    }
+
+    fn reports_io(&self) -> bool {
+        self.inner.reports_io()
+    }
 }
 
 /// Read a streamed source to the end, one morsel at a time: the `Output` a

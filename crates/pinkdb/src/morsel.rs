@@ -108,6 +108,14 @@ pub trait MorselSource: std::fmt::Debug + Send + Sync {
     fn rows(&self) -> Option<usize> {
         None
     }
+    /// What the source knows about column `column` in morsel `morsel` before
+    /// decoding it: bounds, NULL count and the morsel's rows (a lake row
+    /// group's or file's statistics). A Top-N scan skips a morsel whose
+    /// bounds cannot beat its cut-off. `None` means unknown: the morsel is
+    /// decoded. Bounds need not be exact, only true bounds.
+    fn morsel_stats(&self, _morsel: u64, _column: usize) -> Option<(crate::ColumnStats, u64)> {
+        None
+    }
     /// Whether [`MorselSource::io`] is worth a [`ScanRecord`]: a source with
     /// no object-storage reads (a store scan) has nothing to report.
     fn reports_io(&self) -> bool {
