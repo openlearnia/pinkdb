@@ -13150,11 +13150,7 @@ mod tests {
                 0,
                 "an uncached decode leaves no payload on the handle"
             );
-            assert_eq!(
-                column.decodes(),
-                table.num_chunks(),
-                "one decode per chunk"
-            );
+            assert_eq!(column.decodes(), table.num_chunks(), "one decode per chunk");
         }
         // One MiB of cache: the first chunks fit, the rest are decoded for the
         // scan alone. Either way the query answers, and the cache stays within
@@ -13188,7 +13184,10 @@ mod tests {
         let chunk = table.columns[0].chunk(0).unwrap();
         let (cache, operator) = table.columns[0].charged();
         assert_eq!(cache, 0, "a dirty chunk is not a cache entry");
-        assert!(operator > 0, "a dirty chunk is charged to the operator pool");
+        assert!(
+            operator > 0,
+            "a dirty chunk is charged to the operator pool"
+        );
         drop(chunk);
         crate::memory::reset_cache_limit();
     }
