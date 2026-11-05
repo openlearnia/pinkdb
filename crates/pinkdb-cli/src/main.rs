@@ -1104,6 +1104,47 @@ impl LocalSession {
         }
     }
 
+    /// Run one statement as a streaming cursor, so its result is rendered
+    /// as it is produced and never held whole. Transaction control (and a
+    /// `CALL`, whose body may commit) keeps the materialized path, whose
+    /// COMMIT retry replays the transaction's buffered text; a statement
+    /// inside a transaction is buffered here the same way.
+    fn run_cursor(&mut self, sql: &str) -> Result<pinkdb::QueryCursor, pinkdb::PinkDbError> {
+        use pinkdb::sql::ast::Statement;
+        let materialize = match pinkdb::sql::parse_statements(sql) {
+            Ok(stmts) => {
+                stmts.len() != 1
+                    || matches!(
+                        stmts[0],
+                        Statement::Begin
+                            | Statement::Commit
+                            | Statement::Rollback
+                            | Statement::Call { .. }
+                    )
+            }
+            // The materialized path reports the parse error.
+            Err(_) => true,
+        };
+        if materialize {
+            let mut results = self.run_sql(sql)?;
+            let last = results
+                .pop()
+                .ok_or_else(|| pinkdb::PinkDbError::Execution("no statement to run".to_string()))?;
+            return pinkdb::QueryCursor::from_result(last);
+        }
+        let was = self.db.in_transaction();
+        let cursor = if agent_mode() {
+            self.db.query_cursor_with_limits(sql, agent_limits())
+        } else {
+            self.db.query_cursor(sql)
+        }?;
+        if was && self.db.in_transaction() {
+            self.txn_sql.push_str(sql);
+            self.txn_sql.push('\n');
+        }
+        Ok(cursor)
+    }
+
     /// Execute one SQL string without profiling: the historical zero-cost
     /// path.
     fn run_sql(&mut self, sql: &str) -> Result<Vec<QueryResult>, pinkdb::PinkDbError> {
@@ -1564,6 +1605,17 @@ fn display_value(v: &Value) -> String {
 /// `println!` so a single call reproduces the old per-line output byte for
 /// byte.
 fn format_select(names: &[String], types: &[DataType], rows: &[Vec<Value>]) -> String {
+    format_select_counted(names, types, rows, rows.len() as u64)
+}
+
+/// [`format_select`] for a streamed result: `rows` holds at least the shown
+/// rows (the first [`DISPLAY_CAP`]) and `total` is the result's row count.
+fn format_select_counted(
+    names: &[String],
+    types: &[DataType],
+    rows: &[Vec<Value>],
+    total: u64,
+) -> String {
     let shown = rows.len().min(DISPLAY_CAP);
     // Column names are untrusted too (a quoted identifier may contain ESC, and
     // a hostile server may send arbitrary bytes): sanitize before measuring,
@@ -1617,15 +1669,59 @@ fn format_select(names: &[String], types: &[DataType], rows: &[Vec<Value>]) -> S
         row_out(&mut out, row);
     }
     border(&mut out, "└", "┴", "┘");
-    if rows.len() > DISPLAY_CAP {
-        out.push_str(&format!(
-            "({} more rows not shown)\n",
-            rows.len() - DISPLAY_CAP
-        ));
+    if total > shown as u64 {
+        out.push_str(&format!("({} more rows not shown)\n", total - shown as u64));
     }
-    let noun = if rows.len() == 1 { "row" } else { "rows" };
-    out.push_str(&format!("{} {noun}", rows.len()));
+    let noun = if total == 1 { "row" } else { "rows" };
+    out.push_str(&format!("{total} {noun}"));
     out
+}
+
+/// Render a statement's streamed result. Only the rows the table shows are
+/// kept (the first [`DISPLAY_CAP`], or the agent display's `max_rows`); the
+/// rest are counted as they stream past, so a result of any size prints in
+/// bounded memory. The output is the materialized renderer's, byte for byte.
+fn render_cursor(mut cursor: pinkdb::QueryCursor, sql: &str) {
+    if let Some(result) = cursor.result() {
+        render_results(std::slice::from_ref(&result));
+        return;
+    }
+    let keep = if agent_mode() {
+        agent_display().max_rows
+    } else {
+        DISPLAY_CAP
+    };
+    let (names, types) = (cursor.names().to_vec(), cursor.types().to_vec());
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let mut total = 0u64;
+    loop {
+        match cursor.next_chunk() {
+            Ok(Some(chunk)) => {
+                for i in 0..chunk.num_rows() {
+                    // `max_rows` 0 is the agent display's "no cap".
+                    if keep == 0 || rows.len() < keep {
+                        rows.push(chunk.columns.iter().map(|c| c.get(i)).collect());
+                    }
+                }
+                total += chunk.num_rows() as u64;
+            }
+            Ok(None) => break,
+            Err(e) => {
+                report_sql_error(&e, sql);
+                return;
+            }
+        }
+    }
+    if agent_mode() {
+        let table =
+            pinkdb::agent::format_table_counted(&names, &types, &rows, total, agent_display());
+        println!("{table}");
+    } else {
+        if total == 0 {
+            println!("(no rows)");
+        }
+        println!("{}", format_select_counted(&names, &types, &rows, total));
+    }
 }
 
 /// Print each statement result with the shared DuckDB-style renderer.
@@ -1905,8 +2001,8 @@ fn run_statement(
                     Err(e) => report_sql_error(&e, sql),
                 }
             } else {
-                match local.run_sql(sql) {
-                    Ok(results) => render_results(&results),
+                match local.run_cursor(sql) {
+                    Ok(cursor) => render_cursor(cursor, sql),
                     Err(e) => report_sql_error(&e, sql),
                 }
             }

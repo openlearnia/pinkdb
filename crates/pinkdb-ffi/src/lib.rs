@@ -957,6 +957,16 @@ fn build_result(results: Vec<ChunkedResult>) -> std::result::Result<PinkResult, 
                     types,
                     chunks,
                 } => StmtData::Sel(SelStmt::from_chunks(names, types, chunks)?),
+                // Not produced by the calls this builder serves (C3 wires the
+                // cursor into fetch); drained so the match stays total.
+                ChunkedResult::Cursor(mut cursor) => {
+                    let (names, types) = (cursor.names().to_vec(), cursor.types().to_vec());
+                    let mut chunks = Vec::new();
+                    while let Some(chunk) = cursor.next_chunk().map_err(|e| e.to_string())? {
+                        chunks.push(chunk);
+                    }
+                    StmtData::Sel(SelStmt::from_chunks(names, types, chunks)?)
+                }
                 // The row-shaped paths (a transaction, `RETURNING`, `CALL`)
                 // still arrive as rows; rebuild chunks so fetch works there too.
                 ChunkedResult::Other(QueryResult::Selected { names, types, rows }) => {

@@ -245,7 +245,15 @@ enum Body {
     Whole(Vec<u8>),
     /// The file's beginning (the schema probe), for a file read in windows.
     Stream(Vec<u8>),
+    /// A large local file's beginning (the schema probe): a streamed scan
+    /// reads on from there; a materialized scan reads the file whole.
+    LocalHead(Vec<u8>),
 }
+
+/// Bytes a local file must exceed to be sniffed from its first
+/// [`SNIFF_BYTES`] (like a remote one) instead of read whole at bind, so a
+/// streamed scan of it holds a window, not the file.
+const LOCAL_STREAM_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Bytes a remote file must exceed to be streamed instead of read whole. Up
 /// to this much there is nothing to bound (it is the read-ahead window
@@ -325,6 +333,18 @@ impl CsvSource {
         s3: Option<&pinkdb::secret::S3Secret>,
     ) -> Result<(Body, CsvSchema)> {
         if !is_remote(&call.path) {
+            let len = std::fs::metadata(&call.path).map(|m| m.len()).unwrap_or(0);
+            if !call.gzip && len > LOCAL_STREAM_BYTES {
+                use std::io::Read as _;
+                let mut head = Vec::with_capacity(SNIFF_BYTES as usize);
+                std::fs::File::open(&call.path)
+                    .and_then(|f| f.take(SNIFF_BYTES).read_to_end(&mut head))
+                    .map_err(|e| {
+                        PinkDbError::Execution(format!("cannot read CSV \"{}\": {e}", call.path))
+                    })?;
+                let schema = sniff_csv(&head, &call.options)?;
+                return Ok((Body::LocalHead(head), schema));
+            }
             let mut bytes = std::fs::read(&call.path).map_err(|e| {
                 PinkDbError::Execution(format!("cannot read CSV \"{}\": {e}", call.path))
             })?;
@@ -390,6 +410,7 @@ impl CsvSource {
         projection: Option<&[usize]>,
         sink: &mut dyn FnMut(DataChunk) -> Result<()>,
         s3: Option<&pinkdb::secret::S3Secret>,
+        streamed: bool,
     ) -> Result<(u64, u64)> {
         let cached = {
             let mut cache = self
@@ -418,6 +439,27 @@ impl CsvSource {
         };
         match body {
             Body::Whole(bytes) => {
+                for chunk in parse_csv_chunks(&bytes, &schema)? {
+                    emit(chunk)?;
+                }
+            }
+            Body::LocalHead(head) if streamed => {
+                use std::io::{Read as _, Seek as _};
+                let mut rest = std::fs::File::open(&call.path).map_err(|e| {
+                    PinkDbError::Execution(format!("cannot read CSV \"{}\": {e}", call.path))
+                })?;
+                rest.seek(std::io::SeekFrom::Start(head.len() as u64))
+                    .map_err(|e| {
+                        PinkDbError::Execution(format!("cannot read CSV \"{}\": {e}", call.path))
+                    })?;
+                stream_csv_chunks(std::io::Cursor::new(head).chain(rest), &schema, &mut emit)?;
+            }
+            Body::LocalHead(_) => {
+                // A materialized scan parses the whole file at once, as
+                // before (the parallel parser is faster than the stream).
+                let bytes = std::fs::read(&call.path).map_err(|e| {
+                    PinkDbError::Execution(format!("cannot read CSV \"{}\": {e}", call.path))
+                })?;
                 for chunk in parse_csv_chunks(&bytes, &schema)? {
                     emit(chunk)?;
                 }
@@ -475,6 +517,7 @@ impl CsvSource {
                 Ok(())
             },
             s3,
+            false,
         )?;
         self.count(rows, decoded);
         Ok(TableScanOutput {
@@ -494,7 +537,7 @@ impl CsvSource {
         s3: Option<&pinkdb::secret::S3Secret>,
         sink: &mut dyn FnMut(DataChunk) -> Result<()>,
     ) -> Result<TableScanOutput> {
-        let (rows, decoded) = self.scan_call(call, projection, sink, s3)?;
+        let (rows, decoded) = self.scan_call(call, projection, sink, s3, true)?;
         self.count(rows, decoded);
         Ok(TableScanOutput {
             chunks: Vec::new(),

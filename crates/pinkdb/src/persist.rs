@@ -821,6 +821,10 @@ trait Sink: Send {
     /// Only the last write of an image uses it, so a file sink may seek away
     /// from the end here.
     fn write_slot(&mut self, idx: usize, slot: &Slot) -> Result<()>;
+
+    /// Step over `len` bytes that are already in place (a staged image's
+    /// pending row groups): the next byte lands `len` further on.
+    fn skip(&mut self, len: u64) -> Result<()>;
 }
 
 /// A [`Sink`] over a `Vec`: the `to_pink_bytes*` API and pink-lake's data
@@ -838,6 +842,12 @@ impl VecSink {
 impl Sink for VecSink {
     fn bytes(&mut self, b: &[u8]) -> Result<()> {
         self.buf.extend_from_slice(b);
+        Ok(())
+    }
+
+    fn skip(&mut self, len: u64) -> Result<()> {
+        // Only a staged file image skips; a buffer has nothing in place.
+        self.buf.resize(self.buf.len() + len as usize, 0);
         Ok(())
     }
 
@@ -889,6 +899,16 @@ impl Sink for FileSink {
 
     fn offset(&self) -> u64 {
         self.pos
+    }
+
+    fn skip(&mut self, len: u64) -> Result<()> {
+        use std::io::{Seek, Write};
+        self.out.flush()?;
+        self.pos += len;
+        self.out
+            .get_mut()
+            .seek(std::io::SeekFrom::Start(self.pos))?;
+        Ok(())
     }
 
     fn write_slot(&mut self, idx: usize, slot: &Slot) -> Result<()> {
@@ -4179,7 +4199,7 @@ impl PinkDb {
         let hooks = Hooks::default();
         #[cfg(not(test))]
         let hooks = Hooks;
-        self.write_image_hooked(data, parallel, collect_stats, omit_rows, &hooks)
+        self.write_image_hooked(data, parallel, collect_stats, omit_rows, &hooks, None)
     }
 
     /// [`PinkDb::write_image`] with the test-only knobs: a non-empty
@@ -4191,6 +4211,7 @@ impl PinkDb {
         collect_stats: bool,
         omit_rows: bool,
         hooks: &Hooks,
+        staged: Option<&StagedPlan<'_>>,
     ) -> Result<Vec<SavedTableStats>> {
         // Both header slots, zero: neither is valid until the slot at the end
         // names a footer that is already on disk.
@@ -4243,6 +4264,7 @@ impl PinkDb {
                     parallel,
                     collect_stats,
                     &mut saved,
+                    staged,
                 )?;
                 repoints.push((t, carried));
                 Ok(dir)
@@ -4682,7 +4704,7 @@ impl PinkDb {
         let file = match opened {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.save_sync(tmp)?;
+                self.save_first_image(tmp)?;
                 return Ok(CheckpointSave::Full);
             }
             Err(e) => return Err(e.into()),
@@ -4771,9 +4793,18 @@ impl PinkDb {
         #[cfg(debug_assertions)]
         self.assert_handles_withheld(&old_footer.free_ranges, &withheld);
         let mut superseded: Vec<crate::storage::SupersededRange> = Vec::new();
+        // A bulk load's row groups already in this file sit past the logical
+        // end: nothing this pass allocates may land on them, and the groups a
+        // table still names are referenced where they are.
+        let mut pending_guard = self.pending_load.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = pending_guard
+            .as_ref()
+            .filter(|load| load.staging.is_none() && same_file(&load.file, &file));
+        let cursor = pending.map_or(old_slot.file_len, |load| old_slot.file_len.max(load.end));
+        let mut pending_used = vec![false; pending.map_or(0, |load| load.groups.len())];
         let mut writer = CheckpointWriter {
             file,
-            cursor: old_slot.file_len,
+            cursor,
             free: old_footer.free_ranges.clone(),
             reuse,
             withheld,
@@ -4822,6 +4853,11 @@ impl PinkDb {
                         *reused_group = true;
                         return Ok(GroupStep::Reused(old_group));
                     }
+                    if let Some((i, group)) =
+                        pending.and_then(|load| load.named_group(ns, name, t, first, last))
+                    {
+                        return Ok(GroupStep::Pending(i, group));
+                    }
                     encode_row_group(ns, name, t, first, last, true).map(GroupStep::Encoded)
                 });
             let write = |step: GroupStep<'_>| -> Result<()> {
@@ -4836,6 +4872,13 @@ impl PinkDb {
                             accs[ci].merge(&acc);
                         }
                         row_groups.push(old_group.clone());
+                    }
+                    GroupStep::Pending(i, group) => {
+                        for (ci, acc) in group.accs.iter().enumerate() {
+                            accs[ci].merge(acc);
+                        }
+                        row_groups.push(group.dir.clone());
+                        pending_used[i] = true;
                     }
                     GroupStep::Encoded(group) => {
                         let (group, table_carry) = write_group(&mut writer, group)?;
@@ -4889,6 +4932,15 @@ impl PinkDb {
         // row group this pass superseded. Old `free_ranges` were already
         // allocatable; these join the new footer's list.
         freed.push((old_slot.footer_offset, old_slot.footer_len));
+        // A pending group no table names any more (a rolled-back or replaced
+        // load) is free space now.
+        if let Some(load) = pending {
+            for (group, used) in load.groups.iter().zip(&pending_used) {
+                if !used {
+                    freed.extend(group.dir.columns.iter().map(|c| (c.offset, c.length)));
+                }
+            }
+        }
         let freed = merge_ranges(freed);
         let mut footer_free = writer.free.clone();
         footer_free.extend_from_slice(&freed);
@@ -4982,6 +5034,8 @@ impl PinkDb {
         let source =
             crate::storage::StoreSource::file(Arc::new(writer.file.try_clone()?), file_len);
         Self::repoint_written(repoints, &source);
+        // Every pending group is now referenced by the footer or free in it.
+        *pending_guard = None;
         #[cfg(test)]
         REPOINT_GENERATION.with(|g| g.set(Some(wal_generation)));
         Ok(())
@@ -5575,7 +5629,11 @@ fn write_table<S: Sink>(
     parallel: bool,
     collect_stats: bool,
     saved: &mut Vec<SavedTableStats>,
+    staged: Option<&StagedPlan<'_>>,
 ) -> Result<(TableDir, TableCarry)> {
+    if let Some(plan) = staged {
+        return write_staged_table(data, plan, ns, name, t, collect_stats, saved);
+    }
     let schema = t.schema();
     let n_chunks = t.num_chunks();
     // The per-column statistics of the whole table (the lake's stats
@@ -5804,10 +5862,357 @@ impl CheckpointWriter {
     }
 }
 
+/// A bulk load's row groups, encoded and written ahead of the checkpoint
+/// that publishes them (the streaming load; see `PinkDb::pending_load`).
+///
+/// The groups go past the store's logical end, where no checkpoint has put
+/// anything a footer names. A store that has no image yet gets a staging file
+/// (`<image>.load`) instead, laid out exactly like the start of a full image
+/// (two zeroed header slots, then the data region), so the first checkpoint
+/// can publish it as the image without moving a byte.
+pub(crate) struct PendingLoad {
+    file: Arc<std::fs::File>,
+    /// The staging file's path, when the store has no image yet.
+    staging: Option<std::path::PathBuf>,
+    /// Where the next group goes.
+    end: u64,
+    groups: Vec<PendingGroup>,
+}
+
+/// One pending row group: where its column chunks are (absolute offsets), its
+/// statistics, and the source its chunks' handles were pointed at.
+pub(crate) struct PendingGroup {
+    db: String,
+    schema: String,
+    table: String,
+    first: usize,
+    dir: RowGroupDir,
+    accs: Vec<ChunkColumnStats>,
+    source: Arc<crate::storage::StoreSource>,
+}
+
+impl std::fmt::Debug for PendingLoad {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLoad")
+            .field("staging", &self.staging)
+            .field("end", &self.end)
+            .field("groups", &self.groups.len())
+            .finish()
+    }
+}
+
+// The streaming load (S2) calls these; until then only the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+impl PendingLoad {
+    /// Open the file a load writes into: the image at `target`, past its
+    /// logical and physical ends, or a fresh staging file beside it.
+    fn open(target: &std::path::Path) -> Result<Self> {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(target)
+        {
+            Ok(file) => {
+                let physical = file.metadata()?.len();
+                let logical = read_checkpoint_file(&file, physical)?
+                    .map_or(physical, |(_, slot, _)| slot.file_len);
+                Ok(Self {
+                    file: Arc::new(file),
+                    staging: None,
+                    end: physical.max(logical),
+                    groups: Vec::new(),
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let staging = staging_path(target);
+                let file = crate::fsutil::open_rw_private(&staging, true)?;
+                pwrite_all(&file, 0, &[0u8; DATA_START as usize])?;
+                Ok(Self {
+                    file: Arc::new(file),
+                    staging: Some(staging),
+                    end: DATA_START,
+                    groups: Vec::new(),
+                })
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The pending group for chunks `first..last` of `ns.name`, when the
+    /// table still names exactly its bytes (an UPDATE or DELETE since the
+    /// load re-encodes the group instead).
+    fn named_group(
+        &self,
+        ns: &crate::storage::SchemaPath,
+        name: &str,
+        t: &DataTable,
+        first: usize,
+        last: usize,
+    ) -> Option<(usize, &PendingGroup)> {
+        let (i, group) = self.groups.iter().enumerate().find(|(_, g)| {
+            g.first == first
+                && g.table.eq_ignore_ascii_case(name)
+                && g.schema.eq_ignore_ascii_case(ns.schema())
+                && g.db.eq_ignore_ascii_case(ns.db())
+        })?;
+        (group.dir.chunk_rows.len() == last - first && group.still_named(t)).then_some((i, group))
+    }
+}
+
+impl PendingGroup {
+    fn still_named(&self, t: &DataTable) -> bool {
+        let last = self.first + self.dir.chunk_rows.len();
+        t.columns.len() == self.dir.columns.len()
+            && last <= t.num_chunks()
+            && t.columns
+                .iter()
+                .zip(&self.dir.columns)
+                .all(|(column, dir)| {
+                    column.stored_chunk(self.first, last).is_some_and(|chunk| {
+                        Arc::ptr_eq(chunk.source(), &self.source)
+                            && chunk.offset() == dir.offset
+                            && chunk.length() == dir.length
+                    })
+                })
+    }
+
+    /// The group's column chunks are back to back from the first one's offset.
+    fn contiguous_from(&self, offset: u64) -> bool {
+        let mut at = offset;
+        for column in &self.dir.columns {
+            if column.offset != at {
+                return false;
+            }
+            at += column.length;
+        }
+        true
+    }
+
+    fn length(&self) -> u64 {
+        self.dir.columns.iter().map(|c| c.length).sum()
+    }
+}
+
+/// The staging file of a store that has no image yet.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn staging_path(target: &std::path::Path) -> std::path::PathBuf {
+    let mut s = target.as_os_str().to_os_string();
+    s.push(".load");
+    std::path::PathBuf::from(s)
+}
+
+/// Whether two handles name the same file (not just the same path).
+#[cfg(unix)]
+fn same_file(a: &std::fs::File, b: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (a.metadata(), b.metadata()) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Without a file identity, nothing is known to be the same file: pending
+/// groups are then copied like any stored chunk instead of referenced.
+#[cfg(not(unix))]
+fn same_file(_: &std::fs::File, _: &std::fs::File) -> bool {
+    false
+}
+
+/// A first checkpoint that publishes a load's staging file as the image: every
+/// table with rows must be pending, its groups exactly where the full image
+/// puts them. Anything else sets `mismatch` before a byte is written over the
+/// staged groups, and the save falls back to a fresh image.
+struct StagedPlan<'a> {
+    load: &'a PendingLoad,
+    mismatch: std::sync::atomic::AtomicBool,
+}
+
+impl StagedPlan<'_> {
+    fn refuse(&self) -> PinkDbError {
+        self.mismatch
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        PinkDbError::Execution("internal: the staged image does not line up".to_string())
+    }
+}
+
+/// [`write_table`] over a staged image: step over each pending group, which
+/// is already where this sink would write it.
+fn write_staged_table<S: Sink>(
+    data: &mut S,
+    plan: &StagedPlan<'_>,
+    ns: &crate::storage::SchemaPath,
+    name: &str,
+    t: &DataTable,
+    collect_stats: bool,
+    saved: &mut Vec<SavedTableStats>,
+) -> Result<(TableDir, TableCarry)> {
+    let schema = t.schema();
+    let n_chunks = t.num_chunks();
+    let mut accs: Vec<ChunkColumnStats> =
+        schema.iter().map(|_| ChunkColumnStats::empty()).collect();
+    let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
+    let mut row_groups: Vec<RowGroupDir> = Vec::with_capacity(n_groups);
+    for g in 0..n_groups {
+        let first = g * CHUNKS_PER_ROW_GROUP;
+        let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
+        let Some((_, group)) = plan.load.named_group(ns, name, t, first, last) else {
+            return Err(plan.refuse());
+        };
+        if !group.contiguous_from(data.offset()) {
+            return Err(plan.refuse());
+        }
+        data.skip(group.length())?;
+        for (ci, acc) in group.accs.iter().enumerate() {
+            accs[ci].merge(acc);
+        }
+        row_groups.push(group.dir.clone());
+    }
+    let carry: TableCarry = (0..schema.len()).map(|_| Vec::new()).collect();
+    Ok((
+        finish_table_dir(ns, name, t, row_groups, &accs, collect_stats, saved)?,
+        carry,
+    ))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PinkDb {
+    /// Encode chunks `first..last` of `ns.name` as one row group and write it
+    /// into the store at `target` ahead of the checkpoint (the streaming
+    /// load). The chunks' handles name the written bytes from here on, so the
+    /// cache may drop their decoded form. Nothing is durable until
+    /// [`PinkDb::sync_pending_load`]; nothing is published until a checkpoint.
+    pub(crate) fn write_pending_group(
+        &self,
+        target: &std::path::Path,
+        ns: &crate::storage::SchemaPath,
+        name: &str,
+        first: usize,
+        last: usize,
+    ) -> Result<()> {
+        if self.encryption_key.is_some() {
+            return Err(PinkDbError::Execution(
+                "an encrypted store cannot stream a load into its file".to_string(),
+            ));
+        }
+        let t = self.table_in(ns, name)?;
+        let group = encode_row_group(ns, name, t, first, last, true)?;
+        let mut guard = self.pending_load.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(PendingLoad::open(target)?);
+        }
+        let load = guard.as_mut().expect("just opened");
+        let base = load.end;
+        for (piece, column) in group.pieces.iter().zip(&group.columns) {
+            pwrite_all(&load.file, base + column.offset, &piece.bytes)?;
+        }
+        let len = group
+            .columns
+            .last()
+            .map_or(0, |column| column.offset + column.length);
+        load.end = base + len;
+        let source = crate::storage::StoreSource::file(Arc::clone(&load.file), load.end);
+        let carry: TableCarry = group
+            .carry
+            .into_iter()
+            .map(|chunks| {
+                chunks
+                    .into_iter()
+                    .map(|mut cc| {
+                        cc.dir.offset += base;
+                        cc
+                    })
+                    .collect()
+            })
+            .collect();
+        Self::repoint_written(vec![(t, carry)], &source);
+        load.groups.push(PendingGroup {
+            db: ns.db().to_string(),
+            schema: ns.schema().to_string(),
+            table: name.to_string(),
+            first,
+            dir: RowGroupDir {
+                rows: group.rows,
+                chunk_rows: group.chunk_rows,
+                columns: group
+                    .columns
+                    .into_iter()
+                    .map(|column| ColumnChunkDir {
+                        offset: base + column.offset,
+                        ..column
+                    })
+                    .collect(),
+            },
+            accs: group.accs,
+            source,
+        });
+        Ok(())
+    }
+
+    /// Make every pending group durable (the commit of a streamed load
+    /// fsyncs before it logs the groups).
+    pub(crate) fn sync_pending_load(&self) -> Result<()> {
+        let guard = self.pending_load.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(load) = guard.as_ref() {
+            load.file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// The first image of a store: publish a load's staging file when it
+    /// lines up, otherwise write a fresh image to `tmp` (copying any pending
+    /// group's bytes through) and drop the staging file.
+    fn save_first_image(&self, tmp: &std::path::Path) -> Result<()> {
+        let mut guard = self.pending_load.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(load) = guard.as_ref().filter(|load| load.staging.is_some()) else {
+            return self.save_sync(tmp);
+        };
+        let staging = load.staging.clone().expect("filtered");
+        let plan = StagedPlan {
+            load,
+            mismatch: std::sync::atomic::AtomicBool::new(false),
+        };
+        let staged = (|| -> Result<()> {
+            use std::io::Seek;
+            let mut file = load.file.try_clone()?;
+            file.seek(std::io::SeekFrom::Start(0))?;
+            let mut sink = FileSink::new(file);
+            #[cfg(test)]
+            let hooks = Hooks::default();
+            #[cfg(not(test))]
+            let hooks = Hooks;
+            self.write_image_hooked(&mut sink, true, false, false, &hooks, Some(&plan))?;
+            sink.finish()?.sync_all()?;
+            Ok(())
+        })();
+        match staged {
+            Ok(()) => {
+                std::fs::rename(&staging, tmp)?;
+                *guard = None;
+                #[cfg(test)]
+                LAST_FIRST_IMAGE_STAGED.with(|last| last.set(Some(true)));
+                Ok(())
+            }
+            Err(_) if plan.mismatch.load(std::sync::atomic::Ordering::Relaxed) => {
+                #[cfg(test)]
+                LAST_FIRST_IMAGE_STAGED.with(|last| last.set(Some(false)));
+                // Nothing was written over the staged groups: copy them into
+                // a fresh image like any stored chunk.
+                self.save_sync(tmp)?;
+                *guard = None;
+                let _ = std::fs::remove_file(&staging);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
 /// One row group of an incremental checkpoint, in table order: kept in place,
 /// or encoded for [`write_group`].
 enum GroupStep<'a> {
     Reused(&'a RowGroupDir),
+    /// A bulk load's group already in the file (index into the load).
+    Pending(usize, &'a PendingGroup),
     Encoded(GroupBuild),
 }
 
@@ -5966,6 +6371,51 @@ fn first_fit(free: &mut Vec<(u64, u64)>, len: u64, min_offset: u64) -> Option<u6
         i += 1;
     }
     None
+}
+
+/// The free ranges the store file at `path` lists in its current footer (a
+/// test view of the allocator's bookkeeping).
+#[cfg(test)]
+pub(crate) fn footer_free_ranges(path: &std::path::Path) -> Vec<(u64, u64)> {
+    let file = std::fs::File::open(path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let (_, _, footer) = read_checkpoint_file(&file, len).unwrap().unwrap();
+    footer.free_ranges
+}
+
+/// Where chunk 0 of each column of `t` is stored, as `(offset, length)` of
+/// its column chunk (a test view of what a checkpoint referenced).
+#[cfg(test)]
+pub(crate) fn stored_column_chunks(t: &DataTable, first: usize, last: usize) -> Vec<(u64, u64)> {
+    t.columns
+        .iter()
+        .map(|c| {
+            let chunk = c.stored_chunk(first, last).expect("stored");
+            (chunk.offset(), chunk.length())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_FIRST_IMAGE_STAGED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether this thread's last first image published a staging file (`true`)
+/// or fell back to a fresh image (`false`).
+#[cfg(test)]
+pub(crate) fn last_first_image_staged() -> Option<bool> {
+    LAST_FIRST_IMAGE_STAGED.with(|last| last.get())
+}
+
+/// Whether the store has a pending load, and whether it is staged.
+#[cfg(test)]
+pub(crate) fn pending_load_state(db: &PinkDb) -> Option<bool> {
+    db.pending_load
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|load| load.staging.is_some())
 }
 
 // A test hook: how many times this thread's incremental checkpoint reused a
@@ -10820,6 +11270,7 @@ mod tests {
                 free_ranges,
                 second_slot,
             },
+            None,
         )
         .unwrap();
         data.buf

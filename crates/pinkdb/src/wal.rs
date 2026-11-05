@@ -2053,14 +2053,22 @@ pub(crate) struct Applied {
     ckpt: Option<CkptMeta>,
 }
 
-/// Enough to witness a checkpoint-file replacement without reading it:
-/// identity, length, and mtime. A `.save` snapshot rewrites the target in
-/// place, so `(dev, ino)` alone cannot see it; the length + mtime pair does.
+/// Enough to witness a checkpoint-file replacement: its identity and a
+/// checksum of its header slots. A `.save` snapshot rewrites the target in
+/// place, so `(dev, ino)` alone cannot see it; every save and checkpoint
+/// writes a slot, so the header does. A streaming load's row groups appended
+/// past the logical end (see `persist::PendingLoad`) change the file's length
+/// and mtime but neither slot, so they are not mistaken for a new checkpoint.
+///
+/// This rests on two invariants: a store checkpointed in place keeps its
+/// `(dev, ino)`, and every way a new image reaches the path (a full
+/// checkpoint's rename, a `.save`) comes with header slots of its own, so
+/// either the identity or the header changes whenever the image does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CkptMeta {
     dev_ino: Option<(u64, u64)>,
-    len: u64,
-    mtime_ns: Option<i128>,
+    /// CRC32C of the header bytes present (up to both slots), and how many.
+    header: (u32, usize),
 }
 
 /// A single-stat witness of a file's identity and length (the optimistic
@@ -2080,15 +2088,23 @@ fn file_meta(path: &Path) -> Option<FileMeta> {
 }
 
 fn ckpt_meta(path: &Path) -> Option<CkptMeta> {
-    let m = std::fs::metadata(path).ok()?;
+    use std::io::Read;
+    let file = File::open(path).ok()?;
+    let m = file.metadata().ok()?;
+    let mut header = [0u8; crate::persist::DATA_START as usize];
+    let mut got = 0;
+    let mut reader = &file;
+    while got < header.len() {
+        match reader.read(&mut header[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
     Some(CkptMeta {
         dev_ino: Some(identity_of(&m)),
-        len: m.len(),
-        mtime_ns: m
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as i128),
+        header: (crate::persist::crc32c(&header[..got]), got),
     })
 }
 
@@ -8382,6 +8398,264 @@ mod tests {
             ints(&mut again, "SELECT a FROM t ORDER BY a;"),
             vec![1, 2, 3]
         );
+        cleanup(&p);
+    }
+
+    /// The streaming load's pending groups (S1): write every row group of `t`
+    /// ahead of the checkpoint, as a streamed load will.
+    fn write_all_pending(db: &PinkDb, p: &Path, table: &str) {
+        let ns = crate::storage::SchemaPath::new("main", "main");
+        let n = db.table_in(&ns, table).unwrap().num_chunks();
+        let per = crate::persist::CHUNKS_PER_ROW_GROUP;
+        for first in (0..n).step_by(per) {
+            db.write_pending_group(p, &ns, table, first, (first + per).min(n))
+                .unwrap();
+        }
+        db.sync_pending_load().unwrap();
+    }
+
+    fn fill(db: &mut PinkDb, table: &str, rows: usize) {
+        db.execute(&format!(
+            "CREATE TABLE {table} AS SELECT i AS a, 'v' || (i % 977) AS v, i * 0.5 AS d \
+             FROM range({rows}) t(i);"
+        ))
+        .unwrap();
+    }
+
+    /// A store with no image yet: the load's staging file becomes the first
+    /// image without moving a byte, and is byte-identical to the image a
+    /// plain checkpoint writes for the same rows.
+    #[test]
+    fn a_staged_first_image_is_the_plain_image() {
+        let plain = tmp_ckpt("staged_plain");
+        let staged = tmp_ckpt("staged_load");
+        let mut a = durable(&plain);
+        fill(&mut a, "t", 300_000);
+        a.checkpoint().unwrap();
+        let mut b = durable(&staged);
+        fill(&mut b, "t", 300_000);
+        write_all_pending(&b, &staged, "t");
+        assert_eq!(crate::persist::pending_load_state(&b), Some(true));
+        b.checkpoint().unwrap();
+        assert_eq!(crate::persist::last_first_image_staged(), Some(true));
+        assert_eq!(crate::persist::pending_load_state(&b), None);
+        assert!(!crate::persist::staging_path(&staged).exists());
+        assert_eq!(
+            std::fs::read(&*plain).unwrap(),
+            std::fs::read(&*staged).unwrap(),
+            "the staged image must be the plain image"
+        );
+        // The live handles read the published file.
+        assert_eq!(ints(&mut b, "SELECT sum(a) FROM t;"), vec![44_999_850_000]);
+        drop(b);
+        let mut back = durable(&staged);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM t;"), vec![300_000]);
+        assert_eq!(
+            strings(&mut back, "SELECT v FROM t WHERE a = 299999;"),
+            vec![format!("v{}", 299_999 % 977)]
+        );
+        drop(back);
+        drop(a);
+        cleanup(&plain);
+        cleanup(&staged);
+    }
+
+    /// A store with an image: the pending groups go past its end and the
+    /// checkpoint references them where they are, rewriting none of them.
+    #[test]
+    fn pending_groups_are_referenced_in_place() {
+        let p = tmp_ckpt("pending_in_place");
+        let mut db = durable(&p);
+        fill(&mut db, "base", 10_000);
+        db.checkpoint().unwrap();
+        fill(&mut db, "t", 300_000);
+        write_all_pending(&db, &p, "t");
+        assert_eq!(crate::persist::pending_load_state(&db), Some(false));
+        let ns = crate::storage::SchemaPath::new("main", "main");
+        let before: Vec<Vec<(u64, u64)>> = {
+            let t = db.table_in(&ns, "t").unwrap();
+            (0..t.num_chunks())
+                .step_by(crate::persist::CHUNKS_PER_ROW_GROUP)
+                .map(|f| {
+                    let l = (f + crate::persist::CHUNKS_PER_ROW_GROUP).min(t.num_chunks());
+                    crate::persist::stored_column_chunks(t, f, l)
+                })
+                .collect()
+        };
+        db.checkpoint().unwrap();
+        assert!(
+            crate::persist::last_checkpoint_reused_holes().is_some(),
+            "an in-place checkpoint"
+        );
+        let after: Vec<Vec<(u64, u64)>> = {
+            let t = db.table_in(&ns, "t").unwrap();
+            (0..t.num_chunks())
+                .step_by(crate::persist::CHUNKS_PER_ROW_GROUP)
+                .map(|f| {
+                    let l = (f + crate::persist::CHUNKS_PER_ROW_GROUP).min(t.num_chunks());
+                    crate::persist::stored_column_chunks(t, f, l)
+                })
+                .collect()
+        };
+        assert_eq!(
+            before, after,
+            "the checkpoint must not move a pending group"
+        );
+        assert_eq!(crate::persist::pending_load_state(&db), None);
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM t;"), vec![300_000]);
+        assert_eq!(
+            ints(&mut back, "SELECT sum(a) FROM t;"),
+            vec![44_999_850_000]
+        );
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM base;"), vec![10_000]);
+        drop(back);
+        cleanup(&p);
+    }
+
+    /// A pending group the table stopped naming is re-encoded (an UPDATE) or
+    /// freed (a DROP): its bytes land in the footer's free list, and nothing
+    /// reads them again.
+    #[test]
+    fn pending_groups_a_table_left_are_reencoded_or_freed() {
+        let p = tmp_ckpt("pending_left");
+        let mut db = durable(&p);
+        fill(&mut db, "base", 10_000);
+        db.checkpoint().unwrap();
+        fill(&mut db, "t", 300_000);
+        fill(&mut db, "gone", 200_000);
+        write_all_pending(&db, &p, "t");
+        write_all_pending(&db, &p, "gone");
+        let ns = crate::storage::SchemaPath::new("main", "main");
+        let gone = {
+            let t = db.table_in(&ns, "gone").unwrap();
+            crate::persist::stored_column_chunks(t, 0, crate::persist::CHUNKS_PER_ROW_GROUP)
+        };
+        let updated = {
+            let t = db.table_in(&ns, "t").unwrap();
+            crate::persist::stored_column_chunks(
+                t,
+                crate::persist::CHUNKS_PER_ROW_GROUP,
+                2 * crate::persist::CHUNKS_PER_ROW_GROUP,
+            )
+        };
+        db.execute("UPDATE t SET v = 'changed' WHERE a = 150000;")
+            .unwrap();
+        db.execute("DROP TABLE gone;").unwrap();
+        db.checkpoint().unwrap();
+        let free = crate::persist::footer_free_ranges(&p);
+        let covered = |(offset, len): (u64, u64)| {
+            free.iter()
+                .any(|&(f, fl)| f <= offset && offset + len <= f + fl)
+        };
+        for range in gone.iter().chain(&updated) {
+            assert!(
+                covered(*range),
+                "{range:?} must be free, free list {free:?}"
+            );
+        }
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM t;"), vec![300_000]);
+        assert_eq!(
+            strings(&mut back, "SELECT v FROM t WHERE a = 150000;"),
+            vec!["changed".to_string()]
+        );
+        assert!(back.execute("SELECT * FROM gone;").is_err());
+        drop(back);
+        cleanup(&p);
+    }
+
+    /// The image witness across two handles (two leases, as two processes):
+    /// a foreign in-place checkpoint changes it, a `.save` replacing the file
+    /// changes it, and a streaming load's appends past the logical end do
+    /// not: no reload for the writer, no conflict for the other handle.
+    #[test]
+    fn the_image_witness_sees_checkpoints_and_saves_but_not_pending_appends() {
+        let p = tmp_ckpt("witness");
+        let mut a = durable(&p);
+        let mut b = durable(&p);
+        a.execute("CREATE TABLE base (x INTEGER); INSERT INTO base VALUES (1); CHECKPOINT;")
+            .unwrap();
+        assert_eq!(ints(&mut b, "SELECT count(*) FROM base;"), vec![1]);
+
+        // 1. B checkpoints in place: the header changes, A sees B's row.
+        let before = ckpt_meta(&p);
+        b.execute("INSERT INTO base VALUES (2);").unwrap();
+        b.checkpoint().unwrap();
+        assert_eq!(crate::persist::last_checkpoint_reused_holes(), Some(false));
+        assert_ne!(
+            ckpt_meta(&p),
+            before,
+            "an in-place checkpoint must change the witness"
+        );
+        assert_eq!(ints(&mut a, "SELECT count(*) FROM base;"), vec![2]);
+
+        // 2. A appends pending row groups past the logical end: the file grows,
+        //    the witness does not change, B's open transaction still commits,
+        //    and A keeps its pending handles (no reload replaced them).
+        b.execute("BEGIN; INSERT INTO base VALUES (3);").unwrap();
+        fill(&mut a, "t", 200_000);
+        let len_before = std::fs::metadata(&*p).unwrap().len();
+        let witness = ckpt_meta(&p);
+        write_all_pending(&a, &p, "t");
+        assert!(std::fs::metadata(&*p).unwrap().len() > len_before);
+        assert_eq!(
+            ckpt_meta(&p),
+            witness,
+            "pending appends must not change the witness"
+        );
+        b.execute("COMMIT;").unwrap();
+        assert_eq!(ints(&mut a, "SELECT count(*) FROM base;"), vec![3]);
+        assert_eq!(crate::persist::pending_load_state(&a), Some(false));
+        let ns = crate::storage::SchemaPath::new("main", "main");
+        crate::persist::stored_column_chunks(
+            a.table_in(&ns, "t").unwrap(),
+            0,
+            crate::persist::CHUNKS_PER_ROW_GROUP,
+        );
+        a.checkpoint().unwrap();
+        drop(b);
+
+        // 3. A `.save` replacing the file (a new inode) changes the witness.
+        let witness = ckpt_meta(&p);
+        let dev_ino = witness.and_then(|m| m.dev_ino);
+        drop(a);
+        PinkDb::new().save(p.to_str().unwrap()).unwrap();
+        let replaced = ckpt_meta(&p);
+        assert_ne!(
+            replaced, witness,
+            "a replaced image must change the witness"
+        );
+        assert_ne!(replaced.and_then(|m| m.dev_ino), dev_ino);
+        cleanup(&p);
+    }
+
+    /// A first image whose tables are not all pending cannot publish the
+    /// staging file: the checkpoint writes a fresh image (copying the pending
+    /// groups through) and removes the staging file.
+    #[test]
+    fn a_staged_image_that_does_not_line_up_falls_back() {
+        let p = tmp_ckpt("staged_mismatch");
+        let mut db = durable(&p);
+        // "a" sorts first and is not pending, so the staged layout is wrong.
+        fill(&mut db, "a", 5_000);
+        fill(&mut db, "t", 300_000);
+        write_all_pending(&db, &p, "t");
+        assert_eq!(crate::persist::pending_load_state(&db), Some(true));
+        db.checkpoint().unwrap();
+        assert_eq!(crate::persist::last_first_image_staged(), Some(false));
+        assert_eq!(crate::persist::pending_load_state(&db), None);
+        assert!(!crate::persist::staging_path(&p).exists());
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM a;"), vec![5_000]);
+        assert_eq!(
+            ints(&mut back, "SELECT sum(a) FROM t;"),
+            vec![44_999_850_000]
+        );
+        drop(back);
         cleanup(&p);
     }
 

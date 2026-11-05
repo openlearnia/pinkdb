@@ -7,6 +7,7 @@
 //! these `run_*` fns later without touching expression or storage code.)
 
 pub mod aggregate;
+pub(crate) mod cursor;
 pub(crate) mod dml;
 pub mod expr;
 pub(crate) mod group_table;
@@ -548,14 +549,29 @@ pub enum ChunkedResult {
     /// A non-SELECT outcome, or a SELECT that only exists as rows (inside a
     /// transaction, a write path's `RETURNING`, `CALL`, `COPY`, a profile).
     Other(QueryResult),
+    /// A SELECT still being produced ([`crate::db::Connection::query_cursor`]).
+    Cursor(QueryCursor),
 }
+
+/// How a statement's SELECT result is handed back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResultMode {
+    /// Materialized rows ([`QueryResult::Selected`]).
+    Rows,
+    /// The executor's chunks ([`ChunkedResult::Selected`]).
+    Chunks,
+    /// A streaming cursor ([`ChunkedResult::Cursor`]).
+    Cursor,
+}
+
+pub use cursor::QueryCursor;
 
 impl ChunkedResult {
     /// The row-shaped view, when this is not a chunked SELECT.
     pub fn as_query_result(&self) -> Option<&QueryResult> {
         match self {
             ChunkedResult::Other(result) => Some(result),
-            ChunkedResult::Selected { .. } => None,
+            ChunkedResult::Selected { .. } | ChunkedResult::Cursor(_) => None,
         }
     }
 
@@ -576,6 +592,11 @@ impl ChunkedResult {
                 QueryResult::Selected { names, types, rows }
             }
             ChunkedResult::Other(result) => result,
+            // Only `ResultMode::Cursor` makes cursors, and its one caller
+            // (`Connection::query_cursor`) hands them out unconverted.
+            ChunkedResult::Cursor(cursor) => cursor
+                .into_query_result()
+                .expect("a cursor result is drained through QueryCursor, not converted"),
         }
     }
 }
@@ -667,6 +688,63 @@ pub(crate) struct Cx<'a> {
     /// Join subtrees the statement repeats, and their results once computed
     /// ([`eval_shared_join`]).
     pub(crate) subplans: std::sync::Arc<SharedSubplans>,
+}
+
+/// A [`Cx`] without its store: what a running pipeline carries when it moves
+/// to another thread and another view of the same data (a result cursor's
+/// snapshot). Every field is owned or shared, so the subquery memo, the scan
+/// projections and the budget stay the statement's own.
+pub(crate) struct CxParts {
+    ctes: HashMap<String, Output>,
+    memo: std::sync::Arc<std::sync::Mutex<HashMap<usize, Memo>>>,
+    projections: std::sync::Arc<crate::plan::ScanProjections>,
+    prunes: std::sync::Arc<crate::plan::ScanFilters>,
+    budget: std::sync::Arc<ExecBudget>,
+    dml_ctes: std::sync::Arc<HashMap<String, Output>>,
+    session: crate::storage::Session,
+    outer_rows: Vec<std::sync::Arc<[Value]>>,
+    dynamic: std::sync::Arc<DynamicFilters>,
+    unordered: bool,
+    subplans: std::sync::Arc<SharedSubplans>,
+}
+
+impl<'a> Cx<'a> {
+    /// Detach this context from its store (see [`CxParts`]).
+    pub(crate) fn detach(self) -> CxParts {
+        CxParts {
+            ctes: self.ctes,
+            memo: self.memo,
+            projections: self.projections,
+            prunes: self.prunes,
+            budget: self.budget,
+            dml_ctes: self.dml_ctes,
+            session: self.session,
+            outer_rows: self.outer_rows,
+            dynamic: self.dynamic,
+            unordered: self.unordered,
+            subplans: self.subplans,
+        }
+    }
+}
+
+impl CxParts {
+    /// Re-attach a detached context to `db`.
+    pub(crate) fn attach(self, db: &PinkDb) -> Cx<'_> {
+        Cx {
+            db,
+            ctes: self.ctes,
+            memo: self.memo,
+            projections: self.projections,
+            prunes: self.prunes,
+            budget: self.budget,
+            dml_ctes: self.dml_ctes,
+            session: self.session,
+            outer_rows: self.outer_rows,
+            dynamic: self.dynamic,
+            unordered: self.unordered,
+            subplans: self.subplans,
+        }
+    }
 }
 
 /// The join subtrees a statement repeats ([`eval_shared_join`]): each
@@ -9938,18 +10016,160 @@ struct Stream<'p> {
     pending: std::collections::VecDeque<DataChunk>,
 }
 
+/// A started scan: materialized chunks, a table function's push scan, or a
+/// store table read chunk by chunk.
+enum ScanChunks {
+    Done(std::vec::IntoIter<DataChunk>),
+    Source(SourceStream),
+    /// A store table, decoded one chunk per pull and dropped by the consumer
+    /// (the decoded cache keeps what its own budget allows), so a scan of a
+    /// large table never holds the table. Only owned indices live here: each
+    /// pull looks the table up in the context's store, so the stream never
+    /// borrows it (see [`StreamKind`]).
+    Store {
+        lookup: crate::storage::SchemaPath,
+        /// The chunks zone pruning left, in scan order.
+        keep: Vec<usize>,
+        next: usize,
+        emitted: usize,
+    },
+}
+
+impl ScanChunks {
+    /// A store-table scan read chunk by chunk, or `None` for any other scan
+    /// (a CTE, a time-travel read, an attached lake table), which
+    /// materializes as before.
+    fn store(cx: &Cx, plan: &LogicalPlan) -> Result<Option<ScanChunks>> {
+        let Some(scan) = store_scan(cx, plan)? else {
+            return Ok(None);
+        };
+        let LogicalPlan::Scan { ns, .. } = plan else {
+            return Ok(None);
+        };
+        let lookup = ns.clone().unwrap_or_else(|| cx.db.current_ns().clone());
+        let keep = (0..scan.len()).map(|i| scan.chunk_index(i)).collect();
+        Ok(Some(ScanChunks::Store {
+            lookup,
+            keep,
+            next: 0,
+            emitted: 0,
+        }))
+    }
+}
+
+/// A table function's push scan ([`TableSource::scan_stream`]) on a thread
+/// of its own, pulled through a bounded channel: the source decodes at most
+/// [`cursor::CURSOR_DEPTH`] chunks ahead of its consumer. Dropping it closes
+/// the channel, so the source's next push fails and its scan stops; the drop
+/// then joins the thread.
+///
+/// [`TableSource::scan_stream`]: crate::table_source::TableSource::scan_stream
+struct SourceStream {
+    rx: Option<std::sync::mpsc::Receiver<Result<DataChunk>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    source: String,
+    schema: Vec<(String, DataType)>,
+    ordinal: usize,
+}
+
+impl Drop for SourceStream {
+    fn drop(&mut self) {
+        self.rx.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl SourceStream {
+    /// Start streaming a table-function scan, or `None` for any other scan (a
+    /// DuckLake function, a store table, an unregistered source whose error
+    /// the materializing path reports).
+    fn start(cx: &Cx, plan: &LogicalPlan) -> Result<Option<SourceStream>> {
+        let LogicalPlan::TableFunction {
+            source,
+            call,
+            schema,
+        } = plan
+        else {
+            return Ok(None);
+        };
+        if source.eq_ignore_ascii_case("ducklake") {
+            return Ok(None);
+        }
+        let Some(src) = cx.db.table_source(source) else {
+            return Ok(None);
+        };
+        let src = std::sync::Arc::clone(src);
+        let call = call.clone();
+        let projection = cx.projections.for_scan(plan).map(<[usize]>::to_vec);
+        let prunes = cx.prunes.for_scan(plan).to_vec();
+        let secrets: Vec<_> = cx
+            .db
+            .visible_secrets(&cx.session)
+            .into_iter()
+            .map(|entry| entry.secret)
+            .collect();
+        let (tx, rx) = std::sync::mpsc::sync_channel(cursor::CURSOR_DEPTH);
+        let handle = std::thread::Builder::new()
+            .name("pinkdb-scan".to_string())
+            .spawn(move || {
+                let mut push = |chunk: DataChunk| {
+                    tx.send(Ok(chunk))
+                        .map_err(|_| PinkDbError::Execution(cursor::CURSOR_CLOSED.to_string()))
+                };
+                if let Err(e) =
+                    src.scan_stream_with(&call, projection.as_deref(), &prunes, &secrets, &mut push)
+                {
+                    // A closed channel means the consumer is gone.
+                    let _ = tx.send(Err(e));
+                }
+            })
+            .map_err(PinkDbError::Io)?;
+        Ok(Some(SourceStream {
+            rx: Some(rx),
+            handle: Some(handle),
+            source: source.clone(),
+            schema: schema.clone(),
+            ordinal: 0,
+        }))
+    }
+
+    fn next(&mut self, cx: &Cx) -> Result<Option<DataChunk>> {
+        cx.check_deadline()?;
+        match self.rx.as_ref().map(|rx| rx.recv()) {
+            Some(Ok(Ok(mut chunk))) => {
+                check_source_chunk(&self.source, &self.schema, &chunk)?;
+                chunk.ordinal = self.ordinal;
+                self.ordinal += 1;
+                Ok(Some(chunk))
+            }
+            Some(Ok(Err(e))) => Err(e),
+            Some(Err(_)) | None => Ok(None),
+        }
+    }
+}
+
 /// How many input chunks a Filter/Project cursor pulls per batch: the batch
 /// keeps the per-chunk operators parallel (they run through `par_iter`)
 /// while bounding the work wasted when the limit is reached mid-batch.
 const STREAM_BATCH: usize = 4;
 
+/// The cursor's contract (`exec::cursor`): a `StreamKind` may borrow only
+/// from the plan (`&'p LogicalPlan`, `&'p BoundExpr`, `&'p [DataType]`).
+/// Everything else it holds must be owned: never a `&Cx`, a `&PinkDb`, a
+/// `&DataTable` or anything else borrowed from the store, because a result
+/// cursor moves a running stream to another thread and another view of the
+/// same data (see `QueryCursor::start`). A scan that needs the store looks
+/// it up in the `Cx` each `next` is given.
 enum StreamKind<'p> {
-    /// A scan, materialized on first pull so a limit satisfied by an earlier
+    /// A scan, started on first pull so a limit satisfied by an earlier
     /// branch never touches the table (an attached lake would otherwise
-    /// decode its columns for nothing).
+    /// decode its columns for nothing). A table function whose source can
+    /// push its chunks streams them; any other scan is materialized.
     Scan {
         plan: &'p LogicalPlan,
-        chunks: Option<std::vec::IntoIter<DataChunk>>,
+        chunks: Option<ScanChunks>,
     },
     /// `SELECT` without `FROM`: one empty row.
     SingleRow(bool),
@@ -10080,11 +10300,43 @@ impl<'p> Stream<'p> {
             match kind {
                 StreamKind::Scan { plan, chunks } => {
                     if chunks.is_none() {
-                        // `eval` dispatches a plain scan to `scan_output` and
-                        // a table-function scan to `table_function_output`.
-                        *chunks = Some(eval(cx, plan)?.chunks.into_iter());
+                        *chunks = Some(match SourceStream::start(cx, plan)? {
+                            Some(source) => ScanChunks::Source(source),
+                            None => match ScanChunks::store(cx, plan)? {
+                                Some(store) => store,
+                                // `eval` dispatches any other scan to
+                                // `scan_output` or `table_function_output`.
+                                None => ScanChunks::Done(eval(cx, plan)?.chunks.into_iter()),
+                            },
+                        });
                     }
-                    return Ok(chunks.as_mut().and_then(|it| it.next()));
+                    return match chunks.as_mut().expect("scan started") {
+                        ScanChunks::Done(it) => Ok(it.next()),
+                        ScanChunks::Source(source) => source.next(cx),
+                        ScanChunks::Store {
+                            lookup,
+                            keep,
+                            next,
+                            emitted,
+                        } => {
+                            let LogicalPlan::Scan { table, .. } = plan else {
+                                unreachable!("a store scan streams a Scan node");
+                            };
+                            while let Some(&index) = keep.get(*next) {
+                                *next += 1;
+                                cx.check_deadline()?;
+                                let t = cx.db.table_in(&*lookup, table)?;
+                                let scan =
+                                    StoreScan::new(t, cx.projections.for_scan(plan), None, true);
+                                if let Some(mut chunk) = scan.chunk(index)? {
+                                    chunk.ordinal = *emitted;
+                                    *emitted += 1;
+                                    return Ok(Some(chunk));
+                                }
+                            }
+                            Ok(None)
+                        }
+                    };
                 }
                 StreamKind::SingleRow(emitted) => {
                     if *emitted {
