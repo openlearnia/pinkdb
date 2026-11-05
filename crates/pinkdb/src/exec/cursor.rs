@@ -33,8 +33,19 @@ use crate::storage::{PinkDb, Session};
 use crate::types::{DataType, PinkDbError, Result};
 use crate::vector::DataChunk;
 
-/// Chunks a producer may run ahead of its consumer.
+/// Batches a producer may run ahead of its consumer (a table function's
+/// push scan uses it for single chunks).
 pub(crate) const CURSOR_DEPTH: usize = 4;
+
+/// A producer hands its chunks over in batches of up to this many estimated
+/// bytes (`check_chunk`'s per-cell estimate, a few times the payload for
+/// fixed-width columns) or [`BATCH_CHUNKS`] chunks: each channel hand-off
+/// parks and wakes a thread, so one per 2048-row chunk made a narrow
+/// streamed scan several times slower than the materialized path (C API
+/// fetch of one SF1 `lineitem` column, 3.9x). In flight: at most
+/// [`CURSOR_DEPTH`] batches plus the one being filled.
+const BATCH_BYTES: usize = 8 << 20;
+const BATCH_CHUNKS: usize = 1024;
 
 /// Result bytes a streaming plan buffers inline before its pipeline moves to
 /// a producer thread over a snapshot.
@@ -58,7 +69,7 @@ pub struct QueryCursor {
 }
 
 struct Producer {
-    rx: Option<Receiver<Result<DataChunk>>>,
+    rx: Option<Receiver<Result<Vec<DataChunk>>>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -113,8 +124,7 @@ impl QueryCursor {
         let (names, types) = (stream.names.clone(), stream.types.clone());
         let mut bytes = 0usize;
         while let Some(chunk) = stream.next(&cx)? {
-            check_chunk(&cx, &chunk)?;
-            bytes += chunk_approx_bytes(&chunk);
+            bytes += check_chunk(&cx, &chunk)?;
             buffered.push_back(chunk);
             if bytes < INLINE_BYTES {
                 continue;
@@ -232,10 +242,25 @@ impl QueryCursor {
             .and_then(|p| p.rx.as_ref())
             .map(|rx| rx.recv())
         {
-            Some(Ok(Ok(chunk))) => return Ok(Some(chunk)),
+            Some(Ok(Ok(batch))) => {
+                // A producer never sends an empty batch.
+                let mut batch = batch.into_iter();
+                let first = batch.next();
+                self.buffered.extend(batch);
+                return Ok(first);
+            }
             Some(Ok(Err(e))) => Err(e),
             // The producer finished (its sender dropped), or none ran.
-            Some(Err(_)) | None => Ok(None),
+            Some(Err(_)) | None => {
+                // It has sent everything; all it has left is to drop its
+                // pipeline and snapshot, which the caller need not wait for
+                // (that drop was a sixth of a narrow streamed scan's time).
+                // A cursor dropped mid-stream still joins its producer.
+                if let Some(mut producer) = self.producer.take() {
+                    producer.handle.take();
+                }
+                Ok(None)
+            }
         };
         self.producer = None;
         next
@@ -261,8 +286,9 @@ impl QueryCursor {
 }
 
 /// What every handed-out chunk is checked against: the deadline and
-/// cancellation, decoded columns, and the result caps.
-fn check_chunk(cx: &Cx, chunk: &DataChunk) -> Result<()> {
+/// cancellation, decoded columns, and the result caps. Returns the chunk's
+/// estimated bytes.
+fn check_chunk(cx: &Cx, chunk: &DataChunk) -> Result<usize> {
     cx.check_deadline()?;
     // A zero-length column would be an undecoded projection placeholder,
     // never a result value (the same check the materializing path runs).
@@ -274,7 +300,9 @@ fn check_chunk(cx: &Cx, chunk: &DataChunk) -> Result<()> {
             )));
         }
     }
-    cx.add_result(chunk.num_rows(), chunk_approx_bytes(chunk))
+    let bytes = chunk_approx_bytes(chunk);
+    cx.add_result(chunk.num_rows(), bytes)?;
+    Ok(bytes)
 }
 
 /// A running pipeline moving to the producer thread. Field order matters:
@@ -305,14 +333,26 @@ fn produce(
     snapshot: PinkDb,
     parts: super::CxParts,
     mut handoff: Handoff,
-    tx: SyncSender<Result<DataChunk>>,
+    tx: SyncSender<Result<Vec<DataChunk>>>,
 ) {
     let cx = parts.attach(&snapshot);
+    let send = |batch: Vec<DataChunk>| {
+        tx.send(Ok(batch))
+            .map_err(|_| PinkDbError::Execution(CURSOR_CLOSED.to_string()))
+    };
     let mut run = || -> Result<()> {
+        let mut batch = Vec::new();
+        let mut bytes = 0;
         while let Some(chunk) = handoff.stream.next(&cx)? {
-            check_chunk(&cx, &chunk)?;
-            tx.send(Ok(chunk))
-                .map_err(|_| PinkDbError::Execution(CURSOR_CLOSED.to_string()))?;
+            bytes += check_chunk(&cx, &chunk)?;
+            batch.push(chunk);
+            if bytes >= BATCH_BYTES || batch.len() >= BATCH_CHUNKS {
+                send(std::mem::take(&mut batch))?;
+                bytes = 0;
+            }
+        }
+        if !batch.is_empty() {
+            send(batch)?;
         }
         Ok(())
     };

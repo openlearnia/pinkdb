@@ -604,6 +604,8 @@ struct SelStmt {
     /// streaming result retains), so the v1 cell API can no longer see every
     /// row: it reports an error instead of a result with rows missing.
     partial: StdCell<bool>,
+    /// Bytes of the chunks a streaming fetch retained for v1 access.
+    retained: StdCell<usize>,
 }
 
 impl SelStmt {
@@ -634,6 +636,7 @@ impl SelStmt {
             stream_error: RefCell::new(None),
             rows: RefCell::new(rows),
             partial: StdCell::new(false),
+            retained: StdCell::new(0),
         })
     }
 
@@ -655,6 +658,7 @@ impl SelStmt {
             stream_error: RefCell::new(None),
             rows: RefCell::new(None),
             partial: StdCell::new(false),
+            retained: StdCell::new(0),
         }
     }
 
@@ -705,17 +709,17 @@ impl SelStmt {
                 Ok(Some(chunk)) => {
                     self.fetched.set(self.fetched.get() + chunk.num_rows as u64);
                     self.row_count.set(self.fetched.get() as usize);
-                    let retained: usize = self
-                        .chunks
-                        .borrow()
-                        .iter()
-                        .map(|c| c.columns.iter().map(|v| v.memory_size()).sum::<usize>())
-                        .sum();
-                    let bytes: usize = chunk.columns.iter().map(|v| v.memory_size()).sum();
                     // Only the first 16 MiB stays available to the v1 cell
                     // API after a streaming fetch; past it, `partial` makes v1
-                    // access report an error rather than skip rows.
-                    if !self.partial.get() && retained + bytes <= 16 << 20 {
+                    // access report an error rather than skip rows. A running
+                    // total keeps this O(1) per fetch.
+                    let bytes = if self.partial.get() {
+                        0
+                    } else {
+                        chunk.columns.iter().map(|v| v.memory_size()).sum()
+                    };
+                    if !self.partial.get() && self.retained.get() + bytes <= 16 << 20 {
+                        self.retained.set(self.retained.get() + bytes);
                         self.chunks.borrow_mut().push(chunk.clone());
                         // Keep the replay index past chunks already handed out.
                         self.next_chunk.set(self.next_chunk.get() + 1);
