@@ -124,6 +124,19 @@ pub fn format_table(
     rows: &[Vec<Value>],
     display: AgentDisplay,
 ) -> String {
+    format_table_counted(names, types, rows, rows.len() as u64, display)
+}
+
+/// [`format_table`] for a streamed result: `rows` holds at least the rows
+/// the table shows (the first `display.max_rows`), and `total` is how many
+/// the result had, which the "… N more rows" notice reports.
+pub fn format_table_counted(
+    names: &[String],
+    types: &[DataType],
+    rows: &[Vec<Value>],
+    total: u64,
+    display: AgentDisplay,
+) -> String {
     let total_columns = names.len().min(types.len());
     let shown_columns = if display.max_columns == 0 {
         total_columns
@@ -173,7 +186,7 @@ pub fn format_table(
         out.pop();
     }
 
-    let hidden_rows = rows.len().saturating_sub(shown_rows);
+    let hidden_rows = (total as usize).saturating_sub(shown_rows);
     let hidden_columns = total_columns.saturating_sub(shown_columns);
     if hidden_rows > 0 || hidden_columns > 0 {
         out.push('\n');
@@ -185,7 +198,7 @@ pub fn format_table(
                 "{} more row{} ({} total)",
                 format_count(hidden_rows as u64),
                 if hidden_rows == 1 { "" } else { "s" },
-                format_count(rows.len() as u64)
+                format_count(total)
             ));
         }
         if hidden_columns > 0 {
