@@ -191,6 +191,35 @@ fn a_chunk_the_cache_refuses_is_charged_to_its_reader_until_dropped() {
     memory::reset_cache_limit();
 }
 
+/// A streamed `SELECT *` over a table larger than `memory_limit` runs to the
+/// end (wave 136c-4). The cursor's producer works on a snapshot that shares,
+/// and so pins, every chunk the inline phase cached: far more than one
+/// eviction pass of the cache admissions probes. An operator reservation still
+/// finds the evictable chunks behind them.
+#[test]
+fn a_cursor_streams_a_table_larger_than_memory_limit() {
+    let store = Store::new("cursor");
+    // 1,600 BIGINT chunks are ~26 MB decoded; the cursor's inline phase
+    // buffers 16 MB before it hands off to its producer.
+    let chunks = 1600;
+    let mut db = store.table("t", chunks);
+    memory::set_limit(24 << 20);
+    let mut cursor = db.query_cursor("SELECT i FROM t").unwrap();
+    let (mut rows, mut sum) = (0usize, 0i64);
+    while let Some(chunk) = cursor.next_chunk().unwrap() {
+        for r in 0..chunk.num_rows() {
+            match chunk.columns[0].get(r) {
+                Value::Bigint(v) => sum += v,
+                other => panic!("expected a BIGINT, got {other:?}"),
+            }
+        }
+        rows += chunk.num_rows();
+    }
+    assert_eq!(rows, chunks * CHUNK_SIZE);
+    assert_eq!(sum, range_sum(chunks * CHUNK_SIZE));
+    assert!(memory::used() + memory::cache_used() <= 24 << 20);
+}
+
 /// A reader holding payloads pins them: a failing reservation cannot evict
 /// them, and once it lets go they are the first to go.
 #[test]

@@ -958,7 +958,8 @@ fn register(handle: &std::sync::Weak<ChunkHandle>) {
 /// The pool's evictor (see [`crate::memory::set_evictor`]): drop decoded
 /// chunks that are clean, still backed by the image and unpinned, oldest
 /// first, until `want` bytes are back, nothing is left to drop, or
-/// [`EVICT_PROBES`] entries were looked at. A pinned entry moves to the back:
+/// [`EVICT_PROBES`] entries were looked at (every entry once, for an
+/// operator's reservation). A pinned entry moves to the back:
 /// it is in use, so it is the most recently used.
 ///
 /// This runs on the thread whose reservation is failing, so it never waits for
@@ -984,9 +985,20 @@ fn evict_decoded(want: usize, wait: bool) -> usize {
             Err(std::sync::TryLockError::WouldBlock) => return 0,
         }
     };
+    // An operator's reservation (`wait`) walks the whole list once before it
+    // gives up: a cursor's snapshot or a materialized join side can pin more
+    // than EVICT_PROBES of the oldest entries, and stopping there failed the
+    // reservation with evictable chunks right behind them (wave 136c-4: a
+    // streamed `SELECT *` under `memory_limit` ran out of memory with its
+    // cache full of chunks it had already read).
+    let budget = if wait {
+        lru.len().max(EVICT_PROBES)
+    } else {
+        EVICT_PROBES
+    };
     let mut freed = 0;
     let mut probes = 0;
-    while freed < want && probes < EVICT_PROBES {
+    while freed < want && probes < budget {
         let Some(weak) = lru.pop_front() else {
             break;
         };
