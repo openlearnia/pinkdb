@@ -195,6 +195,37 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-11-04">2026-11-04<a class="anchor" href="#2026-11-04" aria-label="Permalink: 2026-11-04">#</a></h2>
+<h3>WAL format 8 — appender flushes are logged column by column ✅</h3>
+<p>A durable appender flush no longer records its values one tagged row at a time: the chunk the appender built goes into the log as typed columns, and replay rebuilds the vectors instead of re-reading a value stream.</p>
+<ul>
+<li><strong>The record</strong> shares the flush's chunk instead of copying it, and writes that chunk's validity words plus each column's typed payload. VARIANT and ARRAY columns fall back to tagged values, because they have no column-wise encoding yet.</li>
+<li><strong>Replay</strong> rebuilds the chunk's vectors and runs them through the flush's <code>INSERT … SELECT</code> path; no SQL is rendered or parsed to log an appender flush.</li>
+<li><strong>Speed</strong>, TPC-H SF 1 <code>lineitem</code> at 204,800 rows per flush, interleaved A/B against the previous build: row-at-a-time inserts 8.59 s → 6.79 s (699k → 883k rows/s), chunk-wise appends 6.68 s → 4.91 s (899k → 1.22M rows/s).</li>
+<li><strong>Compatibility</strong>: a v2 or v3 WAL is upgraded in place; a header-only v4–v7 WAL is recreated; a v4–v7 WAL that holds records is refused ("open the store with that version and run CHECKPOINT, or regenerate"), and an older build refuses a v8 WAL cleanly.</li>
+</ul>
+<h3>C ABI 1.4 — an appender and typed parameter binding ✅</h3>
+<p>The C API gains a bulk appender and typed statement parameters. Version 1.4 is additive over 1.3, so a client built against an earlier 1.x header keeps working.</p>
+<ul>
+<li><strong>Appender</strong>: <code>pinkdb_appender_create</code>, the typed <code>append_*</code> calls, <code>end_row</code>, <code>append_chunk</code>, <code>flush</code>, <code>close</code>, <code>destroy</code> and <code>error</code>.</li>
+<li><strong>Typed binding</strong>: <code>pinkdb_bind_*</code> with <code>pinkdb_clear_bindings</code> and <code>pinkdb_execute_bound</code>.</li>
+<li><strong>One write path</strong>: a flush is one statement through the <code>INSERT</code> executor, so assignment coercion, constraints, triggers, indexes, the store's lease and visibility behave exactly as for an <code>INSERT</code>; the appender auto-flushes at 204,800 rows, and a failed flush invalidates it (the rejected batch is not retried). An autocommit durable flush records the chunk section (WAL v7/v8); inside an open transaction it still logs text.</li>
+<li>The <strong>Go driver</strong> now binds typed parameters through 1.4.</li>
+</ul>
+<h3>Top-N under projections — <code>ORDER BY … LIMIT</code> stops full-sorting ✅</h3>
+<p><code>ORDER BY … LIMIT n</code> now runs a top-N operator when a projection sits between the <code>LIMIT</code> and the sort and that projection only selects columns and literals, so the sort never materializes the whole input.</p>
+<ul>
+<li><strong>Plan</strong>: <code>Limit → Project → Sort</code> becomes top-N when the projection chain reads only column references and literals; any other projection (an expression, a cast, an aggregate) keeps the generic path, results unchanged.</li>
+<li><strong>Speed</strong>, TPC-H: SF 1 <code>ORDER BY l_shipdate DESC LIMIT 3</code> 218 → 12 ms, SF 10 3,748 → 132 ms.</li>
+<li><strong>Equal results</strong>: a non-selected sort key, ties, an alias, a NULL key, an expression key, <code>OFFSET</code> and <code>DISTINCT</code> each return what the full sort returned and are pinned by tests. <code>QUALIFY</code>'s top-3-per-key plan is unchanged.</li>
+</ul>
+<h3>Streaming bulk load, step 1 — row groups written ahead of the checkpoint ✅</h3>
+<p>A bulk load can now write its row groups before any checkpoint has placed them, so the load no longer waits for a checkpoint to own its space.</p>
+<ul>
+<li><strong><code>PinkDb::write_pending_group</code></strong> writes a chunk as one row group past the store's logical end (<code>PendingLoad</code>) or into a staging file <code>&lt;image&gt;.load</code>.</li>
+<li><strong>Checkpoint</strong>: it allocates past the pending groups and references them in place. The first checkpoint publishes the staging file as the image when every table that has rows is pending, in image order; otherwise it writes a fresh image, copies those rows through and removes the staging file.</li>
+<li><strong>Witness</strong>: <code>CkptMeta</code> identifies the image by <code>(dev, ino)</code> plus the header slot's CRC32C instead of its length and mtime.</li>
+<li>There is <strong>no SQL caller yet</strong>; the load-path steps (S0, S2) follow.</li>
+</ul>
 <h3>Wave 136 (step c-2) — the decoded cache lives inside <code>memory_limit</code> ✅</h3>
 <p>Decoded chunks are a cache, not a pin: they use whatever room <code>memory_limit</code> leaves free, and a query that needs the memory takes it from them.</p>
 <ul>

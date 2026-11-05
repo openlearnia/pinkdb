@@ -38,3 +38,5 @@ __pycache__/
 
 # The console browser app (wave 121) is outside the workspace: its own build dir.
 crates/pinkdb-server-ui-web/target/
+
+.env

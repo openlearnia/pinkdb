@@ -630,8 +630,9 @@ fn dtype_from_tag(b: u8) -> Result<DataType> {
         11 => Ok(DataType::Uuid),
         12 => Ok(DataType::Hugeint),
         13 => Ok(DataType::Uhugeint),
-        // A tag this build does not know comes from a newer writer (the
-        // format version stays 6, so there is no version to point at).
+        // A tag this build does not know comes from a newer writer (dtype
+        // tags are additive and carry no version of their own, so there is no
+        // version to point at).
         _ => Err(PinkDbError::Execution(format!(
             "unsupported .pink dtype tag {b}; upgrade pinkdb"
         ))),
@@ -821,6 +822,10 @@ trait Sink: Send {
     /// Only the last write of an image uses it, so a file sink may seek away
     /// from the end here.
     fn write_slot(&mut self, idx: usize, slot: &Slot) -> Result<()>;
+
+    /// Step over `len` bytes that are already in place (a staged image's
+    /// pending row groups): the next byte lands `len` further on.
+    fn skip(&mut self, len: u64) -> Result<()>;
 }
 
 /// A [`Sink`] over a `Vec`: the `to_pink_bytes*` API and pink-lake's data
@@ -838,6 +843,12 @@ impl VecSink {
 impl Sink for VecSink {
     fn bytes(&mut self, b: &[u8]) -> Result<()> {
         self.buf.extend_from_slice(b);
+        Ok(())
+    }
+
+    fn skip(&mut self, len: u64) -> Result<()> {
+        // Only a staged file image skips; a buffer has nothing in place.
+        self.buf.resize(self.buf.len() + len as usize, 0);
         Ok(())
     }
 
@@ -889,6 +900,16 @@ impl Sink for FileSink {
 
     fn offset(&self) -> u64 {
         self.pos
+    }
+
+    fn skip(&mut self, len: u64) -> Result<()> {
+        use std::io::{Seek, Write};
+        self.out.flush()?;
+        self.pos += len;
+        self.out
+            .get_mut()
+            .seek(std::io::SeekFrom::Start(self.pos))?;
+        Ok(())
     }
 
     fn write_slot(&mut self, idx: usize, slot: &Slot) -> Result<()> {
@@ -3674,6 +3695,135 @@ fn varchar_zone(v: &Vector, dict: &[&str], codes: &[u32]) -> crate::stats::Zone 
 /// chunk, in chunk order, so a load restores the per-chunk pruning facts
 /// without rescanning the data (`RowGroupDir`'s entries are per *row group*,
 /// far too coarse to prune a 2048-row chunk with).
+/// A table's columns in the footer: `u32 count`, then per column its name, a
+/// type tag, and the DECIMAL precision/scale or ARRAY element/length.
+fn write_schema(w: &mut Writer, schema: &[(String, DataType)]) {
+    w.u32(schema.len() as u32);
+    for (col, dtype) in schema {
+        w.str(col);
+        w.u8(dtype_tag(*dtype));
+        if let DataType::Decimal { precision, scale } = dtype {
+            w.u8(*precision);
+            w.u8(*scale);
+        }
+        if let DataType::Array { elem, len } = dtype {
+            w.u8(elem.tag());
+            w.u32(*len);
+        }
+    }
+}
+
+/// Read [`write_schema`].
+fn read_schema(r: &mut Reader) -> Result<Vec<(String, DataType)>> {
+    let n_cols = r.u32()? as usize;
+    // Each column costs at least 5 bytes (name length + dtype tag).
+    if n_cols > r.remaining() / 5 {
+        return r.err("column count exceeds the remaining file");
+    }
+    let mut schema = Vec::with_capacity(n_cols);
+    for _ in 0..n_cols {
+        let col = r.str()?;
+        let tag = r.u8()?;
+        let dtype = match tag {
+            7 => {
+                let precision = r.u8()?;
+                let scale = r.u8()?;
+                crate::types::decimal_type(precision, scale).ok_or_else(|| {
+                    PinkDbError::Execution("corrupt file: bad DECIMAL precision/scale".to_string())
+                })?
+            }
+            8 => DataType::Interval,
+            10 => {
+                let elem_tag = r.u8()?;
+                let elem = crate::types::ArrayElem::from_tag(elem_tag).ok_or_else(|| {
+                    PinkDbError::Execution(format!(
+                        "corrupt file: bad ARRAY element kind {elem_tag}"
+                    ))
+                })?;
+                let len = r.u32()?;
+                crate::types::array_type(elem, len).ok_or_else(|| {
+                    PinkDbError::Execution("corrupt file: bad ARRAY element count".to_string())
+                })?
+            }
+            other => dtype_from_tag(other)?,
+        };
+        schema.push((col, dtype));
+    }
+    Ok(schema)
+}
+
+/// One row group's footer entry: its rows, its per-chunk row counts, and one
+/// [`ColumnChunkDir`] per column.
+fn write_row_group_dir(w: &mut Writer, rg: &RowGroupDir) {
+    w.u64(rg.rows);
+    w.u32(rg.chunk_rows.len() as u32);
+    for &rows in &rg.chunk_rows {
+        w.u32(rows);
+    }
+    for col in &rg.columns {
+        w.u64(col.offset);
+        w.u64(col.length);
+        w.u32(col.page_count);
+        w.u32(col.encodings);
+        w.u32(col.crc32c);
+        w.u64(col.null_count);
+        w.u64(col.nan_count);
+        write_stat_value(w, col.min.as_ref());
+        write_stat_value(w, col.max.as_ref());
+    }
+}
+
+/// Read [`write_row_group_dir`]: the chunk row counts must agree with every
+/// column's page count and sum to the group's rows.
+fn read_row_group_dir(r: &mut Reader, n_cols: usize) -> Result<RowGroupDir> {
+    let rows = r.u64()?;
+    let chunk_count = r.u32()? as usize;
+    if chunk_count > r.remaining() / 4 {
+        return r.err("the row group's chunk count exceeds the remaining file");
+    }
+    let mut chunk_rows = Vec::with_capacity(chunk_count);
+    for _ in 0..chunk_count {
+        chunk_rows.push(r.u32()?);
+    }
+    let mut columns = Vec::with_capacity(n_cols);
+    for _ in 0..n_cols {
+        let offset = r.u64()?;
+        let length = r.u64()?;
+        let page_count = r.u32()?;
+        let encodings = r.u32()?;
+        let crc = r.u32()?;
+        let null_count = r.u64()?;
+        let nan_count = r.u64()?;
+        let min = read_stat_value(r)?;
+        let max = read_stat_value(r)?;
+        columns.push(ColumnChunkDir {
+            offset,
+            length,
+            page_count,
+            encodings,
+            crc32c: crc,
+            null_count,
+            nan_count,
+            min,
+            max,
+        });
+    }
+    if columns
+        .iter()
+        .any(|c| c.page_count as usize != chunk_rows.len())
+        || chunk_rows.iter().map(|&n| n as u64).sum::<u64>() != rows
+    {
+        return Err(PinkDbError::Execution(
+            "corrupt file: a row group's chunk row counts disagree with its pages".to_string(),
+        ));
+    }
+    Ok(RowGroupDir {
+        rows,
+        chunk_rows,
+        columns,
+    })
+}
+
 fn write_table_stats(
     w: &mut Writer,
     stats: &crate::stats::TableStats,
@@ -4179,7 +4329,7 @@ impl PinkDb {
         let hooks = Hooks::default();
         #[cfg(not(test))]
         let hooks = Hooks;
-        self.write_image_hooked(data, parallel, collect_stats, omit_rows, &hooks)
+        self.write_image_hooked(data, parallel, collect_stats, omit_rows, &hooks, None)
     }
 
     /// [`PinkDb::write_image`] with the test-only knobs: a non-empty
@@ -4191,6 +4341,7 @@ impl PinkDb {
         collect_stats: bool,
         omit_rows: bool,
         hooks: &Hooks,
+        staged: Option<&StagedPlan<'_>>,
     ) -> Result<Vec<SavedTableStats>> {
         // Both header slots, zero: neither is valid until the slot at the end
         // names a footer that is already on disk.
@@ -4243,6 +4394,7 @@ impl PinkDb {
                     parallel,
                     collect_stats,
                     &mut saved,
+                    staged,
                 )?;
                 repoints.push((t, carried));
                 Ok(dir)
@@ -4491,19 +4643,7 @@ impl PinkDb {
                 fw.u32(sdir.tables.len() as u32);
                 for tdir in &sdir.tables {
                     fw.str(&tdir.name);
-                    fw.u32(tdir.schema.len() as u32);
-                    for (col, dtype) in &tdir.schema {
-                        fw.str(col);
-                        fw.u8(dtype_tag(*dtype));
-                        if let DataType::Decimal { precision, scale } = dtype {
-                            fw.u8(*precision);
-                            fw.u8(*scale);
-                        }
-                        if let DataType::Array { elem, len } = dtype {
-                            fw.u8(elem.tag());
-                            fw.u32(*len);
-                        }
-                    }
+                    write_schema(&mut fw, &tdir.schema);
                     if with_constraints {
                         write_constraints(&mut fw, &tdir.constraints);
                     }
@@ -4519,22 +4659,7 @@ impl PinkDb {
                     fw.u64(tdir.row_count);
                     fw.u32(tdir.row_groups.len() as u32);
                     for rg in &tdir.row_groups {
-                        fw.u64(rg.rows);
-                        fw.u32(rg.chunk_rows.len() as u32);
-                        for &rows in &rg.chunk_rows {
-                            fw.u32(rows);
-                        }
-                        for col in &rg.columns {
-                            fw.u64(col.offset);
-                            fw.u64(col.length);
-                            fw.u32(col.page_count);
-                            fw.u32(col.encodings);
-                            fw.u32(col.crc32c);
-                            fw.u64(col.null_count);
-                            fw.u64(col.nan_count);
-                            write_stat_value(&mut fw, col.min.as_ref());
-                            write_stat_value(&mut fw, col.max.as_ref());
-                        }
+                        write_row_group_dir(&mut fw, rg);
                     }
                     write_table_stats(&mut fw, &tdir.stats, &tdir.zones);
                 }
@@ -4682,7 +4807,7 @@ impl PinkDb {
         let file = match opened {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.save_sync(tmp)?;
+                self.save_first_image(tmp, target)?;
                 return Ok(CheckpointSave::Full);
             }
             Err(e) => return Err(e.into()),
@@ -4771,9 +4896,18 @@ impl PinkDb {
         #[cfg(debug_assertions)]
         self.assert_handles_withheld(&old_footer.free_ranges, &withheld);
         let mut superseded: Vec<crate::storage::SupersededRange> = Vec::new();
+        // A bulk load's row groups already in this file sit past the logical
+        // end: nothing this pass allocates may land on them, and the groups a
+        // table still names are referenced where they are.
+        let mut pending_guard = self.pending_load.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = pending_guard
+            .as_ref()
+            .filter(|load| load.staging.is_none() && same_file(&load.file, &file));
+        let cursor = pending.map_or(old_slot.file_len, |load| old_slot.file_len.max(load.end));
+        let mut pending_used = vec![false; pending.map_or(0, |load| load.groups.len())];
         let mut writer = CheckpointWriter {
             file,
-            cursor: old_slot.file_len,
+            cursor,
             free: old_footer.free_ranges.clone(),
             reuse,
             withheld,
@@ -4822,6 +4956,11 @@ impl PinkDb {
                         *reused_group = true;
                         return Ok(GroupStep::Reused(old_group));
                     }
+                    if let Some((i, group)) =
+                        pending.and_then(|load| load.named_group(ns, name, t, first, last))
+                    {
+                        return Ok(GroupStep::Pending(i, group));
+                    }
                     encode_row_group(ns, name, t, first, last, true).map(GroupStep::Encoded)
                 });
             let write = |step: GroupStep<'_>| -> Result<()> {
@@ -4836,6 +4975,13 @@ impl PinkDb {
                             accs[ci].merge(&acc);
                         }
                         row_groups.push(old_group.clone());
+                    }
+                    GroupStep::Pending(i, group) => {
+                        for (ci, acc) in group.accs.iter().enumerate() {
+                            accs[ci].merge(acc);
+                        }
+                        row_groups.push(group.dir.clone());
+                        pending_used[i] = true;
                     }
                     GroupStep::Encoded(group) => {
                         let (group, table_carry) = write_group(&mut writer, group)?;
@@ -4889,6 +5035,15 @@ impl PinkDb {
         // row group this pass superseded. Old `free_ranges` were already
         // allocatable; these join the new footer's list.
         freed.push((old_slot.footer_offset, old_slot.footer_len));
+        // A pending group no table names any more (a rolled-back or replaced
+        // load) is free space now.
+        if let Some(load) = pending {
+            for (group, used) in load.groups.iter().zip(&pending_used) {
+                if !used {
+                    freed.extend(group.dir.columns.iter().map(|c| (c.offset, c.length)));
+                }
+            }
+        }
         let freed = merge_ranges(freed);
         let mut footer_free = writer.free.clone();
         footer_free.extend_from_slice(&freed);
@@ -4982,6 +5137,11 @@ impl PinkDb {
         let source =
             crate::storage::StoreSource::file(Arc::new(writer.file.try_clone()?), file_len);
         Self::repoint_written(repoints, &source);
+        // Every pending group is now referenced by the footer or free in it.
+        *pending_guard = None;
+        // A staging file is only for a store with no image: this one has one,
+        // so a leftover is a load that never committed.
+        let _ = std::fs::remove_file(staging_path(target));
         #[cfg(test)]
         REPOINT_GENERATION.with(|g| g.set(Some(wal_generation)));
         Ok(())
@@ -5575,7 +5735,11 @@ fn write_table<S: Sink>(
     parallel: bool,
     collect_stats: bool,
     saved: &mut Vec<SavedTableStats>,
+    staged: Option<&StagedPlan<'_>>,
 ) -> Result<(TableDir, TableCarry)> {
+    if let Some(plan) = staged {
+        return write_staged_table(data, plan, ns, name, t, collect_stats, saved);
+    }
     let schema = t.schema();
     let n_chunks = t.num_chunks();
     // The per-column statistics of the whole table (the lake's stats
@@ -5804,10 +5968,657 @@ impl CheckpointWriter {
     }
 }
 
+/// A bulk load's row groups, encoded and written ahead of the checkpoint
+/// that publishes them (the streaming load; see `PinkDb::pending_load`).
+///
+/// The groups go past the store's logical end, where no checkpoint has put
+/// anything a footer names. A store that has no image yet gets a staging file
+/// (`<image>.load`) instead, laid out exactly like the start of a full image
+/// (two zeroed header slots, then the data region), so the first checkpoint
+/// can publish it as the image without moving a byte.
+pub(crate) struct PendingLoad {
+    file: Arc<std::fs::File>,
+    /// The staging file's path, when the store has no image yet.
+    staging: Option<std::path::PathBuf>,
+    /// Where the next group goes.
+    end: u64,
+    groups: Vec<PendingGroup>,
+}
+
+/// One pending row group: where its column chunks are (absolute offsets), its
+/// statistics, and the source its chunks' handles were pointed at.
+pub(crate) struct PendingGroup {
+    db: String,
+    schema: String,
+    table: String,
+    first: usize,
+    dir: RowGroupDir,
+    accs: Vec<ChunkColumnStats>,
+    source: Arc<crate::storage::StoreSource>,
+}
+
+impl std::fmt::Debug for PendingLoad {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLoad")
+            .field("staging", &self.staging)
+            .field("end", &self.end)
+            .field("groups", &self.groups.len())
+            .finish()
+    }
+}
+
+// The streaming load (S2) calls these; until then only the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+impl PendingLoad {
+    /// Open the file a load writes into: the image at `target`, past its
+    /// logical and physical ends, or a fresh staging file beside it.
+    fn open(target: &std::path::Path) -> Result<Self> {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(target)
+        {
+            Ok(file) => {
+                let physical = file.metadata()?.len();
+                let logical = read_checkpoint_file(&file, physical)?
+                    .map_or(physical, |(_, slot, _)| slot.file_len);
+                Ok(Self {
+                    file: Arc::new(file),
+                    staging: None,
+                    end: physical.max(logical),
+                    groups: Vec::new(),
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let staging = staging_path(target);
+                let file = crate::fsutil::open_rw_private(&staging, true)?;
+                pwrite_all(&file, 0, &[0u8; DATA_START as usize])?;
+                Ok(Self {
+                    file: Arc::new(file),
+                    staging: Some(staging),
+                    end: DATA_START,
+                    groups: Vec::new(),
+                })
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The pending group for chunks `first..last` of `ns.name`, when the
+    /// table still names exactly its bytes (an UPDATE or DELETE since the
+    /// load re-encodes the group instead).
+    fn named_group(
+        &self,
+        ns: &crate::storage::SchemaPath,
+        name: &str,
+        t: &DataTable,
+        first: usize,
+        last: usize,
+    ) -> Option<(usize, &PendingGroup)> {
+        let (i, group) = self.groups.iter().enumerate().find(|(_, g)| {
+            g.first == first
+                && g.table.eq_ignore_ascii_case(name)
+                && g.schema.eq_ignore_ascii_case(ns.schema())
+                && g.db.eq_ignore_ascii_case(ns.db())
+        })?;
+        (group.dir.chunk_rows.len() == last - first && group.still_named(t)).then_some((i, group))
+    }
+}
+
+impl PendingGroup {
+    fn still_named(&self, t: &DataTable) -> bool {
+        let last = self.first + self.dir.chunk_rows.len();
+        t.columns.len() == self.dir.columns.len()
+            && last <= t.num_chunks()
+            && t.columns
+                .iter()
+                .zip(&self.dir.columns)
+                .all(|(column, dir)| {
+                    column.stored_chunk(self.first, last).is_some_and(|chunk| {
+                        Arc::ptr_eq(chunk.source(), &self.source)
+                            && chunk.offset() == dir.offset
+                            && chunk.length() == dir.length
+                    })
+                })
+    }
+
+    /// The group's column chunks are back to back from the first one's offset.
+    fn contiguous_from(&self, offset: u64) -> bool {
+        let mut at = offset;
+        for column in &self.dir.columns {
+            if column.offset != at {
+                return false;
+            }
+            at += column.length;
+        }
+        true
+    }
+
+    fn length(&self) -> u64 {
+        self.dir.columns.iter().map(|c| c.length).sum()
+    }
+}
+
+/// The staging file of a store that has no image yet.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn staging_path(target: &std::path::Path) -> std::path::PathBuf {
+    let mut s = target.as_os_str().to_os_string();
+    s.push(".load");
+    std::path::PathBuf::from(s)
+}
+
+/// Whether two handles name the same file (not just the same path).
+#[cfg(unix)]
+fn same_file(a: &std::fs::File, b: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (a.metadata(), b.metadata()) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Without a file identity, nothing is known to be the same file: pending
+/// groups are then copied like any stored chunk instead of referenced.
+#[cfg(not(unix))]
+fn same_file(_: &std::fs::File, _: &std::fs::File) -> bool {
+    false
+}
+
+/// A first checkpoint that publishes a load's staging file as the image: every
+/// table with rows must be pending, its groups exactly where the full image
+/// puts them. Anything else sets `mismatch` before a byte is written over the
+/// staged groups, and the save falls back to a fresh image.
+struct StagedPlan<'a> {
+    load: &'a PendingLoad,
+    mismatch: std::sync::atomic::AtomicBool,
+}
+
+impl StagedPlan<'_> {
+    fn refuse(&self) -> PinkDbError {
+        self.mismatch
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        PinkDbError::Execution("internal: the staged image does not line up".to_string())
+    }
+}
+
+/// [`write_table`] over a staged image: step over each pending group, which
+/// is already where this sink would write it.
+fn write_staged_table<S: Sink>(
+    data: &mut S,
+    plan: &StagedPlan<'_>,
+    ns: &crate::storage::SchemaPath,
+    name: &str,
+    t: &DataTable,
+    collect_stats: bool,
+    saved: &mut Vec<SavedTableStats>,
+) -> Result<(TableDir, TableCarry)> {
+    let schema = t.schema();
+    let n_chunks = t.num_chunks();
+    let mut accs: Vec<ChunkColumnStats> =
+        schema.iter().map(|_| ChunkColumnStats::empty()).collect();
+    let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
+    let mut row_groups: Vec<RowGroupDir> = Vec::with_capacity(n_groups);
+    for g in 0..n_groups {
+        let first = g * CHUNKS_PER_ROW_GROUP;
+        let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
+        let Some((_, group)) = plan.load.named_group(ns, name, t, first, last) else {
+            return Err(plan.refuse());
+        };
+        if !group.contiguous_from(data.offset()) {
+            return Err(plan.refuse());
+        }
+        data.skip(group.length())?;
+        for (ci, acc) in group.accs.iter().enumerate() {
+            accs[ci].merge(acc);
+        }
+        row_groups.push(group.dir.clone());
+    }
+    let carry: TableCarry = (0..schema.len()).map(|_| Vec::new()).collect();
+    Ok((
+        finish_table_dir(ns, name, t, row_groups, &accs, collect_stats, saved)?,
+        carry,
+    ))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PinkDb {
+    /// Encode chunks `first..last` of `ns.name` as one row group and write it
+    /// into the store at `target` ahead of the checkpoint (the streaming
+    /// load). The chunks' handles name the written bytes from here on, so the
+    /// cache may drop their decoded form. Nothing is durable until
+    /// [`PinkDb::sync_pending_load`]; nothing is published until a checkpoint.
+    pub(crate) fn write_pending_group(
+        &self,
+        target: &std::path::Path,
+        ns: &crate::storage::SchemaPath,
+        name: &str,
+        first: usize,
+        last: usize,
+    ) -> Result<()> {
+        if self.encryption_key.is_some() {
+            return Err(PinkDbError::Execution(
+                "an encrypted store cannot stream a load into its file".to_string(),
+            ));
+        }
+        let t = self.table_in(ns, name)?;
+        self.write_pending_group_of(target, ns, name, t, first, last)
+    }
+
+    /// [`PinkDb::write_pending_group`] for a table that is not (yet) in the
+    /// catalog: a streamed `CREATE TABLE … AS` builds its table off the
+    /// catalog and adds it under `ns.name` once every row is in.
+    pub(crate) fn write_pending_group_of(
+        &self,
+        target: &std::path::Path,
+        ns: &crate::storage::SchemaPath,
+        name: &str,
+        t: &DataTable,
+        first: usize,
+        last: usize,
+    ) -> Result<()> {
+        if self.encryption_key.is_some() {
+            return Err(PinkDbError::Execution(
+                "an encrypted store cannot stream a load into its file".to_string(),
+            ));
+        }
+        let group = encode_row_group(ns, name, t, first, last, true)?;
+        let mut guard = self.pending_load.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(PendingLoad::open(target)?);
+        }
+        let load = guard.as_mut().expect("just opened");
+        let base = load.end;
+        for (piece, column) in group.pieces.iter().zip(&group.columns) {
+            pwrite_all(&load.file, base + column.offset, &piece.bytes)?;
+        }
+        let len = group
+            .columns
+            .last()
+            .map_or(0, |column| column.offset + column.length);
+        load.end = base + len;
+        let source = crate::storage::StoreSource::file(Arc::clone(&load.file), load.end);
+        let carry: TableCarry = group
+            .carry
+            .into_iter()
+            .map(|chunks| {
+                chunks
+                    .into_iter()
+                    .map(|mut cc| {
+                        cc.dir.offset += base;
+                        cc
+                    })
+                    .collect()
+            })
+            .collect();
+        Self::repoint_written(vec![(t, carry)], &source);
+        load.groups.push(PendingGroup {
+            db: ns.db().to_string(),
+            schema: ns.schema().to_string(),
+            table: name.to_string(),
+            first,
+            dir: RowGroupDir {
+                rows: group.rows,
+                chunk_rows: group.chunk_rows,
+                columns: group
+                    .columns
+                    .into_iter()
+                    .map(|column| ColumnChunkDir {
+                        offset: base + column.offset,
+                        ..column
+                    })
+                    .collect(),
+            },
+            accs: group.accs,
+            source,
+        });
+        Ok(())
+    }
+
+    /// Make every pending group durable (the commit of a streamed load
+    /// fsyncs before it logs the groups).
+    pub(crate) fn sync_pending_load(&self) -> Result<()> {
+        let guard = self.pending_load.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(load) = guard.as_ref() {
+            load.file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// The first image of a store: publish a load's staging file when it
+    /// lines up, otherwise write a fresh image to `tmp` (copying any pending
+    /// group's bytes through) and drop the staging file.
+    fn save_first_image(&self, tmp: &std::path::Path, target: &std::path::Path) -> Result<()> {
+        let mut guard = self.pending_load.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(load) = guard.as_ref().filter(|load| load.staging.is_some()) else {
+            // A staging file nothing names is a load that never committed
+            // (no frame names its groups): the lease rules out a load in
+            // flight, so it is garbage.
+            let _ = std::fs::remove_file(staging_path(target));
+            return self.save_sync(tmp);
+        };
+        let staging = load.staging.clone().expect("filtered");
+        let plan = StagedPlan {
+            load,
+            mismatch: std::sync::atomic::AtomicBool::new(false),
+        };
+        let staged = (|| -> Result<()> {
+            use std::io::Seek;
+            let mut file = load.file.try_clone()?;
+            file.seek(std::io::SeekFrom::Start(0))?;
+            let mut sink = FileSink::new(file);
+            #[cfg(test)]
+            let hooks = Hooks::default();
+            #[cfg(not(test))]
+            let hooks = Hooks;
+            self.write_image_hooked(&mut sink, true, false, false, &hooks, Some(&plan))?;
+            sink.finish()?.sync_all()?;
+            Ok(())
+        })();
+        match staged {
+            Ok(()) => {
+                std::fs::rename(&staging, tmp)?;
+                *guard = None;
+                #[cfg(test)]
+                LAST_FIRST_IMAGE_STAGED.with(|last| last.set(Some(true)));
+                Ok(())
+            }
+            Err(_) if plan.mismatch.load(std::sync::atomic::Ordering::Relaxed) => {
+                #[cfg(test)]
+                LAST_FIRST_IMAGE_STAGED.with(|last| last.set(Some(false)));
+                // Nothing was written over the staged groups: copy them into
+                // a fresh image like any stored chunk.
+                self.save_sync(tmp)?;
+                *guard = None;
+                let _ = std::fs::remove_file(&staging);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// A streamed table as a WAL frame carries it (the streaming load's commit
+/// record): everything a replay needs to attach the table to the row groups
+/// the load already wrote, without running the load's query again.
+///
+/// `u8 version(=1) | str db | str schema | str table | u8 or_replace |
+/// u8 staging | schema | u64 row_count | u32 n_groups |
+/// n_groups × (u64 first_chunk | row group dir) | table statistics + zones`,
+/// with the footer's own encodings for the schema, the row groups and the
+/// statistics. `staging` says the groups are in `<image>.load` (the store
+/// had no image yet), not in the image.
+pub(crate) struct StreamedTable {
+    db: String,
+    schema: String,
+    name: String,
+    or_replace: bool,
+    staging: bool,
+    columns: Vec<(String, DataType)>,
+    row_count: u64,
+    groups: Vec<(usize, RowGroupDir)>,
+    stats: crate::stats::TableStats,
+    zones: Vec<Vec<crate::stats::Zone>>,
+}
+
+const STREAMED_TABLE_VERSION: u8 = 1;
+
+// The streamed `CREATE TABLE … AS` (S2) commits through these; until then
+// only the tests and the replay do.
+#[cfg_attr(not(test), allow(dead_code))]
+impl StreamedTable {
+    /// The table's name in the record.
+    pub(crate) fn table(&self) -> (&str, &str, &str) {
+        (&self.db, &self.schema, &self.name)
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u8(STREAMED_TABLE_VERSION);
+        w.str(&self.db);
+        w.str(&self.schema);
+        w.str(&self.name);
+        w.u8(u8::from(self.or_replace));
+        w.u8(u8::from(self.staging));
+        write_schema(&mut w, &self.columns);
+        w.u64(self.row_count);
+        w.u32(self.groups.len() as u32);
+        for (first, group) in &self.groups {
+            w.u64(*first as u64);
+            write_row_group_dir(&mut w, group);
+        }
+        write_table_stats(&mut w, &self.stats, &self.zones);
+        w.buf
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        let version = r.u8()?;
+        if version != STREAMED_TABLE_VERSION {
+            return r.err(&format!("unknown streamed-table record version {version}"));
+        }
+        let db = r.str()?;
+        let schema = r.str()?;
+        let name = r.str()?;
+        let or_replace = r.u8()? != 0;
+        let staging = r.u8()? != 0;
+        let columns = read_schema(&mut r)?;
+        let row_count = r.u64()?;
+        let n_groups = r.u32()? as usize;
+        if n_groups > r.remaining() / 8 + 1 {
+            return r.err("row-group count exceeds the record");
+        }
+        let mut groups = Vec::with_capacity(n_groups);
+        for _ in 0..n_groups {
+            let first = r.u64()? as usize;
+            groups.push((first, read_row_group_dir(&mut r, columns.len())?));
+        }
+        let (stats, zones) = read_table_stats(&mut r, columns.len(), row_count)?;
+        if r.remaining() != 0 {
+            return r.err("trailing bytes after a streamed-table record");
+        }
+        Ok(Self {
+            db,
+            schema,
+            name,
+            or_replace,
+            staging,
+            columns,
+            row_count,
+            groups,
+            stats,
+            zones,
+        })
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PinkDb {
+    /// The commit record of a streamed table `ns.name` (see
+    /// [`StreamedTable`]): its pending groups, which must cover every chunk
+    /// of `t` in order, and its statistics.
+    pub(crate) fn streamed_table_record(
+        &self,
+        ns: &crate::storage::SchemaPath,
+        name: &str,
+        or_replace: bool,
+        t: &DataTable,
+    ) -> Result<StreamedTable> {
+        let guard = self.pending_load.lock().unwrap_or_else(|e| e.into_inner());
+        let load = guard.as_ref().ok_or_else(|| {
+            PinkDbError::Execution("internal: a streamed table has no pending load".to_string())
+        })?;
+        let mut groups = Vec::new();
+        let mut next = 0usize;
+        while next < t.num_chunks() {
+            let last = (next + CHUNKS_PER_ROW_GROUP).min(t.num_chunks());
+            let (_, group) = load.named_group(ns, name, t, next, last).ok_or_else(|| {
+                PinkDbError::Execution(format!(
+                    "internal: streamed table \"{name}\" has chunks {next}..{last} outside its \
+                     written row groups"
+                ))
+            })?;
+            groups.push((next, group.dir.clone()));
+            next = last;
+        }
+        Ok(StreamedTable {
+            db: ns.db().to_string(),
+            schema: ns.schema().to_string(),
+            name: name.to_string(),
+            or_replace,
+            staging: load.staging.is_some(),
+            columns: t.schema(),
+            row_count: t.num_rows as u64,
+            groups,
+            stats: t.stats.clone(),
+            zones: t.zones.clone(),
+        })
+    }
+
+    /// Stage a streamed table's commit record on this store's WAL, for the
+    /// frame the statement's commit appends next. The row groups must
+    /// already be durable ([`PinkDb::sync_pending_load`]): a frame never names
+    /// bytes that might not be on disk.
+    pub(crate) fn stage_streamed_table(&self, record: &StreamedTable) -> Result<()> {
+        let wal = self.durable_handle().ok_or_else(|| {
+            PinkDbError::Execution("internal: a streamed load needs a durable store".to_string())
+        })?;
+        wal.lock()
+            .map_err(|_| PinkDbError::Execution("internal lock error (poisoned)".to_string()))?
+            .stage_streamed(record.encode());
+        Ok(())
+    }
+
+    /// Replay a streamed table's commit record: verify every column chunk's
+    /// CRC32C in the file the load wrote it to, then create the table over
+    /// those bytes (replacing an existing one for `CREATE OR REPLACE`) and
+    /// register its groups as pending, so this store's next checkpoint
+    /// references them in place. The load's source is never read again.
+    pub(crate) fn attach_streamed_table(
+        &mut self,
+        target: &std::path::Path,
+        record: &StreamedTable,
+    ) -> Result<()> {
+        let path = if record.staging {
+            staging_path(target)
+        } else {
+            target.to_path_buf()
+        };
+        let name = &record.name;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| {
+                PinkDbError::Execution(format!(
+                    "streamed table \"{name}\": cannot open {} with its row groups: {e}",
+                    path.display()
+                ))
+            })?;
+        let len = file.metadata()?.len();
+        let mut buf = Vec::new();
+        for (_, group) in &record.groups {
+            for column in &group.columns {
+                let end = column.offset.checked_add(column.length);
+                if end.is_none_or(|end| end > len) || column.length > usize::MAX as u64 {
+                    return Err(PinkDbError::Execution(format!(
+                        "streamed table \"{name}\": the row group range {}..{} is outside {} \
+                         ({len} bytes)",
+                        column.offset,
+                        column.offset.saturating_add(column.length),
+                        path.display()
+                    )));
+                }
+                buf.resize(column.length as usize, 0);
+                crate::storage::pread_exact(&file, column.offset, &mut buf)?;
+                if crc32c(&buf) != column.crc32c {
+                    return Err(PinkDbError::Execution(format!(
+                        "streamed table \"{name}\": the checksum of bytes {}..{} in {} does not \
+                         match its commit record (the file is damaged)",
+                        column.offset,
+                        column.offset + column.length,
+                        path.display()
+                    )));
+                }
+            }
+        }
+        let file = Arc::new(file);
+        let source = crate::storage::StoreSource::file(Arc::clone(&file), len);
+        let n_cols = record.columns.len();
+        let mut columns: Vec<Vec<Arc<crate::storage::ChunkHandle>>> = Vec::with_capacity(n_cols);
+        for ci in 0..n_cols {
+            let mut handles = Vec::new();
+            for (_, group) in &record.groups {
+                let dir = &group.columns[ci];
+                let chunk = crate::storage::EncodedColumnChunk::new(
+                    Arc::clone(&source),
+                    dir.offset,
+                    dir.length,
+                    dir.crc32c,
+                    dir.page_count,
+                );
+                for (p, &rows) in group.chunk_rows.iter().enumerate() {
+                    handles.push(Arc::new(crate::storage::ChunkHandle::new_encoded(
+                        Arc::clone(&chunk),
+                        p as u32,
+                        rows as usize,
+                    )));
+                }
+            }
+            columns.push(handles);
+        }
+        let ns = crate::storage::SchemaPath::new(&record.db, &record.schema);
+        if record.or_replace && self.table_in(&ns, name).is_ok() {
+            self.drop_table_in(&ns, name)?;
+        }
+        self.create_table_in(&ns, name, record.columns.clone())?;
+        let t = self.table_mut_in(&ns, name)?;
+        t.set_loaded_chunks(columns, record.row_count as usize)?;
+        t.set_loaded_stats(record.stats.clone(), record.zones.clone(), true);
+        // The groups are pending for this store too: its next checkpoint must
+        // reference them where they are and allocate past them.
+        let mut guard = self.pending_load.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(PendingLoad {
+                file: Arc::clone(&file),
+                staging: record.staging.then(|| path.clone()),
+                end: len,
+                groups: Vec::new(),
+            });
+        }
+        let load = guard.as_mut().expect("just set");
+        if load.staging.is_some() == record.staging && same_file(&load.file, &file) {
+            load.end = load.end.max(len);
+            for (first, group) in &record.groups {
+                load.groups.push(PendingGroup {
+                    db: record.db.clone(),
+                    schema: record.schema.clone(),
+                    table: record.name.clone(),
+                    first: *first,
+                    dir: group.clone(),
+                    accs: group
+                        .columns
+                        .iter()
+                        .map(|c| crate::stats::Zone {
+                            null_count: c.null_count,
+                            min: c.min.clone(),
+                            max: c.max.clone(),
+                            nan_count: c.nan_count,
+                        })
+                        .collect(),
+                    source: Arc::clone(&source),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One row group of an incremental checkpoint, in table order: kept in place,
 /// or encoded for [`write_group`].
 enum GroupStep<'a> {
     Reused(&'a RowGroupDir),
+    /// A bulk load's group already in the file (index into the load).
+    Pending(usize, &'a PendingGroup),
     Encoded(GroupBuild),
 }
 
@@ -5966,6 +6777,51 @@ fn first_fit(free: &mut Vec<(u64, u64)>, len: u64, min_offset: u64) -> Option<u6
         i += 1;
     }
     None
+}
+
+/// The free ranges the store file at `path` lists in its current footer (a
+/// test view of the allocator's bookkeeping).
+#[cfg(test)]
+pub(crate) fn footer_free_ranges(path: &std::path::Path) -> Vec<(u64, u64)> {
+    let file = std::fs::File::open(path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let (_, _, footer) = read_checkpoint_file(&file, len).unwrap().unwrap();
+    footer.free_ranges
+}
+
+/// Where chunk 0 of each column of `t` is stored, as `(offset, length)` of
+/// its column chunk (a test view of what a checkpoint referenced).
+#[cfg(test)]
+pub(crate) fn stored_column_chunks(t: &DataTable, first: usize, last: usize) -> Vec<(u64, u64)> {
+    t.columns
+        .iter()
+        .map(|c| {
+            let chunk = c.stored_chunk(first, last).expect("stored");
+            (chunk.offset(), chunk.length())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_FIRST_IMAGE_STAGED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether this thread's last first image published a staging file (`true`)
+/// or fell back to a fresh image (`false`).
+#[cfg(test)]
+pub(crate) fn last_first_image_staged() -> Option<bool> {
+    LAST_FIRST_IMAGE_STAGED.with(|last| last.get())
+}
+
+/// Whether the store has a pending load, and whether it is staged.
+#[cfg(test)]
+pub(crate) fn pending_load_state(db: &PinkDb) -> Option<bool> {
+    db.pending_load
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|load| load.staging.is_some())
 }
 
 // A test hook: how many times this thread's incremental checkpoint reused a
@@ -6910,45 +7766,8 @@ fn parse_store_footer(footer: &[u8], data_end: u64) -> Result<StoreFooter> {
             let mut tables = Vec::with_capacity(n_tables);
             for _ in 0..n_tables {
                 let tname = r.str()?;
-                let n_cols = r.u32()? as usize;
-                // Each column costs at least 5 bytes (name length + dtype tag).
-                if n_cols > r.remaining() / 5 {
-                    return r.err("column count exceeds the remaining file");
-                }
-                let mut schema = Vec::with_capacity(n_cols);
-                for _ in 0..n_cols {
-                    let col = r.str()?;
-                    let tag = r.u8()?;
-                    let dtype = match tag {
-                        7 => {
-                            let precision = r.u8()?;
-                            let scale = r.u8()?;
-                            crate::types::decimal_type(precision, scale).ok_or_else(|| {
-                                PinkDbError::Execution(
-                                    "corrupt file: bad DECIMAL precision/scale".to_string(),
-                                )
-                            })?
-                        }
-                        8 => DataType::Interval,
-                        10 => {
-                            let elem_tag = r.u8()?;
-                            let elem =
-                                crate::types::ArrayElem::from_tag(elem_tag).ok_or_else(|| {
-                                    PinkDbError::Execution(format!(
-                                        "corrupt file: bad ARRAY element kind {elem_tag}"
-                                    ))
-                                })?;
-                            let len = r.u32()?;
-                            crate::types::array_type(elem, len).ok_or_else(|| {
-                                PinkDbError::Execution(
-                                    "corrupt file: bad ARRAY element count".to_string(),
-                                )
-                            })?
-                        }
-                        other => dtype_from_tag(other)?,
-                    };
-                    schema.push((col, dtype));
-                }
+                let schema = read_schema(&mut r)?;
+                let n_cols = schema.len();
                 let tconstraints = if constraints {
                     read_constraints(&mut r, n_cols)?
                 } else {
@@ -6978,53 +7797,7 @@ fn parse_store_footer(footer: &[u8], data_end: u64) -> Result<StoreFooter> {
                 }
                 let mut row_groups = Vec::with_capacity(n_groups);
                 for _ in 0..n_groups {
-                    let rows = r.u64()?;
-                    let chunk_count = r.u32()? as usize;
-                    if chunk_count > r.remaining() / 4 {
-                        return r.err("the row group's chunk count exceeds the remaining file");
-                    }
-                    let mut chunk_rows = Vec::with_capacity(chunk_count);
-                    for _ in 0..chunk_count {
-                        chunk_rows.push(r.u32()?);
-                    }
-                    let mut columns = Vec::with_capacity(n_cols);
-                    for _ in 0..n_cols {
-                        let offset = r.u64()?;
-                        let length = r.u64()?;
-                        let page_count = r.u32()?;
-                        let encodings = r.u32()?;
-                        let crc = r.u32()?;
-                        let null_count = r.u64()?;
-                        let nan_count = r.u64()?;
-                        let min = read_stat_value(&mut r)?;
-                        let max = read_stat_value(&mut r)?;
-                        columns.push(ColumnChunkDir {
-                            offset,
-                            length,
-                            page_count,
-                            encodings,
-                            crc32c: crc,
-                            null_count,
-                            nan_count,
-                            min,
-                            max,
-                        });
-                    }
-                    if columns
-                        .iter()
-                        .any(|c| c.page_count as usize != chunk_rows.len())
-                        || chunk_rows.iter().map(|&n| n as u64).sum::<u64>() != rows
-                    {
-                        return Err(PinkDbError::Execution(
-                            "corrupt file: a row group's chunk row counts disagree with its pages"
-                                .to_string(),
-                        ));
-                    }
-                    row_groups.push(RowGroupDir {
-                        rows,
-                        chunk_rows,
-                        columns,
-                    });
+                    row_groups.push(read_row_group_dir(&mut r, n_cols)?);
                 }
                 let (tstats, tzones) = read_table_stats(&mut r, n_cols, row_count)?;
                 tables.push(TableDir {
@@ -10820,6 +11593,7 @@ mod tests {
                 free_ranges,
                 second_slot,
             },
+            None,
         )
         .unwrap();
         data.buf

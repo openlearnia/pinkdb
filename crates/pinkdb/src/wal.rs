@@ -3,13 +3,14 @@
 //! For `<path>.pink` the log is a sidecar `<path>.pink.wal`:
 //!
 //! ```text
-//! header:  magic "PINKWAL1" (8 bytes) + format version u32 (=7)
+//! header:  magic "PINKWAL1" (8 bytes) + format version u32 (=9)
 //!          + generation u64 + wal_id [16] + crc32(0..36) u32
 //!          + commit slot A (24 bytes) + commit slot B (24 bytes)
 //!          + reserved zero u32×2
 //! record:  payload_len u32 | lsn u64 | crc32(payload) u32 | payload
 //! payload: stmt_count u32 | sets_len u32 | sets | per statement: len u32 + UTF-8 SQL text
-//!          | optional CHUNKS_MARKER + chunk section | memo_count u32 | memo entries
+//!          | optional CHUNKS_MARKER + chunk section
+//!          | optional STREAMED_MARKER + streamed-table section | memo_count u32 | memo entries
 //! sets:    format u8 (=1) | table_count u32 | (db_len u16 + db, name_len u16 + name)*
 //!          | db_count u32 | (db_len u16 + db)*
 //! ```
@@ -28,11 +29,17 @@
 //! snapshot. Version 7 (wave 112d) adds the optional binary appender-chunk
 //! section, so a flush of materialized rows commits without rendering and
 //! re-parsing SQL text; version 8 writes that section column by column and
-//! replays it as the flush's own `INSERT … SELECT`. Version 2/3 WALs are accepted and upgraded in place
-//! under the write lease (records are re-encoded with unknown sets and an
-//! empty memo); older builds refuse version 8 cleanly through the
-//! `BadVersion` path before reading any record. Encrypted **WAL** containers are version 3; encrypted checkpoints
-//! stay at container version 2, so `.pink` bytes are unchanged by this wave.
+//! replays it as the flush's own `INSERT … SELECT`; version 9 (the streaming
+//! load) commits a streamed `CREATE TABLE … AS` by the row groups it wrote
+//! into the store file. Version 2/3 WALs are accepted and upgraded in place under the write lease (records are
+//! re-encoded with unknown sets and an empty memo); a WAL an older build
+//! created in the current header layout (formats 4 up to the current one) that
+//! holds no records is recreated, while one with records is refused with the
+//! instruction to open the store with that version and CHECKPOINT; older
+//! builds refuse version 9 cleanly through the `BadVersion` path before
+//! reading any record. Encrypted **WAL** and checkpoint containers are version
+//! 4 (the WAL's publish block is authenticated); an older container is rebuilt
+//! at open / re-sealed on its next save.
 //!
 //! # Multi-process access (wave 45m) and optimistic commits (wave 45o)
 //!
@@ -228,10 +235,14 @@ pub const WAL_MAGIC: &[u8; 8] = b"PINKWAL1";
 /// [`SECRETS_MARKER`]) when the record changed the store's secrets; version 7
 /// (wave 112d) adds the optional binary appender-chunk section (see
 /// [`CHUNKS_MARKER`]); version 8 writes that section column by column (see
-/// [`encode_chunks`]). Every durable open rewrites a v2/v3 file in place
-/// under the write lease; an older build refuses a v8 file with a clean
-/// version error before it reads any record.
-pub const WAL_VERSION: u32 = 8;
+/// [`encode_chunks`]); version 9 (the streaming load) adds the optional
+/// streamed-table section (see [`STREAMED_MARKER`]): a `CREATE TABLE … AS`
+/// that wrote its row groups into the store file commits a record of them
+/// instead of its statement, and replay attaches the table to those bytes.
+/// Every durable open rewrites a v2/v3 file in place under the write lease;
+/// an older build refuses a v9 file with a clean version error before it
+/// reads any record.
+pub const WAL_VERSION: u32 = 9;
 /// An engine WAL payload detached from a local WAL file. Object-backed
 /// catalog stores use this framing so each immutable object is one logical
 /// WAL record without inheriting a local file's generation, LSN, or nonce.
@@ -1754,6 +1765,10 @@ pub(crate) struct Record {
     /// of the statement text so a large append does not pay SQL rendering
     /// and re-parsing on every durable commit.
     chunks: Vec<WalChunk>,
+    /// Streamed-table commit records (payload v9), applied after the
+    /// statements and chunks: each attaches a table to row groups its load
+    /// already wrote (see `persist::StreamedTable`).
+    streamed: Vec<Vec<u8>>,
     /// The frame's touched-object set (payload v4); `None` = unknown (a
     /// record adopted from a legacy v2/v3 upgrade).
     sets: Option<FrameSets>,
@@ -1814,6 +1829,10 @@ pub struct Wal {
     file: File,
     path: PathBuf,
     checkpoint_path: PathBuf,
+    /// Streamed-table commit records (payload v9) for the next append: the
+    /// streaming load stages its record right before it logs the statement,
+    /// and that append takes them, so a record never rides on another frame.
+    staged_streamed: Vec<Vec<u8>>,
     policy: SyncPolicy,
     /// Generation of the live WAL; rolls carry the drained generation.
     generation: u64,
@@ -2053,14 +2072,22 @@ pub(crate) struct Applied {
     ckpt: Option<CkptMeta>,
 }
 
-/// Enough to witness a checkpoint-file replacement without reading it:
-/// identity, length, and mtime. A `.save` snapshot rewrites the target in
-/// place, so `(dev, ino)` alone cannot see it; the length + mtime pair does.
+/// Enough to witness a checkpoint-file replacement: its identity and a
+/// checksum of its header slots. A `.save` snapshot rewrites the target in
+/// place, so `(dev, ino)` alone cannot see it; every save and checkpoint
+/// writes a slot, so the header does. A streaming load's row groups appended
+/// past the logical end (see `persist::PendingLoad`) change the file's length
+/// and mtime but neither slot, so they are not mistaken for a new checkpoint.
+///
+/// This rests on two invariants: a store checkpointed in place keeps its
+/// `(dev, ino)`, and every way a new image reaches the path (a full
+/// checkpoint's rename, a `.save`) comes with header slots of its own, so
+/// either the identity or the header changes whenever the image does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CkptMeta {
     dev_ino: Option<(u64, u64)>,
-    len: u64,
-    mtime_ns: Option<i128>,
+    /// CRC32C of the header bytes present (up to both slots), and how many.
+    header: (u32, usize),
 }
 
 /// A single-stat witness of a file's identity and length (the optimistic
@@ -2080,15 +2107,23 @@ fn file_meta(path: &Path) -> Option<FileMeta> {
 }
 
 fn ckpt_meta(path: &Path) -> Option<CkptMeta> {
-    let m = std::fs::metadata(path).ok()?;
+    use std::io::Read;
+    let file = File::open(path).ok()?;
+    let m = file.metadata().ok()?;
+    let mut header = [0u8; crate::persist::DATA_START as usize];
+    let mut got = 0;
+    let mut reader = &file;
+    while got < header.len() {
+        match reader.read(&mut header[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
     Some(CkptMeta {
         dev_ino: Some(identity_of(&m)),
-        len: m.len(),
-        mtime_ns: m
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as i128),
+        header: (crate::persist::crc32c(&header[..got]), got),
     })
 }
 
@@ -2343,6 +2378,7 @@ impl Wal {
             file: opened.file,
             path: path.to_path_buf(),
             checkpoint_path,
+            staged_streamed: Vec::new(),
             policy,
             generation: opened.generation,
             wal_id: opened.wal_id,
@@ -2637,6 +2673,14 @@ impl Wal {
         }
     }
 
+    /// Carry `record` (a `persist::StreamedTable`) in the next appended frame.
+    /// The caller appends that frame right away; the append takes every
+    /// staged record, and a failed append drops them with the frame.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn stage_streamed(&mut self, record: Vec<u8>) {
+        self.staged_streamed.push(record);
+    }
+
     /// [`Wal::append`] without the wait: the record is written and the returned
     /// token must be waited on (`Ok`) or dropped (`None`, `SyncPolicy::Batch`)
     /// by the caller *after* releasing the store's write lock, never earlier.
@@ -2667,7 +2711,8 @@ impl Wal {
         if let Some(s) = &mut sets {
             s.canonicalize();
         }
-        let payload = encode_payload(stmts, chunks, sets.as_ref(), secrets, memo)?;
+        let streamed = std::mem::take(&mut self.staged_streamed);
+        let payload = encode_payload(stmts, chunks, &streamed, sets.as_ref(), secrets, memo)?;
         let len = record_len_guard(payload.len())?;
         let portable = encode_portable_record(&payload)?;
         let lsn = self.last_lsn.checked_add(1).ok_or_else(|| {
@@ -3050,13 +3095,15 @@ fn decode_portable_record(bytes: &[u8], lsn: u64) -> Result<Record> {
             "catalog WAL record checksum mismatch".to_string(),
         ));
     }
-    let (stmts, chunks, sets, secrets, memo) = decode_payload(payload).map_err(|message| {
-        PinkDbError::Execution(format!("invalid catalog WAL record: {message}"))
-    })?;
+    let (stmts, chunks, streamed, sets, secrets, memo) =
+        decode_payload(payload).map_err(|message| {
+            PinkDbError::Execution(format!("invalid catalog WAL record: {message}"))
+        })?;
     Ok(Record {
         lsn,
         stmts,
         chunks,
+        streamed,
         sets,
         secrets,
         memo,
@@ -3245,6 +3292,63 @@ const SECRETS_MARKER: u32 = 0x5343_5254;
 /// memo's call count would be; a memo count that large cannot fit a record,
 /// so the two are unambiguous.
 const CHUNKS_MARKER: u32 = 0x4348_4E4B;
+/// Starts the optional streamed-table section (payload v9): the commit
+/// records of `CREATE TABLE … AS` loads whose row groups are already in the
+/// store file (see `persist::StreamedTable`). It follows the chunk section,
+/// where the memo's call count would otherwise be; a memo count that large
+/// cannot fit a record, and it differs from [`CHUNKS_MARKER`] and
+/// [`SECRETS_MARKER`], so none of the three can be mistaken for another.
+const STREAMED_MARKER: u32 = 0x5354_524D;
+
+/// `[u32 STREAMED_MARKER | u32 count | count × (u32 len | record)]`; nothing
+/// when there is no record.
+fn encode_streamed(records: &[Vec<u8>]) -> Result<Vec<u8>> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&STREAMED_MARKER.to_le_bytes());
+    out.extend_from_slice(&(records.len() as u32).to_le_bytes());
+    for record in records {
+        encode_bytes_u32(&mut out, record)?;
+    }
+    Ok(out)
+}
+
+fn encode_bytes_u32(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let len = u32::try_from(bytes.len()).map_err(|_| {
+        PinkDbError::Execution("a streamed-table record is too large for the WAL".to_string())
+    })?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// Read the optional streamed-table section at `pos`.
+fn decode_streamed(
+    payload: &[u8],
+    pos: usize,
+) -> std::result::Result<(Vec<Vec<u8>>, usize), String> {
+    if payload.len().saturating_sub(pos) < 4
+        || u32::from_le_bytes(payload[pos..pos + 4].try_into().expect("4 bytes")) != STREAMED_MARKER
+    {
+        return Ok((Vec::new(), pos));
+    }
+    let mut r = Payload::new(payload, pos + 4);
+    let count = r.u32()? as usize;
+    if count > payload.len() / 4 {
+        return Err(format!("implausible streamed-table count {count}"));
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = r.u32()? as usize;
+        if len > r.remaining() {
+            return Err("truncated streamed-table record".to_string());
+        }
+        out.push(r.take(len)?.to_vec());
+    }
+    Ok((out, r.pos))
+}
 
 /// Encode the frame's touched set (payload v4, format 2):
 /// `u8 ver(=2) | u32 n_tables | n*(u16 db_len | db | u16 s_len | s |
@@ -3369,6 +3473,7 @@ fn decode_sets(bytes: &[u8]) -> std::result::Result<FrameSets, String> {
 fn encode_payload(
     stmts: &[String],
     chunks: &[WalChunk],
+    streamed: &[Vec<u8>],
     sets: Option<&FrameSets>,
     secrets: Option<&[crate::secret::Secret]>,
     memo: &[ExtCall],
@@ -3396,7 +3501,9 @@ fn encode_payload(
     };
     let memo_bytes = encode_ext_calls(memo)?;
     let chunk_bytes = encode_chunks(chunks)?;
-    let mut total = 8usize + sets_bytes.len() + secrets_bytes.len() + chunk_bytes.len();
+    let streamed_bytes = encode_streamed(streamed)?;
+    let mut total =
+        8usize + sets_bytes.len() + secrets_bytes.len() + chunk_bytes.len() + streamed_bytes.len();
     for s in stmts {
         let n = u32::try_from(s.len()).map_err(|_| {
             PinkDbError::Execution("statement is too large for a WAL record".to_string())
@@ -3420,6 +3527,7 @@ fn encode_payload(
         out.extend_from_slice(s.as_bytes());
     }
     out.extend_from_slice(&chunk_bytes);
+    out.extend_from_slice(&streamed_bytes);
     out.extend_from_slice(&memo_bytes);
     debug_assert_eq!(out.len(), total);
     Ok(out)
@@ -4108,6 +4216,7 @@ fn decode_payload_legacy(payload: &[u8]) -> std::result::Result<Vec<String>, Str
 type PayloadParts = (
     Vec<String>,
     Vec<WalChunk>,
+    Vec<Vec<u8>>,
     Option<FrameSets>,
     Option<Vec<crate::secret::Secret>>,
     Vec<ExtCall>,
@@ -4136,8 +4245,9 @@ fn decode_payload(payload: &[u8]) -> std::result::Result<PayloadParts, String> {
     let (secrets, stmts_start) = decode_secrets(payload, sets_end)?;
     let (stmts, pos) = decode_statements(payload, stmts_start, count)?;
     let (chunks, pos) = decode_chunks(payload, pos)?;
+    let (streamed, pos) = decode_streamed(payload, pos)?;
     let memo = decode_ext_calls(payload, pos)?;
-    Ok((stmts, chunks, sets, secrets, memo))
+    Ok((stmts, chunks, streamed, sets, secrets, memo))
 }
 
 /// Decode the optional secret section at `pos` (wave 132b). Absent when the
@@ -4274,7 +4384,7 @@ fn parse_records(
         if end > data.len() {
             break;
         }
-        let (stmts, chunks, sets, secrets, memo) = match cipher {
+        let (stmts, chunks, streamed, sets, secrets, memo) = match cipher {
             Some(c) => {
                 let next = ordinal_base
                     .checked_add(ordinal)
@@ -4304,6 +4414,7 @@ fn parse_records(
                                 decode_payload_legacy(&plain).map_err(|e| {
                                     format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
                                 })?,
+                                Vec::new(),
                                 Vec::new(),
                                 None,
                                 None,
@@ -4347,6 +4458,7 @@ fn parse_records(
                             format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
                         })?,
                         Vec::new(),
+                        Vec::new(),
                         None,
                         None,
                         Vec::new(),
@@ -4358,6 +4470,7 @@ fn parse_records(
             lsn,
             stmts,
             chunks,
+            streamed,
             sets,
             secrets,
             memo,
@@ -4401,6 +4514,7 @@ fn rewrite_encrypted(
             let payload = encode_payload(
                 &rec.stmts,
                 &rec.chunks,
+                &rec.streamed,
                 rec.sets.as_ref(),
                 rec.secrets.as_deref(),
                 &rec.memo,
@@ -4446,6 +4560,7 @@ fn upgrade_plain(path: &Path, data: &[u8], generation: u64, records_start: usize
         let payload = encode_payload(
             &rec.stmts,
             &rec.chunks,
+            &rec.streamed,
             None,
             rec.secrets.as_deref(),
             &rec.memo,
@@ -5744,7 +5859,7 @@ impl PinkDb {
             // reproduce those — and a replayed `LOAD EXTENSION` of an already
             // loaded path is the no-op the WAL intends.
             db.replaying = true;
-            let result = replay_record(&mut db, rec);
+            let result = replay_record(&mut db, rec, Some(&ckpt));
             db.replaying = false;
             result?;
         }
@@ -6352,8 +6467,9 @@ impl PinkDb {
         // catalog set and restore the live one afterwards.
         let saved_temp = std::mem::take(&mut self.temp);
         let mut result = Ok(());
+        let store = wal.checkpoint_path.clone();
         for rec in records {
-            if let Err(e) = replay_record(self, rec) {
+            if let Err(e) = replay_record(self, rec, Some(&store)) {
                 result = Err(e);
                 break;
             }
@@ -6558,7 +6674,7 @@ impl PinkDb {
         self.replaying = true;
         let result = decoded
             .iter()
-            .try_for_each(|record| replay_record(self, record));
+            .try_for_each(|record| replay_record(self, record, None));
         self.replaying = false;
         self.wal = stashed_wal;
         if self.schema_exists(&local_session) {
@@ -6802,7 +6918,11 @@ fn replay_chunk(db: &mut PinkDb, chunk: &WalChunk) -> Result<()> {
 
 /// Apply one recovered record: every statement must replay cleanly. A
 /// CRC-valid record that fails to parse/bind/execute is a hard error.
-fn replay_record(db: &mut PinkDb, rec: &Record) -> Result<()> {
+///
+/// `store` is the store file a streamed-table record's row groups are in
+/// (the record's own store); `None` where records are applied to another
+/// store, which cannot reach those bytes.
+fn replay_record(db: &mut PinkDb, rec: &Record, store: Option<&Path>) -> Result<()> {
     // A record that changed the store's secrets carries the whole persistent
     // set (values in their own section, never in the statement text); install
     // it before the statements so an `ATTACH` finds its password.
@@ -6852,6 +6972,28 @@ fn replay_record(db: &mut PinkDb, rec: &Record) -> Result<()> {
             }
         }
     }
+    // A streamed load's table is attached to the row groups it wrote; its
+    // query (and the files it read) is never run again.
+    if outcome.is_ok() {
+        for bytes in &rec.streamed {
+            let attached = match store {
+                Some(store) => crate::persist::StreamedTable::decode(bytes)
+                    .and_then(|table| db.attach_streamed_table(store, &table)),
+                None => Err(PinkDbError::Execution(
+                    "a streamed table's row groups are in its own store file, which this \
+                     store cannot read"
+                        .to_string(),
+                )),
+            };
+            if let Err(e) = attached {
+                outcome = Err(PinkDbError::Execution(format!(
+                    "WAL replay failed at lsn {}: {e}",
+                    rec.lsn
+                )));
+                break;
+            }
+        }
+    }
     db.set_ext_replay(previous);
     db.restore_replay_pins(pins);
     db.volatile.clear();
@@ -6878,11 +7020,12 @@ mod tests {
             lsn: 1,
             stmts: vec!["INSERT INTO t SELECT uuid() FROM range(2);".to_string()],
             chunks: Vec::new(),
+            streamed: Vec::new(),
             sets: None,
             secrets: None,
             memo: Vec::new(),
         };
-        let err = replay_record(&mut db, &rec).unwrap_err().to_string();
+        let err = replay_record(&mut db, &rec, None).unwrap_err().to_string();
         assert!(err.contains("does not carry a seed"), "{err}");
         let results = db.execute("SELECT count(*) FROM t;").unwrap();
         assert_eq!(
@@ -7034,8 +7177,10 @@ mod tests {
             table: "t".to_string(),
             chunks,
         };
-        let payload = encode_payload(&[], std::slice::from_ref(&chunk), None, None, &[]).unwrap();
-        let (stmts, decoded, sets, secrets, memo) = decode_payload(&payload).unwrap();
+        let payload =
+            encode_payload(&[], std::slice::from_ref(&chunk), &[], None, None, &[]).unwrap();
+        let (stmts, decoded, streamed, sets, secrets, memo) = decode_payload(&payload).unwrap();
+        assert!(streamed.is_empty());
         assert!(stmts.is_empty());
         assert!(sets.is_none() && secrets.is_none() && memo.is_empty());
         let rows = |w: &WalChunk| -> Vec<Vec<Value>> {
@@ -7409,7 +7554,7 @@ mod tests {
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(&Wal::header_fresh(generation)).unwrap();
         for (lsn, stmts) in records {
-            let payload = encode_payload(stmts, &[], None, None, &[]).unwrap();
+            let payload = encode_payload(stmts, &[], &[], None, None, &[]).unwrap();
             f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
             f.write_all(&lsn.to_le_bytes()).unwrap();
             f.write_all(&crc32(&payload).to_le_bytes()).unwrap();
@@ -8309,7 +8454,7 @@ mod tests {
             assert!(err.to_string().contains("exceeds the u32"), "{err}");
         }
         // Real encodings stay far under the limit.
-        let payload = encode_payload(&["SELECT 1".to_string()], &[], None, None, &[]).unwrap();
+        let payload = encode_payload(&["SELECT 1".to_string()], &[], &[], None, None, &[]).unwrap();
         assert!(payload.len() < 100);
     }
 
@@ -8382,6 +8527,560 @@ mod tests {
             ints(&mut again, "SELECT a FROM t ORDER BY a;"),
             vec![1, 2, 3]
         );
+        cleanup(&p);
+    }
+
+    /// The streaming load's pending groups (S1): write every row group of `t`
+    /// ahead of the checkpoint, as a streamed load will.
+    fn write_all_pending(db: &PinkDb, p: &Path, table: &str) {
+        let ns = crate::storage::SchemaPath::new("main", "main");
+        let n = db.table_in(&ns, table).unwrap().num_chunks();
+        let per = crate::persist::CHUNKS_PER_ROW_GROUP;
+        for first in (0..n).step_by(per) {
+            db.write_pending_group(p, &ns, table, first, (first + per).min(n))
+                .unwrap();
+        }
+        db.sync_pending_load().unwrap();
+    }
+
+    fn fill(db: &mut PinkDb, table: &str, rows: usize) {
+        db.execute(&format!(
+            "CREATE TABLE {table} AS SELECT i AS a, 'v' || (i % 977) AS v, i * 0.5 AS d \
+             FROM range({rows}) t(i);"
+        ))
+        .unwrap();
+    }
+
+    /// A store with no image yet: the load's staging file becomes the first
+    /// image without moving a byte, and is byte-identical to the image a
+    /// plain checkpoint writes for the same rows.
+    #[test]
+    fn a_staged_first_image_is_the_plain_image() {
+        let plain = tmp_ckpt("staged_plain");
+        let staged = tmp_ckpt("staged_load");
+        let mut a = durable(&plain);
+        fill(&mut a, "t", 300_000);
+        a.checkpoint().unwrap();
+        let mut b = durable(&staged);
+        fill(&mut b, "t", 300_000);
+        write_all_pending(&b, &staged, "t");
+        assert_eq!(crate::persist::pending_load_state(&b), Some(true));
+        b.checkpoint().unwrap();
+        assert_eq!(crate::persist::last_first_image_staged(), Some(true));
+        assert_eq!(crate::persist::pending_load_state(&b), None);
+        assert!(!crate::persist::staging_path(&staged).exists());
+        assert_eq!(
+            std::fs::read(&*plain).unwrap(),
+            std::fs::read(&*staged).unwrap(),
+            "the staged image must be the plain image"
+        );
+        // The live handles read the published file.
+        assert_eq!(ints(&mut b, "SELECT sum(a) FROM t;"), vec![44_999_850_000]);
+        drop(b);
+        let mut back = durable(&staged);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM t;"), vec![300_000]);
+        assert_eq!(
+            strings(&mut back, "SELECT v FROM t WHERE a = 299999;"),
+            vec![format!("v{}", 299_999 % 977)]
+        );
+        drop(back);
+        drop(a);
+        cleanup(&plain);
+        cleanup(&staged);
+    }
+
+    /// A store with an image: the pending groups go past its end and the
+    /// checkpoint references them where they are, rewriting none of them.
+    #[test]
+    fn pending_groups_are_referenced_in_place() {
+        let p = tmp_ckpt("pending_in_place");
+        let mut db = durable(&p);
+        fill(&mut db, "base", 10_000);
+        db.checkpoint().unwrap();
+        fill(&mut db, "t", 300_000);
+        write_all_pending(&db, &p, "t");
+        assert_eq!(crate::persist::pending_load_state(&db), Some(false));
+        let ns = crate::storage::SchemaPath::new("main", "main");
+        let before: Vec<Vec<(u64, u64)>> = {
+            let t = db.table_in(&ns, "t").unwrap();
+            (0..t.num_chunks())
+                .step_by(crate::persist::CHUNKS_PER_ROW_GROUP)
+                .map(|f| {
+                    let l = (f + crate::persist::CHUNKS_PER_ROW_GROUP).min(t.num_chunks());
+                    crate::persist::stored_column_chunks(t, f, l)
+                })
+                .collect()
+        };
+        db.checkpoint().unwrap();
+        assert!(
+            crate::persist::last_checkpoint_reused_holes().is_some(),
+            "an in-place checkpoint"
+        );
+        let after: Vec<Vec<(u64, u64)>> = {
+            let t = db.table_in(&ns, "t").unwrap();
+            (0..t.num_chunks())
+                .step_by(crate::persist::CHUNKS_PER_ROW_GROUP)
+                .map(|f| {
+                    let l = (f + crate::persist::CHUNKS_PER_ROW_GROUP).min(t.num_chunks());
+                    crate::persist::stored_column_chunks(t, f, l)
+                })
+                .collect()
+        };
+        assert_eq!(
+            before, after,
+            "the checkpoint must not move a pending group"
+        );
+        assert_eq!(crate::persist::pending_load_state(&db), None);
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM t;"), vec![300_000]);
+        assert_eq!(
+            ints(&mut back, "SELECT sum(a) FROM t;"),
+            vec![44_999_850_000]
+        );
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM base;"), vec![10_000]);
+        drop(back);
+        cleanup(&p);
+    }
+
+    /// A pending group the table stopped naming is re-encoded (an UPDATE) or
+    /// freed (a DROP): its bytes land in the footer's free list, and nothing
+    /// reads them again.
+    #[test]
+    fn pending_groups_a_table_left_are_reencoded_or_freed() {
+        let p = tmp_ckpt("pending_left");
+        let mut db = durable(&p);
+        fill(&mut db, "base", 10_000);
+        db.checkpoint().unwrap();
+        fill(&mut db, "t", 300_000);
+        fill(&mut db, "gone", 200_000);
+        write_all_pending(&db, &p, "t");
+        write_all_pending(&db, &p, "gone");
+        let ns = crate::storage::SchemaPath::new("main", "main");
+        let gone = {
+            let t = db.table_in(&ns, "gone").unwrap();
+            crate::persist::stored_column_chunks(t, 0, crate::persist::CHUNKS_PER_ROW_GROUP)
+        };
+        let updated = {
+            let t = db.table_in(&ns, "t").unwrap();
+            crate::persist::stored_column_chunks(
+                t,
+                crate::persist::CHUNKS_PER_ROW_GROUP,
+                2 * crate::persist::CHUNKS_PER_ROW_GROUP,
+            )
+        };
+        db.execute("UPDATE t SET v = 'changed' WHERE a = 150000;")
+            .unwrap();
+        db.execute("DROP TABLE gone;").unwrap();
+        db.checkpoint().unwrap();
+        let free = crate::persist::footer_free_ranges(&p);
+        let covered = |(offset, len): (u64, u64)| {
+            free.iter()
+                .any(|&(f, fl)| f <= offset && offset + len <= f + fl)
+        };
+        for range in gone.iter().chain(&updated) {
+            assert!(
+                covered(*range),
+                "{range:?} must be free, free list {free:?}"
+            );
+        }
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM t;"), vec![300_000]);
+        assert_eq!(
+            strings(&mut back, "SELECT v FROM t WHERE a = 150000;"),
+            vec!["changed".to_string()]
+        );
+        assert!(back.execute("SELECT * FROM gone;").is_err());
+        drop(back);
+        cleanup(&p);
+    }
+
+    /// Load `src`'s rows as a new table `name` the way a streamed load does:
+    /// a table off the catalog, its row groups written ahead of the
+    /// checkpoint, then its commit record.
+    fn stream_copy(db: &PinkDb, p: &Path, src: &str, name: &str) -> crate::persist::StreamedTable {
+        let ns = crate::storage::SchemaPath::new("main", "main");
+        let mut t = db.table_in(&ns, src).unwrap().clone();
+        t.name = name.to_string();
+        let per = crate::persist::CHUNKS_PER_ROW_GROUP;
+        let n = t.num_chunks();
+        for first in (0..n).step_by(per) {
+            db.write_pending_group_of(p, &ns, name, &t, first, (first + per).min(n))
+                .unwrap();
+        }
+        db.sync_pending_load().unwrap();
+        let record = db.streamed_table_record(&ns, name, false, &t).unwrap();
+        crate::persist::StreamedTable::decode(&record.encode()).unwrap()
+    }
+
+    /// Commit `src`'s rows as table `name` the way a streamed `CREATE TABLE …
+    /// AS` does: row groups written and synced, then (when `frame`) the
+    /// commit frame carrying the record and no statement, then the table in
+    /// the writer's catalog. Dropping the store afterwards is the crash.
+    fn commit_streamed_copy(
+        db: &mut PinkDb,
+        p: &Path,
+        src: &str,
+        name: &str,
+        or_replace: bool,
+        frame: bool,
+    ) {
+        let ns = crate::storage::SchemaPath::new("main", "main");
+        let mut t = db.table_in(&ns, src).unwrap().clone();
+        t.name = name.to_string();
+        let per = crate::persist::CHUNKS_PER_ROW_GROUP;
+        let n = t.num_chunks();
+        for first in (0..n).step_by(per) {
+            db.write_pending_group_of(p, &ns, name, &t, first, (first + per).min(n))
+                .unwrap();
+        }
+        db.sync_pending_load().unwrap();
+        if !frame {
+            return;
+        }
+        let record = db.streamed_table_record(&ns, name, or_replace, &t).unwrap();
+        let lease = db.acquire_lease().unwrap();
+        db.stage_streamed_table(&record).unwrap();
+        db.wal_append_local(&ns, &ns, &[], &[], &[], &[], None, None, &[])
+            .unwrap();
+        drop(lease);
+        if or_replace && db.table_in(&ns, name).is_ok() {
+            db.drop_table_in(&ns, name).unwrap();
+        }
+        db.create_table_in(&ns, name, t.schema()).unwrap();
+        *db.table_mut_in(&ns, name).unwrap() = t;
+    }
+
+    /// S0: a crash after the commit frame and before any checkpoint: the
+    /// replay attaches the table from the frame alone (it carries no
+    /// statement, so the load's source is never read again).
+    #[test]
+    fn a_streamed_table_frame_replays_without_its_source() {
+        let p = tmp_ckpt("streamed_frame");
+        let mut db = durable(&p);
+        fill(&mut db, "src", 300_000);
+        db.checkpoint().unwrap();
+        commit_streamed_copy(&mut db, &p, "src", "t", false, true);
+        db.execute("DROP TABLE src;").unwrap();
+        assert_eq!(ints(&mut db, "SELECT sum(a) FROM t;"), vec![44_999_850_000]);
+        drop(db);
+        let recs = records_of(&wal_path(&p));
+        let frame = recs
+            .iter()
+            .find(|r| !r.streamed.is_empty())
+            .expect("the commit frame");
+        assert!(
+            frame.stmts.is_empty(),
+            "no statement to re-run: {:?}",
+            frame.stmts
+        );
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM t;"), vec![300_000]);
+        assert_eq!(
+            ints(&mut back, "SELECT sum(a) FROM t;"),
+            vec![44_999_850_000]
+        );
+        assert!(back.execute("SELECT * FROM src;").is_err());
+        back.checkpoint().unwrap();
+        drop(back);
+        let mut again = durable(&p);
+        assert_eq!(
+            ints(&mut again, "SELECT sum(a) FROM t;"),
+            vec![44_999_850_000]
+        );
+        drop(again);
+        cleanup(&p);
+    }
+
+    /// S0: a crash after the row groups and before the frame leaves no
+    /// table, and the next checkpoint reclaims the bytes: past the image's
+    /// end they are overwritten, and a staging file is removed.
+    #[test]
+    fn a_streamed_load_without_its_frame_leaves_nothing() {
+        // A store with an image: the groups went past its end.
+        let p = tmp_ckpt("streamed_noframe");
+        let mut db = durable(&p);
+        fill(&mut db, "src", 300_000);
+        db.checkpoint().unwrap();
+        let before = std::fs::metadata(&*p).unwrap().len();
+        commit_streamed_copy(&mut db, &p, "src", "t", false, false);
+        assert!(std::fs::metadata(&*p).unwrap().len() > before);
+        drop(db);
+        let mut back = durable(&p);
+        assert!(back.execute("SELECT * FROM t;").is_err());
+        back.execute("INSERT INTO src SELECT * FROM src LIMIT 10;")
+            .unwrap();
+        back.checkpoint().unwrap();
+        assert!(
+            std::fs::metadata(&*p).unwrap().len() < before + 2 * 1024 * 1024,
+            "the uncommitted groups must not stay in the file"
+        );
+        drop(back);
+        cleanup(&p);
+        // A store with no image yet: the groups went to a staging file.
+        let q = tmp_ckpt("streamed_noframe_staged");
+        let mut db = durable(&q);
+        fill(&mut db, "src", 200_000);
+        commit_streamed_copy(&mut db, &q, "src", "t", false, false);
+        assert!(crate::persist::staging_path(&q).exists());
+        drop(db);
+        let mut back = durable(&q);
+        assert!(back.execute("SELECT * FROM t;").is_err());
+        back.checkpoint().unwrap();
+        assert!(!crate::persist::staging_path(&q).exists());
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM src;"), vec![200_000]);
+        drop(back);
+        cleanup(&q);
+    }
+
+    /// S0: the replaying store's own checkpoint fails at every boundary; the
+    /// next open still has the streamed table, intact.
+    #[test]
+    fn a_replayed_streamed_table_survives_a_failing_checkpoint() {
+        use crate::persist::CheckpointFault as F;
+        for fault in [F::AfterData, F::AfterFirstSync, F::AfterSlot, F::TornSlot] {
+            let p = tmp_ckpt("streamed_fault");
+            let mut db = durable(&p);
+            fill(&mut db, "src", 200_000);
+            db.checkpoint().unwrap();
+            commit_streamed_copy(&mut db, &p, "src", "t", false, true);
+            drop(db);
+            let mut replayed = durable(&p);
+            crate::persist::set_checkpoint_fault(Some(fault));
+            let failed = replayed.checkpoint();
+            crate::persist::set_checkpoint_fault(None);
+            assert!(failed.is_err(), "{fault:?}");
+            drop(replayed);
+            let mut back = durable(&p);
+            assert_eq!(
+                ints(&mut back, "SELECT count(*) FROM t;"),
+                vec![200_000],
+                "{fault:?}"
+            );
+            assert_eq!(
+                ints(&mut back, "SELECT sum(a) FROM t;"),
+                vec![19_999_900_000]
+            );
+            back.checkpoint().unwrap();
+            drop(back);
+            let mut again = durable(&p);
+            assert_eq!(
+                ints(&mut again, "SELECT sum(a) FROM t;"),
+                vec![19_999_900_000]
+            );
+            drop(again);
+            cleanup(&p);
+        }
+    }
+
+    /// S0: `CREATE OR REPLACE` keeps the old table until its frame is
+    /// durable: a crash before the frame reopens the old rows, after it the
+    /// new ones (the old ranges are freed only by a later checkpoint).
+    #[test]
+    fn a_streamed_replace_keeps_the_old_table_until_its_frame() {
+        let p = tmp_ckpt("streamed_replace");
+        let mut db = durable(&p);
+        fill(&mut db, "t", 50_000);
+        fill(&mut db, "src", 200_000);
+        db.checkpoint().unwrap();
+        commit_streamed_copy(&mut db, &p, "src", "t", true, false);
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM t;"), vec![50_000]);
+        commit_streamed_copy(&mut back, &p, "src", "t", true, true);
+        drop(back);
+        let mut replaced = durable(&p);
+        assert_eq!(
+            ints(&mut replaced, "SELECT count(*) FROM t;"),
+            vec![200_000]
+        );
+        replaced.checkpoint().unwrap();
+        drop(replaced);
+        let mut again = durable(&p);
+        assert_eq!(ints(&mut again, "SELECT count(*) FROM t;"), vec![200_000]);
+        drop(again);
+        cleanup(&p);
+    }
+
+    /// S0 on a store with no image: the frame names a staging file, and the
+    /// replay attaches from it.
+    #[test]
+    fn a_streamed_table_frame_replays_from_the_staging_file() {
+        let p = tmp_ckpt("streamed_staged_frame");
+        let mut db = durable(&p);
+        fill(&mut db, "src", 200_000);
+        commit_streamed_copy(&mut db, &p, "src", "t", false, true);
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(
+            ints(&mut back, "SELECT sum(a) FROM t;"),
+            vec![19_999_900_000]
+        );
+        back.checkpoint().unwrap();
+        assert!(!crate::persist::staging_path(&p).exists());
+        drop(back);
+        let mut again = durable(&p);
+        assert_eq!(ints(&mut again, "SELECT count(*) FROM t;"), vec![200_000]);
+        drop(again);
+        cleanup(&p);
+    }
+
+    /// S0: another handle (a replay) attaches a streamed table from its
+    /// commit record alone, with identical results, and its own checkpoint
+    /// references the groups where the load wrote them.
+    #[test]
+    fn a_streamed_table_record_attaches_on_another_handle() {
+        let p = tmp_ckpt("attach_record");
+        let mut a = durable(&p);
+        fill(&mut a, "src", 300_000);
+        a.checkpoint().unwrap();
+        let record = stream_copy(&a, &p, "src", "t");
+        assert_eq!(record.table(), ("main", "main", "t"));
+        let mut b = durable(&p);
+        b.attach_streamed_table(&p, &record).unwrap();
+        assert_eq!(ints(&mut b, "SELECT sum(a) FROM t;"), vec![44_999_850_000]);
+        assert_eq!(
+            strings(&mut b, "SELECT v FROM t WHERE a = 123456;"),
+            vec![format!("v{}", 123_456 % 977)]
+        );
+        assert_eq!(crate::persist::pending_load_state(&b), Some(false));
+        drop(a);
+        b.checkpoint().unwrap();
+        assert_eq!(crate::persist::pending_load_state(&b), None);
+        drop(b);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM t;"), vec![300_000]);
+        assert_eq!(
+            ints(&mut back, "SELECT sum(a) FROM src;"),
+            vec![44_999_850_000]
+        );
+        drop(back);
+        cleanup(&p);
+    }
+
+    /// S0: a commit record over damaged bytes is refused with the table and
+    /// the range named, never attached as empty or wrong data.
+    #[test]
+    fn a_streamed_table_record_over_damaged_bytes_is_refused() {
+        let p = tmp_ckpt("attach_damaged");
+        let mut a = durable(&p);
+        fill(&mut a, "src", 150_000);
+        a.checkpoint().unwrap();
+        let record = stream_copy(&a, &p, "src", "t");
+        // Flip one byte inside the last written row group.
+        // The copy's groups are the last bytes of the file.
+        let offset = std::fs::metadata(&*p).unwrap().len() - 1000;
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(&*p).unwrap();
+            let mut byte = [0u8; 1];
+            let r = std::fs::File::open(&*p).unwrap();
+            r.read_exact_at(&mut byte, offset).unwrap();
+            byte[0] ^= 0xFF;
+            f.write_all_at(&byte, offset).unwrap();
+        }
+        let mut b = durable(&p);
+        let err = b
+            .attach_streamed_table(&p, &record)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"t\"") && err.contains("checksum"), "{err}");
+        assert!(b.execute("SELECT * FROM t;").is_err(), "nothing attached");
+        drop(b);
+        drop(a);
+        cleanup(&p);
+    }
+
+    /// The image witness across two handles (two leases, as two processes):
+    /// a foreign in-place checkpoint changes it, a `.save` replacing the file
+    /// changes it, and a streaming load's appends past the logical end do
+    /// not: no reload for the writer, no conflict for the other handle.
+    #[test]
+    fn the_image_witness_sees_checkpoints_and_saves_but_not_pending_appends() {
+        let p = tmp_ckpt("witness");
+        let mut a = durable(&p);
+        let mut b = durable(&p);
+        a.execute("CREATE TABLE base (x INTEGER); INSERT INTO base VALUES (1); CHECKPOINT;")
+            .unwrap();
+        assert_eq!(ints(&mut b, "SELECT count(*) FROM base;"), vec![1]);
+
+        // 1. B checkpoints in place: the header changes, A sees B's row.
+        let before = ckpt_meta(&p);
+        b.execute("INSERT INTO base VALUES (2);").unwrap();
+        b.checkpoint().unwrap();
+        assert_eq!(crate::persist::last_checkpoint_reused_holes(), Some(false));
+        assert_ne!(
+            ckpt_meta(&p),
+            before,
+            "an in-place checkpoint must change the witness"
+        );
+        assert_eq!(ints(&mut a, "SELECT count(*) FROM base;"), vec![2]);
+
+        // 2. A appends pending row groups past the logical end: the file grows,
+        //    the witness does not change, B's open transaction still commits,
+        //    and A keeps its pending handles (no reload replaced them).
+        b.execute("BEGIN; INSERT INTO base VALUES (3);").unwrap();
+        fill(&mut a, "t", 200_000);
+        let len_before = std::fs::metadata(&*p).unwrap().len();
+        let witness = ckpt_meta(&p);
+        write_all_pending(&a, &p, "t");
+        assert!(std::fs::metadata(&*p).unwrap().len() > len_before);
+        assert_eq!(
+            ckpt_meta(&p),
+            witness,
+            "pending appends must not change the witness"
+        );
+        b.execute("COMMIT;").unwrap();
+        assert_eq!(ints(&mut a, "SELECT count(*) FROM base;"), vec![3]);
+        assert_eq!(crate::persist::pending_load_state(&a), Some(false));
+        let ns = crate::storage::SchemaPath::new("main", "main");
+        crate::persist::stored_column_chunks(
+            a.table_in(&ns, "t").unwrap(),
+            0,
+            crate::persist::CHUNKS_PER_ROW_GROUP,
+        );
+        a.checkpoint().unwrap();
+        drop(b);
+
+        // 3. A `.save` replacing the file (a new inode) changes the witness.
+        let witness = ckpt_meta(&p);
+        let dev_ino = witness.and_then(|m| m.dev_ino);
+        drop(a);
+        PinkDb::new().save(p.to_str().unwrap()).unwrap();
+        let replaced = ckpt_meta(&p);
+        assert_ne!(
+            replaced, witness,
+            "a replaced image must change the witness"
+        );
+        assert_ne!(replaced.and_then(|m| m.dev_ino), dev_ino);
+        cleanup(&p);
+    }
+
+    /// A first image whose tables are not all pending cannot publish the
+    /// staging file: the checkpoint writes a fresh image (copying the pending
+    /// groups through) and removes the staging file.
+    #[test]
+    fn a_staged_image_that_does_not_line_up_falls_back() {
+        let p = tmp_ckpt("staged_mismatch");
+        let mut db = durable(&p);
+        // "a" sorts first and is not pending, so the staged layout is wrong.
+        fill(&mut db, "a", 5_000);
+        fill(&mut db, "t", 300_000);
+        write_all_pending(&db, &p, "t");
+        assert_eq!(crate::persist::pending_load_state(&db), Some(true));
+        db.checkpoint().unwrap();
+        assert_eq!(crate::persist::last_first_image_staged(), Some(false));
+        assert_eq!(crate::persist::pending_load_state(&db), None);
+        assert!(!crate::persist::staging_path(&p).exists());
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT count(*) FROM a;"), vec![5_000]);
+        assert_eq!(
+            ints(&mut back, "SELECT sum(a) FROM t;"),
+            vec![44_999_850_000]
+        );
+        drop(back);
         cleanup(&p);
     }
 
@@ -9027,7 +9726,7 @@ mod tests {
         let wal = wal_path(&p);
         let mut data = std::fs::read(&wal).unwrap();
         let sql = "LOAD EXTENSION '/nonexistent/pinkdb-h5-test.dylib';";
-        let payload = encode_payload(&[sql.to_string()], &[], None, None, &[]).unwrap();
+        let payload = encode_payload(&[sql.to_string()], &[], &[], None, None, &[]).unwrap();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&2u64.to_le_bytes());
         data.extend_from_slice(&crc32(&payload).to_le_bytes());
@@ -9125,6 +9824,7 @@ mod tests {
         let payload = encode_payload(
             &["INSERT INTO t VALUES (7);".to_string()],
             &[],
+            &[],
             None,
             None,
             &[],
@@ -9145,7 +9845,7 @@ mod tests {
                 1,
             )],
         };
-        let payload = encode_payload(&[], &[chunk], None, None, &[]).unwrap();
+        let payload = encode_payload(&[], &[chunk], &[], None, None, &[]).unwrap();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&3u64.to_le_bytes());
         data.extend_from_slice(&crc32(&payload).to_le_bytes());

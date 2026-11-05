@@ -1447,6 +1447,9 @@ pub(crate) fn top_n_streamed(
     ));
     let workers = rayon::current_num_threads().max(1);
     let stop = AtomicBool::new(false);
+    // The same in-flight accounting `run_streamed` reports for a scan.
+    let in_flight = AtomicU64::new(0);
+    let peak = AtomicU64::new(0);
     let sets: Mutex<Vec<Vec<DataChunk>>> = Mutex::new(Vec::new());
     let failed: Mutex<Option<PinkDbError>> = Mutex::new(None);
     let fail = |error: PinkDbError| {
@@ -1470,6 +1473,8 @@ pub(crate) fn top_n_streamed(
             {
                 return fail(error);
             }
+            let now = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+            peak.fetch_max(now, Ordering::Relaxed);
             let mut seq = 0u64;
             let decoded = source.decode(morsel, &mut |chunk| {
                 let Some(out) = flow(cx, &steps, &TopNPass, &chunk)? else {
@@ -1510,6 +1515,7 @@ pub(crate) fn top_n_streamed(
                 }
                 Ok(())
             });
+            in_flight.fetch_sub(1, Ordering::Relaxed);
             if let Err(error) = decoded {
                 return fail(error);
             }
@@ -1517,7 +1523,9 @@ pub(crate) fn top_n_streamed(
         sets.lock().unwrap_or_else(|e| e.into_inner()).push(set);
     });
     if source.reports_io() {
-        cx.db.record_scan(source.label(), source.io());
+        let mut io = source.io();
+        io.in_flight_peak = peak.load(Ordering::Relaxed);
+        cx.db.record_scan(source.label(), io);
     }
     if let Some(error) = failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
         return Err(error);
