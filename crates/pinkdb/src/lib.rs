@@ -42,6 +42,7 @@ pub mod appender;
 pub mod array;
 pub mod attached;
 pub mod catalog_image;
+pub(crate) mod compact;
 pub mod crypto;
 pub mod csv;
 pub mod db;

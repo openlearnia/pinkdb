@@ -3333,15 +3333,30 @@ impl<'a> StoreScan<'a> {
     }
 
     /// Every chunk of the scan, in scan order: for a consumer that cannot work
-    /// from one chunk at a time.
+    /// from one chunk at a time. Read in parallel: a cold chunk decodes and a
+    /// compact cache entry expands (wave 136c-3) on the worker that reads it.
     pub(crate) fn materialize(&self) -> Result<Vec<DataChunk>> {
-        let mut chunks = Vec::with_capacity(self.len());
-        for i in 0..self.len() {
-            if let Some(chunk) = self.chunk(i)? {
-                chunks.push(chunk);
-            }
+        let len = self.len();
+        let runs: Result<Vec<Vec<Option<DataChunk>>>> = (0..len.div_ceil(CHUNKS_PER_TASK))
+            .into_par_iter()
+            .map(|run| {
+                let first = run * CHUNKS_PER_TASK;
+                (first..(first + CHUNKS_PER_TASK).min(len))
+                    .map(|i| self.chunk_full(i))
+                    .collect()
+            })
+            .collect();
+        Ok(runs?.into_iter().flatten().flatten().collect())
+    }
+
+    /// Chunk `i` for a reader that holds it for the whole statement: compact
+    /// cache entries are promoted to full (wave 136c-3).
+    fn chunk_full(&self, i: usize) -> Result<Option<DataChunk>> {
+        if !self.cache {
+            return self.chunk(i);
         }
-        Ok(chunks)
+        self.table
+            .scan_chunk_full(self.chunk_index(i), self.present.as_deref())
     }
 
     /// Fold every chunk of the scan, decoding each chunk when its turn comes
@@ -3925,7 +3940,7 @@ fn index_scan_output(
         let mut valid = true;
         for col in &t.columns {
             if chunk_idx < col.num_chunks() && row_in_chunk < col.chunk_rows(chunk_idx) {
-                values.push(col.chunk(chunk_idx)?.get(row_in_chunk));
+                values.push(col.value(chunk_idx, row_in_chunk)?);
             } else {
                 valid = false;
                 break;

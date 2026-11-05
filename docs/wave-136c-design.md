@@ -593,3 +593,58 @@ interleaved against 136c-1 on the same v7 SF1 store; load 9–12):
 - Pi's earlier capped-budget ladder (256 MiB 2.68, 768 MiB 0.989) was measured on a stale CLI
   binary whose default was the 256 MiB cap. Its relative order holds, but the default row is
   replaced by the numbers above.
+
+## 11. Step 136c-3 — compact cache entries (2026-11-05)
+
+The design's original step (3), save and repoint at the written file, landed inside 136c-1. This
+step is the compressed-resident cache that §8's "Q1 peak far below 973 MB" asked for.
+
+**Why.** At SF10, TPC-H Q1 peaked at 4.3 GB against DuckDB's 599 MB. The decoded cache held each
+chunk fully decoded: 16-byte views for the two flag strings (1.9 GB), 8 bytes per `Decimal64`
+(1.9 GB), and the date. With `decoded_cache_limit = 0` Q1 peaks at 330 MB, but every run pays
+the decoders again.
+
+**The change** (`crates/pinkdb/src/compact.rs`, `ChunkHandle` in `storage.rs`):
+- A clean cache entry keeps a compact form when it has one, built once from the decoded vector:
+  - integer-like columns (`INTEGER`, `DATE`, `BIGINT`, `TIMESTAMP`, `DECIMAL(p ≤ 18)`) as the
+    chunk's minimum plus `u8`/`u16`/`u32` offsets;
+  - VARCHAR with at most one distinct value per four rows as `u8`/`u16` codes into the chunk's own
+    dictionary, whose strings sit in one shared buffer.
+
+  Anything else, and any form that is not smaller, stays a full vector. The cache charges the
+  compact bytes.
+- A read expands the entry into a normal `Vector`, value for value, NULL slots included, so no
+  reader can tell the two forms apart. `Column::value` answers a point read straight from the
+  compact form; `DataTable::get` and index row fetches use it.
+- A write (`chunk_mut`) replaces the entry with the full vector, charged to the operator pool.
+- **Materialized readers decode to full.** `StoreScan::materialize` (semi and anti join sides,
+  probe-through-selection, `scan_output`) holds whole tables for the statement, so it gains
+  nothing from a compact entry and would expand every chunk on every run. Its first decode stores
+  the entry full, and it promotes a compact entry it meets to full when the cache can take the
+  bytes. Streaming scans keep entries compact. `materialize` also reads in parallel now.
+- `CompactChunk::form()` returns the representation itself (`Offsets { base, codes }` or
+  `Dictionary { dict, codes }`), and `Column::compact(i)` returns a chunk's compact entry, for the
+  later consumers: dictionary GROUP BY on codes, filters on rebased constants.
+- `pinkdb::memory::set_compact_cache(false)` keeps entries full: a hidden switch the `chunk_cache`
+  tests use to watch payload identity.
+
+**Results** (interleaved bench-mode A/B against main 0da7379, `tpch-ab` with one warm-up and one
+timed run per process; results identical on all 22 queries at SF1 and SF10):
+
+| | SF1 geomean | SF10 geomean | Q1 peak (SF10) | Q6 peak | Q9 peak |
+|---|---|---|---|---|---|
+| this step | 1.066 | 1.072 | 4,312 → 1,103 MB | 1,941 → 854 MB | 4,379 → 2,367 MB |
+| strings only (measured, not taken) | 1.020 | 1.040 | 4,314 → 2,593 MB | unchanged | unchanged |
+| DuckDB v2.0.0 | | | 599 MB | 534 MB | 1,307 MB |
+
+Load was 5–11 during these runs. The cost is the expansion each streaming read pays: Q6, Q12 and
+Q19 at SF10 are 1.11–1.33. Q4 and Q17 are 1.2–1.4, because the timed run is the first warm read
+after a compacting decode. Their steady-state profiles match the baseline: `expand` is about 2 % of
+samples. The speed gate (≤ 1.03) is **not met**. The step stays on its branch until 136d-dec's
+vectorized decode and the filters on the compact form win it back.
+
+Process notes:
+- the first materialized-path version deadlocked: a lock guard in a `match` scrutinee lived
+  through an arm that took the same lock (`get_full`);
+- the A/Bs opened the shared `cmp/` stores through symlinks, so the WAL-8 binaries left their
+  format-7 WALs untouched.

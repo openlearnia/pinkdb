@@ -125,6 +125,21 @@ pub fn set_cache_limit(bytes: usize) {
     trim_cache();
 }
 
+/// Whether clean cache entries keep their compact form (wave 136c-3).
+static COMPACT_CACHE: AtomicBool = AtomicBool::new(true);
+
+/// Keep every cache entry fully decoded (`false`) or let clean ones keep
+/// their compact form (`true`, the default). Tests of the cache's own rules
+/// pin full entries, whose identity a `Weak` can watch.
+#[doc(hidden)]
+pub fn set_compact_cache(on: bool) {
+    COMPACT_CACHE.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn compact_cache() -> bool {
+    COMPACT_CACHE.load(Ordering::Relaxed)
+}
+
 /// `RESET decoded_cache_limit`: back to the free room under `memory_limit`.
 pub fn reset_cache_limit() {
     CACHE_EXPLICIT.store(false, Ordering::Relaxed);
@@ -390,6 +405,14 @@ impl Reservation {
             account: None,
             pool: Pool::Operator,
         }
+    }
+
+    /// Whether this charges the decoded cache rather than the operator pool
+    /// (a test hook: per-entry accounting, which tests running alongside
+    /// cannot move).
+    #[cfg(test)]
+    pub(crate) fn is_cache(&self) -> bool {
+        matches!(self.pool, Pool::Cache)
     }
 
     pub fn bytes(&self) -> usize {

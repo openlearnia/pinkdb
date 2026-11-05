@@ -8,6 +8,16 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-11-05
+
+### Wave 136 (step c-3) — the decoded cache keeps a compact form (on its branch)
+
+Clean cache entries keep integers as a base plus byte-wide offsets and
+low-cardinality strings as codes into a per-chunk dictionary, and expand per
+read. TPC-H SF10 peak memory: Q1 4.3 → 1.1 GB, Q6 1.9 → 0.85 GB, Q9 4.4 → 2.4
+GB, with identical results. Warm TPC-H costs 7 % (geomean 1.066 at SF1, 1.072
+at SF10), so the step waits on its branch for the faster decoders.
+
 ## 2026-11-04
 
 ### Wave 136 (step c-2) — the decoded cache lives inside `memory_limit` ✅

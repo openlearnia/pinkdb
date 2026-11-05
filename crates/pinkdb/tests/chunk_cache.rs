@@ -6,7 +6,8 @@
 //!
 //! A chunk is evicted only when nothing else holds its payload, so a `Weak` to
 //! the vector is how a test sees an eviction: `upgrade()` is `None` exactly
-//! while the chunk is back in its encoded form.
+//! while the chunk is back in its encoded form. Entries are kept full here;
+//! the compact form has its own test at the end.
 
 use std::sync::{Arc, MutexGuard};
 
@@ -24,6 +25,9 @@ impl Store {
     fn new(tag: &str) -> Store {
         let lock = memory::test_lock();
         memory::reset_limit();
+        // These tests watch a cached payload through a `Weak`: a compact
+        // entry hands out a fresh expansion per read (wave 136c-3).
+        memory::set_compact_cache(false);
         let dir =
             std::env::temp_dir().join(format!("pinkdb_chunk_cache_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -60,6 +64,7 @@ impl Drop for Store {
     fn drop(&mut self) {
         memory::reset_limit();
         memory::reset_cache_limit();
+        memory::set_compact_cache(true);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -567,4 +572,60 @@ fn a_hash_join_build_bigger_than_the_limit_fails() {
         Err(e) => e.to_string(),
     };
     assert!(err.starts_with("Out of Memory Error"), "{err}");
+}
+
+/// Wave 136c-3: a clean cache entry keeps its compact form, a quarter of the
+/// decoded BIGINT bytes here, and every read path still sees the same rows:
+/// a scan, a point read, and a write, which takes the chunk back to full.
+#[test]
+fn clean_entries_are_compact_and_read_back_exactly() {
+    let store = Store::new("compact");
+    memory::set_compact_cache(true);
+    let chunks = 4;
+    let mut db = store.table("t", chunks);
+    let before = memory::cache_used();
+    assert_eq!(
+        int(&mut db, "SELECT sum(i) FROM t"),
+        range_sum(chunks * CHUNK_SIZE)
+    );
+    let charged = memory::cache_used() - before;
+    let full = chunks * CHUNK_SIZE * 8;
+    assert!(
+        charged > 0 && charged < full / 2,
+        "charged {charged} of {full}"
+    );
+    // Warm: expanded from the compact entries, and charged nothing new.
+    assert_eq!(
+        int(&mut db, "SELECT sum(i) FROM t"),
+        range_sum(chunks * CHUNK_SIZE)
+    );
+    assert_eq!(memory::cache_used() - before, charged);
+    let table = db.table("t").unwrap();
+    assert_eq!(
+        table.get(CHUNK_SIZE + 7, 0).unwrap(),
+        Some(Value::Bigint(CHUNK_SIZE as i64 + 7))
+    );
+    assert_eq!(sum_chunks(table), range_sum(chunks * CHUNK_SIZE));
+    // A materialized reader (a semi join's side) promotes the entries it
+    // reads back to full, and still answers the same.
+    assert_eq!(
+        int(
+            &mut db,
+            "SELECT count(*) FROM t WHERE i IN (SELECT i FROM t WHERE i % 2 = 0)"
+        ),
+        (chunks * CHUNK_SIZE / 2) as i64
+    );
+    assert_eq!(
+        int(&mut db, "SELECT sum(i) FROM t"),
+        range_sum(chunks * CHUNK_SIZE)
+    );
+    db.execute("UPDATE t SET i = i + 1 WHERE i < 10").unwrap();
+    assert_eq!(
+        int(&mut db, "SELECT sum(i) FROM t"),
+        range_sum(chunks * CHUNK_SIZE) + 10
+    );
+    assert_eq!(
+        db.table("t").unwrap().get(3, 0).unwrap(),
+        Some(Value::Bigint(4))
+    );
 }

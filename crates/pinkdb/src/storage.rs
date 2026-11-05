@@ -613,8 +613,42 @@ struct ChunkState {
 /// is shared with a snapshot's copy of the handle: the bytes stay charged
 /// while any handle can still reach them.
 struct ChunkPayload {
-    vector: Arc<Vector>,
+    form: Resident,
     charge: Arc<crate::memory::Reservation>,
+}
+
+/// How a decoded chunk is held. A clean cache entry keeps the compact form
+/// when it has one and expands it per read (wave 136c-3); a written chunk is
+/// always full, since it is the truth until saved.
+#[derive(Clone)]
+enum Resident {
+    Full(Arc<Vector>),
+    Compact(Arc<crate::compact::CompactChunk>),
+}
+
+impl Resident {
+    fn len(&self) -> usize {
+        match self {
+            Resident::Full(vector) => vector.len(),
+            Resident::Compact(compact) => compact.len(),
+        }
+    }
+
+    /// Whether another owner (a scan, a hash-join build, a snapshot, an
+    /// expansion in progress) holds this payload.
+    fn shared(&self) -> bool {
+        match self {
+            Resident::Full(vector) => Arc::strong_count(vector) != 1,
+            Resident::Compact(compact) => Arc::strong_count(compact) != 1,
+        }
+    }
+
+    fn full(&self) -> Option<&Arc<Vector>> {
+        match self {
+            Resident::Full(vector) => Some(vector),
+            Resident::Compact(_) => None,
+        }
+    }
 }
 
 /// What the cache found when it tried to evict one chunk.
@@ -638,7 +672,7 @@ impl ChunkHandle {
             state: Mutex::new(ChunkState {
                 encoded: None,
                 payload: Some(ChunkPayload {
-                    vector: decoded,
+                    form: Resident::Full(decoded),
                     charge: Arc::new(charge),
                 }),
                 dirty: true,
@@ -654,7 +688,7 @@ impl ChunkHandle {
             state: Mutex::new(ChunkState {
                 encoded: None,
                 payload: Some(ChunkPayload {
-                    vector: Arc::new(Vector::new_empty(dtype)),
+                    form: Resident::Full(Arc::new(Vector::new_empty(dtype))),
                     charge: Arc::new(crate::memory::Reservation::empty()),
                 }),
                 dirty: true,
@@ -680,14 +714,22 @@ impl ChunkHandle {
     }
 
     /// The payload if it is already decoded, marking it dirty for a write
-    /// path.
+    /// path. A compact entry is expanded for a read, outside the lock; a write
+    /// gets `None` and goes through [`ChunkHandle::get`], which replaces the
+    /// entry with the full vector.
     fn decoded(&self, dirty: bool) -> Option<Arc<Vector>> {
         let mut state = self.lock();
-        let vector = state.payload.as_ref().map(|p| Arc::clone(&p.vector));
-        if vector.is_some() && dirty {
-            state.dirty = true;
+        match state.payload.as_ref()?.form.clone() {
+            Resident::Full(vector) => {
+                state.dirty |= dirty;
+                Some(vector)
+            }
+            Resident::Compact(_) if dirty => None,
+            Resident::Compact(compact) => {
+                drop(state);
+                Some(Arc::new(compact.expand()))
+            }
         }
-        vector
     }
 
     /// The payload, decoding it from the store image on first touch (and again
@@ -699,6 +741,17 @@ impl ChunkHandle {
     /// `try_lock`, and must not find this one held by the thread that needs
     /// the memory.
     fn get(handle: &Arc<ChunkHandle>, dtype: DataType, dirty: bool) -> Result<Arc<Vector>> {
+        ChunkHandle::get_with(handle, dtype, dirty, true)
+    }
+
+    /// [`ChunkHandle::get`], where `compact` says whether a fresh cache entry
+    /// may keep its compact form: a materialized reader decodes to full.
+    fn get_with(
+        handle: &Arc<ChunkHandle>,
+        dtype: DataType,
+        dirty: bool,
+        compact: bool,
+    ) -> Result<Arc<Vector>> {
         install_evictor();
         if let Some(vector) = handle.decoded(dirty) {
             return Ok(vector);
@@ -724,9 +777,30 @@ impl ChunkHandle {
         let mut state = handle.lock();
         // Another thread may have decoded the chunk while this one reserved.
         if let Some(payload) = state.payload.as_ref() {
-            let vector = Arc::clone(&payload.vector);
-            state.dirty |= dirty;
-            return Ok(vector);
+            match payload.form.clone() {
+                Resident::Full(vector) => {
+                    state.dirty |= dirty;
+                    return Ok(vector);
+                }
+                Resident::Compact(compact) if !dirty => {
+                    drop(state);
+                    return Ok(Arc::new(compact.expand()));
+                }
+                Resident::Compact(compact) => {
+                    // A write on a compact cache entry: the full vector
+                    // replaces it, charged to the operator pool like any
+                    // write's decode.
+                    let vector = Arc::new(compact.expand());
+                    let mut charge = charge.expect("a write reserves");
+                    charge.resize(vector.memory_size())?;
+                    state.payload = Some(ChunkPayload {
+                        form: Resident::Full(Arc::clone(&vector)),
+                        charge: Arc::new(charge),
+                    });
+                    state.dirty = true;
+                    return Ok(vector);
+                }
+            }
         }
         let encoded = state.encoded.clone().ok_or_else(missing_payload)?;
         let mut cached = charge.is_some();
@@ -734,14 +808,20 @@ impl ChunkHandle {
         handle
             .decodes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A clean cache entry keeps its compact form when it has one: the
+        // read that decoded it gets the full vector, later reads expand.
+        let compact = if compact && cached && !dirty && crate::memory::compact_cache() {
+            crate::compact::CompactChunk::of(&decoded).map(Arc::new)
+        } else {
+            None
+        };
         if cached {
-            // The bound over-estimates; the charge follows the chunk's real
+            // The bound over-estimates; the charge follows the entry's real
             // size. A cache entry that cannot grow to it is simply not cached.
-            match charge
-                .as_mut()
-                .expect("cached")
-                .resize(decoded.memory_size())
-            {
+            let size = compact
+                .as_ref()
+                .map_or_else(|| decoded.memory_size(), |c| c.memory_size());
+            match charge.as_mut().expect("cached").resize(size) {
                 Ok(()) => {}
                 Err(_) if !dirty => cached = false,
                 Err(e) => return Err(e),
@@ -752,7 +832,10 @@ impl ChunkHandle {
             return Ok(decoded);
         }
         state.payload = Some(ChunkPayload {
-            vector: Arc::clone(&decoded),
+            form: match compact {
+                Some(compact) => Resident::Compact(compact),
+                None => Resident::Full(Arc::clone(&decoded)),
+            },
             charge: Arc::new(charge.expect("cached")),
         });
         state.dirty |= dirty;
@@ -764,15 +847,48 @@ impl ChunkHandle {
         Ok(decoded)
     }
 
-    /// The payload of a chunk the write path just decoded (`set_chunk` or
-    /// `chunk_mut` on this chunk). A still-encoded handle here is a caller
-    /// bug, not a corrupt file.
+    /// [`ChunkHandle::get`] for a materialized reader: a compact entry is
+    /// promoted to full when the cache can take the full bytes (the
+    /// reservation is taken before the lock, as in `get`); otherwise the
+    /// reader gets its own expansion and the entry stays compact.
+    fn get_full(handle: &Arc<ChunkHandle>, dtype: DataType) -> Result<Arc<Vector>> {
+        // Bound first: a guard in the `match` scrutinee would live through the
+        // arms, and `get` takes this lock again.
+        let form = handle.lock().payload.as_ref().map(|p| p.form.clone());
+        let compact = match form {
+            Some(Resident::Compact(compact)) => compact,
+            _ => return ChunkHandle::get_with(handle, dtype, false, false),
+        };
+        let vector = Arc::new(compact.expand());
+        if let Some(charge) = crate::memory::reserve_decoded(vector.memory_size()) {
+            let mut state = handle.lock();
+            if let Some(payload) = state.payload.as_mut()
+                && matches!(&payload.form, Resident::Compact(c) if Arc::ptr_eq(c, &compact))
+            {
+                payload.form = Resident::Full(Arc::clone(&vector));
+                // A snapshot still sharing the compact entry keeps paying for
+                // it through its own copy of the old charge.
+                payload.charge = Arc::new(charge);
+            }
+        }
+        Ok(vector)
+    }
+
+    /// The payload of a decoded chunk (`set_chunk` or `chunk_mut` on this
+    /// chunk, or a pass over a column whose chunks were all read). A compact
+    /// cache entry is decoded state too, and expands here. A still-encoded
+    /// handle is a caller bug, not a corrupt file.
     fn decoded_chunk(&self) -> Arc<Vector> {
-        self.lock()
+        let form = self
+            .lock()
             .payload
             .as_ref()
-            .map(|p| Arc::clone(&p.vector))
-            .expect("the write path decoded this chunk")
+            .map(|p| p.form.clone())
+            .expect("the write path decoded this chunk");
+        match form {
+            Resident::Full(vector) => vector,
+            Resident::Compact(compact) => Arc::new(compact.expand()),
+        }
     }
 
     /// Rows in this chunk: a decoded payload is authoritative (it grows
@@ -781,7 +897,7 @@ impl ChunkHandle {
     fn rows(&self) -> usize {
         let state = self.lock();
         match state.payload.as_ref() {
-            Some(payload) => payload.vector.len(),
+            Some(payload) => payload.form.len(),
             None => state.encoded.as_ref().map_or(0, |e| e.rows),
         }
     }
@@ -792,11 +908,13 @@ impl ChunkHandle {
     /// charge is taken before the write, so it can lag one write behind; the
     /// budget is approximate by construction (see [`crate::memory`]).
     fn charge_current(&self) -> Result<()> {
-        let bytes = match self.lock().payload.as_ref() {
-            Some(payload) if payload.vector.memory_size() != payload.charge.bytes() => {
-                payload.vector.memory_size()
-            }
-            _ => return Ok(()),
+        // Only a full payload grows; a compact cache entry is immutable.
+        let bytes = match self.lock().payload.as_ref().and_then(|p| {
+            let vector = p.form.full()?;
+            (vector.memory_size() != p.charge.bytes()).then(|| vector.memory_size())
+        }) {
+            Some(bytes) => bytes,
+            None => return Ok(()),
         };
         // Taken before the lock: a failure runs the evictor, which locks
         // handles with `try_lock` and must not find this one held.
@@ -829,7 +947,7 @@ impl ChunkHandle {
         };
         // Another owner (a scan, a hash-join build, a snapshot) decides what
         // this chunk's rows are; dropping the payload would not free them.
-        if Arc::strong_count(&payload.vector) != 1 {
+        if payload.form.shared() {
             return Evict::Busy;
         }
         let bytes = payload.charge.bytes();
@@ -849,7 +967,7 @@ impl ChunkHandle {
             state: Mutex::new(ChunkState {
                 encoded: state.encoded.clone(),
                 payload: state.payload.as_ref().map(|p| ChunkPayload {
-                    vector: Arc::clone(&p.vector),
+                    form: p.form.clone(),
                     charge: Arc::clone(&p.charge),
                 }),
                 dirty: state.dirty,
@@ -891,14 +1009,14 @@ impl std::fmt::Debug for ChunkHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let state = self.lock();
         let rows = match state.payload.as_ref() {
-            Some(payload) => payload.vector.len(),
+            Some(payload) => payload.form.len(),
             None => state.encoded.as_ref().map_or(0, |e| e.rows),
         };
         f.debug_struct("ChunkHandle")
             .field("rows", &rows)
             .field(
                 "decoded",
-                &state.payload.as_ref().map(|payload| payload.vector.len()),
+                &state.payload.as_ref().map(|payload| payload.form.len()),
             )
             .field(
                 "encoded",
@@ -1057,14 +1175,21 @@ impl std::ops::Deref for ChunkMut<'_> {
     type Target = Vector;
 
     fn deref(&self) -> &Vector {
-        &self.0.payload.as_ref().expect("chunk_mut decodes").vector
+        self.0
+            .payload
+            .as_ref()
+            .and_then(|p| p.form.full())
+            .expect("chunk_mut decodes in full")
     }
 }
 
 impl std::ops::DerefMut for ChunkMut<'_> {
     fn deref_mut(&mut self) -> &mut Vector {
         let payload = self.0.payload.as_mut().expect("chunk_mut decodes");
-        Arc::make_mut(&mut payload.vector)
+        match &mut payload.form {
+            Resident::Full(vector) => Arc::make_mut(vector),
+            Resident::Compact(_) => unreachable!("chunk_mut decodes in full"),
+        }
     }
 }
 
@@ -1123,6 +1248,24 @@ impl Column {
             .count()
     }
 
+    /// The bytes this column's chunks charge to the decoded cache, and to the
+    /// operator pool (a test hook: unlike the process-wide counters, tests
+    /// running alongside cannot move it).
+    #[cfg(test)]
+    pub(crate) fn charged(&self) -> (usize, usize) {
+        let (mut cache, mut operator) = (0, 0);
+        for chunk in &self.chunks {
+            if let Some(payload) = chunk.lock().payload.as_ref() {
+                if payload.charge.is_cache() {
+                    cache += payload.charge.bytes();
+                } else {
+                    operator += payload.charge.bytes();
+                }
+            }
+        }
+        (cache, operator)
+    }
+
     /// How many times this column's chunks were decoded from stored bytes,
     /// whether or not the decoded cache kept them (a test hook: unlike
     /// [`Column::decoded_chunks`], no other statement's budget changes it).
@@ -1138,6 +1281,44 @@ impl Column {
         match self.chunks.get(i) {
             Some(handle) => ChunkHandle::get(handle, self.dtype, false),
             None => Err(self.out_of_range(i)),
+        }
+    }
+
+    /// Chunk `i`'s compact cache entry, when it holds one: the codes and
+    /// dictionary (or base and offsets) without expanding them.
+    #[allow(dead_code)] // the dictionary GROUP BY wave is the first consumer
+    pub(crate) fn compact(&self, i: usize) -> Option<Arc<crate::compact::CompactChunk>> {
+        let handle = self.chunks.get(i)?;
+        let state = handle.lock();
+        match &state.payload.as_ref()?.form {
+            Resident::Compact(compact) => Some(Arc::clone(compact)),
+            Resident::Full(_) => None,
+        }
+    }
+
+    /// Chunk `i` for a reader that holds it for the whole statement: a
+    /// compact cache entry is expanded and kept full from then on, when the
+    /// cache has room. Holding the chunk costs the full bytes anyway, and the
+    /// next such reader is spared the expansion: TPC-H Q4's and Q17's
+    /// materialized `lineitem` side would expand 60M rows per run at SF10.
+    pub(crate) fn chunk_full(&self, i: usize) -> Result<Arc<Vector>> {
+        match self.chunks.get(i) {
+            Some(handle) => ChunkHandle::get_full(handle, self.dtype),
+            None => Err(self.out_of_range(i)),
+        }
+    }
+
+    /// Row `row` of chunk `i`. A compact cache entry answers it without
+    /// expanding the chunk: point lookups stay O(1).
+    pub(crate) fn value(&self, i: usize, row: usize) -> Result<Value> {
+        let handle = self.chunks.get(i).ok_or_else(|| self.out_of_range(i))?;
+        let compact = handle.lock().payload.as_ref().and_then(|p| match &p.form {
+            Resident::Compact(compact) => Some(Arc::clone(compact)),
+            Resident::Full(_) => None,
+        });
+        match compact {
+            Some(compact) => Ok(compact.value(row)),
+            None => Ok(self.chunk(i)?.get(row)),
         }
     }
 
@@ -3092,6 +3273,33 @@ impl DataTable {
         Ok(Some(chunk))
     }
 
+    /// [`Self::scan_chunk`] or [`Self::scan_chunk_projected`] for a reader
+    /// that holds the chunk for its whole statement (a materialized scan): a
+    /// compact cache entry it reads is promoted to full (wave 136c-3).
+    pub(crate) fn scan_chunk_full(
+        &self,
+        idx: usize,
+        present: Option<&[bool]>,
+    ) -> Result<Option<DataChunk>> {
+        if idx >= self.num_chunks() {
+            return Ok(None);
+        }
+        let mut cols = Vec::with_capacity(self.columns.len());
+        for (ci, c) in self.columns.iter().enumerate() {
+            if present.is_none_or(|p| p.get(ci).copied().unwrap_or(false)) {
+                cols.push(c.chunk_full(idx)?);
+            } else {
+                cols.push(Arc::new(Vector::new_empty(c.dtype)));
+            }
+        }
+        if present.is_none() {
+            return Ok(DataChunk::from_arcs(cols));
+        }
+        let mut chunk = DataChunk::projected(cols, self.chunk_rows(idx));
+        chunk.ordinal = idx;
+        Ok(Some(chunk))
+    }
+
     /// Value at (row, col).
     pub fn get(&self, row: usize, col: usize) -> Result<Option<Value>> {
         if row >= self.num_rows || col >= self.columns.len() {
@@ -3102,7 +3310,7 @@ impl DataTable {
         for i in 0..column.num_chunks() {
             let len = column.chunk_rows(i);
             if base < len {
-                return Ok(Some(column.chunk(i)?.get(base)));
+                return Ok(Some(column.value(i, base)?));
             }
             base -= len;
         }
