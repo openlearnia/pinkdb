@@ -114,9 +114,15 @@ fn check_all(db: &mut PinkDb, label: &str) {
         for (grouped, reference) in queries(window, bound) {
             // Equal results prove nothing if the rewrite never fires.
             let plan = explained(db, &grouped);
-            assert!(plan.contains("per partition)"), "{label}: not rewritten: {grouped}\n{plan}");
+            assert!(
+                plan.contains("per partition)"),
+                "{label}: not rewritten: {grouped}\n{plan}"
+            );
             let plan = explained(db, &reference);
-            assert!(!plan.contains("per partition)"), "{label}: reference rewritten: {reference}\n{plan}");
+            assert!(
+                !plan.contains("per partition)"),
+                "{label}: reference rewritten: {reference}\n{plan}"
+            );
             let want = rows(db, &reference);
             let got = rows(db, &grouped);
             assert_eq!(got, want, "{label}: {grouped}");
