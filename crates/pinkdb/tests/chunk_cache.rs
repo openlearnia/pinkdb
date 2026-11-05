@@ -96,22 +96,33 @@ fn sum_chunks(table: &DataTable) -> i64 {
     sum
 }
 
-fn first_chunk(db: &PinkDb, table: &str) -> Arc<Vector> {
-    db.table(table).unwrap().columns[0].chunk(0).unwrap()
+/// Weak handles on every decoded chunk of `table`'s first column.
+fn watch(db: &PinkDb, table: &str) -> Vec<std::sync::Weak<Vector>> {
+    let column = &db.table(table).unwrap().columns[0];
+    (0..column.num_chunks())
+        .map(|i| Arc::downgrade(&column.chunk(i).unwrap()))
+        .collect()
 }
 
-/// Each table fits in the limit alone, both do not: the second statement
-/// evicts the first table's chunks as it decodes, and the third decodes them
-/// again — same answers, and the pool never passes the limit.
+fn alive(watched: &[std::sync::Weak<Vector>]) -> usize {
+    watched.iter().filter(|w| w.upgrade().is_some()).count()
+}
+
+/// Each table fits in the cache alone, both do not (wave 136c-4, scan
+/// resistance): the first statement over the second table finds the cache full
+/// and decodes its chunks for itself alone, charged to the operator pool and
+/// released when it ends — the first table's chunks stay. The second
+/// statement over it has read those chunks before, so it admits them by
+/// evicting; the first table then decodes again. Same answers throughout, and
+/// the cache never passes its limit.
 #[test]
-fn a_second_statement_evicts_the_first_tables_chunks() {
+fn a_one_pass_scan_does_not_flush_a_full_cache_and_a_second_pass_does() {
     let store = Store::new("scan");
     let chunks = 30;
     let mut a = store.table("a", chunks);
     let mut b = store.table("b", chunks);
     let expected = range_sum(chunks * CHUNK_SIZE);
-    // 30 BIGINT chunks are ~500 KB decoded: 900 KiB fits one table and the
-    // chunks a statement decodes at once, not both tables.
+    // 30 BIGINT chunks are ~500 KB decoded: 700 KiB holds one table.
     memory::set_cache_limit(700 * 1024);
     let limit = memory::cache_limit();
 
@@ -121,19 +132,62 @@ fn a_second_statement_evicts_the_first_tables_chunks() {
         "the decoded chunks are not charged to the cache"
     );
     assert!(memory::cache_used() <= limit);
-    let watched = Arc::downgrade(&first_chunk(&a, "a"));
-    assert!(watched.upgrade().is_some(), "a's chunk is not decoded");
+    let watched = watch(&a, "a");
+    assert_eq!(alive(&watched), chunks, "a's chunks are not all cached");
+
+    let operators = memory::used();
+    assert_eq!(int(&mut b, "SELECT sum(i) FROM b"), expected);
+    assert!(memory::cache_used() <= limit);
+    assert_eq!(
+        alive(&watched),
+        chunks,
+        "b's first scan flushed a's chunks from a full cache"
+    );
+    assert_eq!(
+        memory::used(),
+        operators,
+        "b's own chunks stayed charged after the statement"
+    );
 
     assert_eq!(int(&mut b, "SELECT sum(i) FROM b"), expected);
     assert!(memory::cache_used() <= limit);
+    // Which of a's chunks go depends on the order parallel workers decoded
+    // them and on which worker wins the evictor; that some go does not.
     assert!(
-        watched.upgrade().is_none(),
-        "b did not evict a's chunk, so 60 chunks fit in a 30-chunk limit"
+        alive(&watched) < chunks,
+        "b's second scan did not admit its chunks over a's"
     );
 
     // Decoded again from the retained image, CRC and all.
     assert_eq!(int(&mut a, "SELECT sum(i) FROM a"), expected);
     assert!(memory::cache_used() <= limit);
+    memory::reset_cache_limit();
+}
+
+/// A chunk the cache does not take belongs to its reader: it is charged to
+/// the operator pool while the reader holds it and released when the last
+/// reader drops it (wave 136c-4).
+#[test]
+fn a_chunk_the_cache_refuses_is_charged_to_its_reader_until_dropped() {
+    let store = Store::new("own");
+    let db = store.table("t", 4);
+    memory::set_cache_limit(0);
+    let column = &db.table("t").unwrap().columns[0];
+    let before = memory::used();
+    let chunk = column.chunk(0).unwrap();
+    assert_eq!(memory::cache_used(), 0, "a refused chunk was cached");
+    assert!(
+        memory::used() >= before + chunk.memory_size(),
+        "a refused chunk is not charged to the operator pool"
+    );
+    let shared = Arc::clone(&chunk);
+    drop(chunk);
+    assert!(
+        memory::used() > before,
+        "the charge left with one reader of two"
+    );
+    drop(shared);
+    assert_eq!(memory::used(), before, "the charge outlived its readers");
     memory::reset_cache_limit();
 }
 

@@ -712,14 +712,15 @@ impl ChunkHandle {
         };
         // A write's decode is the truth until saved: it charges the operator
         // pool and fails when there is truly no room. A scan's decode is a
-        // cache entry, charged to `decoded_cache_limit`; when that budget is
-        // full even after evicting, the chunk is decoded for this caller alone
-        // — a query never fails because the cache is full.
+        // cache entry when [`admit`] finds it room; otherwise it is decoded
+        // for this caller alone and charged to the operator pool until the
+        // last reader drops it — a query never fails because the cache is
+        // full, only when its own chunks do not fit (wave 136c-4).
         let bound = encoded.decoded_bound(dtype)?;
-        let mut charge = if dirty {
-            Some(crate::memory::reserve(bound)?)
+        let (mut charge, cached) = if dirty {
+            (crate::memory::reserve(bound)?, true)
         } else {
-            crate::memory::reserve_decoded(bound)
+            admit(handle, bound)?
         };
         let mut state = handle.lock();
         // Another thread may have decoded the chunk while this one reserved.
@@ -729,31 +730,32 @@ impl ChunkHandle {
             return Ok(vector);
         }
         let encoded = state.encoded.clone().ok_or_else(missing_payload)?;
-        let mut cached = charge.is_some();
-        let decoded = Arc::new(encoded.decode(dtype)?);
+        let mut decoded = encoded.decode(dtype)?;
         handle
             .decodes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if cached {
-            // The bound over-estimates; the charge follows the chunk's real
-            // size. A cache entry that cannot grow to it is simply not cached.
-            match charge
-                .as_mut()
-                .expect("cached")
-                .resize(decoded.memory_size())
-            {
-                Ok(()) => {}
-                Err(_) if !dirty => cached = false,
-                Err(e) => return Err(e),
+        // The bound over-estimates; the charge follows the chunk's real size.
+        // A cache entry that cannot grow to it is not cached: its reader owns
+        // it, charged to the operator pool like any other miss.
+        let size = decoded.memory_size();
+        if let Err(e) = charge.resize(size) {
+            if dirty || !cached {
+                return Err(e);
             }
+            // Reserved with the handle unlocked, like the first reservation.
+            drop(state);
+            decoded.set_charge(crate::memory::reserve(size)?);
+            return Ok(Arc::new(decoded));
         }
         if !cached {
             drop(state);
-            return Ok(decoded);
+            decoded.set_charge(charge);
+            return Ok(Arc::new(decoded));
         }
+        let decoded = Arc::new(decoded);
         state.payload = Some(ChunkPayload {
             vector: Arc::clone(&decoded),
-            charge: Arc::new(charge.expect("cached")),
+            charge: Arc::new(charge),
         });
         state.dirty |= dirty;
         // Registered under the handle's lock: an eviction that raced past here
@@ -928,6 +930,25 @@ static DECODED: Mutex<std::collections::VecDeque<std::sync::Weak<ChunkHandle>>> 
 /// is decoded for its reader alone.
 const EVICT_PROBES: usize = 64;
 
+/// Where a clean decode's bytes are charged, and whether the cache keeps it
+/// (wave 136c-4). Room in the cache budget as it stands admits at once — so a
+/// cache with room (the default, under `memory_limit`) behaves as before.
+/// Admitting by evicting is for a chunk read before (2Q's second touch): a
+/// one-pass scan over a full cache then never flushes it, and never runs the
+/// evictor. A chunk the cache does not take is its reader's, charged to the
+/// operator pool, so what materialized join sides and streamed scans hold is
+/// counted where the spill decision sees it.
+fn admit(handle: &ChunkHandle, bound: usize) -> Result<(crate::memory::Reservation, bool)> {
+    if let Some(charge) = crate::memory::try_reserve_decoded(bound) {
+        return Ok((charge, true));
+    }
+    let seen = handle.decodes.load(std::sync::atomic::Ordering::Relaxed) > 0;
+    if seen && let Some(charge) = crate::memory::reserve_decoded(bound) {
+        return Ok((charge, true));
+    }
+    Ok((crate::memory::reserve(bound)?, false))
+}
+
 /// Note a just-decoded chunk as a candidate, after the currently oldest.
 fn register(handle: &std::sync::Weak<ChunkHandle>) {
     let mut lru = DECODED.lock().unwrap_or_else(|e| e.into_inner());
@@ -945,10 +966,24 @@ fn register(handle: &std::sync::Weak<ChunkHandle>) {
 /// after a decode, a write), and blocking here would deadlock those two
 /// threads against each other. `try_lock` plus the retry in
 /// [`crate::memory::acquire`] is what makes the eviction best-effort instead.
-fn evict_decoded(want: usize) -> usize {
+///
+/// A cache admission (`wait` false) does not queue behind another thread's
+/// pass either: with every decoding thread failing its reservation at once,
+/// they used to convoy on this lock (TPC-H SF10 Q4 at `decoded_cache_limit =
+/// '32MB'`: three quarters of the sampled thread time waiting here). It frees
+/// nothing, and its chunk is decoded for its reader alone.
+fn evict_decoded(want: usize, wait: bool) -> usize {
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let trace = *TRACE.get_or_init(|| std::env::var_os("PINKDB_EVICT_TRACE").is_some());
-    let mut lru = DECODED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lru = if wait {
+        DECODED.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match DECODED.try_lock() {
+            Ok(lru) => lru,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return 0,
+        }
+    };
     let mut freed = 0;
     let mut probes = 0;
     while freed < want && probes < EVICT_PROBES {

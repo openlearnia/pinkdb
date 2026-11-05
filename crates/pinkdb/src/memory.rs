@@ -32,8 +32,10 @@ static EXPLICIT: AtomicBool = AtomicBool::new(false);
 static DEFAULT: OnceLock<usize> = OnceLock::new();
 
 /// The cache's eviction hook: frees up to the requested bytes of decoded
-/// chunks and returns how much the pool got back.
-pub type Evictor = fn(usize) -> usize;
+/// chunks and returns how much the pool got back. With `wait` false it gives
+/// up (frees nothing) when another thread is already evicting; an operator's
+/// reservation waits, so a busy evictor never fails it.
+pub type Evictor = fn(usize, bool) -> usize;
 
 static EVICTOR: OnceLock<Evictor> = OnceLock::new();
 
@@ -139,7 +141,7 @@ fn trim_cache() {
         return;
     }
     if let Some(evict) = EVICTOR.get() {
-        evict(used - limit);
+        evict(used - limit, true);
     }
 }
 
@@ -148,6 +150,19 @@ fn trim_cache() {
 /// caching, so a query never fails because the cache is full.
 pub fn reserve_decoded(bytes: usize) -> Option<Reservation> {
     reserve_in(Pool::Cache, bytes)
+}
+
+/// Charge `bytes` to the decoded cache only if its budget has room as it is:
+/// never evicts. A chunk's first decode admits this way, so a one-pass scan
+/// over a full cache neither flushes it nor queues on its evictor (wave 136c-4).
+pub fn try_reserve_decoded(bytes: usize) -> Option<Reservation> {
+    // `then`, not `then_some`: a reservation built eagerly for a failed
+    // acquire would release bytes it never took when it drops.
+    try_acquire(Pool::Cache, bytes).then(|| Reservation {
+        bytes,
+        account: None,
+        pool: Pool::Cache,
+    })
 }
 
 /// Which budget a reservation charges: operators (and the chunks a write
@@ -468,7 +483,7 @@ fn acquire(pool: Pool, bytes: usize) -> Result<()> {
     let Some(evict) = EVICTOR.get() else {
         return Err(out_of_memory(bytes));
     };
-    while evict(bytes.saturating_mul(2)) > 0 {
+    while evict(bytes.saturating_mul(2), true) > 0 {
         if try_acquire(pool, bytes) {
             return Ok(());
         }
@@ -487,8 +502,11 @@ fn reserve_in(pool: Pool, bytes: usize) -> Option<Reservation> {
             pool,
         });
     }
+    // A cache admission never waits for another thread's eviction pass: when
+    // the evictor is busy it frees nothing, and the chunk is decoded for its
+    // reader alone (wave 136c-4).
     let evict = EVICTOR.get()?;
-    while evict(bytes.saturating_mul(2)) > 0 {
+    while evict(bytes.saturating_mul(2), false) > 0 {
         if try_acquire(pool, bytes) {
             return Some(Reservation {
                 bytes,

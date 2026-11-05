@@ -332,6 +332,37 @@ pub struct Vector {
     /// Bit `i` set ⇒ row `i` is valid; clear ⇒ NULL. Length = ceil(len/64).
     validity: Vec<u64>,
     len: usize,
+    /// The memory pool charge a store chunk decoded for its readers alone
+    /// carries (wave 136c-4): released when the last reader drops the chunk.
+    charge: Charge,
+}
+
+/// A [`Vector`]'s own pool charge. A copy of the vector is a new allocation
+/// nobody charged, so a clone carries none, and the charge never takes part in
+/// equality or debug output. Boxed: every vector carries the field, almost
+/// none a charge.
+#[derive(Default)]
+pub(crate) struct Charge(Option<Box<crate::memory::Reservation>>);
+
+impl Clone for Charge {
+    fn clone(&self) -> Self {
+        Charge(None)
+    }
+}
+
+impl PartialEq for Charge {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for Charge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(r) => write!(f, "{}", r.bytes()),
+            None => f.write_str("-"),
+        }
+    }
 }
 
 /// The source index of a [`Vector::gather_located`] pick that is NULL.
@@ -393,6 +424,7 @@ impl Vector {
             data: VectorData::with_capacity(dtype, cap.min(CHUNK_SIZE)),
             validity: vec![0u64; mask_len(cap.min(CHUNK_SIZE))],
             len: 0,
+            charge: Charge::default(),
         }
     }
 
@@ -499,6 +531,12 @@ impl Vector {
         Ok(vector)
     }
 
+    /// Hand this vector the pool charge that pays for it, released when it
+    /// drops (a store chunk decoded outside the decoded cache).
+    pub(crate) fn set_charge(&mut self, charge: crate::memory::Reservation) {
+        self.charge = Charge(Some(Box::new(charge)));
+    }
+
     /// Build a vector directly from raw parts (crate-internal fast paths):
     /// `data` must hold exactly `len` elements; `validity` is normalized to
     /// `mask_len(len)` words (extra words dropped, missing ones read NULL).
@@ -513,6 +551,7 @@ impl Vector {
             data,
             validity,
             len,
+            charge: Charge::default(),
         }
     }
 
@@ -635,6 +674,7 @@ impl Vector {
             data,
             validity,
             len,
+            charge: Charge::default(),
         }
     }
 

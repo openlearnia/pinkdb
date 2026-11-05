@@ -593,3 +593,48 @@ interleaved against 136c-1 on the same v7 SF1 store; load 9–12):
 - Pi's earlier capped-budget ladder (256 MiB 2.68, 768 MiB 0.989) was measured on a stale CLI
   binary whose default was the 256 MiB cap. Its relative order holds, but the default row is
   replaced by the numbers above.
+
+---
+
+## 11. Step 136c-4: scan-resistant admission (2026-11-05)
+
+**Why.** After 136c-3's fixes, a 32MB cache still ran about 1.23× slower than no cache at all
+(`decoded_cache_limit = 0`): SF1 1483 ms against 1208 ms, SF10 17.9 s against 14.5 s. A `sample` of
+SF10 Q4 at 32MB put 10,001 of about 13,300 thread samples in `__psynch_mutexwait` under
+`ChunkHandle::get → reserve_decoded → evict_decoded`. Each failed cache reservation ran the
+evictor, which held the global `DECODED` mutex while it probed entries that materialized readers
+mostly had pinned, and every other decoding thread queued behind it. The decode itself was about
+1,200 samples. The cost was lock convoying, not decoding.
+
+**Admission** (`storage.rs`, `admit`). This is 2Q's idea, keyed on the per-handle `decodes`
+counter:
+
+- A clean decode goes into the cache at once when the budget has room without evicting
+  (`memory::try_reserve_decoded`). That is the default cache's usual case, and it is unchanged.
+- When admitting would need an eviction, a chunk is admitted only on its second touch (`decodes > 0`).
+  A first touch against a full cache never runs the evictor, so a one-pass scan cannot flush the
+  warm set.
+- A cache admission's eviction pass only `try_lock`s `DECODED` (`Evictor = fn(usize, bool)`). If
+  another thread is already evicting, the pass frees nothing and the chunk is not admitted.
+  Operator reservations (`acquire`, `trim_cache`) still wait for the lock, so a busy evictor never
+  fails an operator.
+- The cache can never pass its limit: every admission is a successful `try_acquire` on
+  `CACHE_USED`.
+
+**A chunk the cache refuses belongs to its reader.** It is decoded for the caller alone and charged
+to the operator pool as a `Reservation` inside the `Vector` (`Vector::set_charge`). The charge is
+released when the last `Arc` drops it. A clone of the vector does not inherit the charge, because
+the clone owns its own buffers. What materialized join sides and streamed scans hold is therefore
+counted where the spill decision sees it. Before this step it was counted nowhere. A query gets an
+out-of-memory error only when its own chunks do not fit, never because the cache is full.
+
+**Rule change.** `tests/chunk_cache.rs` used to expect that a second table's first statement evicts
+the first table's chunks (`a_second_statement_evicts_the_first_tables_chunks`). Now that statement
+leaves the first table cached and returns its own charge when it ends. The second statement over the
+same table admits by evicting
+(`a_one_pass_scan_does_not_flush_a_full_cache_and_a_second_pass_does`). A further test checks the
+reader-owned charge
+(`a_chunk_the_cache_refuses_is_charged_to_its_reader_until_dropped`).
+
+**Result.** See §11.1. The A/B reports run 1, run 2 and the steady state separately, because
+second-touch admission moves cost from run 1 to run 2.
