@@ -105,9 +105,18 @@ fn queries(window: &str, bound: &str) -> Vec<(String, String)> {
     ]
 }
 
+fn explained(db: &mut PinkDb, sql: &str) -> String {
+    rows(db, &format!("EXPLAIN {sql}")).join("\n")
+}
+
 fn check_all(db: &mut PinkDb, label: &str) {
     for (window, bound) in SHAPES {
         for (grouped, reference) in queries(window, bound) {
+            // Equal results prove nothing if the rewrite never fires.
+            let plan = explained(db, &grouped);
+            assert!(plan.contains("per partition)"), "{label}: not rewritten: {grouped}\n{plan}");
+            let plan = explained(db, &reference);
+            assert!(!plan.contains("per partition)"), "{label}: reference rewritten: {reference}\n{plan}");
             let want = rows(db, &reference);
             let got = rows(db, &grouped);
             assert_eq!(got, want, "{label}: {grouped}");

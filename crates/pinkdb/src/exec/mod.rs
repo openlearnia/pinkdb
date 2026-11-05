@@ -9426,7 +9426,14 @@ fn explain_into(
         }
         LogicalPlan::Filter { input, predicate } => {
             children.push(input);
-            format!("Filter {}", expr_text(predicate))
+            match top_n::grouped_shape(plan) {
+                Some(shape) => format!(
+                    "Filter {} (top {} per partition)",
+                    expr_text(predicate),
+                    shape.limit
+                ),
+                None => format!("Filter {}", expr_text(predicate)),
+            }
         }
         LogicalPlan::Cte {
             name,

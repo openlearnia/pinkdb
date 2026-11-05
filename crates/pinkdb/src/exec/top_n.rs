@@ -600,9 +600,15 @@ fn row_number_bound(expr: &BoundExpr, col: usize) -> Option<usize> {
         Value::Bigint(x) => Some(*x),
         _ => None,
     };
+    // QUALIFY binds the number as a `WindowRef`; a Filter written over the
+    // Window by hand sees it as a plain column.
+    let is_number = |e: &BoundExpr| match e {
+        BoundExpr::Column { index, .. } | BoundExpr::WindowRef { index, .. } => *index == col,
+        _ => false,
+    };
     let (op, k) = match (&**left, &**right) {
-        (BoundExpr::Column { index, .. }, BoundExpr::Literal(v)) if *index == col => (*op, int(v)?),
-        (BoundExpr::Literal(v), BoundExpr::Column { index, .. }) if *index == col => (
+        (l, BoundExpr::Literal(v)) if is_number(l) => (*op, int(v)?),
+        (BoundExpr::Literal(v), r) if is_number(r) => (
             match op {
                 BinaryOp::GtEq => BinaryOp::LtEq,
                 BinaryOp::Gt => BinaryOp::Lt,
