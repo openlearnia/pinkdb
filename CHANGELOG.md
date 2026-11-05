@@ -33,11 +33,9 @@ API, ETL and console can talk to pinkdb unchanged. Plan and contract:
   is never written unencrypted by surprise.
 - **The image**: `docker build --build-arg VARIANT=quacklab`, which accepts
   QuackLab's `duckdb` argument and serves `$PORT`.
-- **Shadow run** against the Go service over DuckDB: typed cells 6 of 7
-  (pinkdb has no `TIME`), the lease choreography 18 of 18, and QuackLab's
-  goldens 234 of 249 before this wave's two error-text fixes, with every
-  success identical. The results are the same on a local and on a lake
-  warehouse.
+- **Shadow run** against the Go service over DuckDB, on a local and on a lake
+  warehouse alike: typed cells 6 of 7 (pinkdb has no `TIME`), the lease
+  choreography 18 of 18, and QuackLab's goldens 249 of 249.
 - **Engine fixes**: `DELETE`/`UPDATE` on a view says `Can only delete from base
   table` / `Can only update base table` (it said the table did not exist); the
   server's lake policy accepts a libpq conninfo catalog (`postgres:host=…`).

@@ -110,34 +110,45 @@ Deliberate, per the wave 138 plan:
 * `rows` beyond `GRAIN_SQL_RESULT_ROW_LIMIT` truncate at the adapter's own
   limit, so a corpus that changes the limit changes both sides.
 
-## Last measured run (2026-11-01)
+## Running pinkdb over a lake warehouse
 
-Against the Go service in file mode (`DUCKDB_PATH=/tmp/ref/warehouse.duckdb`)
-and `pinkdb-server --features quacklab,httpfs,parquet`:
+The same corpora run against the adapter's lake warehouse (wave 138c): a
+Postgres catalog and S3 data. Locally that is a throwaway Postgres (port
+55433, database `lakecat`) and a mock S3 (`docker run -d -p
+127.0.0.1:9090:9090 -e initialBuckets=lake adobe/s3mock`):
 
-| corpus | match | differ |
+```
+GRAIN_DUCKLAKE=1 DUCKLAKE_ENCRYPTED=0 \
+DUCKLAKE_PG_URI="host=127.0.0.1 port=55433 dbname=lakecat user=postgres password=…" \
+PINKDB_LAKE_CATALOG_SCHEMA=shadow1 DUCKLAKE_DATA_PATH=s3://lake/shadow1 \
+R2_ACCESS_KEY_ID=mock R2_SECRET_ACCESS_KEY=mock R2_ENDPOINT=http://127.0.0.1:9090 \
+DUCKDB_SQL_TOKEN=tok ./target/release/pinkdb-server \
+    --in-memory --host 127.0.0.1 --port 0 --quacklab-bind 127.0.0.1:12941
+```
+
+Use a fresh `PINKDB_LAKE_CATALOG_SCHEMA` and data prefix per run: the lake
+outlives the server.
+
+## Last measured run (2026-11-05)
+
+Against the Go service built from grain `59cbb96f` in file mode
+(`DUCKDB_PATH=…/warehouse.duckdb`) and `pinkdb-server` 5bdd579 with
+`--features quacklab,parquet,httpfs,lake-s3,catalog-postgres`, on both
+warehouses (logs: `pinkdb-wt/logs/w138-shadow-{local,lake}-5bdd579.log`):
+
+| corpus | local warehouse | lake warehouse |
 |---|---|---|
-| `types.jsonl` | 6 | 1 |
-| `lease.jsonl` | 18 | 0 |
-| `goldens.jsonl` | 224 | 25 |
+| `types.jsonl` | 6 / 7 | 6 / 7 |
+| `lease.jsonl` | 18 / 18 | 18 / 18 |
+| `goldens.jsonl` | 249 / 249 | 249 / 249 |
 
-The remaining differences are all engine gaps in pinkdb, not adapter bugs;
-every successful statement answers byte-for-byte the same result:
+The one difference is an engine gap: the typed-literal statement uses
+`TIME '01:02:03'`, and pinkdb has no `TIME` type (the parser stops there).
+Its other cells (HUGEINT, `INTERVAL 3 DAY`, `1e300`, `-0.0`, `DECIMAL(38,3)`,
+timestamps, dates) match.
 
-* `types.jsonl`: one statement (the typed literals) — pinkdb has no `TIME`
-  type or literal (`TIME '01:02:03'`, `'…'::TIME`) and no 128-bit integer,
-  so `170141183460469231731687303715884105727::HUGEINT` is "integer literal
-  out of range". Its other cells (`INTERVAL 3 DAY`, `1e300`, `-0.0`,
-  `DECIMAL(38,3)`, timestamps, dates) match.
-* `goldens.jsonl`, 10 statements `DELETE FROM <a view>`: DuckDB says
-  `Binder Error: Can only delete from base table`, pinkdb resolves the target
-  as a base table only and says `Catalog Error: Table with name … does not
-  exist!`.
-* `goldens.jsonl`, 10 statements `INSERT INTO <a view> SELECT * FROM (…)`:
-  DuckDB binds and rejects the view, pinkdb's parser stops first with
-  `Parser Error: … derived table needs an alias` (DuckDB accepts an unaliased
-  derived table).
-* `goldens.jsonl`, 5 `read_csv` loads: the fixture rows are `v0,v1,…`, so both
-  sides fail the cast to `BIGINT`; DuckDB reports `Conversion Error: CSV Error
-  on Line: 2 …`, pinkdb `Binder Error: cannot CAST "v1" AS BIGINT` from the
-  reader's bind step, with no line context.
+History: 2026-11-01 measured 6/7, 18/18, 224/249 (later 222); wave 138 on
+11-05 closed the goldens' error-class differences (`DELETE`/`UPDATE` on a view
+now fails with DuckDB's `Binder Error: Can only delete from base table`, and a
+value that does not cast is a `Conversion Error`), and the dialect waves since
+11-01 closed the unaliased derived table.

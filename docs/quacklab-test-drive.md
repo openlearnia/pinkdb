@@ -54,14 +54,21 @@ Push it to the environment's Artifact Registry under a tag of its own (for
 example `…/quacklab/pinkdb-quacklab:w138-<commit>`); the Grain image tag is not
 reused.
 
-Measured on this Mac (Docker Desktop, arm64, 2026-11-05), see
-`~/Desktop/projects/pinkdb-wt/logs/w138-image.log`:
+Measured on this Mac (Docker Desktop, arm64, 2026-11-05, image from 5bdd579),
+see `~/Desktop/projects/pinkdb-wt/logs/w138-image.log`:
 
 | | pinkdb:quacklab |
 |---|---|
-| image size | IMAGE_SIZE |
-| time to first `200` on `/health` (median of 5 `docker run`s) | HEALTH_MS |
-| idle RSS after boot | IDLE_RSS |
+| image size | 68.1 MB (20.3 MB compressed) |
+| time to first `200` on `/health`, median of 5 `docker run`s, local warehouse | 212 ms |
+| the same with a lake warehouse (local `pink:` catalog inside the container) | 363 ms |
+| idle RSS after boot, local / lake warehouse | 7.8 MB / 12.2 MB |
+| native binary, lake on Postgres + S3 mock, first `200` (warm runs) | 58–77 ms (350 ms first) |
+
+A lake on Neon and R2 adds those services' round trips to the boot (the attach
+reads the catalog head and takes the writer lease), and a non-empty writable
+lake is loaded into memory at attach until wave 134 (0.8 s and 200 MB for a
+2M-row table on the local services).
 
 ## Environment
 
@@ -74,7 +81,7 @@ export`) and change only what this table says.
 | `GRAIN_DUCKLAKE` | `1` | `1` (keep) | turns on the lake warehouse; `PINKDB_QUACKLAB_LAKE=1` is the same switch |
 | `GRAIN_CR_SERVERLESS` | `1` | `1` (keep) | Cloud Run IAM authenticates callers; the adapter skips its bearer check |
 | `DUCKLAKE_ALIAS` | `warehouse` | keep | the database requests run in |
-| `DUCKLAKE_PG_URI` | Neon conninfo | keep | the password is moved into a secret, never into a statement or log |
+| `DUCKLAKE_PG_URI` | Neon conninfo | keep | the password is moved into a secret, never into a statement or log; pink-lake reads the keys QuackLab writes (`dbname host port user password sslmode`) and refuses plaintext (`sslmode=disable`) to any host but localhost |
 | `PINKDB_LAKE_CATALOG_SCHEMA` | — | **`pinkdb_lake`** | new: the pinkdb lake's catalog tables live in this Postgres schema, apart from DuckLake's |
 | `DUCKLAKE_DATA_PATH` | `s3://<lake-bucket>/…` | **`s3://<lake-bucket>/pinkdb/`** | a prefix of its own |
 | `DUCKLAKE_ENCRYPTED` | `1` | **`0`** | pinkdb has no per-lake encryption; the adapter refuses to boot with `1` rather than write unencrypted files silently (R2 still encrypts at rest) |
@@ -190,4 +197,40 @@ and the next ETL run brings it up to date. To remove the pinkdb lake, drop the
 In order of how much they block a real test drive; each has a one-line repro
 in the wave 138 hand-off (`~/Desktop/projects/pinkdb-wt/logs/w138-gaps.md`).
 
-GAPS_LIST
+1. **Lake writes still materialize the lake (wave 134 is not on `main`).** A
+   writable lake is loaded into memory when it is attached, and every commit
+   diffs whole tables. On a 2M-row, 4-column table (local Postgres and a mock
+   S3), a one-row `INSERT` takes 0.9–1.3 s, a 50k-row `DELETE` 3.3 s, the
+   writer holds 590 MB, and a reboot re-materializes the table (0.8 s,
+   200 MB). Small commits cost 200–300 ms each even on tiny tables. Pick a
+   test environment whose warehouse is small, and expect ETL runs to be slower
+   than on DuckDB until wave 134 lands.
+2. **DuckLake's materialized-view functions are missing (wave 137).**
+   `ducklake_create_materialized_view`, `ducklake_refresh_materialized_view`,
+   `ducklake_materialized_views` and `ducklake_drop_materialized_view` are
+   unknown table functions, and QuackLab's MV DDL and mart refresh call them.
+   A model with materialized views does not deploy. pinkdb's own `CREATE
+   MATERIALIZED VIEW … / REFRESH MATERIALIZED VIEW` work on the lake. Pick a
+   model without materialized views.
+3. **quack-ro does not see the writer's commits.** A read-only attachment
+   stays at the lake version it attached, until `/recover` or a restart. Send
+   reads to the writer (deploy step 3).
+4. **`DUCKLAKE_ENCRYPTED` must be `0`.** pinkdb has no per-lake encryption
+   (DuckLake's `ENCRYPTED` was dropped on 11-03). The adapter refuses to boot
+   with `1` rather than write plaintext files without warning.
+5. **No JavaScript procedures in the server build.** `CREATE PROCEDURE …
+   LANGUAGE JAVASCRIPT` answers `JavaScript procedures are not available in
+   this build`. QuackLab's ETL no longer calls its staging-reset procedure,
+   but deploy DDL that creates one fails.
+6. **One writer per lake.** A rollout's new instance answers 503 until the
+   old one stops. Keep `--max-instances=1`.
+7. **No `TIME` type.** The parser rejects `TIME '…'` and `::TIME`.
+8. **The sandbox only refuses `LOAD`/`INSTALL`.** `GRAIN_DUCKDB_SANDBOX=1`
+   has no file allow-list (DuckDB's `allowed_directories`): tenant SQL can
+   `read_csv` any path the container can read.
+
+These were checked and work on a lake warehouse: `CALL
+ducklake_flush_inlined_data('warehouse')`, `CHECKPOINT`, `ducklake_snapshots`,
+write leases and `/recover` (shadow `lease.jsonl` 18 of 18), and QuackLab's
+golden statements (249 of 249 against the Go service, the same as on a local
+warehouse).
