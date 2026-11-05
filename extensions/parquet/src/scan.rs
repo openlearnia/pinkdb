@@ -2763,6 +2763,33 @@ pub struct MorselCounters {
 }
 
 impl RowGroupMorsels {
+    /// The footer statistics of morsel `index`'s row group for output column
+    /// `column` and the group's rows: true bounds (a truncated string bound
+    /// still bounds) and the NULL count, for a running Top-N's cut-off.
+    /// `None` when the column is not read from the file, the group has no
+    /// statistics for it, or the file stores it as another type.
+    pub fn group_stats(&self, index: usize, column: usize) -> Option<(pinkdb::ColumnStats, u64)> {
+        let group = self.groups.get(index)?;
+        let file = self.resolved.files.first()?;
+        if self.resolved.kind.get(column) != Some(&OutKind::FileColumn) {
+            return None;
+        }
+        let at = file.out_to_file.get(column).copied().flatten()?;
+        if file.meta.columns.get(at)?.ty != self.resolved.schema.get(column)?.1 {
+            return None;
+        }
+        let rg = file.meta.row_groups.get(group.index)?;
+        let stats = rg.stats.get(at)?.as_ref()?;
+        Some((
+            pinkdb::ColumnStats {
+                null_count: stats.null_count,
+                min: stats.min.clone(),
+                max: stats.max.clone(),
+            },
+            rg.rows,
+        ))
+    }
+
     /// How many morsels the plan hands out.
     pub fn count(&self) -> usize {
         self.groups.len()

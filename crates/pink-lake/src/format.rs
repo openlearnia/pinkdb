@@ -539,6 +539,12 @@ pub trait FileMorsels: Send + Sync {
     ) -> pinkdb::Result<()>;
     /// What the plan pruned, and how many row groups and pages it will read.
     fn counters(&self) -> ScanCounters;
+    /// Morsel `index`'s statistics for the file's physical column `column`
+    /// (true bounds, NULL count) and its rows, for a running Top-N's cut-off
+    /// (see `pinkdb::MorselSource::morsel_stats`). `None` when unknown.
+    fn stats(&self, _index: usize, _column: usize) -> Option<(pinkdb::ColumnStats, u64)> {
+        None
+    }
 }
 
 /// One file's pruning counters, as a morsel plan reports them.
