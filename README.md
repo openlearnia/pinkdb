@@ -1380,7 +1380,7 @@ segment, so a container cut at a segment boundary is rejected instead of
 loading a silently shorter database. Encrypted WAL records always frame
 `crc = 0` (GCM authenticates the payload); a nonzero crc on a record whose
 ciphertext authenticates is refused as framing tampering. Keys are zeroed on
-drop on a best-effort basis (safe writes only, no unsafe).
+drop with volatile writes (`zeroize`).
 
 The key is a raw 32-byte key or a passphrase stretched with Argon2id (defaults
 m=19 MiB, t=2, p=1; the salt and parameters live in the header, so raising the
@@ -2526,11 +2526,10 @@ unchanged (1.004×) and Q6 is 1.7% slower (1.017×) against the base commit.
 
 The `pinkdb-ffi` crate exposes the engine over a small C ABI as
 `libpinkdb_ffi.dylib` / `libpinkdb_ffi.a` for foreign bindings (Python `cffi`,
-Go `cgo`, ...). Its `unsafe` is the C boundary itself; the core keeps
-`unsafe` to a few narrow spots (CRC32C intrinsics, `flock` and the data-sync
-call, zeroing key bytes, validated UTF-8 views and the result cursor's
-pipeline hand-off), and `pinkdb-ext-loader` owns
-the extension loader's.
+Go `cgo`, ...). Its `unsafe` is the C boundary itself; the core crate is
+`#![forbid(unsafe_code)]` (CRC32C, file locks, the WAL's sync calls and key
+zeroing go through std, `crc32c`, `rustix` and `zeroize`), and
+`pinkdb-ext-loader` owns the extension loader's.
 
 ```sh
 cargo build --release -p pinkdb-ffi

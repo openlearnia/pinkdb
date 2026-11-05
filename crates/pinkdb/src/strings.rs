@@ -166,10 +166,10 @@ pub(crate) fn views_eq(a: &StrVec, i: usize, b: &StrVec, j: usize) -> bool {
 /// vector costs one reference count, however many buffers a join's gather
 /// left it pointing into), and no allocation at all while empty.
 #[derive(Clone, Default)]
-struct SharedList(Option<Arc<Vec<Arc<[u8]>>>>);
+struct SharedList(Option<Arc<Vec<Arc<str>>>>);
 
 impl SharedList {
-    fn of(list: Vec<Arc<[u8]>>) -> SharedList {
+    fn of(list: Vec<Arc<str>>) -> SharedList {
         SharedList(Some(Arc::new(list)))
     }
 
@@ -178,7 +178,7 @@ impl SharedList {
         self.0.as_ref().map_or(0, |l| l.len())
     }
 
-    fn iter(&self) -> impl Iterator<Item = &Arc<[u8]>> {
+    fn iter(&self) -> impl Iterator<Item = &Arc<str>> {
         self.0.iter().flat_map(|l| l.iter())
     }
 
@@ -186,13 +186,13 @@ impl SharedList {
     /// even when another vector's list shares the buffer.
     fn memory_size(&self) -> usize {
         self.0.as_ref().map_or(0, |list| {
-            list.capacity() * std::mem::size_of::<Arc<[u8]>>()
+            list.capacity() * std::mem::size_of::<Arc<str>>()
                 + list.iter().map(|b| b.len()).sum::<usize>()
         })
     }
 
     /// Append `buffer`, returning its index.
-    fn push(&mut self, buffer: &Arc<[u8]>) -> u32 {
+    fn push(&mut self, buffer: &Arc<str>) -> u32 {
         let list = Arc::make_mut(self.0.get_or_insert_with(Arc::default));
         list.push(Arc::clone(buffer));
         (list.len() - 1) as u32
@@ -200,10 +200,10 @@ impl SharedList {
 }
 
 impl std::ops::Index<usize> for SharedList {
-    type Output = Arc<[u8]>;
+    type Output = Arc<str>;
 
     #[inline]
-    fn index(&self, i: usize) -> &Arc<[u8]> {
+    fn index(&self, i: usize) -> &Arc<str> {
         &self
             .0
             .as_ref()
@@ -213,10 +213,14 @@ impl std::ops::Index<usize> for SharedList {
 
 /// A VARCHAR vector's cells. Reads look like a `Vec<String>` (`v[i]` is a
 /// `str`); writes append.
+///
+/// The buffers are `str`, so a long cell's bytes are a `str` slice by type
+/// (a read checks only that its range falls on character boundaries); an
+/// inline cell's bytes are validated on read, at most 12 of them.
 #[derive(Clone, Default)]
 pub struct StrVec {
     views: Vec<StrView>,
-    own: Vec<u8>,
+    own: String,
     /// The shared buffers, as one list behind one `Arc`: copying the vector
     /// (a filter's take) costs one reference count, however many buffers a
     /// join's gather left it pointing into.
@@ -231,7 +235,7 @@ impl StrVec {
     pub fn with_capacity(cap: usize) -> StrVec {
         StrVec {
             views: Vec::with_capacity(cap),
-            own: Vec::new(),
+            own: String::new(),
             shared: SharedList::default(),
         }
     }
@@ -252,30 +256,30 @@ impl StrVec {
         if b.len() <= INLINE {
             return StrVec {
                 views: vec![StrView::inline(b); n],
-                own: Vec::new(),
+                own: String::new(),
                 shared: SharedList::default(),
             };
         }
         let view = StrView::long(b, 0, 0);
         StrVec {
             views: vec![view; n],
-            own: Vec::new(),
-            shared: SharedList::of(vec![Arc::from(b)]),
+            own: String::new(),
+            shared: SharedList::of(vec![Arc::from(s)]),
         }
     }
 
-    /// Cells over one shared buffer: `ranges` are `(offset, len)` of UTF-8
-    /// strings inside `buffer` (a decoded column chunk's bytes). The bytes
-    /// are not copied; short strings are inlined.
+    /// Cells over one shared buffer: `ranges` are `(offset, len)` of strings
+    /// inside `buffer` (a decoded column chunk's bytes), each on character
+    /// boundaries (a range that is not panics). The bytes are not copied;
+    /// short strings are inlined.
     pub fn over_buffer(
-        buffer: Arc<[u8]>,
+        buffer: Arc<str>,
         ranges: impl ExactSizeIterator<Item = (usize, usize)>,
     ) -> StrVec {
         let mut views = Vec::with_capacity(ranges.len());
         let mut any_long = false;
         for (offset, len) in ranges {
-            let s = &buffer[offset..offset + len];
-            debug_assert!(std::str::from_utf8(s).is_ok());
+            let s = buffer[offset..offset + len].as_bytes();
             if len <= INLINE {
                 views.push(StrView::inline(s));
             } else {
@@ -285,7 +289,7 @@ impl StrVec {
         }
         StrVec {
             views,
-            own: Vec::new(),
+            own: String::new(),
             shared: if any_long {
                 SharedList::of(vec![buffer])
             } else {
@@ -317,8 +321,8 @@ impl StrVec {
         } else {
             let at = v.offset();
             match v.heap() {
-                OWN => &self.own[at..at + len],
-                h => &self.shared[h as usize][at..at + len],
+                OWN => &self.own.as_bytes()[at..at + len],
+                h => &self.shared[h as usize].as_bytes()[at..at + len],
             }
         }
     }
@@ -326,11 +330,20 @@ impl StrVec {
     /// Cell `i`.
     #[inline]
     pub fn get(&self, i: usize) -> &str {
-        let b = self.bytes_of(&self.views[i]);
-        // SAFETY: every view was built from a `&str` (or, for
-        // `over_buffer`, a range the decoder validated as UTF-8), and
-        // buffers are never mutated under an existing view.
-        unsafe { std::str::from_utf8_unchecked(b) }
+        let v = &self.views[i];
+        let len = v.len as usize;
+        if len <= INLINE {
+            // An inline view holds a whole string copied from a `str`.
+            std::str::from_utf8(&v.data[..len]).expect("an inline view holds UTF-8")
+        } else {
+            // Buffers only grow, and every long view was cut on character
+            // boundaries of one of them.
+            let at = v.offset();
+            match v.heap() {
+                OWN => &self.own[at..at + len],
+                h => &self.shared[h as usize][at..at + len],
+            }
+        }
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &str> + '_ {
@@ -345,7 +358,7 @@ impl StrVec {
             self.views.push(StrView::inline(b));
         } else {
             let offset = self.own_offset(b.len());
-            self.own.extend_from_slice(b);
+            self.own.push_str(s);
             self.views.push(StrView::long(b, OWN, offset));
         }
     }
@@ -366,13 +379,13 @@ impl StrVec {
             StrView::inline(b)
         } else {
             let offset = self.own_offset(b.len());
-            self.own.extend_from_slice(b);
+            self.own.push_str(s);
             StrView::long(b, OWN, offset)
         };
     }
 
     /// The index in `self.shared` of `buffer`, adding it when new.
-    fn shared_index(&mut self, buffer: &Arc<[u8]>) -> u32 {
+    fn shared_index(&mut self, buffer: &Arc<str>) -> u32 {
         if let Some(i) = self.shared.iter().position(|b| Arc::ptr_eq(b, buffer)) {
             return i as u32;
         }
@@ -393,7 +406,7 @@ impl StrVec {
                 let len = v.len as usize;
                 let at = v.offset();
                 let offset = self.own_offset(len);
-                self.own.extend_from_slice(&src.own[at..at + len]);
+                self.own.push_str(&src.own[at..at + len]);
                 self.views.push(v.with_location(OWN, offset));
             }
             h => {
@@ -436,7 +449,7 @@ impl StrVec {
             // copies and the buffers come along by reference.
             return StrVec {
                 views: rows.map(|i| self.views[i]).collect(),
-                own: Vec::new(),
+                own: String::new(),
                 shared: self.shared.clone(),
             };
         }
@@ -484,7 +497,7 @@ impl StrVec {
                     let len = v.len as usize;
                     let at = v.offset();
                     let offset = out.own_offset(len);
-                    out.own.extend_from_slice(&src.own[at..at + len]);
+                    out.own.push_str(&src.own[at..at + len]);
                     out.views.push(v.with_location(OWN, offset));
                 }
                 h => {
@@ -551,14 +564,14 @@ mod tests {
 
     #[test]
     fn memory_size_counts_a_shared_buffer_once_per_vector() {
-        let buffer: Arc<[u8]> = Arc::from("a string long enough to live in the buffer".as_bytes());
+        let buffer: Arc<str> = Arc::from("a string long enough to live in the buffer");
         let ranges = [(0usize, 40usize), (0, 40)];
         let a = StrVec::over_buffer(Arc::clone(&buffer), ranges.into_iter());
         let b = StrVec::over_buffer(Arc::clone(&buffer), ranges.into_iter());
         let views = 2 * std::mem::size_of::<StrView>();
         // Both views read the one buffer, counted once: the vector's charge is
         // the views plus the bytes, not twice the bytes.
-        let list = std::mem::size_of::<Arc<[u8]>>() + buffer.len();
+        let list = std::mem::size_of::<Arc<str>>() + buffer.len();
         assert_eq!(a.memory_size(), views + list);
         // Two vectors over the same buffer each count it, so the pool errs
         // high: see `StrVec::memory_size`.
@@ -611,7 +624,7 @@ mod tests {
 
     #[test]
     fn shared_buffers_are_shared_not_copied() {
-        let bytes: Arc<[u8]> = Arc::from(&b"shortlong string number onelong string number two"[..]);
+        let bytes: Arc<str> = Arc::from("shortlong string number onelong string number two");
         let v = StrVec::over_buffer(Arc::clone(&bytes), [(0, 5), (5, 22), (27, 22)].into_iter());
         assert_eq!(
             v.iter().collect::<Vec<_>>(),

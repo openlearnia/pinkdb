@@ -93,9 +93,9 @@ impl QueryCursor {
         budget: Arc<ExecBudget>,
         session: Session,
     ) -> Result<QueryCursor> {
-        // The plan sits at a fixed heap address for the whole statement: the
-        // pipeline borrows it, and the scan projections and the subquery memo
-        // are keyed by its nodes' addresses.
+        // The plan sits at a fixed heap address for the whole statement, on
+        // this thread and on a producer thread alike: the scan projections
+        // and the subquery memo are keyed by its nodes' addresses.
         let plan = Arc::new(plan);
         let cx = Cx::with_budget(db, budget)
             .with_session(session)
@@ -112,7 +112,7 @@ impl QueryCursor {
         };
         let (names, types) = (stream.names.clone(), stream.types.clone());
         let mut bytes = 0usize;
-        while let Some(chunk) = stream.next(&cx)? {
+        while let Some(chunk) = stream.next(&cx, &plan)? {
             check_chunk(&cx, &chunk)?;
             bytes += chunk_approx_bytes(&chunk);
             buffered.push_back(chunk);
@@ -122,18 +122,12 @@ impl QueryCursor {
             // Past the inline bound: the rest of this same pipeline continues
             // on a producer thread, over a snapshot of exactly the view it has
             // read so far (the caller still holds it, so nothing changed).
+            // The stream owns its state and the `Arc` moves along with it,
+            // so the producer continues on the very plan nodes (and node
+            // addresses) this thread started on.
             let snapshot = db.cursor_snapshot();
             let parts = cx.detach();
-            // SAFETY: the stream borrows only from `*plan` (`Stream::build`
-            // and `next` keep references to plan nodes, nothing else), which
-            // lives in the `Arc`'s heap allocation: it never moves and is
-            // never mutated. `Handoff` owns that `Arc` and drops the stream
-            // before it, so the references never outlive their target.
-            let stream = unsafe { std::mem::transmute::<Stream<'_>, Stream<'static>>(stream) };
-            let handoff = Handoff {
-                stream,
-                _plan: plan,
-            };
+            let handoff = Handoff { stream, plan };
             let mut cursor = QueryCursor::buffered(names, types, buffered);
             cursor.producer = Some(Producer::spawn(snapshot, parts, handoff)?);
             return Ok(cursor);
@@ -277,12 +271,11 @@ fn check_chunk(cx: &Cx, chunk: &DataChunk) -> Result<()> {
     cx.add_result(chunk.num_rows(), chunk_approx_bytes(chunk))
 }
 
-/// A running pipeline moving to the producer thread. Field order matters:
-/// the stream borrows the plan, so it is declared (and dropped) first.
+/// A running pipeline moving to the producer thread: the stream and the plan
+/// it was built from (each pull is handed its plan node).
 struct Handoff {
-    stream: Stream<'static>,
-    /// Never read: it only keeps the plan the stream borrows alive.
-    _plan: Arc<LogicalPlan>,
+    stream: Stream,
+    plan: Arc<LogicalPlan>,
 }
 
 impl Producer {
@@ -309,7 +302,8 @@ fn produce(
 ) {
     let cx = parts.attach(&snapshot);
     let mut run = || -> Result<()> {
-        while let Some(chunk) = handoff.stream.next(&cx)? {
+        let Handoff { stream, plan } = &mut handoff;
+        while let Some(chunk) = stream.next(&cx, plan)? {
             check_chunk(&cx, &chunk)?;
             tx.send(Ok(chunk))
                 .map_err(|_| PinkDbError::Execution(CURSOR_CLOSED.to_string()))?;
@@ -320,8 +314,8 @@ fn produce(
         // A closed channel means the consumer is gone: nothing to report.
         let _ = tx.send(Err(e));
     }
-    // The stream (and any scan thread it owns) goes before the plan it
-    // borrows; `Handoff`'s field order guarantees it.
+    // The stream (and any scan thread it owns) ends here, before the
+    // channel's sender: the consumer sees the end only once the scan stopped.
     drop(handoff);
 }
 

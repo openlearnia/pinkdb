@@ -645,10 +645,13 @@ fn dtype_from_tag(b: u8) -> Result<DataType> {
 // uses: it is the checksum every columnar format uses, and it is cheap
 // enough to verify every column chunk of a large store on open.
 //
-// The implementation is a portable slicing-by-8 (no `unsafe`, no
-// dependency): the eight tables are derived from the reflected Castagnoli
-// polynomial 0x82F63B78 at compile time.
+// The checksum runs on the CPU's CRC32C instructions (SSE 4.2, ARMv8 CRC)
+// through the `crc32c` crate, which detects them at run time and falls back
+// to tables: the core is `forbid(unsafe_code)`, and calling an instruction
+// needs `unsafe` outside a `#[target_feature]` function. The slicing-by-8
+// tables below are the independent reference the tests check it against.
 
+#[cfg(test)]
 const fn crc32c_tables() -> [[u32; 256]; 8] {
     let mut tables = [[0u32; 256]; 8];
     let mut i = 0usize;
@@ -679,6 +682,7 @@ const fn crc32c_tables() -> [[u32; 256]; 8] {
     tables
 }
 
+#[cfg(test)]
 static CRC32C_TABLES: [[u32; 256]; 8] = crc32c_tables();
 
 /// The CRC32C (Castagnoli) checksum of `bytes`.
@@ -693,54 +697,14 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
 /// for the preceding bytes. A streamed check seeds with `!0` and inverts the
 /// final state, exactly like [`crc32c`].
 pub(crate) fn crc32c_update(crc: u32, bytes: &[u8]) -> u32 {
-    // The CPU's CRC32C instructions compute the same Castagnoli checksum an
-    // order of magnitude faster than the tables (the checkpoint checksums every
-    // byte it writes); the tables remain the portable path.
-    #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("crc") {
-        // SAFETY: the `crc` feature was detected at run time.
-        return unsafe { crc32c_update_aarch64(crc, bytes) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("sse4.2") {
-        // SAFETY: SSE4.2 was detected at run time.
-        return unsafe { crc32c_update_x86_64(crc, bytes) };
-    }
-    crc32c_update_tables(crc, bytes)
+    // The crate continues from a finished checksum: undo the final inversion
+    // going in and redo it coming out.
+    !crc32c::crc32c_append(!crc, bytes)
 }
 
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "crc")]
-unsafe fn crc32c_update_aarch64(mut crc: u32, bytes: &[u8]) -> u32 {
-    use std::arch::aarch64::{__crc32cb, __crc32cd};
-    let (words, rest) = bytes.as_chunks::<8>();
-    for w in words {
-        crc = __crc32cd(crc, u64::from_le_bytes(*w));
-    }
-    for &b in rest {
-        crc = __crc32cb(crc, b);
-    }
-    crc
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse4.2")]
-unsafe fn crc32c_update_x86_64(crc: u32, bytes: &[u8]) -> u32 {
-    use std::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
-    let (words, rest) = bytes.as_chunks::<8>();
-    let mut wide = crc as u64;
-    for w in words {
-        wide = _mm_crc32_u64(wide, u64::from_le_bytes(*w));
-    }
-    let mut crc = wide as u32;
-    for &b in rest {
-        crc = _mm_crc32_u8(crc, b);
-    }
-    crc
-}
-
-/// [`crc32c_update`] from the slicing-by-8 tables: the portable path and the
-/// reference the instruction paths are tested against.
+/// [`crc32c_update`] from the slicing-by-8 tables: the reference the
+/// instruction paths are tested against.
+#[cfg(test)]
 fn crc32c_update_tables(mut crc: u32, bytes: &[u8]) -> u32 {
     let (chunks, remainder) = bytes.as_chunks::<8>();
     for c in chunks {
@@ -2750,7 +2714,9 @@ fn decode_strs(reader: &mut Reader, count: usize) -> Result<StrVec> {
 
 /// The strings at `offsets` (`count + 1` boundaries) of `data`, validated as
 /// UTF-8 and kept in one shared buffer (wave 128a: rows of a chunk point
-/// into it instead of each owning a copy).
+/// into it instead of each owning a copy). The buffer is validated once, as a
+/// whole, and every offset must fall on a character boundary: exactly the
+/// pieces' validity, which the buffer's `str` type then carries.
 fn strs_over(reader: &Reader, offsets: &[usize], data: &[u8]) -> Result<StrVec> {
     let count = offsets.len().saturating_sub(1);
     for i in 0..count {
@@ -2758,10 +2724,14 @@ fn strs_over(reader: &Reader, offsets: &[usize], data: &[u8]) -> Result<StrVec> 
         if b < a || b > data.len() {
             return reader.err("bad string offsets");
         }
-        std::str::from_utf8(&data[a..b])
-            .map_err(|_| PinkDbError::Execution("corrupt file: bad UTF-8".to_string()))?;
     }
-    let buffer: Arc<[u8]> = Arc::from(data);
+    let bad_utf8 = || PinkDbError::Execution("corrupt file: bad UTF-8".to_string());
+    let text = std::str::from_utf8(data).map_err(|_| bad_utf8())?;
+    // `is_char_boundary` is false past the end, so it checks the bounds too.
+    if !offsets.iter().all(|&o| text.is_char_boundary(o)) {
+        return Err(bad_utf8());
+    }
+    let buffer: Arc<str> = Arc::from(text);
     Ok(StrVec::over_buffer(
         buffer,
         (0..count).map(|i| (offsets[i], offsets[i + 1] - offsets[i])),

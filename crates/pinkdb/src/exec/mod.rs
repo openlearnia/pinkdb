@@ -5639,7 +5639,7 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 let mut chunks = Vec::new();
                 let mut remaining = *limit;
                 while remaining > 0 {
-                    let Some(chunk) = stream.next(cx)? else {
+                    let Some(chunk) = stream.next(cx, input)? else {
                         break;
                     };
                     if chunk.num_rows() <= remaining {
@@ -10008,8 +10008,14 @@ fn expr_text(e: &BoundExpr) -> String {
 /// the materializing path does (see `filter_chunk`/`project_chunk`), in the
 /// same order, so the two paths emit identical chunks — the early stop only
 /// skips work no output row can depend on.
-struct Stream<'p> {
-    kind: StreamKind<'p>,
+///
+/// A stream owns everything it holds and borrows nothing: its tree mirrors
+/// the plan's, and every [`Stream::next`] is handed the plan node the stream
+/// was built from. So a result cursor can move a running stream, together
+/// with the `Arc` of its plan, to a producer thread (see
+/// `QueryCursor::start`).
+struct Stream {
+    kind: StreamKind,
     names: Vec<String>,
     types: Vec<DataType>,
     /// Output chunks produced by the last batch pull (Filter/Project).
@@ -10155,61 +10161,61 @@ impl SourceStream {
 /// while bounding the work wasted when the limit is reached mid-batch.
 const STREAM_BATCH: usize = 4;
 
-/// The cursor's contract (`exec::cursor`): a `StreamKind` may borrow only
-/// from the plan (`&'p LogicalPlan`, `&'p BoundExpr`, `&'p [DataType]`).
-/// Everything else it holds must be owned: never a `&Cx`, a `&PinkDb`, a
-/// `&DataTable` or anything else borrowed from the store, because a result
-/// cursor moves a running stream to another thread and another view of the
-/// same data (see `QueryCursor::start`). A scan that needs the store looks
-/// it up in the `Cx` each `next` is given.
-enum StreamKind<'p> {
+/// The cursor's contract (`exec::cursor`): a `StreamKind` holds only owned
+/// state. Its plan node (a predicate, the projection's expressions, a scan's
+/// table) comes with each `next`; the store comes from the `Cx` each `next`
+/// is given. Never a `&Cx`, a `&PinkDb`, a `&DataTable` or anything else
+/// borrowed from the store, because a result cursor moves a running stream
+/// to another thread and another view of the same data (see
+/// `QueryCursor::start`).
+enum StreamKind {
     /// A scan, started on first pull so a limit satisfied by an earlier
     /// branch never touches the table (an attached lake would otherwise
     /// decode its columns for nothing). A table function whose source can
     /// push its chunks streams them; any other scan is materialized.
-    Scan {
-        plan: &'p LogicalPlan,
-        chunks: Option<ScanChunks>,
-    },
+    Scan { chunks: Option<ScanChunks> },
     /// `SELECT` without `FROM`: one empty row.
     SingleRow(bool),
     Filter {
-        input: Box<Stream<'p>>,
-        predicate: &'p BoundExpr,
+        input: Box<Stream>,
     },
     Project {
-        input: Box<Stream<'p>>,
-        exprs: &'p [BoundExpr],
+        input: Box<Stream>,
         /// Which outputs a consumer reads (wave 127b), `None` = all.
         read: Option<Vec<bool>>,
     },
     /// `UNION ALL` (a distinct union is blocking): left chunks, then right.
     Union {
-        left: Box<Stream<'p>>,
-        right: Box<Stream<'p>>,
-        types: &'p [DataType],
+        left: Box<Stream>,
+        right: Box<Stream>,
         on_left: bool,
     },
     Limit {
-        input: Box<Stream<'p>>,
+        input: Box<Stream>,
         remaining: usize,
     },
 }
 
-impl<'p> Stream<'p> {
+/// A stream was handed a plan node of another shape than it was built from.
+fn stream_plan_mismatch() -> PinkDbError {
+    PinkDbError::Execution("internal error: a stream was pulled with another plan".to_string())
+}
+
+impl Stream {
     /// Build a cursor for `plan`, or `None` when its evaluation is blocking.
     /// Building looks up schemas only: no chunk is materialized and no
     /// predicate evaluated until the first pull.
-    fn build(cx: &Cx, plan: &'p LogicalPlan) -> Result<Option<Stream<'p>>> {
+    /// Every later [`Stream::next`] must be given this same `plan`.
+    fn build(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Stream>> {
         let (kind, names, types) = match plan {
             LogicalPlan::Scan { .. } | LogicalPlan::TableFunction { .. } => {
                 let (names, types) = plan_schema_of(cx, plan)?;
-                (StreamKind::Scan { plan, chunks: None }, names, types)
+                (StreamKind::Scan { chunks: None }, names, types)
             }
             LogicalPlan::SingleRow => (StreamKind::SingleRow(false), Vec::new(), Vec::new()),
             // Constant rows are cheap to materialize: no streaming form.
             LogicalPlan::Values { .. } | LogicalPlan::Chunks { .. } => return Ok(None),
-            LogicalPlan::Filter { input, predicate } => {
+            LogicalPlan::Filter { input, .. } => {
                 let Some(input) = Stream::build(cx, input)? else {
                     return Ok(None);
                 };
@@ -10217,7 +10223,6 @@ impl<'p> Stream<'p> {
                 (
                     StreamKind::Filter {
                         input: Box::new(input),
-                        predicate,
                     },
                     names,
                     types,
@@ -10235,7 +10240,6 @@ impl<'p> Stream<'p> {
                 (
                     StreamKind::Project {
                         input: Box::new(input),
-                        exprs,
                         read,
                     },
                     names.clone(),
@@ -10259,7 +10263,6 @@ impl<'p> Stream<'p> {
                     StreamKind::Union {
                         left: Box::new(left),
                         right: Box::new(right),
-                        types,
                         on_left: true,
                     },
                     names,
@@ -10290,15 +10293,16 @@ impl<'p> Stream<'p> {
         }))
     }
 
-    /// The next output chunk, or `None` when the input is exhausted.
-    fn next(&mut self, cx: &Cx) -> Result<Option<DataChunk>> {
+    /// The next output chunk, or `None` when the input is exhausted. `plan`
+    /// is the node the stream was built from.
+    fn next(&mut self, cx: &Cx, plan: &LogicalPlan) -> Result<Option<DataChunk>> {
         let Stream { kind, pending, .. } = self;
         if let Some(chunk) = pending.pop_front() {
             return Ok(Some(chunk));
         }
         loop {
             match kind {
-                StreamKind::Scan { plan, chunks } => {
+                StreamKind::Scan { chunks } => {
                     if chunks.is_none() {
                         *chunks = Some(match SourceStream::start(cx, plan)? {
                             Some(source) => ScanChunks::Source(source),
@@ -10320,7 +10324,7 @@ impl<'p> Stream<'p> {
                             emitted,
                         } => {
                             let LogicalPlan::Scan { table, .. } = plan else {
-                                unreachable!("a store scan streams a Scan node");
+                                return Err(stream_plan_mismatch());
                             };
                             while let Some(&index) = keep.get(*next) {
                                 *next += 1;
@@ -10349,9 +10353,16 @@ impl<'p> Stream<'p> {
                         ordinal: 0,
                     }));
                 }
-                StreamKind::Filter { input, predicate } => {
+                StreamKind::Filter { input } => {
+                    let LogicalPlan::Filter {
+                        input: input_plan,
+                        predicate,
+                    } = plan
+                    else {
+                        return Err(stream_plan_mismatch());
+                    };
                     if pending.is_empty() {
-                        let batch = pull_batch(cx, input)?;
+                        let batch = pull_batch(cx, input, input_plan)?;
                         if batch.is_empty() {
                             return Ok(None);
                         }
@@ -10366,9 +10377,17 @@ impl<'p> Stream<'p> {
                     }
                     return Ok(pending.pop_front());
                 }
-                StreamKind::Project { input, exprs, read } => {
+                StreamKind::Project { input, read } => {
+                    let LogicalPlan::Project {
+                        input: input_plan,
+                        exprs,
+                        ..
+                    } = plan
+                    else {
+                        return Err(stream_plan_mismatch());
+                    };
                     if pending.is_empty() {
-                        let batch = pull_batch(cx, input)?;
+                        let batch = pull_batch(cx, input, input_plan)?;
                         if batch.is_empty() {
                             return Ok(None);
                         }
@@ -10384,25 +10403,40 @@ impl<'p> Stream<'p> {
                 StreamKind::Union {
                     left,
                     right,
-                    types,
                     on_left,
                 } => {
+                    let LogicalPlan::SetOp {
+                        left: left_plan,
+                        right: right_plan,
+                        types,
+                        ..
+                    } = plan
+                    else {
+                        return Err(stream_plan_mismatch());
+                    };
                     if *on_left {
-                        match left.next(cx)? {
+                        match left.next(cx, left_plan)? {
                             Some(chunk) => return Ok(Some(coerce_union_chunk(&chunk, types)?)),
                             None => *on_left = false,
                         }
                     }
-                    match right.next(cx)? {
+                    match right.next(cx, right_plan)? {
                         Some(chunk) => return Ok(Some(coerce_union_chunk(&chunk, types)?)),
                         None => return Ok(None),
                     }
                 }
                 StreamKind::Limit { input, remaining } => {
+                    let LogicalPlan::Limit {
+                        input: input_plan,
+                        ..
+                    } = plan
+                    else {
+                        return Err(stream_plan_mismatch());
+                    };
                     if *remaining == 0 {
                         return Ok(None);
                     }
-                    let Some(chunk) = input.next(cx)? else {
+                    let Some(chunk) = input.next(cx, input_plan)? else {
                         return Ok(None);
                     };
                     let take = chunk.num_rows().min(*remaining);
@@ -10419,10 +10453,10 @@ impl<'p> Stream<'p> {
 }
 
 /// Pull up to [`STREAM_BATCH`] chunks from `input`.
-fn pull_batch(cx: &Cx, input: &mut Stream<'_>) -> Result<Vec<DataChunk>> {
+fn pull_batch(cx: &Cx, input: &mut Stream, plan: &LogicalPlan) -> Result<Vec<DataChunk>> {
     let mut batch = Vec::new();
     while batch.len() < STREAM_BATCH {
-        match input.next(cx)? {
+        match input.next(cx, plan)? {
             Some(chunk) => batch.push(chunk),
             None => break,
         }

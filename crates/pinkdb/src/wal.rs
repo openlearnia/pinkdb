@@ -560,7 +560,7 @@ impl Sidecar {
         let file = crate::fsutil::open_rw_private(&path, false)?;
         // Blocking: the exclusive lock is held for one checkpoint's allocation
         // only, so an opener waits at most that long.
-        flock(&file, libc::LOCK_SH).map_err(PinkDbError::Io)?;
+        flock(&file, Flock::Shared).map_err(PinkDbError::Io)?;
         Ok(Sidecar { file, path })
     }
 
@@ -569,7 +569,7 @@ impl Sidecar {
     /// get the shared lock back.
     fn probe(&self) -> HoleProbe<'_> {
         let exclusive = sidecar_lost_by_sidecar(&self.path).is_none()
-            && flock(&self.file, libc::LOCK_EX | libc::LOCK_NB).is_ok()
+            && flock(&self.file, Flock::TryExclusive).is_ok()
             // A deleted or replaced sidecar locks nothing: read that as "some
             // other handle may be open" and append.
             && self.identity_current();
@@ -605,18 +605,36 @@ fn new_sidecar(_checkpoint: &Path, _mode: LockMode) -> Result<Option<Sidecar>> {
     Ok(None)
 }
 
-/// Convert `file`'s flock to `how`, retrying an interrupted wait.
+/// The sidecar lock states a handle moves between.
 #[cfg(unix)]
-fn flock(file: &File, how: i32) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
+#[derive(Clone, Copy, Debug)]
+enum Flock {
+    /// `LOCK_SH`, blocking.
+    Shared,
+    /// `LOCK_EX | LOCK_NB`: fails with `WouldBlock` while any other handle
+    /// holds the file.
+    TryExclusive,
+}
+
+/// Convert `file`'s lock to `how`, retrying an interrupted wait. std's file
+/// locks are `flock(2)` on Linux, the BSDs and macOS, so a held lock converts
+/// in place (not atomically: see [`HoleProbe`]); a target or filesystem with
+/// no such lock returns an error, and the store fails closed on it.
+#[cfg(unix)]
+fn flock(file: &File, how: Flock) -> std::io::Result<()> {
     loop {
-        // SAFETY: `file` owns the fd for the duration of the call.
-        if unsafe { libc::flock(file.as_raw_fd(), how) } == 0 {
-            return Ok(());
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::Interrupted {
-            return Err(err);
+        let res = match how {
+            Flock::Shared => file.lock_shared(),
+            Flock::TryExclusive => file.try_lock().map_err(|e| match e {
+                std::fs::TryLockError::WouldBlock => {
+                    std::io::Error::from(std::io::ErrorKind::WouldBlock)
+                }
+                std::fs::TryLockError::Error(e) => e,
+            }),
+        };
+        match res {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => return other,
         }
     }
 }
@@ -655,7 +673,7 @@ impl Drop for HoleProbe<'_> {
             let restored = if injected {
                 Err(())
             } else {
-                flock(&sidecar.file, libc::LOCK_SH).map_err(|_| ())
+                flock(&sidecar.file, Flock::Shared).map_err(|_| ())
             };
             if restored.is_err() || !sidecar.identity_current() {
                 // Fail closed: with the shared lock gone another handle may
@@ -1383,41 +1401,29 @@ impl WalSyncMethod {
 }
 
 /// Sync `file` with `method`. `File::sync_all` and `File::sync_data` are both
-/// `F_FULLFSYNC` on macOS, so the cheaper methods must call the syscall.
+/// `F_FULLFSYNC` on macOS, so the cheaper methods call the syscalls through
+/// `rustix`.
 fn sync_file(method: WalSyncMethod, file: &File) -> std::io::Result<()> {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(unix)]
     {
-        use std::os::fd::AsRawFd;
-
-        let fd = file.as_raw_fd();
-        // SAFETY: `fd` is owned by `file`, which outlives the call. macOS has no
-        // `fdatasync(2)`: `fsync` is the cheapest data sync there.
-        let rc = unsafe {
-            match method {
-                #[cfg(target_os = "macos")]
-                WalSyncMethod::Full => libc::fcntl(fd, libc::F_FULLFSYNC),
-                #[cfg(not(target_os = "macos"))]
-                WalSyncMethod::Full => libc::fsync(fd),
-                WalSyncMethod::Fsync => libc::fsync(fd),
-                #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-                WalSyncMethod::Fdatasync => libc::fdatasync(fd),
-                #[cfg(not(any(
-                    target_os = "linux",
-                    target_os = "android",
-                    target_os = "freebsd"
-                )))]
-                WalSyncMethod::Fdatasync => libc::fsync(fd),
-            }
-        };
-        if rc < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
+        // macOS has no `fdatasync(2)`: `fsync` is the cheapest data sync there.
+        match method {
+            // `fcntl(F_FULLFSYNC)` on macOS, `fsync(2)` elsewhere.
+            WalSyncMethod::Full => file.sync_all(),
+            WalSyncMethod::Fsync => Ok(rustix::fs::fsync(file)?),
+            #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+            WalSyncMethod::Fdatasync => Ok(rustix::fs::fdatasync(file)?),
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "freebsd"
+            )))]
+            WalSyncMethod::Fdatasync => Ok(rustix::fs::fsync(file)?),
         }
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(not(unix))]
     {
-        // No syscall to reach; wasm hosts are not durable stores.
+        // No syscall to reach (wasm hosts are not durable stores).
         let _ = method;
         file.sync_all()
     }
@@ -13371,7 +13377,7 @@ mod tests {
         // upgrade had dropped `db`'s shared lock instead of restoring it.
         let probe = std::fs::File::open(open_sidecar_path(&p)).unwrap();
         assert!(
-            flock(&probe, libc::LOCK_EX | libc::LOCK_NB).is_err(),
+            flock(&probe, Flock::TryExclusive).is_err(),
             "the store must still be held shared after a failed upgrade"
         );
         drop(probe);

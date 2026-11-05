@@ -1,8 +1,8 @@
 //! pinkdb — mini DuckDB: embedded analytical SQL in Rust.
 //!
 //! v1: in-memory columnar storage, vectorized execution (CHUNK_SIZE = 2048),
-//! PEG SQL frontend, CSV import. Single connection, single thread, no unsafe,
-//! no async.
+//! PEG SQL frontend, CSV import. Single connection, single thread, no unsafe
+//! (`forbid(unsafe_code)`), no async.
 //!
 //! Loadable extensions add scalar functions at runtime through
 //! [`PinkDb::load_extension`]: native targets load ABI v1 shared libraries
@@ -35,6 +35,9 @@
 // `Drop`, so clippy flags the deliberate `drop(file)` calls that close files
 // before a rename or release a lease on native targets (wave 85: the
 // playground module lints the core for wasm32).
+// The core has no `unsafe` of its own: the C ABI, the extension loader and the
+// wasm boundary live in their own crates.
+#![forbid(unsafe_code)]
 #![cfg_attr(target_arch = "wasm32", allow(clippy::drop_non_drop))]
 
 pub mod agent;

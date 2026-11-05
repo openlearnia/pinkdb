@@ -63,8 +63,7 @@
 //! [`EncryptionKey`] is either a raw 32-byte key or a passphrase. Passphrases
 //! are stretched with Argon2id; the salt and parameters live in the file
 //! header, so a file saved with different defaults still opens. Key bytes are
-//! zeroed on drop on a best-effort basis (safe writes only — no unsafe; a
-//! compiler may in principle elide the overwrite).
+//! zeroed on drop with volatile writes (`zeroize`), which the compiler keeps.
 
 // Without the `encryption` feature this module is a parse/identity stub: the
 // crypto internals are intentionally unreferenced (they exist behind `cfg`),
@@ -208,7 +207,13 @@ impl EncryptionKey {
     /// non-UTF-8 value is a hard error: silently ignoring it would make a
     /// keyed invocation write plaintext.
     pub fn from_env() -> Result<Option<Self>> {
-        match std::env::var_os("PINKDB_KEY") {
+        Self::from_env_value(std::env::var_os("PINKDB_KEY"))
+    }
+
+    /// [`Self::from_env`] over the variable's value (`None` when unset): the
+    /// pure half, so a test never mutates the process environment.
+    pub fn from_env_value(value: Option<std::ffi::OsString>) -> Result<Option<Self>> {
+        match value {
             None => Ok(None),
             Some(v) if v.is_empty() => Ok(None),
             Some(v) => match v.into_string() {
@@ -237,16 +242,14 @@ impl std::fmt::Debug for EncryptionKey {
 
 impl Drop for EncryptionKey {
     fn drop(&mut self) {
-        // Best-effort zeroization with safe writes only (no `unsafe`).
+        // Volatile writes (`zeroize`): a plain store into memory freed right
+        // after may be dropped as dead.
+        use zeroize::Zeroize;
         if let Some(raw) = self.raw.as_mut() {
-            for b in raw.iter_mut() {
-                *b = 0;
-            }
+            raw.zeroize();
         }
         if let Some(pass) = self.passphrase.as_mut() {
-            for b in pass.iter_mut() {
-                *b = 0;
-            }
+            pass.zeroize();
         }
     }
 }
@@ -1450,35 +1453,27 @@ mod enc_tests {
     }
 
     #[test]
-    fn from_env_reads_pinkdb_key() {
-        // Serialized access: `set_var` affects the whole test process.
-        // `remove_var`/`set_var` are `unsafe` as of Rust 2024 (environment
-        // mutation races concurrent reads in other threads); the lock below
-        // serialises every test in this binary that touches `PINKDB_KEY`.
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap();
-        let saved = std::env::var("PINKDB_KEY").ok();
-        unsafe { std::env::remove_var("PINKDB_KEY") };
-        assert!(EncryptionKey::from_env().unwrap().is_none());
-        unsafe { std::env::set_var("PINKDB_KEY", "") };
-        assert!(EncryptionKey::from_env().unwrap().is_none());
-        unsafe { std::env::set_var("PINKDB_KEY", "sesame") };
-        assert!(EncryptionKey::from_env().unwrap().is_some());
+    fn from_env_value_reads_pinkdb_key() {
+        use std::ffi::OsString;
+        assert!(EncryptionKey::from_env_value(None).unwrap().is_none());
+        assert!(
+            EncryptionKey::from_env_value(Some(OsString::new()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            EncryptionKey::from_env_value(Some(OsString::from("sesame")))
+                .unwrap()
+                .is_some()
+        );
         // A set-but-non-UTF-8 value is a hard error, never a silent fallback
         // to plaintext.
         #[cfg(unix)]
         {
-            use std::ffi::OsString;
             use std::os::unix::ffi::OsStringExt;
-            unsafe { std::env::set_var("PINKDB_KEY", OsString::from_vec(vec![0xFF, 0xFE])) };
-            let err = EncryptionKey::from_env().unwrap_err();
+            let bad = OsString::from_vec(vec![0xFF, 0xFE]);
+            let err = EncryptionKey::from_env_value(Some(bad)).unwrap_err();
             assert!(err.to_string().contains("not valid UTF-8"), "{err}");
-        }
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var("PINKDB_KEY", v),
-                None => std::env::remove_var("PINKDB_KEY"),
-            }
         }
     }
 

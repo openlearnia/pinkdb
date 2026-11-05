@@ -170,14 +170,11 @@ impl Drop for StoreSource {
         if !self.secret {
             return;
         }
-        // One volatile byte store at a time: a plain store into memory that is
-        // freed right after may be dropped as dead, and `write_volatile` needs
-        // an aligned pointer, which a `u8` buffer does not guarantee for wider
-        // words. This runs once, when an encrypted session ends.
-        for byte in bytes.iter_mut() {
-            unsafe { std::ptr::write_volatile(byte, 0) };
-        }
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        // Volatile writes (`zeroize`): a plain store into memory that is freed
+        // right after may be dropped as dead. This runs once, when an
+        // encrypted session ends.
+        use zeroize::Zeroize;
+        bytes[..].zeroize();
     }
 }
 
