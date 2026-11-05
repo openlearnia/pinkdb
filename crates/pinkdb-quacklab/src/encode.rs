@@ -37,8 +37,11 @@ fn write_cell(out: &mut String, value: &Value, ty: Option<&DataType>) -> Result<
         Value::Boolean(flag) => out.push_str(if *flag { "true" } else { "false" }),
         Value::Integer(n) => out.push_str(&n.to_string()),
         Value::Bigint(n) => out.push_str(&n.to_string()),
-        // A HUGEINT has no pinkdb type, but a BIGINT is already a plain JSON
-        // number in Go, which is what the plan asks for.
+        // Go's driver scans HUGEINT/UHUGEINT into a `*big.Int`, whose
+        // `MarshalJSON` writes the plain number (`SUM` over integers is a
+        // HUGEINT in both engines).
+        Value::Hugeint(n) => out.push_str(&n.to_string()),
+        Value::Uhugeint(n) => out.push_str(&n.to_string()),
         Value::Double(x) => out.push_str(&go_float(*x)?),
         Value::Varchar(s) => push_json_string(out, s),
         Value::Date(days) => {
@@ -265,6 +268,19 @@ mod tests {
         assert_eq!(
             cell(&Value::Uuid(1), DataType::Uuid),
             "\"00000000-0000-0000-0000-000000000001\""
+        );
+    }
+
+    #[test]
+    fn hugeints_are_plain_numbers_like_go_big_int() {
+        assert_eq!(
+            cell(&Value::Hugeint(i128::MAX), DataType::Hugeint),
+            "170141183460469231731687303715884105727"
+        );
+        assert_eq!(cell(&Value::Hugeint(-5), DataType::Hugeint), "-5");
+        assert_eq!(
+            cell(&Value::Uhugeint(u128::MAX), DataType::Uhugeint),
+            "340282366920938463463374607431768211455"
         );
     }
 

@@ -110,6 +110,12 @@ fn check_request(allowed: &[PathBuf], request: &LakeOpenRequest) -> pinkdb::Resu
 /// One catalog or data location: a URL of an allowed scheme, or a local path
 /// inside an allowed directory.
 fn check_location(allowed: &[PathBuf], location: &str, catalog: bool) -> pinkdb::Result<()> {
+    // A libpq conninfo catalog (`postgres:host=… dbname=…`, the form
+    // `ATTACH 'ducklake:postgres:…'` and QuackLab's `DUCKLAKE_PG_URI` use) is
+    // a Postgres catalog like a `postgres://` URL, not a local path.
+    if catalog && location.starts_with("postgres:") && !location.contains("://") {
+        return Ok(());
+    }
     if let Some((scheme, _)) = location.split_once("://") {
         let scheme = scheme.to_ascii_lowercase();
         let ok = if catalog {
@@ -234,6 +240,14 @@ mod tests {
         let dotdot = format!("pink:{}/../escape.pink", lakes.display());
         assert!(policy(&request(&dotdot, None)).is_err());
         assert!(policy(&request("postgres://h/db", Some("s3://b/p"))).is_ok());
+        // QuackLab's libpq conninfo catalog (wave 138c).
+        assert!(
+            policy(&request(
+                "postgres:host=h dbname=d user=u",
+                Some("s3://b/p")
+            ))
+            .is_ok()
+        );
         let err = policy(&request("http://h/x", None))
             .unwrap_err()
             .to_string();

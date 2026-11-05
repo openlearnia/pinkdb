@@ -1516,32 +1516,51 @@ fn start_ui(
     Ok(handle)
 }
 
-/// Start QuackLab's `/sql` adapter (wave 138a).
+/// Start QuackLab's `/sql` adapter (wave 138a): over a local warehouse
+/// database, or (`GRAIN_DUCKLAKE=1`, wave 138c) over a lake database attached
+/// from the Go service's environment.
 #[cfg(feature = "quacklab")]
 fn start_quacklab(
     db: &Database,
     bind: &str,
 ) -> Result<pinkdb_server::quacklab::QuacklabHandle, String> {
-    use pinkdb_server::quacklab::{QuacklabOptions, QuacklabServer};
+    use pinkdb_server::quacklab::{LakeConfig, LakeWarehouse, QuacklabOptions, QuacklabServer};
     let options = QuacklabOptions::from_env();
+    let lake = LakeConfig::from_env().map_err(|e| format!("QuackLab lake warehouse: {e}"))?;
     // DuckDB's own knobs have no counterpart here: say once that they are
     // ignored rather than let a deployment believe it configured something.
-    let ignored = pinkdb_server::quacklab::ignored_settings_from_env();
+    let ignored = pinkdb_server::quacklab::ignored_settings_from_env(lake.is_some());
     if !ignored.is_empty() {
         println!(
             "pinkdb-server: QuackLab adapter ignores DuckDB-only settings: {}",
             ignored.join(", ")
         );
     }
-    let server = QuacklabServer::bind(bind, db.clone(), options)
-        .map_err(|e| format!("cannot start the QuackLab adapter on {bind}: {e}"))?;
+    let (server, mode) = match lake {
+        Some(config) => {
+            let summary = config.summary();
+            let warehouse = LakeWarehouse::boot(db.clone(), config).map_err(|e| e.to_string())?;
+            let server = QuacklabServer::bind_with_warehouse(
+                bind,
+                db.clone(),
+                options,
+                std::sync::Arc::new(warehouse),
+            );
+            (server, summary)
+        }
+        None => (
+            QuacklabServer::bind(bind, db.clone(), options),
+            "mode=local".to_string(),
+        ),
+    };
+    let server = server.map_err(|e| format!("cannot start the QuackLab adapter on {bind}: {e}"))?;
     let url = server.url();
     let read_only = server.options().read_only;
     let handle = server
         .spawn()
         .map_err(|e| format!("cannot start the QuackLab adapter on {bind}: {e}"))?;
     println!(
-        "pinkdb-server: QuackLab adapter on {url} ({})",
+        "pinkdb-server: QuackLab adapter on {url} ({}, {mode})",
         if read_only { "read-only" } else { "read-write" }
     );
     Ok(handle)

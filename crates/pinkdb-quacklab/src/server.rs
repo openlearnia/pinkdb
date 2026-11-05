@@ -159,6 +159,26 @@ impl QuacklabServer {
         db: Database,
         options: QuacklabOptions,
     ) -> Result<Self, QuacklabError> {
+        let shared = Arc::new(Shared::new(db, options, Arc::new(LocalWarehouse)));
+        shared
+            .ensure_warehouse()
+            .map_err(QuacklabError::Warehouse)?;
+        Self::bind_shared(addr, shared)
+    }
+
+    /// Bind `addr` over a warehouse the caller has already opened: the lake
+    /// warehouse ([`crate::LakeWarehouse`], `GRAIN_DUCKLAKE=1`), whose
+    /// database `options.warehouse` must name.
+    pub fn bind_with_warehouse(
+        addr: impl ToSocketAddrs,
+        db: Database,
+        options: QuacklabOptions,
+        warehouse: Arc<dyn crate::Warehouse>,
+    ) -> Result<Self, QuacklabError> {
+        Self::bind_shared(addr, Arc::new(Shared::new(db, options, warehouse)))
+    }
+
+    fn bind_shared(addr: impl ToSocketAddrs, shared: Arc<Shared>) -> Result<Self, QuacklabError> {
         let addr = addr
             .to_socket_addrs()
             .map_err(QuacklabError::Bind)?
@@ -174,10 +194,6 @@ impl QuacklabServer {
             .set_nonblocking(true)
             .map_err(QuacklabError::Bind)?;
         let addr = listener.local_addr().map_err(QuacklabError::Bind)?;
-        let shared = Arc::new(Shared::new(db, options, Arc::new(LocalWarehouse)));
-        shared
-            .ensure_warehouse()
-            .map_err(QuacklabError::Warehouse)?;
         let (stop, _) = watch::channel(false);
         Ok(Self {
             listener,
@@ -216,6 +232,13 @@ impl QuacklabServer {
         let thread = std::thread::Builder::new()
             .name("pinkdb-quacklab".to_string())
             .spawn(move || {
+                // The store (and a lake warehouse's catalog connection) must
+                // not be dropped on a runtime worker: a lake's synchronous
+                // Postgres client runs its own runtime when it closes, and
+                // tokio refuses to start one inside another. This clone
+                // outlives the runtime, so the last reference, if it is the
+                // adapter's, goes on this plain thread.
+                let keep = Arc::clone(&shared);
                 runtime.block_on(async move {
                     let listener = match tokio::net::TcpListener::from_std(listener) {
                         Ok(listener) => listener,
@@ -240,6 +263,8 @@ impl QuacklabServer {
                         eprintln!("pinkdb-server: the QuackLab adapter stopped: {e}");
                     }
                 });
+                drop(runtime);
+                drop(keep);
             })?;
         Ok(QuacklabHandle {
             addr,

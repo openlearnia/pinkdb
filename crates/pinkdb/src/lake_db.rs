@@ -433,7 +433,7 @@ fn local_catalog_path(location: &str) -> Option<(&str, &str)> {
 /// URI (`postgres://user:pw@host/db`) and a conninfo
 /// (`postgres:host=h dbname=d password=pw`). The password is percent-decoded
 /// (URI) or unquoted (conninfo) — it is about to become a secret value.
-pub(crate) fn split_catalog_password(location: &str) -> (String, Option<String>) {
+pub fn split_catalog_password(location: &str) -> (String, Option<String>) {
     if let Some((scheme, rest)) = location.split_once("://") {
         let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let (authority, tail) = rest.split_at(end);

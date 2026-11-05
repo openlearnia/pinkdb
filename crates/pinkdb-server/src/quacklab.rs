@@ -28,26 +28,29 @@ pub use pinkdb_quacklab::*;
 
 /// The QuackLab settings the adapter accepts and does not use: DuckDB's own
 /// engine knobs, the sandbox's file-path allow-list (pinkdb has no file-read
-/// root policy; only `LOAD`/`INSTALL` are refused) and the DuckLake attach
-/// (wave 138c), which pinkdb's engine has no counterpart for. They are named
-/// here so the server can say once, at start, that it is ignoring them instead
-/// of silently accepting a configuration it cannot honour.
+/// root policy; only `LOAD`/`INSTALL` are refused), the file-mode warehouse
+/// path (the warehouse is a database in the server's own data directory) and
+/// the DuckLake extension/migration knobs a pinkdb lake has no use for. They
+/// are named here so the server can say once, at start, that it is ignoring
+/// them instead of silently accepting a configuration it cannot honour.
 pub const IGNORED_ENVIRONMENT: &[&str] = &[
     "DUCKDB_PATH",
     "DUCKDB_MEMORY_LIMIT",
     "DUCKDB_THREADS",
+    "DUCKDB_MAX_CONNS",
+    "DUCKDB_TEMP_DIRECTORY",
+    "DUCKDB_MAX_TEMP_DIRECTORY_SIZE",
     "GRAIN_DUCKDB_ALLOWED_PATHS",
-    "GRAIN_DUCKLAKE",
-    "DUCKLAKE_PG_URI",
-    "DUCKLAKE_DATA_PATH",
-    "DUCKLAKE_ENCRYPTED",
 ];
 
-/// The settings from [`IGNORED_ENVIRONMENT`] present in the environment, for
-/// the server's one log line.
-pub fn ignored_settings_from_env() -> Vec<&'static str> {
+/// The settings from [`IGNORED_ENVIRONMENT`] and, for a lake warehouse,
+/// [`LAKE_IGNORED_ENVIRONMENT`] present in the environment, for the server's
+/// one log line.
+pub fn ignored_settings_from_env(lake: bool) -> Vec<&'static str> {
+    let lake_names: &[&'static str] = if lake { LAKE_IGNORED_ENVIRONMENT } else { &[] };
     IGNORED_ENVIRONMENT
         .iter()
+        .chain(lake_names)
         .copied()
         .filter(|name| std::env::var_os(name).is_some())
         .collect()

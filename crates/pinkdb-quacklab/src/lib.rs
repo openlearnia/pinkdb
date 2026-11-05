@@ -33,11 +33,16 @@
 mod app;
 mod encode;
 mod errors;
+mod lake;
 mod lease;
 mod sandbox;
 mod server;
 
 pub use app::{router, router_with_warehouse};
+pub use lake::{
+    BootError, ConfigError, LAKE_IGNORED_ENVIRONMENT, LakeConfig, LakeWarehouse, ObjectStoreSecret,
+    Step, go_truthy, remote_data_path,
+};
 pub use lease::Warehouse;
 pub use server::{
     DEFAULT_BIND, DEFAULT_ROW_LIMIT, DEFAULT_WAREHOUSE, MAX_ROW_LIMIT, QuacklabError,

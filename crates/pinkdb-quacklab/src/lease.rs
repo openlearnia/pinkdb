@@ -27,11 +27,18 @@ pub(crate) const MIN_WRITE_LEASE_TTL: Duration = Duration::from_secs(30);
 pub(crate) const MAX_WRITE_LEASE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// What a lease does to the warehouse: close it for the duration, open it
-/// again at the end. The local warehouse has nothing to do either way; 138c
-/// gives the lake one that attaches and detaches its catalog.
+/// again at the end. The local warehouse has nothing to do either way; the
+/// lake warehouse (`crate::lake`, 138c) detaches and re-attaches its lake.
 pub trait Warehouse: Send + Sync {
     fn close(&self) -> Result<(), String>;
     fn open(&self) -> Result<(), String>;
+    /// Called by every admitted request before it runs: reopen a warehouse
+    /// that a failed release, an expiry or the boot left closed (Go's
+    /// `admit` self-heal). The error becomes `503 conn_error` (`/sql`) or
+    /// `503 not_ready` (`/health`).
+    fn ensure_open(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The adapter's own warehouse: a [`pinkdb::Database`] that never closes.
@@ -127,7 +134,7 @@ impl Leases {
         self.lock().lease.as_ref().map(|lease| lease.id.clone())
     }
 
-    async fn wait_drained(&self) {
+    pub(crate) async fn wait_drained(&self) {
         let mut drained = self.drained.subscribe();
         let _ = drained.wait_for(|in_flight| *in_flight == 0).await;
     }

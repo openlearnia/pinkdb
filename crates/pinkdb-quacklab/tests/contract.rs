@@ -18,18 +18,13 @@ use serde_json::{Value, json};
 
 /// Recorded answers pinkdb cannot reproduce body-for-body.
 ///
-/// - 4: the statement uses `TIME` and `HUGEINT`, which pinkdb's parser and
+/// - 4: the statement uses `TIME`, which pinkdb's parser and
 ///   type system do not have, so it answers 400 where DuckDB answered 200.
 ///   (Cell encoding is unit-tested in `src/encode.rs`.)
 /// - 15, 16, 17: the error's wording after DuckDB's prefix is pinkdb's
 ///   ("table \"nope\" not found", the parser's caret, "cannot CAST …"), while
 ///   DuckDB's own text is the recording's.
 const BODY_DEVIATIONS: &[usize] = &[4, 15, 16, 17];
-
-/// Recorded answers that differ only in a result column's name: pinkdb names
-/// `count(*)` after the input, DuckDB after the function it becomes
-/// (`count_star()`).
-const COLUMN_NAME_DEVIATIONS: &[usize] = &[14];
 
 /// Recorded answers checked field by field: the 5,000-row answer keeps only
 /// its first rows in the fixture.
@@ -157,12 +152,6 @@ fn the_go_reference_replays() {
             continue;
         }
         strip_timing(&mut actual);
-        if COLUMN_NAME_DEVIATIONS.contains(&index) {
-            let mut recorded = case["body"].clone();
-            recorded["columns"] = json!(["count(*)", "sum(a)", "avg(a)"]);
-            assert_eq!(actual, recorded, "case {index} `{statement}`");
-            continue;
-        }
         assert_eq!(actual, case["body"], "case {index} `{statement}`");
     }
 }

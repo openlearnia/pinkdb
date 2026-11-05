@@ -113,16 +113,42 @@ pre-migration `pg_dump`) are accepted and ignored, logged once.
    shutdown — the same shape as the console (`pinkdb-server-ui` behind `ui`).
    HTTP is axum + tokio + hyper, already in the tree for the console: no new
    dependency. Not in the default build.
-2. **Warehouse lifecycle.** Until wave 132 lands, the warehouse is a local
-   database named `DUCKLAKE_ALIAS` in the server's store (`DUCKDB_PATH` /
-   `--data-dir`), created if missing. With `GRAIN_DUCKLAKE=1` and 132 merged,
-   boot runs `CREATE SECRET` from the R2/AWS/Bunny variables and `ATTACH
-   'ducklake:postgres:…' AS warehouse (DATA_PATH …, [ENCRYPTED],
-   [READ_ONLY])`, retrying Postgres serialization conflicts like the Go
-   `execBootstrap`. A write lease **detaches** the lake (releasing pinkdb's
-   own lake lease so the external writer owns it) and release **re-attaches**
-   it, picking up what the external writer committed; `/recover` is the same
-   detach + attach. For a local warehouse a lease only blocks admission.
+2. **Warehouse lifecycle** (138c, re-scoped 2026-11-05: since 11-03 pinkdb
+   has no DuckLake compatibility goal, and the test drive starts from a fresh
+   lake pinkdb writes). Without `GRAIN_DUCKLAKE` the warehouse is a local
+   database named `DUCKLAKE_ALIAS` in the server's store (`--data-dir`),
+   created if missing. With `GRAIN_DUCKLAKE=1` (Go's truthy rule: `1`,
+   `true`, `yes`; `PINKDB_QUACKLAB_LAKE=1` is the same switch) it is a **pinkdb
+   lake database** (wave 124), built by `crates/pinkdb-quacklab/src/lake.rs`:
+   - the object-store secret from the R2 / AWS / Bunny variables exactly as
+     `r2S3SecretSQL` selects them, only for a remote `DUCKLAKE_DATA_PATH`, as a
+     `PERSISTENT` secret (pinkdb's temporary secrets are per session and every
+     request has its own session);
+   - the catalog from `DUCKLAKE_PG_URI` (libpq conninfo or URL; its password
+     becomes a `postgres` secret scoped to the catalog), optionally in its own
+     Postgres schema (`PINKDB_LAKE_CATALOG_SCHEMA`), or any pinkdb catalog
+     from `PINKDB_LAKE_CATALOG`;
+   - `ATTACH 'lake:<catalog>' AS <alias> (DATA '<path>/', CREATE_IF_NOT_EXISTS)`
+     (what `CREATE DATABASE … (TYPE LAKE, CATALOG, DATA)` makes on the first
+     boot, the existing lake after), `READ_ONLY` instead on the read-only
+     service. Each statement goes through `execBootstrap`'s retry (8 attempts,
+     200 ms linear) on serialization conflicts and on the lake's writer lease;
+     errors name the step, never the SQL.
+   - Skipped, with no counterpart: `SET home_directory` / `extension_directory`,
+     `INSTALL`/`LOAD`, `SET httpfs_connection_caching`, the five
+     `CALL <alias>.set_option(…)` writes (Parquet compression/version describe
+     files a pinkdb lake does not write; snapshot expiry has its own pinkdb
+     maintenance). `DUCKLAKE_AUTOMATIC_MIGRATION` and the extension knobs are
+     logged once as ignored. `DUCKLAKE_ENCRYPTED=1` **fails the boot** (pinkdb
+     has no per-lake encryption; never silently unencrypted).
+   - A write lease **detaches** the lake (releasing pinkdb's writer lease on the
+     catalog so the external writer owns it); the holder's SQL and `release`
+     re-attach it at the new head; `/recover` drains, detaches and attaches.
+     A lake another writer still serves at boot (a revision rollout) leaves the
+     warehouse closed instead of failing: requests answer `503 conn_error`
+     (`/health` `503 not_ready`) until the first one after that writer lets go
+     attaches it — Go's `admit` self-heal.
+   - In the image, lake mode runs the server's own store `--in-memory`.
 3. **Results through the same code path as the CLI's**: run the script on a
    per-request `Connection`, keep the last statement's result, map
    `QueryResult` kinds to DuckDB's `Count` / `Success` shapes, encode cells as
@@ -156,7 +182,7 @@ pre-migration `pg_dump`) are accepted and ignored, logged once.
 |---|---|
 | 138a adapter | Decisions 1, 3, 4: crate, router, auth, `/sql`, `/health`, `/recover`, result encoding, limits, errors, against a local warehouse. |
 | 138b lease and sandbox | The write-lease runtime (acquire/drain/renew/release/expiry/holder SQL), decision 5. |
-| 138c lake warehouse | Decision 2 once wave 132 is on `main`. |
+| 138c lake warehouse | Decision 2, re-scoped 2026-11-05 to a pinkdb lake database (no DuckLake attach). |
 | 138d image and shadow | Decisions 6 and 7. |
 
 ## Tests

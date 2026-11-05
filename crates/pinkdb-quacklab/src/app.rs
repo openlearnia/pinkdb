@@ -93,6 +93,9 @@ impl Shared {
                 EndError::Reopen(message) => format!("reopen warehouse: {message}"),
                 EndError::Unknown => String::new(),
             })?;
+        // Go's `reopenWarehouse` waits for in-flight requests before it
+        // closes the warehouse under them.
+        self.leases.wait_drained().await;
         let warehouse = Arc::clone(&self.warehouse);
         tokio::task::spawn_blocking(move || {
             warehouse.close()?;
@@ -108,6 +111,7 @@ impl Shared {
 
     /// `SELECT 1` in the warehouse: what `/health` and `/recover` answer with.
     pub(crate) fn probe(&self) -> Result<(), String> {
+        self.warehouse.ensure_open()?;
         let mut conn = self.db.connect();
         conn.execute(&format!("USE {}", quoted(&self.options.warehouse)))
             .map_err(|e| engine_message(&e))?;
@@ -378,6 +382,9 @@ async fn run_statement(shared: Arc<Shared>, admit: Admit, sql: String) -> Respon
     {
         Ok(Ok(body)) => json(StatusCode::OK, body),
         Ok(Err(Failure::Engine(message))) => fail(StatusCode::BAD_REQUEST, "sql_error", &message),
+        Ok(Err(Failure::Unavailable(message))) => {
+            fail(StatusCode::SERVICE_UNAVAILABLE, "conn_error", &message)
+        }
         Ok(Err(Failure::Encode(message))) => {
             fail(StatusCode::INTERNAL_SERVER_ERROR, "encode_error", &message)
         }
@@ -492,6 +499,8 @@ enum Failure {
     Engine(String),
     /// A result value Go's `json.Marshal` would refuse (NaN, ±Infinity).
     Encode(String),
+    /// The warehouse is closed and would not reopen: Go's `503 conn_error`.
+    Unavailable(String),
 }
 
 /// One request's whole life on a fresh connection.
@@ -506,9 +515,12 @@ fn execute(shared: &Shared, sql: &str, limit: usize) -> Result<String, Failure> 
     if shared.options.read_only && writes {
         return Err(Failure::Engine(READ_ONLY_MESSAGE.to_string()));
     }
-    let mut conn = shared.db.connect();
-
     let setup_started = Instant::now();
+    shared
+        .warehouse
+        .ensure_open()
+        .map_err(Failure::Unavailable)?;
+    let mut conn = shared.db.connect();
     conn.execute(&format!("USE {}", quoted(&shared.options.warehouse)))
         .map_err(|e| Failure::Engine(engine_message(&e)))?;
     let setup_ms = setup_started.elapsed().as_millis();
