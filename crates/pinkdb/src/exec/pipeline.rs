@@ -878,6 +878,12 @@ fn descend<'a>(
             break;
         }
         match cursor {
+            // A `QUALIFY row_number() <= N` filter is answered by the grouped
+            // Top-N in `eval`'s filter arm; the pipeline reads its output.
+            LogicalPlan::Filter { .. } if super::top_n::grouped_shape(cursor).is_some() => {
+                declined = true;
+                break;
+            }
             LogicalPlan::Filter {
                 input: inner,
                 predicate,
@@ -1540,6 +1546,135 @@ pub(crate) fn top_n_streamed(
     for chunk in &mut chunks {
         chunk.columns.truncate(position);
     }
+    Ok(Some(Output {
+        chunks,
+        names,
+        types,
+    }))
+}
+
+/// `QUALIFY row_number() OVER (PARTITION BY … ORDER BY …) <= N` as a grouped
+/// Top-N (T4): the window's input streams into per-worker, per-partition
+/// [`TopNHeap`](super::top_n::TopNHeap)s keyed like the window path orders
+/// (ties by input position: morsel, chunk in the morsel, row), so only N rows
+/// per partition are ever held. The output is the window's: input columns
+/// plus the row number, in input order, restricted to `rn <= N`; the caller
+/// applies the full predicate. `Ok(None)` ⇒ a key came back typed unlike its
+/// expression, so the caller takes the window path.
+pub(crate) fn grouped_top_n(
+    cx: &Cx,
+    shape: &super::top_n::GroupedShape<'_>,
+) -> Result<Option<Output>> {
+    use super::top_n::{GroupedWorker, grouped_chunks, grouped_finish};
+    let w = shape.window;
+    expr::prime(cx, w.partition.iter().chain(w.order.iter().map(|(e, _)| e)))?;
+    let compiled = if cx.pipeline_execution() {
+        compile(cx, shape.input)?
+    } else {
+        None
+    };
+    let (mut names, mut types, workers) = match compiled {
+        None => {
+            let out = eval(cx, shape.input)?;
+            let Some(workers) = grouped_chunks(cx, shape, &out.chunks)? else {
+                return Ok(None);
+            };
+            (out.names, out.types, workers)
+        }
+        Some(compiled) => {
+            let steps = steps(cx, &compiled.builds, &compiled.ops)?;
+            let (names, types) = (compiled.names.clone(), compiled.types.clone());
+            let workers = match &compiled.source {
+                Source::Chunks(output) => {
+                    let Some(chunks) = run_chunks(cx, &steps, &TopNPass, &output.chunks)? else {
+                        return Ok(None);
+                    };
+                    grouped_chunks(cx, shape, &chunks)?
+                }
+                Source::Streamed(source) => {
+                    let source = source.as_ref();
+                    let stop = AtomicBool::new(false);
+                    let declined = AtomicBool::new(false);
+                    let in_flight = AtomicU64::new(0);
+                    let peak = AtomicU64::new(0);
+                    let done: Mutex<Vec<GroupedWorker>> = Mutex::new(Vec::new());
+                    let failed: Mutex<Option<PinkDbError>> = Mutex::new(None);
+                    let fail = |error: PinkDbError| {
+                        stop.store(true, Ordering::Relaxed);
+                        failed
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_insert(error);
+                    };
+                    let threads = rayon::current_num_threads().max(1);
+                    (0..threads).into_par_iter().for_each(|_| {
+                        let mut worker = GroupedWorker::new(shape);
+                        while !stop.load(Ordering::Relaxed) {
+                            let morsel = match source.next_morsel() {
+                                Ok(Some(morsel)) => morsel,
+                                Ok(None) => break,
+                                Err(error) => return fail(error),
+                            };
+                            if morsel % CHECK_DEADLINE_EVERY as u64 == 0
+                                && let Err(error) = cx.check_deadline()
+                            {
+                                return fail(error);
+                            }
+                            let now = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+                            peak.fetch_max(now, Ordering::Relaxed);
+                            let mut seq = 0u64;
+                            let decoded = source.decode(morsel, &mut |chunk| {
+                                let Some(out) = flow(cx, &steps, &TopNPass, &chunk)? else {
+                                    return Err(PinkDbError::Execution(
+                                        "internal: the grouped top-N sink declined a chunk"
+                                            .to_string(),
+                                    ));
+                                };
+                                for chunk in out {
+                                    if chunk.num_rows() == 0 || stop.load(Ordering::Relaxed) {
+                                        continue;
+                                    }
+                                    // morsel (32 bits) | chunk in the morsel (21) | row (11),
+                                    // the order the window path's materialized input has.
+                                    debug_assert!(chunk.num_rows() <= 1 << 11 && seq < 1 << 21);
+                                    let base = (morsel << 32) | (seq << 11);
+                                    seq += 1;
+                                    if !worker.push(cx, chunk, |row| base | row as u64)? {
+                                        declined.store(true, Ordering::Relaxed);
+                                        stop.store(true, Ordering::Relaxed);
+                                    }
+                                }
+                                Ok(())
+                            });
+                            in_flight.fetch_sub(1, Ordering::Relaxed);
+                            if let Err(error) = decoded {
+                                return fail(error);
+                            }
+                        }
+                        done.lock().unwrap_or_else(|e| e.into_inner()).push(worker);
+                    });
+                    if source.reports_io() {
+                        let mut io = source.io();
+                        io.in_flight_peak = peak.load(Ordering::Relaxed);
+                        cx.db.record_scan(source.label(), io);
+                    }
+                    if let Some(error) = failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                        return Err(error);
+                    }
+                    (!declined.load(Ordering::Relaxed))
+                        .then(|| done.into_inner().unwrap_or_else(|e| e.into_inner()))
+                }
+            };
+            let Some(workers) = workers else {
+                return Ok(None);
+            };
+            (names, types, workers)
+        }
+    };
+    let chunks = grouped_finish(cx, &types, workers)?;
+    let (win_names, win_types) = crate::plan::win_output_schema(shape.windows);
+    names.extend(win_names);
+    types.extend(win_types);
     Ok(Some(Output {
         chunks,
         names,

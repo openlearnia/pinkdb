@@ -14,17 +14,19 @@ pub(crate) mod group_table;
 pub(crate) mod grouping_sets;
 pub(crate) mod pipeline;
 pub(crate) mod selection;
+pub(crate) mod top_n;
 pub(crate) mod window;
 
 use crate::types::{FastMap, FastSet};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
-use aggregate::{EvalVec as FusedVec, eval_agg_vec as eval_fused_vec};
+use aggregate::EvalVec as FusedVec;
 use aggregate::{aggregate, fold_stream, merge_and_emit};
 use dml::{captured, returning_result};
 use expr::{coerce_to, eval_expr, select_true};
 use rayon::prelude::*;
+use top_n::{encode_sort_keys, eval_sort_keys, select_top, top_n};
 use window::eval_window;
 
 use crate::attached::{AttachedTable, PruneOp, PrunePredicate};
@@ -4960,7 +4962,16 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             types: vec![],
         }),
         LogicalPlan::Filter { input, predicate } => {
-            let inner = eval(cx, input)?;
+            // T4: `QUALIFY row_number() OVER (…) <= N` keeps N rows per
+            // partition instead of numbering every row first.
+            let grouped = match top_n::grouped_shape(plan) {
+                Some(shape) => pipeline::grouped_top_n(cx, &shape)?,
+                None => None,
+            };
+            let inner = match grouped {
+                Some(out) => out,
+                None => eval(cx, input)?,
+            };
             // Per-chunk predicates evaluate in parallel; order is preserved.
             // A subquery inside one is evaluated once, here, before the fan-out
             // (see `expr::prime`).
@@ -8378,258 +8389,6 @@ fn distinct_on(cx: &Cx, chunks: &[DataChunk], keys: &[usize]) -> Result<Vec<Data
 
 // ---------- sort ----------
 
-/// One sort's order-preserving key encoding: every input row's keys packed
-/// into a single byte arena; `offsets[i]..offsets[i + 1]` is row `i`'s slice.
-struct SortArena {
-    bytes: Vec<u8>,
-    offsets: Vec<u32>,
-}
-
-impl SortArena {
-    /// Row `row`'s encoded key bytes.
-    #[inline]
-    fn key(&self, row: u32) -> &[u8] {
-        let row = row as usize;
-        &self.bytes[self.offsets[row] as usize..self.offsets[row + 1] as usize]
-    }
-}
-
-/// A top-N candidate: encoded key bytes + global row index. Row indices are
-/// unique, so `(key, row)` is a *total* order — the heap keeps exactly the
-/// right `limit` rows regardless of heap-internal tie shuffling.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Candidate<'a> {
-    key: &'a [u8],
-    row: u32,
-}
-
-impl Ord for Candidate<'_> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.key.cmp(other.key).then(self.row.cmp(&other.row))
-    }
-}
-
-impl PartialOrd for Candidate<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// Evaluate every sort key over every chunk in parallel, preserving chunk
-/// order (the same per-chunk assembly the old `Row` build used). A bare
-/// column key borrows its chunk's vector instead of deep-copying it.
-fn eval_sort_keys<'a>(
-    cx: &Cx,
-    chunks: &'a [DataChunk],
-    keys: &[(BoundExpr, SortSpec)],
-) -> Result<Vec<Vec<FusedVec<'a>>>> {
-    chunks
-        .par_iter()
-        .map(|chunk| {
-            cx.check_deadline()?;
-            keys.iter()
-                .map(|(k, _)| eval_fused_vec(k, chunk, cx))
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect()
-}
-
-/// Push the low `width` bytes of `x` big-endian, each byte inverted when
-/// `desc` (ascending byte order then means descending value order).
-#[inline]
-fn push_be(out: &mut Vec<u8>, x: u64, width: usize, desc: bool) {
-    let be = x.to_be_bytes();
-    let be = &be[8 - width..];
-    if desc {
-        out.extend(be.iter().map(|b| !b));
-    } else {
-        out.extend_from_slice(be);
-    }
-}
-
-/// Append one key cell to `out` so ascending byte comparison of two rows'
-/// concatenated encodings reproduces the `Value` comparator (reversed for
-/// DESC keys):
-///
-/// - NULL → a single tag byte: `0x00` under NULLS FIRST (before every
-///   non-null), `0xFF` under NULLS LAST (after every non-null) — the tag is
-///   independent of the sort direction;
-/// - otherwise tag `0x01` (NULLS FIRST) or `0x00` (NULLS LAST) + payload;
-///   DESC inverts payload bytes only.
-///
-/// Payloads are order-preserving and, per key, prefix-free — a prefix
-/// relation inside one key must never let the *next* key decide a comparison
-/// the earlier key already settled:
-/// - BOOLEAN: `0`/`1`;
-/// - INTEGER/DATE, BIGINT/TIMESTAMP: big-endian two's complement with the
-///   sign bit flipped (`x ^ MIN`), so unsigned byte order = signed order;
-/// - DOUBLE: sign-magnitude → total-order bits (negatives inverted,
-///   positives get the sign bit); −0.0 folds onto +0.0 and every NaN onto
-///   all-ones (above `+inf`'s encoding), matching `num_cmp`'s DuckDB order;
-/// - VARCHAR: each UTF-8 byte shifted up one (bytes are ≤ 0xF4, so `0x00`
-///   is free) then a `0x00` terminator. The shift preserves order and the
-///   terminator makes the encoding prefix-free ("ab" must beat "a" DESC).
-///   DESC: inverted shifted bytes + inverted terminator `0xFF`.
-fn encode_key_into(v: &Vector, idx: usize, spec: SortSpec, out: &mut Vec<u8>) {
-    let desc = spec.desc;
-    if v.is_null(idx) {
-        out.push(if spec.nulls_first { 0x00 } else { 0xFF });
-        return;
-    }
-    out.push(if spec.nulls_first { 0x01 } else { 0x00 });
-    match v.data() {
-        VectorData::Boolean(d) => {
-            let b = d[idx] as u8;
-            out.push(if desc { !b } else { b });
-        }
-        VectorData::Int32(d) => push_be(out, ((d[idx] ^ i32::MIN) as u32) as u64, 4, desc),
-        VectorData::Int64(d) => push_be(out, (d[idx] ^ i64::MIN) as u64, 8, desc),
-        VectorData::Float64(d) => {
-            let x = d[idx];
-            let x = if x == 0.0 { 0.0 } else { x }; // −0.0 == +0.0 in num_cmp
-            let b = x.to_bits();
-            let b = if x.is_nan() {
-                u64::MAX // NaN == NaN, above +inf (0xFFF0…) in num_cmp
-            } else if b & (1u64 << 63) != 0 {
-                !b
-            } else {
-                b | (1u64 << 63)
-            };
-            push_be(out, b, 8, desc);
-        }
-        VectorData::VarChar(d) => {
-            let s: &str = &d[idx];
-            if desc {
-                out.extend(s.bytes().map(|b| !(b + 1)));
-                out.push(0xFF);
-            } else {
-                out.extend(s.bytes().map(|b| b + 1));
-                out.push(0x00);
-            }
-        }
-        VectorData::Date32(d) => push_be(out, ((d[idx] ^ i32::MIN) as u32) as u64, 4, desc),
-        VectorData::TimestampMicros(d) => push_be(out, (d[idx] ^ i64::MIN) as u64, 8, desc),
-        // DECIMAL: one scale per column, so plain i128 order works (sign bit
-        // flipped like the integer encodings).
-        VectorData::Decimal { values, .. } => push_be_i128(out, values[idx], desc),
-        VectorData::Decimal64 { values, .. } => push_be_i128(out, i128::from(values[idx]), desc),
-        // INTERVAL: encode the comparison key (months → 30 days, days →
-        // micros), which is monotone in `interval_cmp`.
-        VectorData::Interval(d) => {
-            let iv = d[idx];
-            let key = iv.months as i128 * 30 * 86_400_000_000i128
-                + iv.days as i128 * 86_400_000_000i128
-                + iv.micros as i128;
-            push_be_i128(out, key, desc);
-        }
-        // UUID: unsigned 128-bit big-endian, the order `compare_values` uses.
-        VectorData::Uuid(d) => {
-            let be = d[idx].to_be_bytes();
-            if desc {
-                out.extend(be.iter().map(|b| !b));
-            } else {
-                out.extend_from_slice(&be);
-            }
-        }
-        VectorData::Int128(d) => push_be_i128(out, d[idx], desc),
-        VectorData::UInt128(d) => {
-            let be = d[idx].to_be_bytes();
-            if desc {
-                out.extend(be.iter().map(|b| !b));
-            } else {
-                out.extend_from_slice(&be);
-            }
-        }
-        // Unreachable: `encode_sort_keys` bails to the `Value` comparator for
-        // VARIANT and ARRAY, whose byte order is not their sort order.
-        VectorData::Variant(_) => unreachable!("VARIANT sort keys use the Value comparator"),
-        VectorData::Array { .. } => unreachable!("ARRAY sort keys use the Value comparator"),
-    }
-}
-
-/// Big-endian i128 with the sign bit flipped (ascending byte order); `desc`
-/// inverts the bytes.
-fn push_be_i128(out: &mut Vec<u8>, x: i128, desc: bool) {
-    let be = (x ^ i128::MIN).to_be_bytes();
-    if desc {
-        out.extend(be.iter().map(|b| !b));
-    } else {
-        out.extend_from_slice(&be);
-    }
-}
-
-/// Pack all rows' keys into one arena. `None` ⇒ the byte order cannot
-/// reproduce `compare_values` exactly (dtypes differing across chunks, or
-/// sizes past `u32`) and the caller must use the `Value` comparator path.
-fn encode_sort_keys(
-    chunks: &[DataChunk],
-    keyed: &[Vec<FusedVec>],
-    keys: &[(BoundExpr, SortSpec)],
-) -> Option<SortArena> {
-    let n: usize = chunks.iter().map(|c| c.num_rows()).sum();
-    if n > u32::MAX as usize {
-        return None;
-    }
-    // Key vectors are typed by binding, so one dtype per key across chunks;
-    // anything else would make byte order diverge from `compare_values`.
-    let mut dtypes: Vec<DataType> = Vec::with_capacity(keys.len());
-    for ks in keyed {
-        for (ki, v) in ks.iter().enumerate() {
-            match dtypes.get(ki) {
-                None => dtypes.push(v.v().dtype()),
-                Some(t) if *t == v.v().dtype() => {}
-                Some(_) => return None,
-            }
-        }
-    }
-    // VARIANT sorts by the cross-kind total order and one chunk may mix kinds,
-    // so no byte encoding reproduces `compare_values`; the same holds for
-    // ARRAY (element-wise, NULL-element-last). The caller's `Value`
-    // comparator (first-seen ties) takes over.
-    if dtypes
-        .iter()
-        .any(|d| matches!(d, DataType::Variant | DataType::Array { .. }))
-    {
-        return None;
-    }
-    // Encode chunks in parallel into per-chunk buffers, then concatenate in
-    // chunk order (offsets shifted by each chunk's base), so the arena stays
-    // a single contiguous byte range.
-    let encoded: Vec<Option<(Vec<u8>, Vec<u32>)>> = chunks
-        .par_iter()
-        .zip(keyed.par_iter())
-        .map(|(chunk, ks)| {
-            let mut bytes = Vec::new();
-            let mut offsets = Vec::with_capacity(chunk.num_rows());
-            for i in 0..chunk.num_rows() {
-                if bytes.len() > u32::MAX as usize {
-                    return None;
-                }
-                offsets.push(bytes.len() as u32);
-                for (ki, (_, spec)) in keys.iter().enumerate() {
-                    encode_key_into(ks[ki].v(), i, *spec, &mut bytes);
-                }
-            }
-            Some((bytes, offsets))
-        })
-        .collect();
-    let mut arena = SortArena {
-        bytes: Vec::new(),
-        offsets: Vec::with_capacity(n + 1),
-    };
-    for part in encoded {
-        let (bytes, offsets) = part?;
-        if arena.bytes.len() + bytes.len() > u32::MAX as usize {
-            return None;
-        }
-        let base = arena.bytes.len() as u32;
-        arena.offsets.extend(offsets.iter().map(|o| o + base));
-        arena.bytes.extend_from_slice(&bytes);
-    }
-    arena.offsets.push(arena.bytes.len() as u32);
-    Some(arena)
-}
-
 /// Global index of each chunk's first row, plus the total row count at the
 /// end (so `partition_point` maps a global row → its chunk).
 fn chunk_starts(chunks: &[DataChunk]) -> Vec<usize> {
@@ -8739,42 +8498,6 @@ fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, SortSpec)]) -> Result
     Ok(out)
 }
 
-/// The first `limit` rows of `chunks` under `keys`, in order, ties in input
-/// order: the top-N heaps when the limit is small against the rows, a full
-/// sort otherwise. What the `LIMIT` arm returns for the same chunks.
-fn select_top(
-    cx: &Cx,
-    chunks: &[DataChunk],
-    keys: &[(BoundExpr, SortSpec)],
-    limit: usize,
-) -> Result<Vec<DataChunk>> {
-    let n: usize = chunks.iter().map(DataChunk::num_rows).sum();
-    let sorted = if n > limit && limit.saturating_mul(16) <= n {
-        match top_n(cx, chunks, keys, limit)? {
-            Some(chunks) => chunks,
-            None => sort(cx, chunks, keys)?,
-        }
-    } else {
-        sort(cx, chunks, keys)?
-    };
-    let mut out = Vec::new();
-    let mut left = limit;
-    for chunk in sorted {
-        if left == 0 {
-            break;
-        }
-        if chunk.num_rows() <= left {
-            left -= chunk.num_rows();
-            out.push(chunk);
-        } else {
-            let sel: Vec<usize> = (0..left).collect();
-            out.push(chunk.gather(&sel));
-            left = 0;
-        }
-    }
-    Ok(out)
-}
-
 /// Apply a `Project` node to an already evaluated input (the few rows a
 /// top-N kept; see the `LIMIT` arm).
 fn project_output(cx: &Cx, projection: &LogicalPlan, input: Output) -> Result<Output> {
@@ -8794,77 +8517,6 @@ fn project_output(cx: &Cx, projection: &LogicalPlan, input: Output) -> Result<Ou
         names: names.clone(),
         types: exprs.iter().map(|e| e.dtype()).collect(),
     })
-}
-
-/// Top-N selection for `LIMIT` directly over `SORT`: every rayon partition
-/// keeps a bounded max-heap of its `limit` smallest rows under the byte
-/// comparator; the ≤ partitions × limit candidates merge to the global first
-/// `limit`. `Ok(None)` ⇒ encoding unavailable (see [`encode_sort_keys`]);
-/// the caller then falls back to a full sort.
-fn top_n(
-    cx: &Cx,
-    chunks: &[DataChunk],
-    keys: &[(BoundExpr, SortSpec)],
-    limit: usize,
-) -> Result<Option<Vec<DataChunk>>> {
-    let keyed = eval_sort_keys(cx, chunks, keys)?;
-    let Some(arena) = encode_sort_keys(chunks, &keyed, keys) else {
-        return Ok(None);
-    };
-    let n = arena.offsets.len() - 1;
-    debug_assert!(0 < limit && limit < n, "top-N needs a truncating limit");
-    // Wave 136a: the row indices and the candidate keys the heap partitions
-    // hold, charged per statement; the output is at most `limit` rows.
-    let mut held = cx
-        .budget
-        .memory()
-        .reserve(n * 12 + chunks_approx_bytes(chunks))?;
-    // Cap the partition count so the merged candidate list stays a small
-    // fraction of n: each partition returns ≤ limit candidates, and the
-    // caller only routes here when limit × 16 ≤ n.
-    let parts = rayon::current_num_threads()
-        .saturating_mul(8)
-        .min((n / limit.saturating_mul(8)).max(1))
-        .max(1);
-    let part_size = n.div_ceil(parts);
-    let indices: Vec<u32> = (0..n as u32).collect();
-    let candidates: Vec<Vec<Candidate>> = indices
-        .par_chunks(part_size)
-        .map(|part| {
-            let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(limit + 1);
-            for &row in part {
-                let cand = Candidate {
-                    key: arena.key(row),
-                    row,
-                };
-                if heap.len() < limit {
-                    heap.push(cand);
-                } else if let Some(&max) = heap.peek()
-                    && cand < max
-                {
-                    heap.pop();
-                    heap.push(cand);
-                }
-            }
-            heap.into_vec()
-        })
-        .collect();
-    let mut merged: Vec<Candidate> = candidates.into_iter().flatten().collect();
-    merged.sort_unstable(); // (key, row) is total, so the merge is deterministic
-    merged.truncate(limit);
-    let rows: Vec<u32> = merged.iter().map(|c| c.row).collect();
-    let mut out = rebuild_sorted(chunks, &rows)?;
-    // The generic LIMIT shape gathers a straddling final chunk; do the same
-    // so the top-N output equals full-sort-then-truncate exactly (validity
-    // mask padding included).
-    if let Some(last) = out.last_mut()
-        && last.num_rows() < CHUNK_SIZE
-    {
-        let sel: Vec<usize> = (0..last.num_rows()).collect();
-        *last = last.gather(&sel);
-    }
-    held.resize(chunks_approx_bytes(&out))?;
-    Ok(Some(out))
 }
 
 /// Legacy fallback: materialize `Value` keys and compare with
@@ -10476,6 +10128,7 @@ fn is_builtin_extension(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::top_n::encode_key_into;
     use super::*;
     use crate::types::Value as V;
 
