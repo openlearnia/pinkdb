@@ -1413,11 +1413,7 @@ fn sync_file(method: WalSyncMethod, file: &File) -> std::io::Result<()> {
             WalSyncMethod::Fsync => Ok(rustix::fs::fsync(file)?),
             #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
             WalSyncMethod::Fdatasync => Ok(rustix::fs::fdatasync(file)?),
-            #[cfg(not(any(
-                target_os = "linux",
-                target_os = "android",
-                target_os = "freebsd"
-            )))]
+            #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
             WalSyncMethod::Fdatasync => Ok(rustix::fs::fsync(file)?),
         }
     }

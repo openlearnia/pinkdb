@@ -10173,7 +10173,9 @@ enum StreamKind {
     /// branch never touches the table (an attached lake would otherwise
     /// decode its columns for nothing). A table function whose source can
     /// push its chunks streams them; any other scan is materialized.
-    Scan { chunks: Option<ScanChunks> },
+    Scan {
+        chunks: Option<ScanChunks>,
+    },
     /// `SELECT` without `FROM`: one empty row.
     SingleRow(bool),
     Filter {
@@ -10427,8 +10429,7 @@ impl Stream {
                 }
                 StreamKind::Limit { input, remaining } => {
                     let LogicalPlan::Limit {
-                        input: input_plan,
-                        ..
+                        input: input_plan, ..
                     } = plan
                     else {
                         return Err(stream_plan_mismatch());

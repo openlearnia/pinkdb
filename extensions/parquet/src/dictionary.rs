@@ -463,11 +463,14 @@ impl Rows {
 }
 
 /// The dictionary page's values: a PLAIN `BYTE_ARRAY` sequence of 4-byte
-/// little-endian lengths and bytes, checked as UTF-8 once per entry.
+/// little-endian lengths and bytes, checked as UTF-8 once per entry. The
+/// values are copied, without their length prefixes, into one shared `str`
+/// buffer the vector's views point into.
 fn dictionary_page(buf: &[u8], entries: usize, column: &FileColumn) -> Result<StrVec> {
     // A page header's entry count is untrusted too: each entry needs 4 bytes
     // of length prefix, so the page bounds the hint.
     let mut ranges = Vec::with_capacity(entries.min(buf.len() / 4));
+    let mut text = String::with_capacity(buf.len());
     let mut at = 0usize;
     for _ in 0..entries {
         let len = buf
@@ -478,12 +481,13 @@ fn dictionary_page(buf: &[u8], entries: usize, column: &FileColumn) -> Result<St
         let bytes = buf
             .get(at..at + len)
             .ok_or_else(|| decode_error(column, "the dictionary page ended inside a value"))?;
-        std::str::from_utf8(bytes)
+        let value = std::str::from_utf8(bytes)
             .map_err(|_| decode_error(column, "the bytes are not valid UTF-8"))?;
-        ranges.push((at, len));
+        ranges.push((text.len(), len));
+        text.push_str(value);
         at += len;
     }
-    let buffer: Arc<[u8]> = Arc::from(buf.to_vec());
+    let buffer: Arc<str> = Arc::from(text);
     Ok(StrVec::over_buffer(buffer, ranges.into_iter()))
 }
 

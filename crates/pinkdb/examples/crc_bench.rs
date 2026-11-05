@@ -39,7 +39,10 @@ fn main() {
             best = best.min(t.elapsed().as_secs_f64());
         }
         let gbs = (calls * size) as f64 / best / 1e9;
-        println!("size={size:>9} B  best={:8.2} ms  {gbs:6.2} GB/s", best * 1e3);
+        println!(
+            "size={size:>9} B  best={:8.2} ms  {gbs:6.2} GB/s",
+            best * 1e3
+        );
     }
     println!("checksum sink {sink:08x}");
 }

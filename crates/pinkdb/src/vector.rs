@@ -2085,7 +2085,7 @@ mod tests {
         assert_eq!(
             heap.memory_size(),
             4 * std::mem::size_of::<crate::strings::StrView>()
-                + std::mem::size_of::<Arc<[u8]>>()
+                + std::mem::size_of::<Arc<str>>()
                 + 20
                 + 8
                 + base
