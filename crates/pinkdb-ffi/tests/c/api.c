@@ -1,4 +1,4 @@
-/* C-level acceptance suite for ABI 1.4: database/connection split, config,
+/* C-level acceptance suite for ABI 1.5: database/connection split, config,
  * per-result errors, interrupt, chunk fetch, typed vectors, Arrow export,
  * appender and typed parameter binding.
  * Built and run by tests/c_api.rs. Keep it dependency-free (libc + pthreads). */
@@ -676,6 +676,181 @@ static void test_arrow_schema_and_array(void) {
     close_conn(conn);
 }
 
+
+static void test_streaming_large_result(void) {
+    pinkdb_connection *conn = open_conn();
+    pinkdb_result *result = query_ok(conn, "SELECT i FROM range(0, 100000) t(i)");
+    CHECK(pinkdb_result_is_streaming(result, 0) == 1);
+    CHECK(pinkdb_result_column_count(result, 0) == 1);
+    CHECK(pinkdb_result_rows_fetched(result, 0) == 0);
+
+    uint64_t seen = 0;
+    pinkdb_data_chunk *chunk;
+    while ((chunk = pinkdb_result_fetch_chunk(result, 0)) != NULL) {
+        seen += pinkdb_chunk_size(chunk);
+        pinkdb_destroy_chunk(chunk);
+    }
+    CHECK(seen == 100000);
+    CHECK(pinkdb_result_rows_fetched(result, 0) == 100000);
+    CHECK(strcmp(result_error(result), "") == 0);
+    CHECK(pinkdb_result_row_count(result, 0) == 100000);
+    pinkdb_result_free(result);
+
+    /* Row count drains a live cursor instead of waiting for the caller. */
+    result = query_ok(conn, "SELECT i FROM range(0, 100000) t(i)");
+    CHECK(pinkdb_result_is_streaming(result, 0) == 1);
+    chunk = pinkdb_result_fetch_chunk(result, 0);
+    CHECK(chunk != NULL);
+    pinkdb_destroy_chunk(chunk);
+    CHECK(pinkdb_result_row_count(result, 0) == 100000);
+    CHECK(pinkdb_result_is_streaming(result, 0) == 0);
+    while ((chunk = pinkdb_result_fetch_chunk(result, 0)) != NULL) {
+        CHECK(pinkdb_chunk_size(chunk) > 0);
+        pinkdb_destroy_chunk(chunk);
+    }
+    pinkdb_result_free(result);
+
+    result = query_ok(conn, "SELECT 1; SELECT 2");
+    CHECK(pinkdb_result_is_streaming(result, 0) == 0);
+    CHECK(pinkdb_result_is_streaming(result, 1) == 0);
+    pinkdb_result_free(result);
+    close_conn(conn);
+}
+
+/* Past 16 MiB a chunk fetch keeps nothing for the v1 cell API, so a v1 read
+ * afterwards reports an error instead of answering with rows missing. */
+static void test_streaming_v1_after_a_large_fetch(void) {
+    pinkdb_connection *conn = open_conn();
+    pinkdb_result *result = query_ok(conn, "SELECT i FROM range(0, 5000000) t(i)");
+    CHECK(pinkdb_result_is_streaming(result, 0) == 1);
+    pinkdb_data_chunk *chunk;
+    uint64_t seen = 0;
+    while ((chunk = pinkdb_result_fetch_chunk(result, 0)) != NULL) {
+        seen += pinkdb_chunk_size(chunk);
+        pinkdb_destroy_chunk(chunk);
+    }
+    CHECK(seen == 5000000);
+    CHECK(strcmp(result_error(result), "") == 0);
+    pink_value v = pinkdb_result_value(result, 0, 0, 0);
+    (void)v;
+    CHECK(strstr(result_error(result), "16 MiB") != NULL);
+    pinkdb_result_free(result);
+    close_conn(conn);
+}
+
+static void test_streaming_early_free(void) {
+    pinkdb_connection *conn = open_conn();
+    pinkdb_result *result =
+        query_ok(conn, "SELECT i FROM range(0, 100000000) t(i)");
+    CHECK(pinkdb_result_is_streaming(result, 0) == 1);
+    pinkdb_data_chunk *chunk = pinkdb_result_fetch_chunk(result, 0);
+    CHECK(chunk != NULL);
+    pinkdb_destroy_chunk(chunk);
+    pinkdb_result_free(result);
+
+    /* Dropping the cursor stops its producer; the connection is usable. */
+    result = query_ok(conn, "SELECT count(*) FROM range(0, 10)");
+    CHECK(scalar(result) == 10);
+    pinkdb_result_free(result);
+    close_conn(conn);
+}
+
+static void test_streaming_mid_error(void) {
+    pinkdb_connection *conn = open_conn();
+    pinkdb_result *result = query_ok(
+        conn,
+        "SELECT CASE WHEN i = 1000000 THEN i / 0 ELSE i END,"
+        " 'x' || i::VARCHAR || 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'"
+        " FROM range(0, 2000000) t(i)");
+    CHECK(pinkdb_result_is_streaming(result, 0) == 1);
+    pinkdb_data_chunk *chunk;
+    int saw_rows = 0;
+    while ((chunk = pinkdb_result_fetch_chunk(result, 0)) != NULL) {
+        saw_rows = 1;
+        pinkdb_destroy_chunk(chunk);
+    }
+    CHECK(saw_rows == 1);
+    CHECK(strcmp(result_error(result), "") != 0);
+    CHECK(strcmp(result_class(result), "execution") == 0);
+    CHECK(pinkdb_result_fetch_chunk(result, 0) == NULL);
+    pinkdb_result_free(result);
+    close_conn(conn);
+}
+
+static void test_streaming_interrupt(void) {
+    pinkdb_connection *conn = open_conn();
+    pinkdb_result *result =
+        query_ok(conn, "SELECT i FROM range(0, 100000000) t(i)");
+    CHECK(pinkdb_result_is_streaming(result, 0) == 1);
+    pinkdb_data_chunk *chunk = pinkdb_result_fetch_chunk(result, 0);
+    CHECK(chunk != NULL);
+    pinkdb_destroy_chunk(chunk);
+
+    /* Interrupt between fetches, a few chunks in: the whole range streams in
+       well under 100 ms, so a timed interrupter thread can arrive after the
+       last chunk. The fetch after the interrupt ends the stream early. */
+    int fetched = 1;
+    while ((chunk = pinkdb_result_fetch_chunk(result, 0)) != NULL) {
+        pinkdb_destroy_chunk(chunk);
+        if (++fetched == 4) {
+            pinkdb_interrupt(conn);
+        }
+    }
+    CHECK(fetched == 4);
+    CHECK(strcmp(result_class(result), "interrupted") == 0);
+    pinkdb_result_free(result);
+
+    result = query_ok(conn, "SELECT 1");
+    CHECK(scalar(result) == 1);
+    pinkdb_result_free(result);
+    close_conn(conn);
+}
+
+static void test_streaming_arrow(void) {
+    pinkdb_connection *conn = open_conn();
+    pinkdb_result *result = query_ok(conn, "SELECT i FROM range(0, 10000) t(i)");
+    CHECK(pinkdb_result_is_streaming(result, 0) == 1);
+    uint64_t rows = 0;
+    struct ArrowArray array;
+    while (pinkdb_result_fetch_arrow(result, 0, &array) == 1) {
+        if (array.release == NULL) {
+            break;
+        }
+        rows += (uint64_t)array.length;
+        array.release(&array);
+    }
+    CHECK(rows == 10000);
+    CHECK(pinkdb_result_rows_fetched(result, 0) == 10000);
+    CHECK(strcmp(result_error(result), "") == 0);
+    pinkdb_result_free(result);
+    close_conn(conn);
+}
+
+static void test_streaming_materialize_config(void) {
+    pinkdb_config *config = pinkdb_create_config();
+    CHECK(config != NULL);
+    CHECK(pinkdb_config_set(config, "materialize_results", "true") == 1);
+    pinkdb_database *db = NULL;
+    char *errmsg = NULL;
+    CHECK(pinkdb_open_ext(NULL, config, &db, &errmsg) == 1);
+    pinkdb_destroy_config(config);
+    pinkdb_connection *conn = NULL;
+    CHECK(pinkdb_connect(db, &conn) == 1);
+    pinkdb_result *result = query_ok(conn, "SELECT i FROM range(0, 5000) t(i)");
+    CHECK(pinkdb_result_is_streaming(result, 0) == 0);
+    CHECK(pinkdb_result_row_count(result, 0) == 5000);
+    uint64_t seen = 0;
+    pinkdb_data_chunk *chunk;
+    while ((chunk = pinkdb_result_fetch_chunk(result, 0)) != NULL) {
+        seen += pinkdb_chunk_size(chunk);
+        pinkdb_destroy_chunk(chunk);
+    }
+    CHECK(seen == 5000);
+    pinkdb_result_free(result);
+    pinkdb_disconnect(conn);
+    pinkdb_close_database(db);
+}
+
 static void test_appender_all_types(void) {
     pinkdb_connection *conn = open_conn();
     query_ok(conn, "CREATE TABLE app_all ("
@@ -1226,8 +1401,8 @@ static void test_appender_chunk_every_type(void) {
 
 static void test_version(void) {
     CHECK(PINKDB_ABI_VERSION_MAJOR == 1);
-    CHECK(PINKDB_ABI_VERSION_MINOR == 4);
-    CHECK(PINKDB_ABI_VERSION == ((1u << 16) | 4u));
+    CHECK(PINKDB_ABI_VERSION_MINOR == 5);
+    CHECK(PINKDB_ABI_VERSION == ((1u << 16) | 5u));
     CHECK(pinkdb_abi_version() == PINKDB_ABI_VERSION);
     CHECK((pinkdb_abi_version() >> 16) == PINKDB_ABI_VERSION_MAJOR);
 }
@@ -1243,6 +1418,13 @@ int main(void) {
     test_arrow_schema_and_array();
     test_connections_across_threads();
     test_interrupt();
+    test_streaming_large_result();
+    test_streaming_early_free();
+    test_streaming_mid_error();
+    test_streaming_interrupt();
+    test_streaming_arrow();
+    test_streaming_materialize_config();
+    test_streaming_v1_after_a_large_fetch();
     test_appender_all_types();
     test_binding_all_types();
     test_appender_constraints_and_transactions();

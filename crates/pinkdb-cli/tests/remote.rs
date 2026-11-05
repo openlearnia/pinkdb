@@ -186,3 +186,34 @@ fn remote_timer_reports_the_servers_profile() {
     let plain_lines: Vec<&str> = plain.lines().collect();
     assert_eq!(stripped, plain_lines, "timer changed the remote results");
 }
+
+/// The remote CLI streams a large SELECT through `query_stream` and renders
+/// byte for byte like the embedded cursor renderer.
+#[test]
+fn remote_and_local_streaming_rendering_are_identical() {
+    let server = Server::bind("127.0.0.1:0", Database::new()).expect("bind");
+    let addr = server.local_addr().to_string();
+    let handle = server.spawn().expect("spawn");
+
+    let script = "SELECT i, 'row-' || i::VARCHAR AS s FROM range(0, 25000) t(i);\n\
+                  .quit\n";
+    let run = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pinkdb"));
+        command.args(args);
+        let (out, status) = common::run_merged(command, script);
+        common::assert_script_exit(status);
+        out
+    };
+    let local = run(&[]);
+    let remote = run(&["--host", &addr]);
+    let normalize = |text: &str| -> String {
+        text.lines()
+            .filter(|line| {
+                !line.starts_with("pinkdb v0.1.0") && !line.starts_with("Run Time (s): real ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(normalize(&local), normalize(&remote));
+    handle.join();
+}

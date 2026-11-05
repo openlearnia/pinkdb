@@ -54,11 +54,14 @@
 //! all and is never WAL-logged.
 
 use std::fmt;
-use std::path::Path;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::storage::{DataTable, PinkDb};
-use crate::types::{PinkDbError, Result};
+use crate::types::{DataType, PinkDbError, Result};
+use crate::vector::DataChunk;
 
 /// Register a write sink **process-wide** (idempotent: same-name
 /// registration replaces).
@@ -102,7 +105,53 @@ pub(crate) fn seeded_global_formats() -> Vec<Arc<dyn FileFormat>> {
 
 fn global_formats() -> &'static Mutex<Vec<Arc<dyn FileFormat>>> {
     static GLOBAL: OnceLock<Mutex<Vec<Arc<dyn FileFormat>>>> = OnceLock::new();
-    GLOBAL.get_or_init(|| Mutex::new(Vec::new()))
+    GLOBAL.get_or_init(|| Mutex::new(vec![Arc::new(CsvSink)]))
+}
+
+/// A streaming writer for one `COPY … TO` destination. `finish` publishes the
+/// file; dropping one unfinished must leave no target behind.
+pub trait ChunkWriter: Send {
+    fn write_chunk(&mut self, chunk: DataChunk) -> Result<()>;
+    fn finish(self: Box<Self>) -> Result<()>;
+}
+
+/// A unique temp file next to `path`, with the same directory so the final
+/// rename cannot cross filesystems.
+pub fn temp_sibling(path: &Path) -> Result<(PathBuf, std::fs::File)> {
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let name = path.file_name().ok_or_else(|| {
+        PinkDbError::Execution(format!(
+            "cannot write \"{}\": a file name is required",
+            path.display()
+        ))
+    })?;
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(format!(".{}.{seq}.tmp", std::process::id()));
+    let tmp = parent.join(tmp_name);
+    let file = crate::fsutil::create_private(&tmp).map_err(|e| {
+        PinkDbError::Execution(format!(
+            "cannot create a temp file next to \"{}\": {e}",
+            path.display()
+        ))
+    })?;
+    Ok((tmp, file))
+}
+
+/// Publish a finished temp file. The caller has already flushed it.
+pub fn publish_temp(tmp: &Path, path: &Path) -> Result<()> {
+    std::fs::rename(tmp, path).map_err(|e| {
+        PinkDbError::Execution(format!("cannot publish \"{}\": {e}", path.display()))
+    })?;
+    if let Ok(dir) = std::fs::File::open(path.parent().unwrap_or(Path::new("."))) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 /// A registered `COPY … (FORMAT <name>)` **write sink**: Arrow IPC, parquet, …
@@ -121,6 +170,151 @@ pub trait FileFormat: fmt::Debug + Send + Sync {
 
     /// Write one engine table to `path` (created or truncated).
     fn write(&self, path: &Path, table: &DataTable) -> Result<()>;
+
+    /// Start a chunk-at-a-time write. The default buffers the whole table and
+    /// calls [`Self::write`], so an unconverted format keeps working.
+    fn begin_write<'a>(
+        &'a self,
+        path: &Path,
+        schema: &[(String, DataType)],
+    ) -> Result<Box<dyn ChunkWriter + 'a>> {
+        Ok(Box::new(BufferedWriter {
+            format: self,
+            path: path.to_path_buf(),
+            table: DataTable::new("copy".to_string(), schema.to_vec())?,
+        }))
+    }
+}
+
+struct BufferedWriter<'a, T: FileFormat + ?Sized> {
+    format: &'a T,
+    path: PathBuf,
+    table: DataTable,
+}
+
+impl<T: FileFormat + ?Sized> ChunkWriter for BufferedWriter<'_, T> {
+    fn write_chunk(&mut self, chunk: DataChunk) -> Result<()> {
+        self.table.append_shared_chunk(&chunk.columns)
+    }
+
+    fn finish(self: Box<Self>) -> Result<()> {
+        self.format.write(&self.path, &self.table)
+    }
+}
+
+/// The engine's own CSV sink. It exists so `COPY … TO 'x.csv'` needs no
+/// extension; reads still go through the table-source surface.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CsvSink;
+
+impl FileFormat for CsvSink {
+    fn name(&self) -> &str {
+        "csv"
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["csv"]
+    }
+
+    fn write(&self, path: &Path, table: &DataTable) -> Result<()> {
+        let mut writer = self.begin_write(path, &table.schema())?;
+        for i in 0..table.num_chunks() {
+            if let Some(chunk) = table.scan_chunk(i)? {
+                writer.write_chunk(chunk)?;
+            }
+        }
+        writer.finish()
+    }
+
+    fn begin_write<'a>(
+        &'a self,
+        path: &Path,
+        schema: &[(String, DataType)],
+    ) -> Result<Box<dyn ChunkWriter + 'a>> {
+        Ok(Box::new(CsvWriter::new(path, schema)?))
+    }
+}
+
+struct CsvWriter {
+    out: BufWriter<std::fs::File>,
+    tmp: PathBuf,
+    path: PathBuf,
+    finished: bool,
+}
+
+impl CsvWriter {
+    fn new(path: &Path, schema: &[(String, DataType)]) -> Result<Self> {
+        let (tmp, file) = temp_sibling(path)?;
+        let mut writer = Self {
+            out: BufWriter::new(file),
+            tmp,
+            path: path.to_path_buf(),
+            finished: false,
+        };
+        for (i, (name, _)) in schema.iter().enumerate() {
+            if i > 0 {
+                writer.out.write_all(b",")?;
+            }
+            write_csv_field(&mut writer.out, name)?;
+        }
+        writer.out.write_all(b"\n")?;
+        Ok(writer)
+    }
+}
+
+impl ChunkWriter for CsvWriter {
+    fn write_chunk(&mut self, chunk: DataChunk) -> Result<()> {
+        for row in 0..chunk.num_rows() {
+            for (column, value) in chunk.columns.iter().enumerate() {
+                if column > 0 {
+                    self.out.write_all(b",")?;
+                }
+                match value.get(row) {
+                    crate::types::Value::Null => {}
+                    other => write_csv_field(&mut self.out, &other.to_string())?,
+                }
+            }
+            self.out.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<()> {
+        self.out.flush()?;
+        self.out.get_ref().sync_all()?;
+        publish_temp(&self.tmp, &self.path)?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for CsvWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+fn write_csv_field(out: &mut impl Write, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value
+            .bytes()
+            .any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r'))
+    {
+        out.write_all(b"\"")?;
+        for byte in value.bytes() {
+            if byte == b'"' {
+                out.write_all(b"\"\"")?;
+            } else {
+                out.write_all(&[byte])?;
+            }
+        }
+        out.write_all(b"\"")?;
+    } else {
+        out.write_all(value.as_bytes())?;
+    }
+    Ok(())
 }
 
 impl PinkDb {
@@ -274,8 +468,8 @@ mod tests {
         }
     }
 
-    /// A stock engine has no sinks: every COPY surface fails with the
-    /// documented error, never a silent no-op.
+    /// A stock engine has CSV but no extension sinks: an unknown format fails
+    /// with the documented error, never a silent no-op.
     #[test]
     fn stock_store_refuses_every_copy_surface() {
         let mut db = PinkDb::new();
@@ -289,7 +483,68 @@ mod tests {
             "{err}"
         );
         assert!(db.file_format("testfmt").is_none());
-        assert!(db.file_format_names().contains("none"));
+        assert!(db.file_format_names().contains("csv"));
+    }
+
+    #[test]
+    fn csv_streaming_round_trips_and_copy_select_reads_a_query() {
+        let dir = scratch_dir("csv_stream");
+        let table_path = dir.join("table.csv");
+        let query_path = dir.join("query.csv");
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER, s VARCHAR);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (1, 'plain'), (2, 'a,b'), (3, 'he\"llo'), (4, 'line\nbreak'), (5, ''), (6, NULL);",
+        )
+        .unwrap();
+        let copied = db
+            .execute(&format!(
+                "COPY t TO '{}' (FORMAT csv);",
+                table_path.display()
+            ))
+            .unwrap();
+        assert_eq!(
+            copied,
+            vec![QueryResult::Selected {
+                names: vec!["Count".to_string()],
+                types: vec![DataType::Bigint],
+                rows: vec![vec![Value::Bigint(6)]],
+            }]
+        );
+        // Empty strings stay strings (quoted); NULL stays an empty field.
+        let text = std::fs::read_to_string(&table_path).unwrap();
+        assert!(text.contains("\"\"\n"), "{text}");
+
+        let opts = crate::csv::CsvOptions {
+            allow_quoted_nulls: false,
+            ..Default::default()
+        };
+        crate::csv::import_csv_opts(
+            &mut db,
+            table_path.to_str().unwrap(),
+            Some("roundtrip"),
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(
+            db.execute("SELECT a, s FROM roundtrip ORDER BY a;")
+                .unwrap(),
+            db.execute("SELECT a, s FROM t ORDER BY a;").unwrap()
+        );
+
+        db.execute(&format!(
+            "COPY (SELECT a * 2 AS b, s FROM t WHERE a <= 2 ORDER BY a) TO '{}' (FORMAT csv);",
+            query_path.display()
+        ))
+        .unwrap();
+        crate::csv::import_csv(&mut db, query_path.to_str().unwrap(), Some("qcopy")).unwrap();
+        assert_eq!(
+            db.execute("SELECT b, s FROM qcopy ORDER BY b;").unwrap(),
+            db.execute("SELECT a * 2 AS b, s FROM t WHERE a <= 2 ORDER BY a;")
+                .unwrap()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A registered sink drives `COPY … TO … (FORMAT …)`, including extension

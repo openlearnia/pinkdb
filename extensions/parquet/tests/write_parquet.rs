@@ -735,3 +735,57 @@ fn copy_of_hugeint_columns_reads_back_as_double() {
     );
     cleanup(&dir);
 }
+
+/// `COPY (SELECT …) TO` pulls from a cursor, so a result larger than one row
+/// group is written across several groups without materializing it first.
+#[test]
+fn copy_select_streams_across_row_groups() {
+    let dir = scratch("copy_select");
+    let path = dir.join("copy.parquet");
+    let mut db = PinkDb::new();
+    pinkdb_parquet::register(&mut db);
+    db.execute(&format!(
+        "COPY (SELECT i, 'row-' || i::VARCHAR AS s FROM range(70000) t(i)) TO '{}' (FORMAT parquet);",
+        path.display()
+    ))
+    .unwrap();
+
+    let schema = vec![
+        ("i".to_string(), DataType::Bigint),
+        ("s".to_string(), DataType::Varchar),
+    ];
+    let (read_schema, read) = read_rows(&path, schema);
+    let want: Vec<Vec<Value>> = (0..70_000i64)
+        .map(|i| vec![Value::Bigint(i), Value::Varchar(format!("row-{i}"))])
+        .collect();
+    assert_eq!(read_schema.len(), 2);
+    assert_rows_equal(&want, &read, "streamed copy");
+
+    let reader = SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+    assert!(
+        reader.metadata().num_row_groups() >= 2,
+        "70,000 streamed rows must span multiple row groups"
+    );
+    cleanup(&dir);
+}
+
+/// A source error after the first row group must remove the partial file.
+#[test]
+fn copy_select_mid_write_error_leaves_no_file() {
+    let dir = scratch("copy_mid_error");
+    let path = dir.join("bad.parquet");
+    let mut db = PinkDb::new();
+    pinkdb_parquet::register(&mut db);
+    let err = db
+        .execute(&format!(
+            "COPY (SELECT CASE WHEN i = 70000 THEN i / 0 ELSE i END AS i FROM range(0, 140000) t(i)) TO '{}' (FORMAT parquet);",
+            path.display()
+        ))
+        .unwrap_err();
+    assert!(err.to_string().contains("division by zero"), "{err}");
+    assert!(
+        !path.exists(),
+        "a failed write must not publish a target file"
+    );
+    cleanup(&dir);
+}

@@ -304,12 +304,12 @@ fn describe_analyze_and_copy_take_three_part_names() {
     run(&mut db, "CREATE TABLE s.t (x INTEGER);");
     assert!(!rows(&mut db, "DESCRIBE s.t;").is_empty());
     assert_eq!(ints(&mut db, "ANALYZE s.t; SELECT 1;"), vec![1]);
-    // The default build registers no file formats; reaching the format error
-    // proves `s.t` bound (a missing table fails before it).
+    // Reaching the format error proves `s.t` bound (a missing table fails
+    // before it).
     let copy = std::env::temp_dir().join("pinkdb_schemas_copy.csv");
     let e = err(
         &mut db,
-        &format!("COPY s.t TO '{}' (FORMAT CSV);", copy.display()),
+        &format!("COPY s.t TO '{}' (FORMAT nope);", copy.display()),
     );
     assert!(e.contains("no file format"), "{e}");
 }

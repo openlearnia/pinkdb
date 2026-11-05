@@ -74,6 +74,130 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 /// One result set being assembled from frames: names, types, rows so far.
 type PendingResult = Option<(Vec<String>, Vec<DataType>, Vec<Vec<Value>>)>;
 
+/// A row-producing query in flight: [`Client::query_stream`] reads its
+/// `Rows` frames lazily, one batch per [`Iterator::next`]. The borrow keeps
+/// the connection busy until the stream ends or is dropped.
+#[derive(Debug)]
+pub struct RowStream<'a> {
+    client: &'a mut Client,
+    names: Vec<String>,
+    types: Vec<DataType>,
+    /// A non-row single statement (SET, CREATE, …) completes during
+    /// `query_stream`; its result is kept here for the caller to render.
+    result: Option<QueryResult>,
+    done: bool,
+}
+
+impl RowStream<'_> {
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    pub fn types(&self) -> &[DataType] {
+        &self.types
+    }
+
+    /// The completed non-row result, if this stream did not produce rows.
+    pub fn result(&self) -> Option<&QueryResult> {
+        self.result.as_ref()
+    }
+
+    fn fail(&mut self, error: ClientError) -> Option<<Self as Iterator>::Item> {
+        self.done = true;
+        if let ClientError::Protocol(e) = &error
+            && !matches!(e, ProtocolError::Server(_))
+        {
+            self.client.broken = true;
+        }
+        Some(Err(error))
+    }
+
+    /// Read the frames after `Done` up to `BatchDone`, checking that this was
+    /// the batch's only statement.
+    fn finish_batch(&mut self) -> Result<()> {
+        loop {
+            match protocol::read_response(&mut self.client.reader)? {
+                Response::Profile { .. } => {}
+                Response::BatchDone { statements } => {
+                    if statements != 1 {
+                        self.client.broken = true;
+                        return Err(ProtocolError::Malformed(format!(
+                            "query_stream read one result group but the batch reports {statements} statements"
+                        ))
+                        .into());
+                    }
+                    self.done = true;
+                    return Ok(());
+                }
+                Response::Error { message } => {
+                    return Err(ProtocolError::Server(message).into());
+                }
+                other => {
+                    self.client.broken = true;
+                    return Err(ProtocolError::Unexpected(format!(
+                        "expected BatchDone after the streamed result, got {}",
+                        other.kind()
+                    ))
+                    .into());
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RowStream<'_> {
+    fn drop(&mut self) {
+        // Dropping early leaves unread frames on the wire.
+        if !self.done {
+            self.client.broken = true;
+        }
+    }
+}
+
+impl Iterator for RowStream<'_> {
+    type Item = Result<Vec<Vec<Value>>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let response = match protocol::read_response(&mut self.client.reader) {
+            Ok(response) => response,
+            Err(e) => return self.fail(e.into()),
+        };
+        match response {
+            Response::Rows { rows } => {
+                if let Some(row) = rows.iter().find(|row| row.len() != self.names.len()) {
+                    self.client.broken = true;
+                    return Some(Err(ProtocolError::Malformed(format!(
+                        "row has {} values but the result set has {} columns",
+                        row.len(),
+                        self.names.len()
+                    ))
+                    .into()));
+                }
+                Some(Ok(rows))
+            }
+            Response::Profile { .. } => self.next(),
+            Response::Done {
+                kind: DoneKind::Selected,
+                ..
+            } => match self.finish_batch() {
+                Ok(()) => None,
+                Err(e) => self.fail(e),
+            },
+            Response::Error { message } => self.fail(ProtocolError::Server(message).into()),
+            other => {
+                self.client.broken = true;
+                self.fail(
+                    ProtocolError::Unexpected(format!("expected Rows, got {}", other.kind()))
+                        .into(),
+                )
+            }
+        }
+    }
+}
+
 /// The byte stream under a client connection: plain TCP, or TLS over TCP
 /// (crate feature `tls`).
 ///
@@ -350,6 +474,89 @@ impl Client {
             }
         })();
         self.finish(result)
+    }
+
+    /// Run one statement and return its rows as they arrive, one batch per
+    /// [`Iterator::next`]. A non-row statement completes immediately and its
+    /// result is available through [`RowStream::result`].
+    ///
+    /// The stream borrows the client: no other request can use the connection
+    /// until it ends. Dropping it early leaves unread frames, so the client is
+    /// marked broken and must reconnect.
+    pub fn query_stream(&mut self, sql: &str) -> Result<RowStream<'_>> {
+        self.check_usable()?;
+        protocol::write_request(
+            self.reader.get_mut(),
+            &Request::Execute {
+                sql: sql.to_string(),
+            },
+        )?;
+        match protocol::read_response(&mut self.reader)? {
+            Response::ResultSet { names, types } => {
+                if names.len() != types.len() {
+                    self.broken = true;
+                    return Err(ProtocolError::Malformed(format!(
+                        "ResultSet has {} names but {} types",
+                        names.len(),
+                        types.len()
+                    ))
+                    .into());
+                }
+                Ok(RowStream {
+                    client: self,
+                    names,
+                    types,
+                    result: None,
+                    done: false,
+                })
+            }
+            Response::Done { kind, count, name } => {
+                let result = build_result(kind, count, name, None)?;
+                // Read the batch terminator before handing the stream back,
+                // so a non-row statement leaves the connection in sync.
+                loop {
+                    match protocol::read_response(&mut self.reader)? {
+                        Response::Profile { .. } => {}
+                        Response::BatchDone { statements } => {
+                            if statements != 1 {
+                                self.broken = true;
+                                return Err(ProtocolError::Malformed(format!(
+                                    "query_stream read one result but the batch reports {statements} statements"
+                                ))
+                                .into());
+                            }
+                            break;
+                        }
+                        Response::Error { message } => {
+                            return Err(ProtocolError::Server(message).into());
+                        }
+                        other => {
+                            self.broken = true;
+                            return Err(ProtocolError::Unexpected(format!(
+                                "expected BatchDone, got {}",
+                                other.kind()
+                            ))
+                            .into());
+                        }
+                    }
+                }
+                Ok(RowStream {
+                    client: self,
+                    names: Vec::new(),
+                    types: Vec::new(),
+                    result: Some(result),
+                    done: true,
+                })
+            }
+            Response::Error { message } => Err(ProtocolError::Server(message).into()),
+            other => {
+                self.broken = true;
+                Err(
+                    ProtocolError::Unexpected(format!("expected ResultSet, got {}", other.kind()))
+                        .into(),
+                )
+            }
+        }
     }
 
     /// Run every statement in `sql` on the server, returning one result each.

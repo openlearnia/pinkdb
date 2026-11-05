@@ -3934,7 +3934,7 @@ pub struct PinkDb {
     /// Registered `COPY … (FORMAT <name>)` write sinks (wave 71): a sink
     /// resolves by name or by the target path's extension. Process/store-level
     /// like loadable extensions — never persisted, shared by store clones,
-    /// empty in a stock engine (COPY then fails with a clear "no file format
+    /// seeded with the built-in CSV sink in a stock engine (COPY to any other
     /// …" error). Reads are the separate table-source registry above. See
     /// [`crate::filefmt`].
     pub(crate) file_formats: Vec<Arc<dyn crate::filefmt::FileFormat>>,

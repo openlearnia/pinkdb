@@ -190,6 +190,8 @@ test('a row stream stops early and a closed database invalidates statements', ()
   const prepared = db.prepare('SELECT a FROM t ORDER BY a');
   const stream = prepared.iterate();
   assert.deepEqual(stream.next(), { done: false, value: { a: 1 } });
+  assert.throws(() => db.run('SELECT 1'), /database is busy/);
+  assert.throws(() => prepared.all(), /database is busy/);
   stream.close();
   assert.deepEqual(stream.next(), { done: true, value: undefined });
   prepared.close();

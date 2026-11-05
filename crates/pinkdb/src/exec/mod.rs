@@ -3209,7 +3209,7 @@ fn run_read_chunks_with(cx: &Cx, plan: &LogicalPlan, keep_chunks: bool) -> Resul
     // file is written) but produces DuckDB's `Count` result, not a row set —
     // handle it before the row evaluator.
     if let LogicalPlan::CopyTo { .. } = plan {
-        return execute_copy_to(cx.db, plan).map(ChunkedResult::Other);
+        return execute_copy_to(cx, plan).map(ChunkedResult::Other);
     }
     let out = eval(cx, plan)?;
     let mut rows = Vec::new();
@@ -3264,17 +3264,18 @@ fn run_read_chunks_with(cx: &Cx, plan: &LogicalPlan, keep_chunks: bool) -> Resul
 /// must never write the wrong table), and the writer's schema check is the
 /// table's own schema. The result is DuckDB's `Count` shape: one row, one
 /// `BIGINT` column naming the rows written.
-fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
+fn execute_copy_to(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
+    let db = cx.db;
     let LogicalPlan::CopyTo {
         ns: qdb,
         table,
+        source,
         format,
         path,
     } = plan
     else {
         unreachable!("execute_copy_to needs a CopyTo node");
     };
-    let target = resolve_ns(db, qdb);
     // M-3: the destination policy is enforced in the engine, not at bind
     // time, so a policy changed after prepare still applies. A disabled
     // server refuses even an ADMIN; the opt-in form confines the parent.
@@ -3300,9 +3301,39 @@ fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             db.file_format_names()
         ))
     })?;
-    let t = db.table_in(&target, table)?;
-    format.write(&destination, t)?;
-    let rows = i64::try_from(t.num_rows).unwrap_or(i64::MAX);
+    let rows = if let Some(source) = source {
+        let mut cursor = crate::exec::cursor::QueryCursor::start(
+            db,
+            (**source).clone(),
+            cx.budget.clone(),
+            cx.session.clone(),
+        )?;
+        let schema: Vec<(String, DataType)> = cursor
+            .names()
+            .iter()
+            .cloned()
+            .zip(cursor.types().iter().copied())
+            .collect();
+        let mut writer = format.begin_write(&destination, &schema)?;
+        let mut rows = 0i64;
+        while let Some(chunk) = cursor.next_chunk()? {
+            rows = rows.saturating_add(chunk.num_rows() as i64);
+            writer.write_chunk(chunk)?;
+        }
+        writer.finish()?;
+        rows
+    } else {
+        let target = resolve_ns(db, qdb);
+        let t = db.table_in(&target, table)?;
+        let mut writer = format.begin_write(&destination, &t.schema())?;
+        for i in 0..t.num_chunks() {
+            if let Some(chunk) = t.scan_chunk(i)? {
+                writer.write_chunk(chunk)?;
+            }
+        }
+        writer.finish()?;
+        i64::try_from(t.num_rows).unwrap_or(i64::MAX)
+    };
     Ok(QueryResult::Selected {
         names: vec!["Count".to_string()],
         types: vec![DataType::Bigint],
@@ -9466,6 +9497,7 @@ fn explain_into(
             table,
             format,
             path,
+            ..
         } => {
             format!("CopyTo {} ({format}) -> '{path}'", qualify(db, table))
         }
@@ -10075,6 +10107,9 @@ struct Stream<'p> {
     types: Vec<DataType>,
     /// Output chunks produced by the last batch pull (Filter/Project).
     pending: std::collections::VecDeque<DataChunk>,
+    /// The next Filter/Project batch's length: [`STREAM_BATCH`], then
+    /// [`next_ahead`].
+    batch: usize,
 }
 
 /// A started scan: materialized chunks, a table function's push scan, or a
@@ -10082,17 +10117,21 @@ struct Stream<'p> {
 enum ScanChunks {
     Done(std::vec::IntoIter<DataChunk>),
     Source(SourceStream),
-    /// A store table, decoded one chunk per pull and dropped by the consumer
-    /// (the decoded cache keeps what its own budget allows), so a scan of a
-    /// large table never holds the table. Only owned indices live here: each
-    /// pull looks the table up in the context's store, so the stream never
-    /// borrows it (see [`StreamKind`]).
+    /// A store table, decoded a run of chunks at a time and dropped by the
+    /// consumer (the decoded cache keeps what its own budget allows), so a
+    /// scan of a large table never holds the table. Only owned indices live
+    /// here: each run looks the table up in the context's store, so the
+    /// stream never borrows it (see [`StreamKind`]).
     Store {
         lookup: crate::storage::SchemaPath,
         /// The chunks zone pruning left, in scan order.
         keep: Vec<usize>,
         next: usize,
         emitted: usize,
+        /// Chunks decoded by the last run and not yet pulled.
+        ready: std::collections::VecDeque<DataChunk>,
+        /// The next run's length: 1 at first, then [`next_ahead`].
+        ahead: usize,
     },
 }
 
@@ -10114,6 +10153,8 @@ impl ScanChunks {
             keep,
             next: 0,
             emitted: 0,
+            ready: std::collections::VecDeque::new(),
+            ahead: 1,
         }))
     }
 }
@@ -10211,10 +10252,38 @@ impl SourceStream {
     }
 }
 
-/// How many input chunks a Filter/Project cursor pulls per batch: the batch
-/// keeps the per-chunk operators parallel (they run through `par_iter`)
-/// while bounding the work wasted when the limit is reached mid-batch.
+/// How many input chunks a Filter/Project cursor pulls in its first batch:
+/// the batch keeps the per-chunk operators parallel (they run through
+/// `par_iter`) while bounding the work wasted when the limit is reached
+/// mid-batch. Each later batch doubles, up to [`STREAM_AHEAD`] chunks or
+/// [`STREAM_AHEAD_BYTES`].
 const STREAM_BATCH: usize = 4;
+
+/// The longest run of chunks a streaming store scan decodes at once, and the
+/// largest Filter/Project batch; [`STREAM_AHEAD_BYTES`] caps both first.
+/// Runs start short, so a `LIMIT` met by the first chunk decodes only that
+/// chunk, and double, so a long scan pays one parallel hand-off per run
+/// instead of one per chunk. A cursor's producer thread is not a pool
+/// worker, and each `par_iter` it starts waits for the pool to pick the work
+/// up: with 4-chunk batches that wait was most of a streamed scan's time
+/// (C API fetch of SF1 `lineitem` 2.3x the materialized path), and with a
+/// 32-chunk cap a one-column scan still paid it 90 times (2.4x).
+const STREAM_AHEAD: usize = 1024;
+
+/// What one run or batch may hold, measured on its first chunk: about 30
+/// chunks of every `lineitem` column, about 500 of one `BIGINT` column.
+const STREAM_AHEAD_BYTES: usize = 8 << 20;
+
+/// The next run length after one of `len` chunks whose first chunk took
+/// `first_bytes`: double, within both caps, and never below one chunk.
+fn next_ahead(len: usize, first_bytes: usize) -> usize {
+    let by_bytes = STREAM_AHEAD_BYTES / first_bytes.max(1);
+    (len * 2).min(STREAM_AHEAD).min(by_bytes).max(1)
+}
+
+fn chunk_memory_size(chunk: &DataChunk) -> usize {
+    chunk.columns.iter().map(|v| v.memory_size()).sum()
+}
 
 /// The cursor's contract (`exec::cursor`): a `StreamKind` may borrow only
 /// from the plan (`&'p LogicalPlan`, `&'p BoundExpr`, `&'p [DataType]`).
@@ -10348,12 +10417,18 @@ impl<'p> Stream<'p> {
             names,
             types,
             pending: std::collections::VecDeque::new(),
+            batch: STREAM_BATCH,
         }))
     }
 
     /// The next output chunk, or `None` when the input is exhausted.
     fn next(&mut self, cx: &Cx) -> Result<Option<DataChunk>> {
-        let Stream { kind, pending, .. } = self;
+        let Stream {
+            kind,
+            pending,
+            batch: batch_len,
+            ..
+        } = self;
         if let Some(chunk) = pending.pop_front() {
             return Ok(Some(chunk));
         }
@@ -10379,23 +10454,36 @@ impl<'p> Stream<'p> {
                             keep,
                             next,
                             emitted,
+                            ready,
+                            ahead,
                         } => {
                             let LogicalPlan::Scan { table, .. } = plan else {
                                 unreachable!("a store scan streams a Scan node");
                             };
-                            while let Some(&index) = keep.get(*next) {
-                                *next += 1;
+                            while ready.is_empty() && *next < keep.len() {
                                 cx.check_deadline()?;
+                                let end = (*next + *ahead).min(keep.len());
+                                let run = &keep[*next..end];
+                                *next = end;
                                 let t = cx.db.table_in(&*lookup, table)?;
                                 let scan =
                                     StoreScan::new(t, cx.projections.for_scan(plan), None, true);
-                                if let Some(mut chunk) = scan.chunk(index)? {
+                                let decoded = if let [index] = run {
+                                    vec![scan.chunk(*index)?]
+                                } else {
+                                    run.par_iter()
+                                        .map(|&index| scan.chunk(index))
+                                        .collect::<Result<Vec<_>>>()?
+                                };
+                                let first = decoded.iter().flatten().next();
+                                *ahead = next_ahead(run.len(), first.map_or(0, chunk_memory_size));
+                                for mut chunk in decoded.into_iter().flatten() {
                                     chunk.ordinal = *emitted;
                                     *emitted += 1;
-                                    return Ok(Some(chunk));
+                                    ready.push_back(chunk);
                                 }
                             }
-                            Ok(None)
+                            Ok(ready.pop_front())
                         }
                     };
                 }
@@ -10412,7 +10500,7 @@ impl<'p> Stream<'p> {
                 }
                 StreamKind::Filter { input, predicate } => {
                     if pending.is_empty() {
-                        let batch = pull_batch(cx, input)?;
+                        let batch = pull_batch(cx, input, batch_len)?;
                         if batch.is_empty() {
                             return Ok(None);
                         }
@@ -10429,7 +10517,7 @@ impl<'p> Stream<'p> {
                 }
                 StreamKind::Project { input, exprs, read } => {
                     if pending.is_empty() {
-                        let batch = pull_batch(cx, input)?;
+                        let batch = pull_batch(cx, input, batch_len)?;
                         if batch.is_empty() {
                             return Ok(None);
                         }
@@ -10479,14 +10567,19 @@ impl<'p> Stream<'p> {
     }
 }
 
-/// Pull up to [`STREAM_BATCH`] chunks from `input`.
-fn pull_batch(cx: &Cx, input: &mut Stream<'_>) -> Result<Vec<DataChunk>> {
-    let mut batch = Vec::new();
-    while batch.len() < STREAM_BATCH {
+/// Pull up to `*len` chunks from `input`, then grow `*len` (see
+/// [`next_ahead`]).
+fn pull_batch(cx: &Cx, input: &mut Stream<'_>, len: &mut usize) -> Result<Vec<DataChunk>> {
+    let want = *len;
+    let mut batch = Vec::with_capacity(want);
+    while batch.len() < want {
         match input.next(cx)? {
             Some(chunk) => batch.push(chunk),
             None => break,
         }
+    }
+    if let Some(first) = batch.first() {
+        *len = next_ahead(want, chunk_memory_size(first));
     }
     Ok(batch)
 }

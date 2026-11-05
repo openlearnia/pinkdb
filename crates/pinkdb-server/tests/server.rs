@@ -1614,3 +1614,111 @@ fn clients_start_in_the_default_database_after_a_logged_use() {
     handle.join();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A single SELECT streams through `Client::query_stream`; every row arrives
+/// exactly once and the connection is usable afterwards.
+#[test]
+fn query_stream_reads_a_large_result_to_the_end() {
+    let (handle, addr) = start();
+    let mut client = Client::connect(&addr).expect("connect");
+    let mut stream = client
+        .query_stream("SELECT i, i * 2 AS doubled FROM range(0, 100000) t(i);")
+        .expect("query_stream");
+    assert_eq!(stream.names(), ["i", "doubled"]);
+    let mut count = 0usize;
+    let mut sum = 0i64;
+    for batch in &mut stream {
+        for row in batch.expect("batch") {
+            let i = match &row[0] {
+                Value::Bigint(i) => *i,
+                other => panic!("expected BIGINT, got {other:?}"),
+            };
+            assert_eq!(row[1], Value::Bigint(i * 2));
+            count += 1;
+            sum += i;
+        }
+    }
+    assert_eq!(count, 100_000);
+    assert_eq!(sum, (0..100_000).sum::<i64>());
+    drop(stream);
+    assert_eq!(
+        rows(client.execute("SELECT 7;").unwrap()),
+        vec![vec![Value::Integer(7)]]
+    );
+    handle.join();
+}
+
+/// A cursor error after the first `Rows` frame reaches the client as an
+/// `Error`, with the rows already sent still delivered.
+/// The byte cap bounds results a statement buffers, not a stream: a cursor
+/// hands chunks to the socket without ever holding the whole result. The row
+/// cap still applies (see `result_caps_are_enforced_over_the_wire`).
+#[test]
+fn query_stream_ignores_byte_cap() {
+    let server = Server::bind("127.0.0.1:0", Database::new())
+        .unwrap()
+        .max_result_bytes(64);
+    let addr = server.local_addr().to_string();
+    let _handle = server.spawn().unwrap();
+    let mut client = Client::connect(&addr).unwrap();
+    let stream = client
+        .query_stream("SELECT i FROM range(0, 1000) t(i);")
+        .unwrap();
+    let rows: usize = stream.map(|batch| batch.unwrap().len()).sum();
+    assert_eq!(rows, 1000);
+}
+
+#[test]
+fn query_stream_reports_a_mid_stream_error() {
+    let (handle, addr) = start();
+    let mut client = Client::connect(&addr).expect("connect");
+    let mut stream = client
+        .query_stream(
+            "SELECT CASE WHEN i = 1000000 THEN i / 0 ELSE i END AS i, \
+             'x' || i::VARCHAR || 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' AS s \
+             FROM range(0, 2000000) t(i);",
+        )
+        .expect("query_stream");
+    let mut seen = 0usize;
+    let mut error = None;
+    for batch in &mut stream {
+        match batch {
+            Ok(batch) => seen += batch.len(),
+            Err(e) => {
+                error = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    assert!(seen > 0, "the error must follow some Rows frames");
+    let error = error.expect("mid-stream error");
+    assert!(error.contains("division by zero"), "{error}");
+    drop(stream);
+    // The server reports a cursor error and closes that connection; a fresh
+    // client is unaffected.
+    assert_server_healthy(&addr);
+    handle.join();
+}
+
+/// Dropping a client mid-stream stops the server's cursor and leaves the
+/// server able to accept new clients.
+#[test]
+fn client_disconnect_mid_stream_leaves_the_server_healthy() {
+    let (handle, addr) = start();
+    let mut raw = Raw::connect(&addr);
+    raw.execute("SELECT i FROM range(0, 5000000) t(i);");
+    match raw.read() {
+        Response::ResultSet { .. } => {}
+        other => panic!("expected ResultSet, got {other:?}"),
+    }
+    match raw.read() {
+        Response::Rows { rows } => assert!(!rows.is_empty()),
+        other => panic!("expected Rows, got {other:?}"),
+    }
+    drop(raw);
+
+    // The connection thread notices the closed socket on its next write and
+    // drops the cursor; new clients are admitted independently.
+    assert_server_healthy(&addr);
+    handle.join();
+}

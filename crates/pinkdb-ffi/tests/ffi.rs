@@ -553,12 +553,22 @@ fn profiling_is_per_handle() {
     pinkdb_close(plain);
 }
 
-/// Run a statement that is expected to fail: its error message and class.
-fn exec_err(h: *mut PinkHandle, sql: &str) -> (String, String) {
+/// Run a query whose v1 cell conversion is expected to fail. A streaming
+/// result defers that conversion until the cell is read.
+fn cell_err(h: *mut PinkHandle, sql: &str) -> (String, String) {
     let c = CString::new(sql).unwrap();
     let r = pinkdb_execute(h, c.as_ptr(), sql.len());
-    assert!(r.is_null(), "expected an error for {sql:?}");
-    (last_error(), last_error_class())
+    assert!(!r.is_null(), "expected a result for {sql:?}");
+    let value = pinkdb_result_value(r, 0, 0, 0);
+    assert_eq!(value.type_tag, PINKDB_TYPE_NULL, "{sql:?}");
+    let msg = unsafe { CStr::from_ptr(pinkdb_result_error(r)) }
+        .to_string_lossy()
+        .into_owned();
+    let class = unsafe { CStr::from_ptr(pinkdb_result_error_class(r)) }
+        .to_string_lossy()
+        .into_owned();
+    pinkdb_result_free(r);
+    (msg, class)
 }
 
 /// The `f64` elements of an ARRAY cell.
@@ -718,10 +728,10 @@ fn arrays_cross_the_c_abi_as_double_payloads() {
 
     // A NULL element has no channel, and an INTEGER array has no payload: both
     // are refused with a type error instead of being guessed at.
-    let (msg, class) = exec_err(h, "SELECT [1, 2, 3];");
+    let (msg, class) = cell_err(h, "SELECT [1, 2, 3];");
     assert_eq!(class, "type", "{msg}");
     assert!(msg.contains("only FLOAT and DOUBLE arrays"), "{msg}");
-    let (msg, class) = exec_err(h, "SELECT CAST('[1.0, NULL, 3.0]' AS DOUBLE[3]);");
+    let (msg, class) = cell_err(h, "SELECT CAST('[1.0, NULL, 3.0]' AS DOUBLE[3]);");
     assert_eq!(class, "type", "{msg}");
     assert!(msg.contains("NULL element"), "{msg}");
     pinkdb_result_free(r);

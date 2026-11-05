@@ -150,6 +150,7 @@ pub mod write;
 use std::sync::Arc;
 
 use pinkdb::attached::PrunePredicate;
+use pinkdb::filefmt::ChunkWriter;
 use pinkdb::{
     DataChunk, DataTable, DataType, FileFormat, PinkDb, PinkDbError, Result, TableFunctionCall,
     TableScanOutput, TableSource,
@@ -199,6 +200,41 @@ impl FileFormat for ParquetSink {
                 PinkDbError::Execution(format!("cannot write \"{}\": {e}", path.display()))
             })
         })
+    }
+
+    fn begin_write<'a>(
+        &'a self,
+        path: &Path,
+        schema: &[(String, DataType)],
+    ) -> Result<Box<dyn ChunkWriter + 'a>> {
+        let inner = write::ParquetFileWriter::new(path, schema).map_err(|e| {
+            PinkDbError::Execution(format!("cannot write \"{}\": {e}", path.display()))
+        })?;
+        Ok(Box::new(ParquetChunkWriter { inner }))
+    }
+}
+
+struct ParquetChunkWriter {
+    inner: write::ParquetFileWriter,
+}
+
+impl ChunkWriter for ParquetChunkWriter {
+    fn write_chunk(&mut self, chunk: DataChunk) -> Result<()> {
+        let path = self.inner.path().display().to_string();
+        self.inner
+            .write_chunk(&chunk)
+            .map_err(|e| PinkDbError::Execution(format!("cannot write \"{path}\": {e}")))
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<()> {
+        let path = self.inner.path().to_path_buf();
+        let tmp = self.inner.tmp().to_path_buf();
+        self.inner.close().map_err(|e| {
+            PinkDbError::Execution(format!("cannot finish \"{}\": {e}", path.display()))
+        })?;
+        pinkdb::filefmt::publish_temp(&tmp, &path)?;
+        self.inner.mark_finished();
+        Ok(())
     }
 }
 

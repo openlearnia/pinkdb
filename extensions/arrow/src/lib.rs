@@ -97,10 +97,12 @@ use std::sync::Arc;
 #[cfg(feature = "remote")]
 use std::sync::Mutex;
 
+use pinkdb::filefmt::ChunkWriter;
 use pinkdb::table_source::{TableFunctionCall, TableScanOutput, TableSource, TableSourceStats};
 use pinkdb::types::Result;
 use pinkdb::{
-    AttachedScan, DataTable, DataType, ExtensionPackage, FileFormat, PinkDb, PrunePredicate,
+    AttachedScan, DataChunk, DataTable, DataType, ExtensionPackage, FileFormat, PinkDb,
+    PinkDbError, PrunePredicate,
 };
 
 /// The registered format's name: `FORMAT arrow`.
@@ -288,6 +290,74 @@ impl FileFormat for ArrowSink {
     fn write(&self, path: &Path, table: &DataTable) -> Result<()> {
         write::write(path, table)
     }
+
+    fn begin_write<'a>(
+        &'a self,
+        path: &Path,
+        schema: &[(String, DataType)],
+    ) -> Result<Box<dyn ChunkWriter + 'a>> {
+        let arrow_schema = arrow_schema(schema)?;
+        let (tmp, file) = pinkdb::filefmt::temp_sibling(path)?;
+        let writer = arrow_ipc::writer::FileWriter::try_new(file, &arrow_schema).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            PinkDbError::Execution(format!("cannot write \"{}\": {e}", path.display()))
+        })?;
+        Ok(Box::new(ArrowChunkWriter {
+            writer: Some(writer),
+            schema: arrow_schema,
+            tmp,
+            path: path.to_path_buf(),
+            finished: false,
+        }))
+    }
+}
+
+fn arrow_schema(schema: &[(String, DataType)]) -> Result<arrow_schema::Schema> {
+    schema
+        .iter()
+        .map(|(name, dtype)| crate::types::arrow_field(name, *dtype))
+        .collect::<Result<Vec<_>>>()
+        .map(arrow_schema::Schema::new)
+}
+
+struct ArrowChunkWriter {
+    writer: Option<arrow_ipc::writer::FileWriter<std::fs::File>>,
+    schema: arrow_schema::Schema,
+    tmp: std::path::PathBuf,
+    path: std::path::PathBuf,
+    finished: bool,
+}
+
+impl ChunkWriter for ArrowChunkWriter {
+    fn write_chunk(&mut self, chunk: DataChunk) -> Result<()> {
+        let batch = write::build_batch(&self.schema, &chunk)?;
+        self.writer
+            .as_mut()
+            .expect("arrow writer is still open")
+            .write(&batch)
+            .map_err(|e| {
+                PinkDbError::Execution(format!("cannot write \"{}\": {e}", self.path.display()))
+            })
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<()> {
+        let mut writer = self.writer.take().expect("arrow writer is still open");
+        writer.finish().map_err(|e| {
+            PinkDbError::Execution(format!("cannot finish \"{}\": {e}", self.path.display()))
+        })?;
+        drop(writer);
+        pinkdb::filefmt::publish_temp(&self.tmp, &self.path)?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for ArrowChunkWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
 }
 
 /// Register the Arrow IPC read source and write sink on one store (embedder
@@ -380,7 +450,7 @@ mod tests {
         );
         // Re-registration replaces instead of duplicating.
         register(&mut db);
-        assert_eq!(db.file_format_names(), "arrow");
+        assert_eq!(db.file_format_names(), "arrow, csv");
     }
 
     /// `read_*` name resolution, arity and argument-type refusals.

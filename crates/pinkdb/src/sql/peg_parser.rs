@@ -2880,7 +2880,22 @@ peg::parser! {
         /// time, DuckDB's rule.
         rule copy_stmt() -> Statement
             = word("copy") t:table_ref() word("to") p:string_lit() fmt:copy_format() {
-                  Statement::CopyTo { qual: t.0, table: t.1, path: p, format: fmt }
+                  Statement::CopyTo {
+                      qual: t.0,
+                      table: Some(t.1),
+                      query: None,
+                      path: p,
+                      format: fmt,
+                  }
+              }
+            / word("copy") lparen() q:query() rparen() word("to") p:string_lit() fmt:copy_format() {
+                  Statement::CopyTo {
+                      qual: Qualifier::none(),
+                      table: None,
+                      query: Some(Box::new(q)),
+                      path: p,
+                      format: fmt,
+                  }
               }
 
         rule copy_format() -> Option<String>

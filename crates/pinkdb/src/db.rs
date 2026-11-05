@@ -552,6 +552,29 @@ impl<'a> ExecInput<'a> {
         }
     }
 
+    /// Run the optimizer over a statement's bound plan, as `PinkDb::execute`
+    /// does for every statement. Callers run it after the privilege check,
+    /// so the check sees the plan as bound. A plan input (the appender's
+    /// flush) is a fixed INSERT and runs as built.
+    fn optimize(
+        &self,
+        db: &PinkDb,
+        plan: LogicalPlan,
+        profile: Option<&mut ProfileDraft>,
+    ) -> LogicalPlan {
+        match self {
+            Self::Stmt(_) => {
+                let start = profile.as_ref().map(|_| Instant::now());
+                let plan = crate::optimizer::optimize(db, plan);
+                if let Some(p) = profile {
+                    p.optimize += start.map(|s| s.elapsed()).unwrap_or_default();
+                }
+                plan
+            }
+            Self::Plan(_) => plan,
+        }
+    }
+
     /// Bind under `db`. A plan input is already bound and typed; cloning it
     /// shares its chunk columns (`Arc`), so a flush copies no row values.
     fn bind(
@@ -634,8 +657,7 @@ impl Connection {
     /// their effects.
     ///
     /// Unlike the engine runner, this path binds and validates under the store
-    /// lock it executes against and runs no optimizer pass, so
-    /// [`QueryProfile::optimize`] is always zero here.
+    /// lock it executes against; it optimizes like the engine runner.
     pub fn execute_profiled(&mut self, sql: &str) -> Result<Vec<(QueryResult, QueryProfile)>> {
         let mut profiles = Vec::new();
         let results =
@@ -902,6 +924,11 @@ impl Connection {
     /// deadline starting before binding.
     pub fn set_exec_limits(&mut self, limits: crate::exec::ExecLimits) {
         self.exec_limits = Some(limits);
+    }
+
+    /// This connection's per-statement limits (the embedded default when unset).
+    pub fn exec_limits(&self) -> crate::exec::ExecLimits {
+        self.exec_limits.unwrap_or_default()
     }
 
     /// Remove this connection's limits (back to the embedded default).
@@ -1197,6 +1224,7 @@ impl Connection {
                 // the snapshot binds and runs in this session.
                 txn.work.session = self.session.clone();
                 enforce(gate.as_deref(), &txn.work, &plan, &pre_ns)?;
+                let plan = input.optimize(&txn.work, plan, profile.as_deref_mut());
                 // Wave 124: a transaction writes one storage (what it wrote so
                 // far comes from its write set).
                 let prior = txn_storages(&txn.work, &txn.table_writes)?;
@@ -1343,6 +1371,7 @@ impl Connection {
                 // the same lock the bind took, so no statement can slip
                 // between the check and its execution.
                 enforce(self.gate(), &shared, &plan, &pre_ns)?;
+                let plan = input.optimize(&shared, plan, profile.as_deref_mut());
                 // Re-attaching the lake a name already serves, with the same
                 // options, changes nothing: answer it here so it never takes
                 // the write lease or appends a WAL record (a store replays
@@ -1527,6 +1556,7 @@ impl Connection {
         shared.session_principal = self.principal.clone();
         shared.session = self.session.clone();
         enforce(self.gate(), &shared, &plan, &pre_ns)?;
+        let plan = input.optimize(&shared, plan, profile.as_deref_mut());
         shared.check_statement_storages(&plan, pre_ns.db(), &Default::default())?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
@@ -1549,6 +1579,7 @@ impl Connection {
             shared.session_principal = self.principal.clone();
             shared.session = self.session.clone();
             enforce(self.gate(), &shared, &plan, &pre_ns)?;
+            let plan = input.optimize(&shared, plan, profile.as_deref_mut());
             shared.check_statement_storages(&plan, pre_ns.db(), &Default::default())?;
             if crate::plan::writes_tables(&plan) {
                 shared.refuse_logged_attached_reads(&plan)?;
@@ -1673,6 +1704,7 @@ impl Connection {
         let plan = crate::plan::with_mv_source(plan, sql_text);
         shared.session_principal = self.principal.clone();
         enforce(self.gate(), &shared, &plan, &pre_ns)?;
+        let plan = input.optimize(&shared, plan, profile.as_deref_mut());
         shared.check_statement_storages(&plan, pre_ns.db(), &Default::default())?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;

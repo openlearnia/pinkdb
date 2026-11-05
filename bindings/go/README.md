@@ -70,9 +70,11 @@ func main() {
 | `Open(path string) (*DB, error)` | Open a durable database (checkpoint + WAL) at `path`. |
 | `OpenMemory() (*DB, error)` | Open a fresh, empty in-memory database. |
 | `(*DB).Execute(sql string) ([]Result, error)` | Run one or more `;`-separated statements; one `Result` per statement. |
+| `(*DB).Query(sql string) (*Rows, error)` | Stream one row-producing statement, one chunk at a time. |
 | `(*DB).SetAllowLoadExtension(allow bool) error` | Allow or refuse the SQL `LOAD EXTENSION '<path>'` statement (off by default). |
 | `(*DB).Prepare(sql string) (*Stmt, error)` | Parse exactly one statement with `?` placeholders into a reusable `Stmt`. |
 | `(*Stmt).Execute(args ...any) (Result, error)` | Bind one value per `?` and run the statement once. |
+| `(*Stmt).Query(args ...any) (*Rows, error)` | Bind one value per `?` and stream the result. |
 | `(*Stmt).ParameterCount() int` | Number of `?` placeholders. |
 | `(*Stmt).SQL() string` | The original statement text. |
 | `(*Stmt).Close()` | Free the native prepared statement. Idempotent. |
@@ -80,7 +82,7 @@ func main() {
 | `(*DB).ABI() uint32` | ABI version reported by the linked library, `major<<16 \| minor` (split it with `ABIMajorMinor`); stays callable after `Close`. |
 
 Both open functions check `pinkdb_abi_version()` first: a library whose ABI is not
-major 1 at minor 4 or later fails with an error naming both versions. `Open` rejects an empty path
+major 1 at minor 5 or later fails with an error naming both versions. `Open` rejects an empty path
 or one containing a NUL byte before any native call; a path with invalid
 UTF-8 fails at the native boundary with `path is not valid UTF-8`. SQL that
 is not valid UTF-8 fails with `SQL is not valid UTF-8` and leaves the handle
@@ -218,10 +220,12 @@ is copied before the next native call on the thread replaces it.
 
 ## Limitations
 
-Results are materialized: `Execute` and `Stmt.Execute` copy every row into
-Go slices before returning, so a very large SELECT costs memory proportional
-to its result. There is no row iterator yet (the Node and Python bindings
-have one); use `LIMIT` for large tables until that follow-up lands.
+`Execute` and `Stmt.Execute` materialize every row into Go slices, so a very
+large SELECT through them costs memory proportional to its result. `Query`
+and `Stmt.Query` stream instead: call `Next`, copy the current row with
+`Scan`, and `Close` (or read to the end) to free the cursor. A `*Rows` is not
+goroutine-safe, and while one is open the `DB` is busy: `Execute`, `Prepare`,
+`Query` and `Stmt.Execute` return `ErrBusy` until it is closed or drained.
 
 ABI v1 returns column names and object/session names (`Columns`, `Name`) as
 NUL-terminated C strings, so an **identifier containing a NUL byte is

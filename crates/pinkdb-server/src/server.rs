@@ -83,7 +83,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use pinkdb::{Connection, DataType, Database, ExecLimits, QueryProfile, QueryResult, Value};
+use pinkdb::{
+    Connection, DataType, Database, ExecLimits, QueryCursor, QueryProfile, QueryResult, Value,
+};
 
 use crate::protocol::{self, DoneKind, PROTOCOL_VERSION, ProtocolError, Request, Response};
 
@@ -1195,26 +1197,62 @@ fn serve_client<S: Read + Write + FrameReadTimeout>(
                     }
                     continue;
                 }
+                let single = !profiling && is_single_statement(&sql);
+                // A cursor streams its result instead of materializing it, so
+                // the materialization caps do not apply; the deadline does.
+                let saved_limits = single.then(|| conn.exec_limits());
+                if let Some(limits) = saved_limits {
+                    conn.set_exec_limits(ExecLimits {
+                        max_result_bytes: None,
+                        ..limits
+                    });
+                }
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_statement_hook(&sql);
-                    if profiling {
-                        conn.execute_profiled(&sql).map(|profiled| {
-                            profiled
-                                .into_iter()
-                                .map(|(result, profile)| (result, Some(profile)))
-                                .collect::<Vec<_>>()
-                        })
+                    if single {
+                        conn.query_cursor(&sql).map(ExecOutcome::Cursor)
+                    } else if profiling {
+                        conn.execute_profiled(&sql)
+                            .map(|profiled| {
+                                profiled
+                                    .into_iter()
+                                    .map(|(result, profile)| (result, Some(profile)))
+                                    .collect::<Vec<_>>()
+                            })
+                            .map(ExecOutcome::Results)
                     } else {
-                        conn.execute(&sql).map(|results| {
-                            results
-                                .into_iter()
-                                .map(|result| (result, None))
-                                .collect::<Vec<_>>()
-                        })
+                        conn.execute(&sql)
+                            .map(|results| {
+                                results
+                                    .into_iter()
+                                    .map(|result| (result, None))
+                                    .collect::<Vec<_>>()
+                            })
+                            .map(ExecOutcome::Results)
                     }
                 }));
+                if let Some(limits) = saved_limits {
+                    conn.set_exec_limits(limits);
+                }
                 match outcome {
-                    Ok(Ok(results)) => {
+                    Ok(Ok(ExecOutcome::Cursor(cursor))) => {
+                        if let Err(e) = send_cursor(reader.get_mut(), cursor) {
+                            if !matches!(e, ProtocolError::Io(_)) {
+                                let _ = send_error(reader.get_mut(), &e.to_string());
+                            }
+                            return;
+                        }
+                        if protocol::write_response(
+                            reader.get_mut(),
+                            &Response::BatchDone { statements: 1 },
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                    Ok(Ok(ExecOutcome::Results(results))) => {
                         let statements = match u32::try_from(results.len()) {
                             Ok(n) => n,
                             Err(_) => {
@@ -1385,6 +1423,13 @@ fn serve_client<S: Read + Write + FrameReadTimeout>(
                     }
                     continue;
                 };
+                let saved_limits = (!profiling).then(|| conn.exec_limits());
+                if let Some(limits) = saved_limits {
+                    conn.set_exec_limits(ExecLimits {
+                        max_result_bytes: None,
+                        ..limits
+                    });
+                }
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let bound = conn.bind(stmt, &values)?;
                     run_statement_hook(bound.sql());
@@ -1393,7 +1438,7 @@ fn serve_client<S: Read + Write + FrameReadTimeout>(
                         // SQL, so the profiled runner parses the same text and
                         // returns the same result — plus the profile.
                         let mut profiled = conn.execute_profiled(bound.sql())?;
-                        profiled
+                        let (result, profile) = profiled
                             .pop()
                             .map(|(result, profile)| (result, Some(profile)))
                             .ok_or_else(|| {
@@ -1401,27 +1446,52 @@ fn serve_client<S: Read + Write + FrameReadTimeout>(
                                     "internal error: bound statement produced no result"
                                         .to_string(),
                                 )
-                            })
+                            })?;
+                        Ok(ExecOutcome::Results(vec![(result, profile)]))
                     } else {
-                        conn.execute_bound(&bound).map(|result| (result, None))
+                        conn.query_cursor(bound.sql()).map(ExecOutcome::Cursor)
                     }
                 }));
+                if let Some(limits) = saved_limits {
+                    conn.set_exec_limits(limits);
+                }
                 match outcome {
-                    Ok(Ok((result, profile))) => {
-                        // A bound statement is exactly one statement: one
-                        // result group, then the batch terminator.
-                        if let Err(e) = send_result(reader.get_mut(), &result) {
+                    Ok(Ok(ExecOutcome::Cursor(cursor))) => {
+                        if let Err(e) = send_cursor(reader.get_mut(), cursor) {
                             if !matches!(e, ProtocolError::Io(_)) {
                                 let _ = send_error(reader.get_mut(), &e.to_string());
                             }
                             return;
                         }
-                        // v10: the statement's profile follows its Done.
-                        if let Some(profile) = profile
-                            && protocol::write_response(reader.get_mut(), &profile_frame(&profile))
-                                .is_err()
+                        if protocol::write_response(
+                            reader.get_mut(),
+                            &Response::BatchDone { statements: 1 },
+                        )
+                        .is_err()
                         {
                             return;
+                        }
+                    }
+                    Ok(Ok(ExecOutcome::Results(results))) => {
+                        for (result, profile) in &results {
+                            // A bound statement is exactly one statement: one
+                            // result group, then the batch terminator.
+                            if let Err(e) = send_result(reader.get_mut(), result) {
+                                if !matches!(e, ProtocolError::Io(_)) {
+                                    let _ = send_error(reader.get_mut(), &e.to_string());
+                                }
+                                return;
+                            }
+                            // v10: the statement's profile follows its Done.
+                            if let Some(profile) = profile
+                                && protocol::write_response(
+                                    reader.get_mut(),
+                                    &profile_frame(profile),
+                                )
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                         if protocol::write_response(
                             reader.get_mut(),
@@ -1479,6 +1549,13 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     } else {
         "non-string panic payload".to_string()
     }
+}
+
+/// One `Execute` batch's outcome: a single statement streams from a cursor,
+/// the profiling and multi-statement paths stay materialized.
+pub(crate) enum ExecOutcome {
+    Cursor(QueryCursor),
+    Results(Vec<(QueryResult, Option<QueryProfile>)>),
 }
 
 /// Stream one statement's result: a `ResultSet` frame, chunked `Rows`
@@ -1653,32 +1730,115 @@ fn stream_selected<S: FrameSink + ?Sized>(
     types: &[DataType],
     rows: &[Vec<Value>],
 ) -> Result<(), ProtocolError> {
-    let result_set = Response::ResultSet {
+    stream_rows(w, names, types, rows.iter().cloned())
+}
+
+/// Stream row batches (a materialized result, or one cursor chunk at a time)
+/// with the same `ResultSet`/`Rows` framing and the same count/byte budget.
+fn stream_rows<S: FrameSink + ?Sized>(
+    w: &mut S,
+    names: &[String],
+    types: &[DataType],
+    rows: impl IntoIterator<Item = Vec<Value>>,
+) -> Result<(), ProtocolError> {
+    w.send_frame(&Response::ResultSet {
         names: names.to_vec(),
         types: types.to_vec(),
-    };
-    w.send_frame(&result_set)?;
-    let mut batch: Vec<Vec<Value>> = Vec::new();
-    let mut batch_bytes = 0usize;
+    })?;
+    let mut batcher = RowsBatcher::default();
     for row in rows {
-        let row_bytes = row_encoded_len(row);
-        if !batch.is_empty()
-            && (batch.len() >= protocol::ROWS_PER_FRAME
-                || batch_bytes + row_bytes > ROWS_FRAME_BUDGET)
+        batcher.push(w, row)?;
+    }
+    batcher.finish(w)
+}
+
+#[derive(Default)]
+struct RowsBatcher {
+    batch: Vec<Vec<Value>>,
+    bytes: usize,
+}
+
+impl RowsBatcher {
+    fn push<S: FrameSink + ?Sized>(
+        &mut self,
+        w: &mut S,
+        row: Vec<Value>,
+    ) -> Result<(), ProtocolError> {
+        let row_bytes = row_encoded_len(&row);
+        if !self.batch.is_empty()
+            && (self.batch.len() >= protocol::ROWS_PER_FRAME
+                || self.bytes + row_bytes > ROWS_FRAME_BUDGET)
         {
-            let frame = Response::Rows {
-                rows: std::mem::take(&mut batch),
-            };
-            w.send_frame(&frame)?;
-            batch_bytes = 0;
+            self.flush(w)?;
         }
-        batch.push(row.clone());
-        batch_bytes += row_bytes;
+        self.batch.push(row);
+        self.bytes += row_bytes;
+        Ok(())
     }
-    if !batch.is_empty() {
-        w.send_frame(&Response::Rows { rows: batch })?;
+
+    fn flush<S: FrameSink + ?Sized>(&mut self, w: &mut S) -> Result<(), ProtocolError> {
+        if !self.batch.is_empty() {
+            w.send_frame(&Response::Rows {
+                rows: std::mem::take(&mut self.batch),
+            })?;
+            self.bytes = 0;
+        }
+        Ok(())
     }
-    Ok(())
+
+    fn finish<S: FrameSink + ?Sized>(self, w: &mut S) -> Result<(), ProtocolError> {
+        if !self.batch.is_empty() {
+            w.send_frame(&Response::Rows { rows: self.batch })?;
+        }
+        Ok(())
+    }
+}
+
+/// Does this text hold exactly one statement? Only then can the server run it
+/// through a query cursor; a multi-statement batch keeps materialized results.
+pub(crate) fn is_single_statement(sql: &str) -> bool {
+    pinkdb::sql::parse_statements(sql).is_ok_and(|statements| statements.len() == 1)
+}
+
+/// Stream a live query cursor: a `ResultSet`, one `Rows` batch per fetched
+/// chunk, then `Done(Selected)`. A non-row single statement has no cursor
+/// rows, so it falls back to the materialized result.
+pub(crate) fn send_cursor<S: FrameSink + ?Sized>(
+    w: &mut S,
+    mut cursor: QueryCursor,
+) -> Result<(), ProtocolError> {
+    if !cursor.has_rows() {
+        let result = cursor.result().ok_or_else(|| {
+            ProtocolError::Unexpected("cursor has neither rows nor a result".to_string())
+        })?;
+        return send_result(w, &result);
+    }
+    let names = cursor.names().to_vec();
+    let types = cursor.types().to_vec();
+    w.send_frame(&Response::ResultSet {
+        names: names.clone(),
+        types: types.clone(),
+    })?;
+    let mut batcher = RowsBatcher::default();
+    loop {
+        match cursor.next_chunk() {
+            Ok(Some(chunk)) => {
+                for i in 0..chunk.num_rows() {
+                    let row = chunk.columns.iter().map(|c| c.get(i)).collect();
+                    batcher.push(w, row)?;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                // Rows already handed out stay on the wire; the Error frame
+                // that follows ends the batch.
+                batcher.flush(w)?;
+                return Err(ProtocolError::Server(e.to_string()));
+            }
+        }
+    }
+    batcher.finish(w)?;
+    done(w, DoneKind::Selected, 0, "")
 }
 
 fn done<S: FrameSink + ?Sized>(
