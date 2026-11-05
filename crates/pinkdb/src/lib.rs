@@ -67,6 +67,7 @@ pub mod macros;
 /// The process-wide memory budget (wave 136a): `SET memory_limit` and the
 /// reservations operators take against it.
 pub mod memory;
+pub mod nested;
 /// Streaming scan sources for the pipeline executor (wave 133b).
 pub mod morsel;
 pub(crate) mod mv;

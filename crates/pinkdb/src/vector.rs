@@ -55,6 +55,17 @@ pub enum VectorData {
     },
     /// UUID: the unsigned 128-bit values.
     Uuid(Vec<u128>),
+    /// LIST (`T[]`): row `i`'s elements are `child[offsets[i]..offsets[i +
+    /// 1]]`. Arrow's layout: `offsets` has one entry more than there are
+    /// rows and starts at 0; a NULL row has an empty range.
+    List {
+        ty: DataType,
+        offsets: Vec<u32>,
+        child: Box<Vector>,
+    },
+    /// STRUCT: one child vector per field, each as long as the parent; the
+    /// parent's validity says which rows are NULL as a whole.
+    Struct { ty: DataType, fields: Vec<Vector> },
     /// Signed 128-bit integers (`HUGEINT`).
     Int128(Vec<i128>),
     /// Unsigned 128-bit integers (`UHUGEINT`).

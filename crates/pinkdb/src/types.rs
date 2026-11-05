@@ -178,6 +178,11 @@ pub enum DataType {
     Hugeint,
     /// Unsigned 128-bit integer (DuckDB's `UHUGEINT`).
     Uhugeint,
+    /// Variable-length list (`T[]`): an interned element type, so `DataType`
+    /// stays `Copy` (see [`crate::nested`]).
+    List(crate::nested::NestedId),
+    /// Named fields (`STRUCT(a T, …)`), interned the same way.
+    Struct(crate::nested::NestedId),
 }
 
 /// Element kind of an [`DataType::Array`]. A small `Copy` enum, not a boxed
@@ -286,7 +291,35 @@ impl DataType {
             DataType::Uuid => "UUID".to_string(),
             DataType::Hugeint => "HUGEINT".to_string(),
             DataType::Uhugeint => "UHUGEINT".to_string(),
+            DataType::List(id) | DataType::Struct(id) => crate::nested::get(id).name(),
         }
+    }
+
+    /// The element type of a LIST, else `None`.
+    pub fn list_elem(self) -> Option<DataType> {
+        match self {
+            DataType::List(id) => match &*crate::nested::get(id) {
+                crate::nested::NestedType::List(elem) => Some(*elem),
+                crate::nested::NestedType::Struct(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The fields of a STRUCT, else `None`.
+    pub fn struct_fields(self) -> Option<std::sync::Arc<[(std::sync::Arc<str>, DataType)]>> {
+        match self {
+            DataType::Struct(id) => match &*crate::nested::get(id) {
+                crate::nested::NestedType::Struct(fields) => Some(std::sync::Arc::clone(fields)),
+                crate::nested::NestedType::List(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// True for LIST and STRUCT.
+    pub fn is_nested(self) -> bool {
+        matches!(self, DataType::List(_) | DataType::Struct(_))
     }
 
     /// Parse a bare type name (`CREATE TABLE`/`CAST`), case-insensitive.
@@ -455,6 +488,10 @@ pub enum Value {
     Hugeint(i128),
     /// Unsigned 128-bit integer (`UHUGEINT`).
     Uhugeint(u128),
+    /// One LIST value, shared so copying a cell never copies the list.
+    List(std::sync::Arc<crate::nested::ListValue>),
+    /// One STRUCT value, shared the same way.
+    Struct(std::sync::Arc<crate::nested::StructValue>),
 }
 
 impl PartialEq for Value {
@@ -491,6 +528,12 @@ impl PartialEq for Value {
             Value::Uuid(a) => matches!(other, Value::Uuid(b) if a == b),
             Value::Hugeint(a) => matches!(other, Value::Hugeint(b) if a == b),
             Value::Uhugeint(a) => matches!(other, Value::Uhugeint(b) if a == b),
+            Value::List(a) => {
+                matches!(other, Value::List(b) if a.ty == b.ty && a.items == b.items)
+            }
+            Value::Struct(a) => {
+                matches!(other, Value::Struct(b) if a.ty == b.ty && a.fields == b.fields)
+            }
         }
     }
 }
@@ -539,7 +582,19 @@ impl Value {
             Value::Uuid(_) => Some(DataType::Uuid),
             Value::Hugeint(_) => Some(DataType::Hugeint),
             Value::Uhugeint(_) => Some(DataType::Uhugeint),
+            Value::List(l) => Some(l.ty),
+            Value::Struct(s) => Some(s.ty),
         }
+    }
+
+    /// A LIST value of type `ty` (a LIST type).
+    pub fn list(ty: DataType, items: Vec<Value>) -> Value {
+        Value::List(std::sync::Arc::new(crate::nested::ListValue { ty, items }))
+    }
+
+    /// A STRUCT value of type `ty` (a STRUCT type), one value per field.
+    pub fn struct_of(ty: DataType, fields: Vec<Value>) -> Value {
+        Value::Struct(std::sync::Arc::new(crate::nested::StructValue { ty, fields }))
     }
 }
 
@@ -570,6 +625,8 @@ impl fmt::Display for Value {
             Value::Uuid(bits) => f.write_str(&crate::uuid::format(*bits)),
             Value::Hugeint(x) => write!(f, "{x}"),
             Value::Uhugeint(x) => write!(f, "{x}"),
+            Value::List(l) => f.write_str(&crate::nested::list_text(&l.items)),
+            Value::Struct(s) => f.write_str(&crate::nested::struct_text(&s.schema(), &s.fields)),
         }
     }
 }
