@@ -27,7 +27,9 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
 use super::eval as evaluate;
-use super::{Cx, ExecBudget, QueryResult, Stream, chunk_approx_bytes};
+use super::{
+    CancelFlag, Cx, ExecBudget, QueryResult, STATEMENT_CANCELLED, Stream, chunk_approx_bytes,
+};
 use crate::plan::LogicalPlan;
 use crate::storage::{PinkDb, Session};
 use crate::types::{DataType, PinkDbError, Result};
@@ -66,6 +68,10 @@ pub struct QueryCursor {
     /// A statement that produced no row set.
     result: Option<QueryResult>,
     rows: u64,
+    /// The statement's interrupt flag, checked on every fetch while a
+    /// producer runs: chunks it already handed over are not handed out
+    /// after an interrupt.
+    cancel: Option<CancelFlag>,
 }
 
 struct Producer {
@@ -108,6 +114,7 @@ impl QueryCursor {
         // pipeline borrows it, and the scan projections and the subquery memo
         // are keyed by its nodes' addresses.
         let plan = Arc::new(plan);
+        let cancel = budget.cancel.clone();
         let cx = Cx::with_budget(db, budget)
             .with_session(session)
             .with_projections(&plan);
@@ -146,6 +153,7 @@ impl QueryCursor {
             };
             let mut cursor = QueryCursor::buffered(names, types, buffered);
             cursor.producer = Some(Producer::spawn(snapshot, parts, handoff)?);
+            cursor.cancel = cancel;
             return Ok(cursor);
         }
         Ok(QueryCursor::buffered(names, types, buffered))
@@ -163,6 +171,7 @@ impl QueryCursor {
             producer: None,
             result: None,
             rows: 0,
+            cancel: None,
         }
     }
 
@@ -182,6 +191,7 @@ impl QueryCursor {
                     producer: None,
                     result: None,
                     rows: 0,
+                    cancel: None,
                 })
             }
             other => Ok(QueryCursor {
@@ -191,6 +201,7 @@ impl QueryCursor {
                 producer: None,
                 result: Some(other),
                 rows: 0,
+                cancel: None,
             }),
         }
     }
@@ -224,6 +235,13 @@ impl QueryCursor {
     /// The next chunk of the row set, or `None` at its end. An error ends the
     /// cursor: later calls return `None`.
     pub fn next_chunk(&mut self) -> Result<Option<DataChunk>> {
+        // A producer runs batches ahead of the caller and may have stopped
+        // already, so an interrupt is checked here as well as there.
+        if self.producer.is_some() && self.cancel.as_ref().is_some_and(CancelFlag::is_cancelled) {
+            self.buffered.clear();
+            self.producer = None;
+            return Err(PinkDbError::Execution(STATEMENT_CANCELLED.to_string()));
+        }
         let next = match self.buffered.pop_front() {
             Some(chunk) => Ok(Some(chunk)),
             None => self.recv(),

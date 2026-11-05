@@ -786,13 +786,17 @@ static void test_streaming_interrupt(void) {
     CHECK(chunk != NULL);
     pinkdb_destroy_chunk(chunk);
 
-    interrupt_arg arg = {conn, 0};
-    pthread_t thread;
-    CHECK(pthread_create(&thread, NULL, interrupter, &arg) == 0);
+    /* Interrupt between fetches, a few chunks in: the whole range streams in
+       well under 100 ms, so a timed interrupter thread can arrive after the
+       last chunk. The fetch after the interrupt ends the stream early. */
+    int fetched = 1;
     while ((chunk = pinkdb_result_fetch_chunk(result, 0)) != NULL) {
         pinkdb_destroy_chunk(chunk);
+        if (++fetched == 4) {
+            pinkdb_interrupt(conn);
+        }
     }
-    pthread_join(thread, NULL);
+    CHECK(fetched == 4);
     CHECK(strcmp(result_class(result), "interrupted") == 0);
     pinkdb_result_free(result);
 

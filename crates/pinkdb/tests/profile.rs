@@ -184,12 +184,10 @@ COMMIT;";
     assert!(profiles[2].in_transaction);
     assert!(profiles[3].in_transaction);
     assert!(profiles[4].in_transaction);
+    // The connection path optimizes like the engine runner (see
+    // tests/connection_plans.rs), so a SELECT reports optimize time.
+    assert!(profiles[3].optimize > Duration::ZERO);
     for profile in profiles {
-        assert_eq!(
-            profile.optimize,
-            Duration::ZERO,
-            "the connection path measures bind+optimize together as bind"
-        );
         assert_total_covers_phases(profile);
     }
 }
