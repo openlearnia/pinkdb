@@ -106,13 +106,13 @@ func nilAt(t *testing.T, row []any, i int) {
 // ----- tests -----
 
 func TestABIVersion(t *testing.T) {
-	if SupportedABI != (1<<16)|4 {
-		t.Fatalf("SupportedABI = %d, want 1.4", SupportedABI)
+	if SupportedABI != (1<<16)|5 {
+		t.Fatalf("SupportedABI = %d, want 1.5", SupportedABI)
 	}
 	db := mustOpenMemory(t)
 	defer db.Close()
 	if got := db.ABI(); got != SupportedABI {
-		t.Fatalf("ABI() = %d, want 1.4", got)
+		t.Fatalf("ABI() = %d, want 1.5", got)
 	}
 }
 
@@ -682,7 +682,7 @@ func TestCloseIdempotentAndUseAfterClose(t *testing.T) {
 	}
 	// ABI() is library-wide and stays callable after Close.
 	if got := db.ABI(); got != SupportedABI {
-		t.Fatalf("ABI() after close = %d, want 1.4", got)
+		t.Fatalf("ABI() after close = %d, want 1.5", got)
 	}
 }
 

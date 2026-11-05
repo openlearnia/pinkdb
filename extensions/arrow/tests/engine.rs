@@ -269,3 +269,34 @@ fn hugeint_columns_export_as_decimal128() {
         ]
     );
 }
+
+/// `COPY (SELECT …) TO` writes from the streaming cursor, not a materialized
+/// table, and reads back the same rows.
+#[test]
+fn copy_select_streams_from_a_cursor() {
+    let dir = scratch_dir("copy_select");
+    let file = dir.join("query.arrow");
+    let mut db = PinkDb::new();
+    pinkdb_arrow::register(&mut db);
+    db.execute(&format!(
+        "COPY (SELECT i, 'row-' || i::VARCHAR AS s FROM range(70000) t(i)) TO '{}' (FORMAT arrow);",
+        file.display()
+    ))
+    .unwrap();
+    let rows = query(
+        &mut db,
+        &format!(
+            "SELECT COUNT(*), SUM(i), COUNT(s) FROM read_arrow('{}');",
+            file.display()
+        ),
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Bigint(70_000),
+            Value::Hugeint(2_449_965_000),
+            Value::Bigint(70_000)
+        ]]
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

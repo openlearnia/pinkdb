@@ -652,69 +652,103 @@ async fn serve_connection(
                     }
                     continue;
                 }
+                let single = !profiling && server::is_single_statement(&sql);
                 let ran = run_blocking(&mut stream, conn, idle_timeout, move |conn, sink| {
+                    let saved_limits = single.then(|| conn.exec_limits());
+                    if let Some(limits) = saved_limits {
+                        conn.set_exec_limits(ExecLimits {
+                            max_result_bytes: None,
+                            ..limits
+                        });
+                    }
                     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         server::run_statement_hook(&sql);
-                        if profiling {
-                            conn.execute_profiled(&sql).map(|profiled| {
-                                profiled
-                                    .into_iter()
-                                    .map(|(result, profile)| (result, Some(profile)))
-                                    .collect::<Vec<_>>()
-                            })
+                        if single {
+                            conn.query_cursor(&sql).map(server::ExecOutcome::Cursor)
+                        } else if profiling {
+                            conn.execute_profiled(&sql)
+                                .map(|profiled| {
+                                    profiled
+                                        .into_iter()
+                                        .map(|(result, profile)| (result, Some(profile)))
+                                        .collect::<Vec<_>>()
+                                })
+                                .map(server::ExecOutcome::Results)
                         } else {
-                            conn.execute(&sql).map(|results| {
-                                results
-                                    .into_iter()
-                                    .map(|result| (result, None))
-                                    .collect::<Vec<_>>()
-                            })
+                            conn.execute(&sql)
+                                .map(|results| {
+                                    results
+                                        .into_iter()
+                                        .map(|result| (result, None))
+                                        .collect::<Vec<_>>()
+                                })
+                                .map(server::ExecOutcome::Results)
                         }
                     }));
+                    if let Some(limits) = saved_limits {
+                        conn.set_exec_limits(limits);
+                    }
                     let mut close = false;
                     match outcome {
-                        Ok(Ok(results)) => match u32::try_from(results.len()) {
-                            Ok(statements) => {
-                                for (result, profile) in &results {
-                                    if let Err(e) = server::send_result(sink, result) {
-                                        // A streaming failure (e.g. a single
-                                        // value larger than the frame cap) is
-                                        // reported before closing; a transport
-                                        // failure just ends the connection.
-                                        if !matches!(e, ProtocolError::Io(_)) {
-                                            let _ = server::send_error(sink, &e.to_string());
+                        Ok(Ok(server::ExecOutcome::Cursor(cursor))) => {
+                            if let Err(e) = server::send_cursor(sink, cursor) {
+                                if !matches!(e, ProtocolError::Io(_)) {
+                                    let _ = server::send_error(sink, &e.to_string());
+                                }
+                                close = true;
+                            } else if sink
+                                .send_frame(&Response::BatchDone { statements: 1 })
+                                .is_err()
+                            {
+                                close = true;
+                            }
+                        }
+                        Ok(Ok(server::ExecOutcome::Results(results))) => {
+                            match u32::try_from(results.len()) {
+                                Ok(statements) => {
+                                    for (result, profile) in &results {
+                                        if let Err(e) = server::send_result(sink, result) {
+                                            // A streaming failure (e.g. a single
+                                            // value larger than the frame cap) is
+                                            // reported before closing; a transport
+                                            // failure just ends the connection.
+                                            if !matches!(e, ProtocolError::Io(_)) {
+                                                let _ = server::send_error(sink, &e.to_string());
+                                            }
+                                            close = true;
+                                            break;
                                         }
-                                        close = true;
-                                        break;
+                                        // v10: one Profile per statement, after its
+                                        // Done and before the next result group.
+                                        if let Some(profile) = profile
+                                            && sink
+                                                .send_frame(&server::profile_frame(profile))
+                                                .is_err()
+                                        {
+                                            close = true;
+                                            break;
+                                        }
                                     }
-                                    // v10: one Profile per statement, after its
-                                    // Done and before the next result group.
-                                    if let Some(profile) = profile
-                                        && sink.send_frame(&server::profile_frame(profile)).is_err()
+                                    // v2 batch terminator: the client reads result
+                                    // groups until this frame, so it never parses
+                                    // SQL to count statements.
+                                    if !close
+                                        && sink
+                                            .send_frame(&Response::BatchDone { statements })
+                                            .is_err()
                                     {
                                         close = true;
-                                        break;
                                     }
                                 }
-                                // v2 batch terminator: the client reads result
-                                // groups until this frame, so it never parses
-                                // SQL to count statements.
-                                if !close
-                                    && sink
-                                        .send_frame(&Response::BatchDone { statements })
-                                        .is_err()
-                                {
+                                Err(_) => {
+                                    let _ = server::send_error(
+                                        sink,
+                                        "too many statements in one Execute batch",
+                                    );
                                     close = true;
                                 }
                             }
-                            Err(_) => {
-                                let _ = server::send_error(
-                                    sink,
-                                    "too many statements in one Execute batch",
-                                );
-                                close = true;
-                            }
-                        },
+                        }
                         // A SQL error is a normal response: report it and keep
                         // the connection open. No BatchDone follows: the Error
                         // frame ends the batch.
@@ -884,6 +918,13 @@ async fn serve_connection(
                     continue;
                 };
                 let ran = run_blocking(&mut stream, conn, idle_timeout, move |conn, sink| {
+                    let saved_limits = (!profiling).then(|| conn.exec_limits());
+                    if let Some(limits) = saved_limits {
+                        conn.set_exec_limits(ExecLimits {
+                            max_result_bytes: None,
+                            ..limits
+                        });
+                    }
                     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         let bound = conn.bind(&stmt, &values)?;
                         server::run_statement_hook(bound.sql());
@@ -893,7 +934,7 @@ async fn serve_connection(
                             // the same text and returns the same result — plus
                             // the profile.
                             let mut profiled = conn.execute_profiled(bound.sql())?;
-                            profiled
+                            let (result, profile) = profiled
                                 .pop()
                                 .map(|(result, profile)| (result, Some(profile)))
                                 .ok_or_else(|| {
@@ -901,28 +942,52 @@ async fn serve_connection(
                                         "internal error: bound statement produced no result"
                                             .to_string(),
                                     )
-                                })
+                                })?;
+                            Ok(server::ExecOutcome::Results(vec![(result, profile)]))
                         } else {
-                            conn.execute_bound(&bound).map(|result| (result, None))
+                            conn.query_cursor(bound.sql())
+                                .map(server::ExecOutcome::Cursor)
                         }
                     }));
+                    if let Some(limits) = saved_limits {
+                        conn.set_exec_limits(limits);
+                    }
                     let mut close = false;
                     match outcome {
-                        Ok(Ok((result, profile))) => {
-                            // A bound statement is exactly one statement: one
-                            // result group, then the batch terminator.
-                            if let Err(e) = server::send_result(sink, &result) {
+                        Ok(Ok(server::ExecOutcome::Cursor(cursor))) => {
+                            if let Err(e) = server::send_cursor(sink, cursor) {
                                 if !matches!(e, ProtocolError::Io(_)) {
                                     let _ = server::send_error(sink, &e.to_string());
                                 }
                                 close = true;
-                            } else if let Some(profile) = profile
-                                && sink.send_frame(&server::profile_frame(&profile)).is_err()
-                            {
-                                close = true;
                             } else if sink
                                 .send_frame(&Response::BatchDone { statements: 1 })
                                 .is_err()
+                            {
+                                close = true;
+                            }
+                        }
+                        Ok(Ok(server::ExecOutcome::Results(results))) => {
+                            for (result, profile) in &results {
+                                // A bound statement is exactly one statement: one
+                                // result group, then the batch terminator.
+                                if let Err(e) = server::send_result(sink, result) {
+                                    if !matches!(e, ProtocolError::Io(_)) {
+                                        let _ = server::send_error(sink, &e.to_string());
+                                    }
+                                    close = true;
+                                    break;
+                                } else if let Some(profile) = profile
+                                    && sink.send_frame(&server::profile_frame(profile)).is_err()
+                                {
+                                    close = true;
+                                    break;
+                                }
+                            }
+                            if !close
+                                && sink
+                                    .send_frame(&Response::BatchDone { statements: 1 })
+                                    .is_err()
                             {
                                 close = true;
                             }

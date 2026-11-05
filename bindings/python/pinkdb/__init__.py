@@ -173,7 +173,7 @@ _EPOCH_DATE = _datetime.date(1970, 1, 1)
 _EPOCH_DATETIME = _datetime.datetime(1970, 1, 1)
 
 #: ABI version this binding targets (``pinkdb_abi_version``).
-_ABI_VERSION = (1 << 16) | 4
+_ABI_VERSION = (1 << 16) | 5
 
 
 class Warning(Exception):  # noqa: A001 - the name PEP 249 requires
@@ -394,6 +394,16 @@ def _bind(lib: ctypes.CDLL, path: str) -> None:
         ctypes.c_size_t,
     )
     declare(
+        "pinkdb_result_is_streaming",
+        [ctypes.c_void_p, ctypes.c_size_t],
+        ctypes.c_int32,
+    )
+    declare(
+        "pinkdb_result_rows_fetched",
+        [ctypes.c_void_p, ctypes.c_size_t],
+        ctypes.c_uint64,
+    )
+    declare(
         "pinkdb_result_value",
         [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t],
         _PinkValue,
@@ -433,6 +443,10 @@ def _bind(lib: ctypes.CDLL, path: str) -> None:
         ctypes.c_size_t,
     )
     declare("pinkdb_result_name", [ctypes.c_void_p, ctypes.c_size_t], ctypes.c_char_p)
+    declare("pinkdb_result_error", [ctypes.c_void_p], ctypes.c_char_p)
+    declare(
+        "pinkdb_result_error_class", [ctypes.c_void_p], ctypes.c_char_p
+    )
     declare("pinkdb_last_error", [], ctypes.c_char_p)
     declare("pinkdb_last_error_class", [], ctypes.c_char_p)
 
@@ -657,6 +671,17 @@ def _chunk_rows(lib: ctypes.CDLL, result_ptr, statement: int, ncols: int):
                 ]
             lib.pinkdb_destroy_chunk(chunk)
             chunk = lib.pinkdb_result_fetch_chunk(result_ptr, statement)
+        # NULL also ends a stream that failed; the error is on the result.
+        message = lib.pinkdb_result_error(result_ptr)
+        if message is not None:
+            pinkdb_class = lib.pinkdb_result_error_class(result_ptr)
+            pinkdb_class = (
+                pinkdb_class.decode("utf-8", "replace") if pinkdb_class else "internal"
+            )
+            exception = _EXCEPTIONS_BY_CLASS.get(pinkdb_class, DatabaseError)
+            raise exception(
+                message.decode("utf-8", "replace"), pinkdb_class=pinkdb_class
+            )
     finally:
         if chunk:
             lib.pinkdb_destroy_chunk(chunk)
@@ -875,12 +900,13 @@ class Database:
     Supports use as a context manager (closes on exit).
     """
 
-    __slots__ = ("_lib", "_handle", "_lock")
+    __slots__ = ("_lib", "_handle", "_lock", "_streaming")
 
     def __init__(self, lib: ctypes.CDLL, handle):
         self._lib = lib
         self._handle = handle
         self._lock = threading.Lock()
+        self._streaming = None
 
     def __copy__(self):
         raise TypeError("cannot copy a Database handle")
@@ -909,6 +935,7 @@ class Database:
         except UnicodeEncodeError as exc:
             raise Error(f"sql is not encodable as UTF-8: {exc}") from exc
         with self._lock:
+            self._check_not_streaming()
             if self._handle is None:
                 raise InterfaceError("database is closed")
             result_ptr = self._lib.pinkdb_execute(self._handle, data, len(data))
@@ -961,6 +988,7 @@ class Database:
         except UnicodeEncodeError as exc:
             raise Error(f"sql is not encodable as UTF-8: {exc}") from exc
         with self._lock:
+            self._check_not_streaming()
             if self._handle is None:
                 raise InterfaceError("database is closed")
             prepared = self._lib.pinkdb_prepare(self._handle, data, len(data))
@@ -975,12 +1003,22 @@ class Database:
                 raise
             return Statement(self, prepared, sql, parameter_count)
 
+    def _check_not_streaming(self) -> None:
+        if self._streaming is not None:
+            raise InterfaceError("connection is busy with an open streaming cursor")
+
+    def _release_stream(self, cursor) -> None:
+        with self._lock:
+            if self._streaming is cursor:
+                self._streaming = None
+
     def close(self) -> None:
         """Close the handle. Idempotent and safe to call more than once."""
         with self._lock:
             handle = self._handle
             if handle is not None:
                 self._handle = None
+                self._streaming = None
                 self._lib.pinkdb_close(handle)
 
     def __enter__(self) -> "Database":
@@ -1058,6 +1096,7 @@ class Statement:
         cannot convert, or a native execution error.
         """
         with self._db._lock:
+            self._db._check_not_streaming()
             if self._closed:
                 raise InterfaceError("statement is closed")
             if self._db._handle is None:
@@ -1246,6 +1285,7 @@ class Cursor:
         self._row_index = 0
         self._rows = iter(())
         self._affected = 0
+        self._is_streaming = False
         self._closed = False
         #: Rows ``fetchmany()`` returns when called without a size.
         self.arraysize = 1
@@ -1269,7 +1309,7 @@ class Cursor:
     @property
     def rowcount(self) -> int:
         """Rows produced by a SELECT or changed by DML; ``-1`` before any
-        statement."""
+        statement, and while a streaming SELECT is still being fetched."""
         if self._kind is None:
             return -1
         return self._row_count if self._kind == "selected" else self._affected
@@ -1293,6 +1333,7 @@ class Cursor:
         self._check_open()
         self._close_result()
         with self._connection._lock:
+            self._connection._check_not_streaming()
             handle = self._connection._handle
             if handle is None:
                 raise InterfaceError("connection is closed")
@@ -1345,7 +1386,16 @@ class Cursor:
     def fetchone(self):
         """The next row as a tuple, or ``None`` when the result is exhausted."""
         self._check_open()
-        result = self._require_result()
+        self._require_result()
+        if self._is_streaming:
+            row = next(self._rows, None)
+            if row is None:
+                self._row_count = self._row_index
+                self._is_streaming = False
+                self._connection._release_stream(self)
+                return None
+            self._row_index += 1
+            return tuple(row)
         if self._row_index >= self._row_count:
             return None
         row = tuple(next(self._rows, ()))
@@ -1436,9 +1486,12 @@ class Cursor:
         self._type_tags = []
         self._kind = None
         self._row_count = 0
+        self._is_streaming = False
         self._row_index = 0
         self._rows = iter(())
         self._affected = 0
+        if getattr(self, "_connection", None) is not None:
+            self._connection._release_stream(self)
 
     def _adopt(self, result) -> None:
         """Take ownership of a native result and read its shape once."""
@@ -1457,12 +1510,22 @@ class Cursor:
                 self._type_tags.append(
                     self._lib.pinkdb_result_column_type(result, 0, col)
                 )
-            self._row_count = self._lib.pinkdb_result_row_count(result, 0)
+            self._is_streaming = bool(
+                self._lib.pinkdb_result_is_streaming(result, 0)
+            )
+            # A streaming result has no up-front count; fetching it all would
+            # defeat the cursor. rowcount becomes exact once it is exhausted.
+            if not self._is_streaming:
+                self._row_count = self._lib.pinkdb_result_row_count(result, 0)
+            else:
+                self._row_count = -1
         else:
             self._affected = int(self._lib.pinkdb_result_affected(result, 0))
         self._result = result
         self._row_index = 0
         self._rows = _chunk_rows(self._lib, result, 0, len(self._columns)) if kind_tag == 0 else iter(())
+        if self._is_streaming:
+            self._connection._streaming = self
 
 
 class Connection(Database):

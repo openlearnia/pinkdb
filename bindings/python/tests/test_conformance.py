@@ -234,7 +234,9 @@ class ConformanceTest(unittest.TestCase):
             types = [pinkdb._TYPE_NAMES[column[1]] for column in cursor.description]
             self.assertEqual(names, expect["columns"], f"{where}: columns")
             self.assertEqual(types, expect["types"], f"{where}: column types")
-            self.assertEqual(cursor.rowcount, expect["row_count"], f"{where}: row count")
+            self.assertIn(
+                cursor.rowcount, (-1, expect["row_count"]), f"{where}: row count"
+            )
 
             # Fetch one row at a time and keep only the head/tail the corpus
             # names. The allocation high-water mark proves the rows are not
@@ -262,6 +264,7 @@ class ConformanceTest(unittest.TestCase):
                 _, peak = tracemalloc.get_traced_memory()
             finally:
                 tracemalloc.stop()
+            self.assertEqual(cursor.rowcount, expect["row_count"], f"{where}: row count")
             self.assertEqual(count, expect["row_count"], f"{where}: streamed rows")
             self.assertEqual(checksum, expect["checksum"], f"{where}: checksum")
             self.assertEqual(

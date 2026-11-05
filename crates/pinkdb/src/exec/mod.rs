@@ -3165,7 +3165,7 @@ fn run_read_chunks_with(cx: &Cx, plan: &LogicalPlan, keep_chunks: bool) -> Resul
     // file is written) but produces DuckDB's `Count` result, not a row set —
     // handle it before the row evaluator.
     if let LogicalPlan::CopyTo { .. } = plan {
-        return execute_copy_to(cx.db, plan).map(ChunkedResult::Other);
+        return execute_copy_to(cx, plan).map(ChunkedResult::Other);
     }
     let out = eval(cx, plan)?;
     let mut rows = Vec::new();
@@ -3220,17 +3220,18 @@ fn run_read_chunks_with(cx: &Cx, plan: &LogicalPlan, keep_chunks: bool) -> Resul
 /// must never write the wrong table), and the writer's schema check is the
 /// table's own schema. The result is DuckDB's `Count` shape: one row, one
 /// `BIGINT` column naming the rows written.
-fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
+fn execute_copy_to(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
+    let db = cx.db;
     let LogicalPlan::CopyTo {
         ns: qdb,
         table,
+        source,
         format,
         path,
     } = plan
     else {
         unreachable!("execute_copy_to needs a CopyTo node");
     };
-    let target = resolve_ns(db, qdb);
     // M-3: the destination policy is enforced in the engine, not at bind
     // time, so a policy changed after prepare still applies. A disabled
     // server refuses even an ADMIN; the opt-in form confines the parent.
@@ -3256,9 +3257,39 @@ fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             db.file_format_names()
         ))
     })?;
-    let t = db.table_in(&target, table)?;
-    format.write(&destination, t)?;
-    let rows = i64::try_from(t.num_rows).unwrap_or(i64::MAX);
+    let rows = if let Some(source) = source {
+        let mut cursor = crate::exec::cursor::QueryCursor::start(
+            db,
+            (**source).clone(),
+            cx.budget.clone(),
+            cx.session.clone(),
+        )?;
+        let schema: Vec<(String, DataType)> = cursor
+            .names()
+            .iter()
+            .cloned()
+            .zip(cursor.types().iter().copied())
+            .collect();
+        let mut writer = format.begin_write(&destination, &schema)?;
+        let mut rows = 0i64;
+        while let Some(chunk) = cursor.next_chunk()? {
+            rows = rows.saturating_add(chunk.num_rows() as i64);
+            writer.write_chunk(chunk)?;
+        }
+        writer.finish()?;
+        rows
+    } else {
+        let target = resolve_ns(db, qdb);
+        let t = db.table_in(&target, table)?;
+        let mut writer = format.begin_write(&destination, &t.schema())?;
+        for i in 0..t.num_chunks() {
+            if let Some(chunk) = t.scan_chunk(i)? {
+                writer.write_chunk(chunk)?;
+            }
+        }
+        writer.finish()?;
+        i64::try_from(t.num_rows).unwrap_or(i64::MAX)
+    };
     Ok(QueryResult::Selected {
         names: vec!["Count".to_string()],
         types: vec![DataType::Bigint],
@@ -9274,6 +9305,7 @@ fn explain_into(
             table,
             format,
             path,
+            ..
         } => {
             format!("CopyTo {} ({format}) -> '{path}'", qualify(db, table))
         }

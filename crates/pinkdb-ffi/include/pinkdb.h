@@ -1,5 +1,5 @@
 /*
- * pinkdb C ABI v1.4 — https://github.com/openlearnia/pinkdb
+ * pinkdb C ABI v1.5 — https://github.com/openlearnia/pinkdb
  *
  * Built as `libpinkdb_ffi.dylib` (cdylib) and `libpinkdb_ffi.a` (staticlib)
  * from the `pinkdb-ffi` crate. Link with `-lpinkdb_ffi`.
@@ -101,7 +101,7 @@ struct ArrowArray {
 #endif /* ARROW_C_DATA_INTERFACE */
 
 #define PINKDB_ABI_VERSION_MAJOR 1
-#define PINKDB_ABI_VERSION_MINOR 4
+#define PINKDB_ABI_VERSION_MINOR 5
 #define PINKDB_ABI_VERSION ((PINKDB_ABI_VERSION_MAJOR << 16) | PINKDB_ABI_VERSION_MINOR)
 
 /* Library (not ABI) version, from the Cargo package version. */
@@ -372,8 +372,18 @@ const char *pinkdb_result_column_name(const pinkdb_result *result,
 int32_t pinkdb_result_column_type(const pinkdb_result *result,
                                   size_t statement, size_t column);
 
-/* SELECT results: row count, else 0. */
+/* SELECT results: row count, else 0. A streaming result is drained first, so
+ * this reads the whole result into memory. */
 size_t pinkdb_result_row_count(const pinkdb_result *result, size_t statement);
+
+/* 1 while the SELECT still has a cursor to pull from, else 0. A materialized
+ * result, a drained result, and every non-SELECT statement are 0. */
+int32_t pinkdb_result_is_streaming(const pinkdb_result *result, size_t statement);
+
+/* Rows handed out by pinkdb_result_fetch_chunk / pinkdb_result_fetch_arrow so
+ * far (0 for a non-SELECT statement). This is the number fetched, not the
+ * final row count; draining does not add to it. */
+uint64_t pinkdb_result_rows_fetched(const pinkdb_result *result, size_t statement);
 
 /* SELECT results: value at (statement, row, column); a NULL value when out of
  * range or when the statement is not a SELECT. */
@@ -397,10 +407,22 @@ pink_value pinkdb_result_value(const pinkdb_result *result, size_t statement,
  *         pinkdb_destroy_chunk(chunk);
  *     }
  *
+ * A lone row-producing statement is backed by a cursor: chunks are produced
+ * on demand and never held all at once. A multi-statement SQL text keeps
+ * materialized chunks. The byte chunk API and the Arrow fetch share the same
+ * position, so use one or the other for a given statement.
+ *
  * Fetch order is statement-local: each call returns the next chunk and NULL
  * once the end is reached. Fetching from a failed result, a non-SELECT
  * statement, or a statement index out of range returns NULL. A fetch after
  * the end keeps returning NULL (it does not restart).
+ *
+ * An error during a fetch is recorded on the result; the fetch returns NULL.
+ * pinkdb_result_error / pinkdb_result_error_class report it like a build-time
+ * error. pinkdb_interrupt makes the next fetch return NULL the same way.
+ *
+ * The v1 cell accessors (pinkdb_result_value and the row-shaped accessors)
+ * drain a streaming result before answering. pinkdb_result_row_count does too.
  *
  * Ownership: the caller owns each chunk and frees it with
  * pinkdb_destroy_chunk. A chunk holds its own reference to the underlying
@@ -511,6 +533,7 @@ int32_t pinkdb_validity_row_is_valid(const uint64_t *validity, size_t row);
  * through pinkdb_result_error/pinkdb_result_error_class; other errors go to
  * pinkdb_last_error/pinkdb_last_error_class. A NULL output pointer or NULL
  * input is an error, except that fetching at the end of a result is success.
+ * pinkdb_result_fetch_arrow pulls the next chunk when the result is streaming.
  *
  * Formats and copies (validity is shared in every case):
  *
@@ -645,6 +668,9 @@ pinkdb_config *pinkdb_create_config(void);
  *   threads                   positive integer
  *   wal_sync_method           "full", "fsync", "fdatasync"
  *   allow_sql_load_extension  "true"/"false" (default false)
+ *   materialize_results       "true"/"false" (default false): true keeps every
+ *                             result materialized instead of streaming a lone
+ *                             row-producing statement
  *
  * memory_limit is process-wide and applies when the database is opened.
  * read_only/access_mode refuse every non-query statement; they are enforced

@@ -1686,28 +1686,49 @@ fn render_cursor(mut cursor: pinkdb::QueryCursor, sql: &str) {
         render_results(std::slice::from_ref(&result));
         return;
     }
+    let (names, types) = (cursor.names().to_vec(), cursor.types().to_vec());
+    let batches = std::iter::from_fn(move || match cursor.next_chunk() {
+        Ok(Some(chunk)) => Some(Ok((0..chunk.num_rows())
+            .map(|i| chunk.columns.iter().map(|c| c.get(i)).collect())
+            .collect())),
+        Ok(None) => None,
+        Err(e) => Some(Err(e)),
+    });
+    render_batches(names, types, batches, |e| report_sql_error(&e, sql));
+}
+
+/// Render streamed row batches with the same bounded-memory display as
+/// [`render_cursor`]. Callers supply their own error reporter so local SQL
+/// errors keep their position/JSON form.
+fn render_batches<E, I>(
+    names: Vec<String>,
+    types: Vec<DataType>,
+    batches: I,
+    mut on_error: impl FnMut(E),
+) where
+    E: std::fmt::Display,
+    I: IntoIterator<Item = Result<Vec<Vec<Value>>, E>>,
+{
     let keep = if agent_mode() {
         agent_display().max_rows
     } else {
         DISPLAY_CAP
     };
-    let (names, types) = (cursor.names().to_vec(), cursor.types().to_vec());
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut total = 0u64;
-    loop {
-        match cursor.next_chunk() {
-            Ok(Some(chunk)) => {
-                for i in 0..chunk.num_rows() {
+    for batch in batches {
+        match batch {
+            Ok(batch) => {
+                total += batch.len() as u64;
+                for row in batch {
                     // `max_rows` 0 is the agent display's "no cap".
                     if keep == 0 || rows.len() < keep {
-                        rows.push(chunk.columns.iter().map(|c| c.get(i)).collect());
+                        rows.push(row);
                     }
                 }
-                total += chunk.num_rows() as u64;
             }
-            Ok(None) => break,
             Err(e) => {
-                report_sql_error(&e, sql);
+                on_error(e);
                 return;
             }
         }
@@ -2017,6 +2038,32 @@ fn run_statement(
                         profiles
                             .get_or_insert_with(Vec::new)
                             .extend(ps.into_iter().flatten());
+                    }
+                    Err(e) => cli_error!("{e}"),
+                }
+            } else if pinkdb::sql::parse_statements(sql).is_ok_and(|s| {
+                s.len() == 1
+                    && !matches!(
+                        s[0],
+                        pinkdb::sql::ast::Statement::Begin
+                            | pinkdb::sql::ast::Statement::Commit
+                            | pinkdb::sql::ast::Statement::Rollback
+                            | pinkdb::sql::ast::Statement::Call { .. }
+                    )
+            }) {
+                match client.query_stream(sql) {
+                    Ok(stream) => {
+                        if let Some(result) = stream.result() {
+                            render_results(std::slice::from_ref(result));
+                        } else {
+                            let (names, types) = (stream.names().to_vec(), stream.types().to_vec());
+                            render_batches(
+                                names,
+                                types,
+                                stream,
+                                |e: pinkdb_server::ClientError| cli_error!("{e}"),
+                            );
+                        }
                     }
                     Err(e) => cli_error!("{e}"),
                 }

@@ -121,7 +121,10 @@ pub enum Statement {
     /// side effect only: no store mutation, never WAL-logged.
     CopyTo {
         qual: Qualifier,
-        table: String,
+        /// The source table, or `None` for `COPY (SELECT …) TO`.
+        table: Option<String>,
+        /// The source query for `COPY (SELECT …) TO`.
+        query: Option<Box<Select>>,
         path: String,
         format: Option<String>,
     },

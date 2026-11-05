@@ -82,6 +82,8 @@ const char *pinkdb_result_column_name(
 int32_t pinkdb_result_column_type(
 	const pinkdb_result *result, size_t statement, size_t column);
 size_t pinkdb_result_row_count(const pinkdb_result *result, size_t statement);
+int32_t pinkdb_result_is_streaming(const pinkdb_result *result, size_t statement);
+uint64_t pinkdb_result_rows_fetched(const pinkdb_result *result, size_t statement);
 pink_value pinkdb_result_value(
 	const pinkdb_result *result, size_t statement, size_t row, size_t column);
 int32_t pinkdb_result_column_decimal_scale(
@@ -162,7 +164,7 @@ import (
 
 // SupportedABI is the C ABI version this binding speaks. Open and OpenMemory
 // refuse a linked library that reports a different version.
-const SupportedABI = (1 << 16) | 4
+const SupportedABI = (1 << 16) | 5
 
 // Errors returned by this package in addition to the native error messages
 // from pinkdb_last_error.
@@ -175,6 +177,11 @@ var (
 	// ErrStmtClosed is returned by Stmt.Execute after the statement has been
 	// closed with Stmt.Close. Stmt.Close itself is idempotent.
 	ErrStmtClosed = errors.New("pinkdb: statement is closed")
+
+	// ErrBusy is returned by a query while a Rows from this DB is still open.
+	// A streaming Rows keeps its connection busy until it is closed or read
+	// to the end.
+	ErrBusy = errors.New("pinkdb: a Rows is already open on this database")
 
 	// ErrOutOfRange wraps DATE and TIMESTAMP payloads that cannot be
 	// represented by Go's time.Time. The guard is defensive-only: no current
@@ -346,6 +353,7 @@ type DB struct {
 	mu     sync.Mutex
 	handle *C.pinkdb_handle
 	closed bool
+	rows   *Rows
 }
 
 // Open opens a durable database (checkpoint + WAL) at path. Empty paths and
@@ -422,6 +430,9 @@ func (db *DB) Execute(sql string) ([]Result, error) {
 	if db.closed {
 		return nil, ErrClosed
 	}
+	if db.rows != nil {
+		return nil, ErrBusy
+	}
 
 	// CBytes + explicit length keeps embedded NULs; free the copy below.
 	var sqlPtr *C.char
@@ -437,6 +448,43 @@ func (db *DB) Execute(sql string) ([]Result, error) {
 	// materialize only reads the result's own memory, which is not
 	// thread-local, so it runs after the OS thread has been released.
 	return materialize(result)
+}
+
+// Query runs one row-producing statement and returns a streaming Rows. Unlike
+// Execute it does not materialize the result: Next/Scan pull one chunk at a
+// time. Close the Rows (or read to the end) before running another statement
+// on the same DB; while it is open the DB reports ErrBusy.
+func (db *DB) Query(sql string) (*Rows, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return nil, ErrClosed
+	}
+	if db.rows != nil {
+		return nil, ErrBusy
+	}
+	var sqlPtr *C.char
+	if len(sql) > 0 {
+		sqlPtr = (*C.char)(C.CBytes([]byte(sql)))
+		defer C.free(unsafe.Pointer(sqlPtr))
+	}
+	result, err := db.executeNative(sqlPtr, C.size_t(len(sql)))
+	if err != nil {
+		return nil, err
+	}
+	return db.adoptRows(result)
+}
+
+// adoptRows wraps a single-result handle; the caller holds db.mu.
+func (db *DB) adoptRows(result *C.pinkdb_result) (*Rows, error) {
+	rows, err := newRows(result)
+	if err != nil {
+		C.pinkdb_result_free(result)
+		return nil, err
+	}
+	rows.db = db
+	db.rows = rows
+	return rows, nil
 }
 
 // executeNative runs pinkdb_execute and, when it fails, reads the thread-local
@@ -495,6 +543,7 @@ func (db *DB) Close() {
 		return
 	}
 	db.closed = true
+	db.rows = nil
 	if db.handle != nil {
 		C.pinkdb_close(db.handle)
 		db.handle = nil
@@ -513,6 +562,9 @@ func (db *DB) Prepare(sql string) (*Stmt, error) {
 	defer db.mu.Unlock()
 	if db.closed {
 		return nil, ErrClosed
+	}
+	if db.rows != nil {
+		return nil, ErrBusy
 	}
 
 	// CBytes + explicit length keeps embedded NULs; free the copy below.
@@ -595,47 +647,11 @@ func (stmt *Stmt) ParameterCount() int { return stmt.nparams }
 func (stmt *Stmt) Execute(args ...any) (Result, error) {
 	stmt.db.mu.Lock()
 	defer stmt.db.mu.Unlock()
-	if stmt.db.closed {
-		return Result{}, ErrClosed
-	}
-	if stmt.closed {
-		return Result{}, ErrStmtClosed
-	}
-	if len(args) < stmt.nparams {
-		return Result{}, &Error{Class: "parameter", Message: fmt.Sprintf(
-			"values were not provided for prepared statement parameters: %d", stmt.nparams)}
-	}
-	if len(args) > stmt.nparams {
-		return Result{}, &Error{Class: "parameter", Message: fmt.Sprintf(
-			"parameter count mismatch: the prepared statement takes %d, but values were provided for: %d",
-			stmt.nparams, len(args))}
-	}
-
-	// Bindings and the execute that consumes them both report errors through
-	// the thread-local last error, so keep them on one OS thread.
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	if C.pinkdb_clear_bindings(stmt.prepared) == 0 {
-		return Result{}, nativeError()
-	}
-	for i, arg := range args {
-		if err := bindTyped(stmt.prepared, C.size_t(i+1), arg); err != nil {
-			return Result{}, err
-		}
-	}
-	connection := C.pinkdb_handle_connection(stmt.db.handle)
-	if connection == nil {
-		return Result{}, nativeError()
-	}
-	var result *C.pinkdb_result
-	C.pinkdb_execute_bound(connection, stmt.prepared, &result)
-	if result == nil {
-		return Result{}, nativeError()
-	}
-	defer C.pinkdb_result_free(result)
-	if err := resultError(result); err != nil {
+	result, err := stmt.executeNative(args)
+	if err != nil {
 		return Result{}, err
 	}
+	defer C.pinkdb_result_free(result)
 	results, err := materialize(result)
 	if err != nil {
 		return Result{}, err
@@ -645,6 +661,69 @@ func (stmt *Stmt) Execute(args ...any) (Result, error) {
 			"pinkdb: prepared statement produced %d results, want 1", len(results))
 	}
 	return results[0], nil
+}
+
+// Query binds args like Execute but returns a streaming Rows instead of
+// materializing the result. Close it (or read to the end) before another
+// statement on the same DB.
+func (stmt *Stmt) Query(args ...any) (*Rows, error) {
+	stmt.db.mu.Lock()
+	defer stmt.db.mu.Unlock()
+	result, err := stmt.executeNative(args)
+	if err != nil {
+		return nil, err
+	}
+	return stmt.db.adoptRows(result)
+}
+
+// executeNative binds and runs the statement, returning a result the caller
+// must free. The caller holds db.mu.
+func (stmt *Stmt) executeNative(args []any) (*C.pinkdb_result, error) {
+	if stmt.db.closed {
+		return nil, ErrClosed
+	}
+	if stmt.db.rows != nil {
+		return nil, ErrBusy
+	}
+	if stmt.closed {
+		return nil, ErrStmtClosed
+	}
+	if len(args) < stmt.nparams {
+		return nil, &Error{Class: "parameter", Message: fmt.Sprintf(
+			"values were not provided for prepared statement parameters: %d", stmt.nparams)}
+	}
+	if len(args) > stmt.nparams {
+		return nil, &Error{Class: "parameter", Message: fmt.Sprintf(
+			"parameter count mismatch: the prepared statement takes %d, but values were provided for: %d",
+			stmt.nparams, len(args))}
+	}
+
+	// Bindings and the execute that consumes them both report errors through
+	// the thread-local last error, so keep them on one OS thread.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if C.pinkdb_clear_bindings(stmt.prepared) == 0 {
+		return nil, nativeError()
+	}
+	for i, arg := range args {
+		if err := bindTyped(stmt.prepared, C.size_t(i+1), arg); err != nil {
+			return nil, err
+		}
+	}
+	connection := C.pinkdb_handle_connection(stmt.db.handle)
+	if connection == nil {
+		return nil, nativeError()
+	}
+	var result *C.pinkdb_result
+	C.pinkdb_execute_bound(connection, stmt.prepared, &result)
+	if result == nil {
+		return nil, nativeError()
+	}
+	if err := resultError(result); err != nil {
+		C.pinkdb_result_free(result)
+		return nil, err
+	}
+	return result, nil
 }
 
 // Close frees the native prepared statement. It is idempotent: after the

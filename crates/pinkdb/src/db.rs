@@ -904,6 +904,11 @@ impl Connection {
         self.exec_limits = Some(limits);
     }
 
+    /// This connection's per-statement limits (the embedded default when unset).
+    pub fn exec_limits(&self) -> crate::exec::ExecLimits {
+        self.exec_limits.unwrap_or_default()
+    }
+
     /// Remove this connection's limits (back to the embedded default).
     pub fn clear_exec_limits(&mut self) {
         self.exec_limits = None;

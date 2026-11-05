@@ -57,7 +57,7 @@ pub fn write(path: &Path, table: &DataTable) -> Result<()> {
 }
 
 /// One engine chunk as one record batch (columns in schema order).
-fn build_batch(schema: &Schema, chunk: &DataChunk) -> Result<RecordBatch> {
+pub(crate) fn build_batch(schema: &Schema, chunk: &DataChunk) -> Result<RecordBatch> {
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(chunk.columns.len());
     for (i, column) in chunk.columns.iter().enumerate() {
         let field = schema.field(i);

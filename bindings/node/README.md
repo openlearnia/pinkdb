@@ -74,7 +74,9 @@ A statement result is:
 | `close()` | free the prepared statement |
 
 `iterate` keeps the native result alive and streams it: the 100k-row conformance
-case never holds the whole result in JavaScript.
+case never holds the whole result in JavaScript. While a stream is open the
+database is busy: other `run`/`all`/`iterate` calls throw until the iterator
+finishes or `stream.close()` runs.
 
 ### Transactions
 

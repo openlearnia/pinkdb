@@ -38,8 +38,9 @@
 //! [`read_identity`]): parquet has no native table identity, and the lake's
 //! loader checks that a data file holds the catalog's database/table.
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parquet::basic::Type as PhysicalType;
@@ -60,7 +61,7 @@ use pinkdb::variant::Variant;
 use pinkdb::variant_shred::{
     ShredKind, ShredPolicy, decode_metadata, encode_metadata, encode_value, infer_policy, shred_row,
 };
-use pinkdb::{ArrayElem, DataTable, DataType, Value, Vector};
+use pinkdb::{ArrayElem, DataChunk, DataTable, DataType, Value, Vector};
 
 /// The footer key naming the database a lake data file belongs to.
 pub const DB_METADATA_KEY: &str = "pinkdb.db";
@@ -293,7 +294,6 @@ fn write_table_with_key_values(
             chunks: (0..column.num_chunks())
                 .map(|i| column.chunk(i).expect("a built table decodes"))
                 .collect(),
-            chunk: 0,
             offset: 0,
         })
         .collect();
@@ -337,25 +337,189 @@ fn write_table_with_key_values(
 
 /// One column's position while walking the table's chunks in row order.
 struct ColumnCursor {
-    chunks: Vec<Arc<Vector>>,
-    chunk: usize,
+    chunks: VecDeque<Arc<Vector>>,
     offset: usize,
 }
 
 impl ColumnCursor {
+    fn push(&mut self, chunk: Arc<Vector>) {
+        self.chunks.push_back(chunk);
+    }
+
     fn next(&mut self) -> Value {
-        while self.chunk < self.chunks.len() && self.offset >= self.chunks[self.chunk].len() {
-            self.chunk += 1;
+        while self
+            .chunks
+            .front()
+            .is_some_and(|chunk| self.offset >= chunk.len())
+        {
+            self.chunks.pop_front();
             self.offset = 0;
         }
         let chunk = self
             .chunks
-            .get(self.chunk)
+            .front()
             .expect("a table column ended before the table's row count");
         let value = chunk.get(self.offset);
         self.offset += 1;
         value
     }
+}
+
+/// A parquet file written chunk by chunk, one row group per
+/// [`DEFAULT_ROW_GROUP_ROWS`] rows. The target only appears after `close` and
+/// a rename, so a failed write leaves no file that looks complete.
+pub struct ParquetFileWriter {
+    writer: Option<SerializedFileWriter<std::fs::File>>,
+    schema: Vec<(String, DataType)>,
+    policies: Vec<ShredPolicy>,
+    cursors: Vec<ColumnCursor>,
+    pending: usize,
+    tmp: PathBuf,
+    path: PathBuf,
+    finished: bool,
+}
+
+impl ParquetFileWriter {
+    pub fn new(path: &Path, schema: &[(String, DataType)]) -> Result<Self, WriteError> {
+        let policies = vec![ShredPolicy::default(); schema.len()];
+        let mut key_values = Vec::new();
+        for (name, dtype) in schema {
+            if let DataType::Array { len, .. } = dtype {
+                key_values.push(KeyValue::new(
+                    crate::schema_map::array_length_key(name),
+                    len.to_string(),
+                ));
+            }
+        }
+        let root = build_schema(schema, &policies, &[])?;
+        let mut builder = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_data_page_row_count_limit(PAGE_ROW_LIMIT)
+            .set_data_page_size_limit(PAGE_SIZE_LIMIT)
+            .set_compression(PAGE_COMPRESSION)
+            .set_dictionary_enabled(true)
+            .set_dictionary_page_size_limit(DICTIONARY_PAGE_LIMIT);
+        if !key_values.is_empty() {
+            builder = builder.set_key_value_metadata(Some(key_values));
+        }
+        let (tmp, file) =
+            pinkdb::filefmt::temp_sibling(path).map_err(|e| WriteError::InvalidValue {
+                column: String::new(),
+                message: e.to_string(),
+            })?;
+        let writer = SerializedFileWriter::new(file, Arc::new(root), Arc::new(builder.build()))?;
+        Ok(Self {
+            writer: Some(writer),
+            schema: schema.to_vec(),
+            policies,
+            cursors: schema
+                .iter()
+                .map(|_| ColumnCursor {
+                    chunks: VecDeque::new(),
+                    offset: 0,
+                })
+                .collect(),
+            pending: 0,
+            tmp,
+            path: path.to_path_buf(),
+            finished: false,
+        })
+    }
+
+    pub fn write_chunk(&mut self, chunk: &DataChunk) -> Result<(), WriteError> {
+        if chunk.columns.len() != self.schema.len() {
+            return Err(WriteError::InvalidValue {
+                column: String::new(),
+                message: format!(
+                    "chunk has {} columns but the parquet schema has {}",
+                    chunk.columns.len(),
+                    self.schema.len()
+                ),
+            });
+        }
+        for (cursor, column) in self.cursors.iter_mut().zip(&chunk.columns) {
+            cursor.push(Arc::clone(column));
+        }
+        self.pending += chunk.num_rows();
+        while self.pending >= DEFAULT_ROW_GROUP_ROWS {
+            let writer = self.writer.as_mut().expect("parquet writer is still open");
+            write_row_group(
+                writer,
+                &self.schema,
+                &self.policies,
+                &mut self.cursors,
+                DEFAULT_ROW_GROUP_ROWS,
+            )?;
+            self.pending -= DEFAULT_ROW_GROUP_ROWS;
+        }
+        Ok(())
+    }
+
+    pub fn close(&mut self) -> Result<(), WriteError> {
+        let writer = self.writer.take().expect("parquet writer is still open");
+        let mut writer = writer;
+        if self.pending > 0 {
+            write_row_group(
+                &mut writer,
+                &self.schema,
+                &self.policies,
+                &mut self.cursors,
+                self.pending,
+            )?;
+        }
+        writer.close()?;
+        Ok(())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn tmp(&self) -> &Path {
+        &self.tmp
+    }
+
+    pub fn mark_finished(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for ParquetFileWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+fn write_row_group<W: std::io::Write + Send>(
+    writer: &mut SerializedFileWriter<W>,
+    schema: &[(String, DataType)],
+    policies: &[ShredPolicy],
+    cursors: &mut [ColumnCursor],
+    rows: usize,
+) -> Result<(), WriteError> {
+    let mut group = writer.next_row_group()?;
+    for (index, (name, dtype)) in schema.iter().enumerate() {
+        if matches!(dtype, DataType::Variant) {
+            write_variant_column(
+                &mut group,
+                &policies[index],
+                rows,
+                &mut cursors[index],
+                name,
+            )?;
+            continue;
+        }
+        if matches!(dtype, DataType::Array { .. }) {
+            write_array_column(&mut group, dtype, rows, &mut cursors[index], name)?;
+            continue;
+        }
+        let column = group.next_column()?.ok_or_else(|| skipped(name))?;
+        write_column(column, dtype, rows, &mut cursors[index], name)?;
+    }
+    group.close()?;
+    Ok(())
 }
 
 /// The physical type of one engine type, or a refusal naming the column.

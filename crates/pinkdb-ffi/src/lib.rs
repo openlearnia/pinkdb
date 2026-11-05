@@ -33,7 +33,7 @@
 // `unsafe fn` here does not apply to this crate.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell as StdCell, RefCell, UnsafeCell};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use pinkdb::db::{Connection, Database};
-use pinkdb::exec::ChunkedResult;
+use pinkdb::exec::{ChunkedResult, QueryCursor};
 use pinkdb::wal::WalSyncMethod;
 use pinkdb::{
     CancelFlag, DataChunk, DataType, EncryptionKey, PinkDbError, QueryProfile, QueryResult, Value,
@@ -54,7 +54,7 @@ pub use arrow::{ArrowArray, ArrowSchema};
 /// ABI version reported by [`pinkdb_abi_version`]: `major << 16 | minor`.
 ///
 /// Additions bump the minor; removals or layout changes bump the major.
-pub const PINKDB_ABI_VERSION: u32 = (1 << 16) | 4;
+pub const PINKDB_ABI_VERSION: u32 = (1 << 16) | 5;
 
 // ----- statement kind tags (`pinkdb_result_kind`) -----
 pub const PINKDB_STMT_SELECTED: i32 = 0;
@@ -581,13 +581,29 @@ struct SelStmt {
     names: Vec<Vec<u8>>,
     types: Vec<i32>,
     dtypes: Vec<DataType>,
-    chunks: Vec<DataChunk>,
-    row_count: usize,
-    /// The next chunk `pinkdb_result_fetch_chunk` hands out.
-    next_chunk: usize,
+    chunks: RefCell<Vec<DataChunk>>,
+    row_count: StdCell<usize>,
+    /// The next chunk `pinkdb_result_fetch_chunk` hands out after a drain.
+    next_chunk: StdCell<usize>,
+    /// Whether a drain materialized chunks for a fetch or v1 access. A live
+    /// cursor serves fetches itself, so retained chunks are not replayed.
+    serve_chunks: StdCell<bool>,
+    /// The rest of a streaming result; `None` once drained or failed. Interior
+    /// mutability lets every `pinkdb_result_*` accessor drain it.
+    cursor: RefCell<Option<QueryCursor>>,
+    /// Rows handed out by chunk/Arrow fetch, for `pinkdb_result_rows_fetched`.
+    /// A drain is not a fetch, so it does not count.
+    fetched: StdCell<u64>,
+    /// An error raised by a fetch after the result was built. `pinkdb_result_error`
+    /// reports it like a build-time error.
+    stream_error: RefCell<Option<(CString, &'static CStr)>>,
     /// Built on the first v1 cell access; NULL-cell conversion is eager for
     /// the types that can fail (ARRAY), so this never loses an error.
     rows: RefCell<Option<Vec<Vec<Cell>>>>,
+    /// A chunk fetch handed out a chunk it did not keep (past the 16 MiB a
+    /// streaming result retains), so the v1 cell API can no longer see every
+    /// row: it reports an error instead of a result with rows missing.
+    partial: StdCell<bool>,
 }
 
 impl SelStmt {
@@ -609,11 +625,37 @@ impl SelStmt {
             names: names.iter().map(|n| nul_terminated(n)).collect(),
             types,
             dtypes,
-            chunks,
-            row_count,
-            next_chunk: 0,
+            chunks: RefCell::new(chunks),
+            row_count: StdCell::new(row_count),
+            next_chunk: StdCell::new(0),
+            serve_chunks: StdCell::new(true),
+            cursor: RefCell::new(None),
+            fetched: StdCell::new(0),
+            stream_error: RefCell::new(None),
             rows: RefCell::new(rows),
+            partial: StdCell::new(false),
         })
+    }
+
+    /// A row-producing cursor stays live: `pinkdb_result_fetch_chunk` pulls
+    /// from it, and a v1 access that needs the whole result drains it.
+    fn from_cursor(cursor: QueryCursor) -> SelStmt {
+        let names = cursor.names().to_vec();
+        let dtypes = cursor.types().to_vec();
+        SelStmt {
+            names: names.iter().map(|n| nul_terminated(n)).collect(),
+            types: dtypes.iter().copied().map(dtype_tag).collect(),
+            dtypes,
+            chunks: RefCell::new(Vec::new()),
+            row_count: StdCell::new(0),
+            next_chunk: StdCell::new(0),
+            serve_chunks: StdCell::new(false),
+            cursor: RefCell::new(Some(cursor)),
+            fetched: StdCell::new(0),
+            stream_error: RefCell::new(None),
+            rows: RefCell::new(None),
+            partial: StdCell::new(false),
+        }
     }
 
     fn from_rows(
@@ -625,11 +667,115 @@ impl SelStmt {
         SelStmt::from_chunks(names, dtypes, chunks)
     }
 
+    /// Read the rest of the cursor into `chunks` for a v1 access or an exact
+    /// row count. A fetch error is recorded and ends the stream.
+    fn drain(&self) {
+        let Some(mut cursor) = self.cursor.borrow_mut().take() else {
+            return;
+        };
+        let mut total = self.fetched.get() as usize;
+        loop {
+            match cursor.next_chunk() {
+                Ok(Some(chunk)) => {
+                    total += chunk.num_rows;
+                    self.chunks.borrow_mut().push(chunk);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let message = CString::new(e.to_string().replace('\0', "\\0"))
+                        .unwrap_or_else(|_| CString::new("stream error").expect("static"));
+                    *self.stream_error.borrow_mut() = Some((message, engine_error_class(&e)));
+                    break;
+                }
+            }
+        }
+        self.row_count.set(total);
+        self.serve_chunks.set(true);
+    }
+
+    /// The next chunk for a fetch call: pulled from the cursor, then from the
+    /// chunks a drain already materialized. While streaming, retain at most
+    /// 16 MiB so a v1 access can still read a small result after a fetch.
+    fn next_fetch(&self) -> Option<DataChunk> {
+        let mut guard = self.cursor.borrow_mut();
+        let streamed = guard.as_mut().map(|cursor| cursor.next_chunk());
+        drop(guard);
+        if let Some(next) = streamed {
+            match next {
+                Ok(Some(chunk)) => {
+                    self.fetched.set(self.fetched.get() + chunk.num_rows as u64);
+                    self.row_count.set(self.fetched.get() as usize);
+                    let retained: usize = self
+                        .chunks
+                        .borrow()
+                        .iter()
+                        .map(|c| c.columns.iter().map(|v| v.memory_size()).sum::<usize>())
+                        .sum();
+                    let bytes: usize = chunk.columns.iter().map(|v| v.memory_size()).sum();
+                    // Only the first 16 MiB stays available to the v1 cell
+                    // API after a streaming fetch; past it, `partial` makes v1
+                    // access report an error rather than skip rows.
+                    if !self.partial.get() && retained + bytes <= 16 << 20 {
+                        self.chunks.borrow_mut().push(chunk.clone());
+                        // Keep the replay index past chunks already handed out.
+                        self.next_chunk.set(self.next_chunk.get() + 1);
+                    } else {
+                        self.partial.set(true);
+                    }
+                    return Some(chunk);
+                }
+                Ok(None) => {
+                    *self.cursor.borrow_mut() = None;
+                    self.row_count.set(self.fetched.get() as usize);
+                    return None;
+                }
+                Err(e) => {
+                    let message = CString::new(e.to_string().replace('\0', "\\0"))
+                        .unwrap_or_else(|_| CString::new("stream error").expect("static"));
+                    *self.stream_error.borrow_mut() = Some((message, engine_error_class(&e)));
+                    *self.cursor.borrow_mut() = None;
+                    self.row_count.set(self.fetched.get() as usize);
+                    return None;
+                }
+            }
+        }
+        if !self.serve_chunks.get() {
+            return None;
+        }
+        let chunk = self.chunks.borrow().get(self.next_chunk.get()).cloned();
+        if chunk.is_some() {
+            self.next_chunk.set(self.next_chunk.get() + 1);
+        }
+        chunk
+    }
+
     fn rows(&self) -> std::cell::Ref<'_, Vec<Vec<Cell>>> {
+        self.drain();
+        if self.partial.get() && self.rows.borrow().is_none() {
+            *self.rows.borrow_mut() = Some(Vec::new());
+            *self.stream_error.borrow_mut() = Some((
+                CString::new(
+                    "this result was read past 16 MiB by chunk fetch, so the v1 cell API \
+                     no longer has all its rows; read it with chunk or Arrow fetch only",
+                )
+                .expect("static"),
+                CLASS_INVALID_ARGUMENT,
+            ));
+        }
         if self.rows.borrow().is_none() {
-            // `from_chunks` already validated the only failing conversion.
-            let rows = cells_from_chunks(&self.chunks).unwrap_or_default();
-            *self.rows.borrow_mut() = Some(rows);
+            // `from_chunks` already validated materialized rows, but a cursor
+            // reaches cell access first here. Keep the failure on the result.
+            match cells_from_chunks(&self.chunks.borrow()) {
+                Ok(rows) => *self.rows.borrow_mut() = Some(rows),
+                Err(message) => {
+                    *self.rows.borrow_mut() = Some(Vec::new());
+                    *self.stream_error.borrow_mut() = Some((
+                        CString::new(message.replace('\0', "\\0"))
+                            .unwrap_or_else(|_| CString::new("cell error").expect("static")),
+                        CLASS_TYPE,
+                    ));
+                }
+            }
         }
         std::cell::Ref::map(self.rows.borrow(), |r| {
             r.as_ref().expect("rows were just initialized")
@@ -834,6 +980,7 @@ impl PinkChunk {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum StmtData {
     Sel(SelStmt),
     Simple {
@@ -896,6 +1043,19 @@ impl PinkResult {
             error_class: Some(class),
         }
     }
+
+    /// A fetch-time error on a streaming SELECT, reported by the same two
+    /// accessors as a build-time error.
+    fn stream_error(&self) -> Option<(*const c_char, *const c_char)> {
+        for stmt in &self.stmts {
+            if let StmtData::Sel(sel) = stmt
+                && let Some((message, class)) = sel.stream_error.borrow().as_ref()
+            {
+                return Some((message.as_ptr(), class.as_ptr()));
+            }
+        }
+        None
+    }
 }
 
 fn failed_result(class: &'static CStr, message: &str) -> *mut PinkResult {
@@ -957,15 +1117,14 @@ fn build_result(results: Vec<ChunkedResult>) -> std::result::Result<PinkResult, 
                     types,
                     chunks,
                 } => StmtData::Sel(SelStmt::from_chunks(names, types, chunks)?),
-                // Not produced by the calls this builder serves (C3 wires the
-                // cursor into fetch); drained so the match stays total.
-                ChunkedResult::Cursor(mut cursor) => {
-                    let (names, types) = (cursor.names().to_vec(), cursor.types().to_vec());
-                    let mut chunks = Vec::new();
-                    while let Some(chunk) = cursor.next_chunk().map_err(|e| e.to_string())? {
-                        chunks.push(chunk);
+                // A cursor is kept live: fetch pulls chunks, a v1 access or
+                // `row_count` drains it first.
+                ChunkedResult::Cursor(cursor) => {
+                    if !cursor.has_rows() {
+                        return Err("internal error: a cursor without rows reached build_result"
+                            .to_string());
                     }
-                    StmtData::Sel(SelStmt::from_chunks(names, types, chunks)?)
+                    StmtData::Sel(SelStmt::from_cursor(cursor))
                 }
                 // The row-shaped paths (a transaction, `RETURNING`, `CALL`)
                 // still arrive as rows; rebuild chunks so fetch works there too.
@@ -1045,6 +1204,18 @@ fn build_result(results: Vec<ChunkedResult>) -> std::result::Result<PinkResult, 
     })
 }
 
+/// Build a C result from one cursor: a row-producing cursor stays streaming;
+/// any other statement's outcome is built like a materialized one.
+fn cursor_result(mut cursor: QueryCursor) -> std::result::Result<PinkResult, String> {
+    if cursor.has_rows() {
+        return build_result(vec![ChunkedResult::Cursor(cursor)]);
+    }
+    let result = cursor
+        .result()
+        .ok_or_else(|| "internal error: a cursor has neither rows nor an outcome".to_string())?;
+    build_result(vec![ChunkedResult::Other(result)])
+}
+
 /// Build a result that also owns one profile per statement. The engine
 /// returns pairs in statement order, so the arrays line up with the
 /// statement-index accessors.
@@ -1070,6 +1241,8 @@ struct DbInner {
     /// sync method is process-wide and only meaningful for durable stores.
     threads: Option<i64>,
     wal_sync_method: Option<&'static str>,
+    /// Every result is materialized, including a lone row-producing SELECT.
+    materialize_results: bool,
 }
 
 /// Opaque database handle (a store plus its open-time policy). May be created
@@ -1216,6 +1389,8 @@ pub struct PinkConfig {
     wal_sync_method: Option<WalSyncMethod>,
     encryption_key: Option<[u8; 32]>,
     allow_sql_load_extension: bool,
+    /// Keep every result materialized instead of streaming a lone SELECT.
+    materialize_results: bool,
     /// Last `pinkdb_config_set` failure; borrowed until the next set/destroy.
     error: Option<CString>,
 }
@@ -1278,6 +1453,10 @@ fn config_set(config: &mut PinkConfig, name: &str, value: &str) -> Result<(), St
         },
         "allow_sql_load_extension" => {
             config.allow_sql_load_extension =
+                parse_bool(value).ok_or_else(|| format!("invalid boolean '{value}'"))?;
+        }
+        "materialize_results" => {
+            config.materialize_results =
                 parse_bool(value).ok_or_else(|| format!("invalid boolean '{value}'"))?;
         }
         _ => return Err(format!("unknown configuration option '{name}'")),
@@ -1394,9 +1573,20 @@ fn executed(conn: &PinkConnection, text: &str) -> *mut PinkResult {
                 Err(e) => Err(QueryFailure::Engine(e)),
             }
         } else {
-            match state.conn.execute_chunked(text) {
-                Ok(results) => build_result(results).map_err(QueryFailure::Build),
-                Err(e) => Err(QueryFailure::Engine(e)),
+            // One row-producing statement streams through a cursor; a batch
+            // keeps the materialized path because a cursor serves one
+            // statement.
+            let single = pinkdb::sql::parse_statements(text).is_ok_and(|s| s.len() == 1);
+            if single && !conn.inner.materialize_results {
+                match state.conn.query_cursor(text) {
+                    Ok(cursor) => cursor_result(cursor).map_err(QueryFailure::Build),
+                    Err(e) => Err(QueryFailure::Engine(e)),
+                }
+            } else {
+                match state.conn.execute_chunked(text) {
+                    Ok(results) => build_result(results).map_err(QueryFailure::Build),
+                    Err(e) => Err(QueryFailure::Engine(e)),
+                }
             }
         }
     }));
@@ -1513,9 +1703,16 @@ fn executed_prepared(
                 Ok(pairs) => build_profiled_result(pairs).map_err(QueryFailure::Build),
                 Err(e) => Err(QueryFailure::Engine(e)),
             }
-        } else {
+        } else if conn.inner.materialize_results {
             match state.conn.execute_bound_chunked(&bound_stmt) {
                 Ok(result) => build_result(vec![result]).map_err(QueryFailure::Build),
+                Err(e) => Err(QueryFailure::Engine(e)),
+            }
+        } else {
+            // A prepared statement is exactly one statement, so its
+            // substituted text can run through a cursor like `pinkdb_query`.
+            match state.conn.query_cursor(bound_stmt.sql()) {
+                Ok(cursor) => cursor_result(cursor).map_err(QueryFailure::Build),
                 Err(e) => Err(QueryFailure::Engine(e)),
             }
         }
@@ -1729,6 +1926,7 @@ pub extern "C" fn pinkdb_open_ext(
                     closed: AtomicBool::new(false),
                     threads: config.threads,
                     wal_sync_method: config.wal_sync_method.map(WalSyncMethod::as_str),
+                    materialize_results: config.materialize_results,
                 }),
             });
             // SAFETY: non-null (checked) and writable.
@@ -1973,10 +2171,13 @@ pub extern "C" fn pinkdb_result_error(result: *const PinkResult) -> *const c_cha
         return ptr::null();
     }
     // SAFETY: non-null, read-only access by the caller's ownership.
-    match unsafe { &*result }.error.as_ref() {
-        Some(message) => message.as_ptr(),
-        None => ptr::null(),
+    let result = unsafe { &*result };
+    if let Some(message) = &result.error {
+        return message.as_ptr();
     }
+    result
+        .stream_error()
+        .map_or(ptr::null(), |(message, _)| message)
 }
 
 /// The stable lower-case error class of [`pinkdb_result_error`], or NULL when
@@ -1987,10 +2188,13 @@ pub extern "C" fn pinkdb_result_error_class(result: *const PinkResult) -> *const
         return ptr::null();
     }
     // SAFETY: non-null, read-only access by the caller's ownership.
-    match unsafe { &*result }.error_class {
-        Some(class) => class.as_ptr(),
-        None => ptr::null(),
+    let result = unsafe { &*result };
+    if let Some(class) = result.error_class {
+        return class.as_ptr();
     }
+    result
+        .stream_error()
+        .map_or(ptr::null(), |(_, class)| class)
 }
 
 /// Open a durable database at `path`. Returns NULL on error; see
@@ -2015,6 +2219,7 @@ pub extern "C" fn pinkdb_open(path: *const c_char) -> *mut PinkHandle {
                 closed: AtomicBool::new(false),
                 threads: config.threads,
                 wal_sync_method: None,
+                materialize_results: config.materialize_results,
             });
             new_connection(inner)
         })
@@ -2051,6 +2256,7 @@ pub extern "C" fn pinkdb_open_memory() -> *mut PinkHandle {
             closed: AtomicBool::new(false),
             threads: config.threads,
             wal_sync_method: None,
+            materialize_results: config.materialize_results,
         });
         new_connection(inner).map(|conn| PinkHandle {
             conn: Box::new(conn),
@@ -3260,10 +3466,34 @@ pub extern "C" fn pinkdb_result_column_type(
 }
 
 /// Rows in a SELECT result (0 for other kinds / out of range).
+///
+/// A streaming result drains first: this reads the whole result into memory.
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_result_row_count(result: *const PinkResult, statement: usize) -> usize {
     match stmt_at(result, statement) {
-        Some(StmtData::Sel(s)) => s.row_count,
+        Some(StmtData::Sel(s)) => {
+            s.drain();
+            s.row_count.get()
+        }
+        _ => 0,
+    }
+}
+
+/// 1 when the statement still has a cursor to pull from, else 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_is_streaming(result: *const PinkResult, statement: usize) -> i32 {
+    match stmt_at(result, statement) {
+        Some(StmtData::Sel(s)) => i32::from(s.cursor.borrow().is_some()),
+        _ => 0,
+    }
+}
+
+/// Rows handed out by `pinkdb_result_fetch_chunk` / `pinkdb_result_fetch_arrow`
+/// so far. A drain (`row_count`, v1 cell access) contributes nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_rows_fetched(result: *const PinkResult, statement: usize) -> u64 {
+    match stmt_at(result, statement) {
+        Some(StmtData::Sel(s)) => s.fetched.get(),
         _ => 0,
     }
 }
@@ -3367,11 +3597,10 @@ pub extern "C" fn pinkdb_result_fetch_chunk(
     let Some(StmtData::Sel(s)) = stmt_at_mut(result, statement) else {
         return ptr::null_mut();
     };
-    let Some(chunk) = s.chunks.get(s.next_chunk).cloned() else {
-        return ptr::null_mut();
-    };
-    s.next_chunk += 1;
-    Box::into_raw(Box::new(PinkChunk::new(chunk)))
+    match s.next_fetch() {
+        Some(chunk) => Box::into_raw(Box::new(PinkChunk::new(chunk))),
+        None => ptr::null_mut(),
+    }
 }
 
 /// Free a chunk from [`pinkdb_result_fetch_chunk`]. NULL-safe.
@@ -3471,14 +3700,15 @@ pub extern "C" fn pinkdb_result_fetch_arrow(
         );
         return 0;
     };
-    let Some(chunk) = sel.chunks.get(sel.next_chunk).cloned() else {
+    let Some(chunk) = sel.next_fetch() else {
+        if let Some((message, class)) = sel.stream_error.borrow().as_ref() {
+            set_error(class, &message.to_string_lossy());
+            return 0;
+        }
         return 1;
     };
     match arrow::chunk_to_arrow(&chunk, out) {
-        Ok(()) => {
-            sel.next_chunk += 1;
-            1
-        }
+        Ok(()) => 1,
         Err(error) => {
             error.report();
             0
@@ -3714,8 +3944,8 @@ mod tests {
     }
 
     #[test]
-    fn abi_version_is_one_four() {
-        assert_eq!(pinkdb_abi_version(), (1 << 16) | 4);
+    fn abi_version_is_one_five() {
+        assert_eq!(pinkdb_abi_version(), (1 << 16) | 5);
     }
 
     #[test]

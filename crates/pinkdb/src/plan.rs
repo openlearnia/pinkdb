@@ -207,6 +207,8 @@ pub enum LogicalPlan {
     CopyTo {
         ns: Option<SchemaPath>,
         table: String,
+        /// The bound source query for `COPY (SELECT …) TO`; `None` for a table.
+        source: Option<Box<LogicalPlan>>,
         format: String,
         path: String,
     },
@@ -1226,10 +1228,16 @@ pub(crate) fn collect_tables_read(
         } => {
             out.insert(key(&Some(db.clone()), table));
         }
-        // A file source reads no store table; `COPY` reads its source table.
-        LogicalPlan::CopyTo { ns, table, .. } => {
-            out.insert(key(ns, table));
-        }
+        // A file source reads no store table; `COPY` reads its source table
+        // or the tables its query reads.
+        LogicalPlan::CopyTo {
+            ns, table, source, ..
+        } => match source {
+            Some(source) => collect_tables_read(source, default_ns, out),
+            None => {
+                out.insert(key(ns, table));
+            }
+        },
         LogicalPlan::Scan { ns: None, .. }
         | LogicalPlan::SingleRow
         | LogicalPlan::Begin

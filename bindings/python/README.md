@@ -76,7 +76,9 @@ the no-op `setinputsizes`/`setoutputsizes`. `execute` prepares the statement
 first, so a multi-statement string is refused before anything runs. Rows are
 tuples in `description` order, fetched one at a time from the native result:
 the 100k-row conformance case streams without materializing the rows in
-Python.
+Python. While a cursor is still fetching a streaming result, `rowcount` is
+`-1` and the connection stays busy: another `execute` raises until the cursor
+is exhausted or closed.
 
 **Autocommit deviation.** The engine is in autocommit mode until `BEGIN`
 (and refuses some catalog DDL inside a transaction), so `execute()` does not

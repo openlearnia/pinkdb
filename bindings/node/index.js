@@ -7,7 +7,7 @@
 const native = require('./build/pinkdb.node');
 
 // 1.4: (major << 16) | minor. The addon still exposes the v1 cell API.
-const ABI_VERSION = (1 << 16) | 4;
+const ABI_VERSION = (1 << 16) | 5;
 
 /**
  * Error raised by pinkdb. `class` is the stable C ABI error class:
@@ -45,14 +45,25 @@ function guard(fn) {
 
 class RowStream {
   #stream;
+  #database;
+  #closed = false;
 
-  constructor(stream) {
+  constructor(stream, database) {
     this.#stream = stream;
+    this.#database = database;
+    database._enterStream(this);
   }
 
   next() {
-    const row = guard(() => this.#stream.next());
+    let row;
+    try {
+      row = guard(() => this.#stream.next());
+    } catch (error) {
+      this.close();
+      throw error;
+    }
     if (row === null || row === undefined) {
+      this.close();
       return { done: true, value: undefined };
     }
     return { done: false, value: row };
@@ -68,15 +79,23 @@ class RowStream {
   }
 
   close() {
-    this.#stream.close();
+    if (this.#closed) return;
+    this.#closed = true;
+    try {
+      guard(() => this.#stream.close());
+    } finally {
+      this.#database._leaveStream(this);
+    }
   }
 }
 
 class Prepared {
   #prepared;
+  #database;
 
-  constructor(prepared) {
+  constructor(prepared, database) {
     this.#prepared = prepared;
+    this.#database = database;
   }
 
   /** Number of `?` placeholders in the statement. */
@@ -86,17 +105,20 @@ class Prepared {
 
   /** Execute for its effect: `{kind, name, affected, columns, columnTypes, rowCount}`. */
   run(params) {
+    this.#database._assertIdle();
     return guard(() => this.#prepared.run(params));
   }
 
   /** Execute and return every row as an object keyed by column name. */
   all(params) {
+    this.#database._assertIdle();
     return guard(() => this.#prepared.all(params));
   }
 
   /** Execute and return a lazy synchronous iterator over the rows. */
   iterate(params) {
-    return new RowStream(guard(() => this.#prepared.iterate(params)));
+    this.#database._assertIdle();
+    return new RowStream(guard(() => this.#prepared.iterate(params)), this.#database);
   }
 
   close() {
@@ -106,9 +128,28 @@ class Prepared {
 
 class Database {
   #database;
+  #busy = null;
 
   constructor(database) {
     this.#database = database;
+  }
+
+  _assertIdle() {
+    if (this.#busy !== null) {
+      throw new PinkdbError(
+        'invalid_argument',
+        'database is busy with an open row stream; close it first',
+      );
+    }
+  }
+
+  _enterStream(stream) {
+    this._assertIdle();
+    this.#busy = stream;
+  }
+
+  _leaveStream(stream) {
+    if (this.#busy === stream) this.#busy = null;
   }
 
   /**
@@ -118,16 +159,19 @@ class Database {
    * `rows` is present only for SELECT results.
    */
   run(sql, params) {
+    this._assertIdle();
     return guard(() => this.#database.execute(sql, params));
   }
 
   /** Prepare, run and return the rows of a single statement. */
   query(sql, params) {
+    this._assertIdle();
     return guard(() => this.#database.query(sql, params));
   }
 
   prepare(sql) {
-    return new Prepared(guard(() => this.#database.prepare(sql)));
+    this._assertIdle();
+    return new Prepared(guard(() => this.#database.prepare(sql)), this);
   }
 
   begin() {
@@ -143,6 +187,7 @@ class Database {
   }
 
   close() {
+    this._assertIdle();
     this.#database.close();
   }
 }

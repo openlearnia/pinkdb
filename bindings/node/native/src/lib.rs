@@ -108,6 +108,29 @@ fn type_name(tag: i32) -> String {
         .to_owned()
 }
 
+/// An error recorded on a result, such as a failure after its first chunk.
+fn result_error(result: *mut PinkResult) -> Option<Error> {
+    // SAFETY: `result` is live for the duration of the call; the strings it
+    // returns are owned by the result.
+    unsafe {
+        let message = ffi::pinkdb_result_error(result);
+        if message.is_null() {
+            return None;
+        }
+        let class = ffi::pinkdb_result_error_class(result);
+        let class = if class.is_null() {
+            "internal".to_owned()
+        } else {
+            CStr::from_ptr(class).to_string_lossy().into_owned()
+        };
+        let message = CStr::from_ptr(message).to_string_lossy().into_owned();
+        Some(Error::new(
+            Status::GenericFailure,
+            format!("{class}\u{1}{message}"),
+        ))
+    }
+}
+
 /// Turn the C ABI's thread-local error into a napi error whose message is
 /// `<class>\x01<message>`; `index.js` splits it back into a `PinkdbError`.
 fn ffi_error() -> Error {
@@ -848,7 +871,11 @@ impl NativeRowStream {
                 self.chunk = ChunkColumns::fetch(self.result, 0);
                 self.chunk_row = 0;
                 if self.chunk.is_none() {
+                    let error = result_error(self.result);
                     self.close();
+                    if let Some(error) = error {
+                        return Err(error);
+                    }
                     return Ok(None);
                 }
             }

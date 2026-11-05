@@ -8466,9 +8466,20 @@ fn bind_tracked_plan(
         Statement::CopyTo {
             qual: qdb,
             table,
+            query,
             path,
             format,
-        } => bind_copy_to(db, default_ns, qdb, table, path, format.as_deref(), session),
+        } => bind_copy_to(
+            db,
+            default_ns,
+            qdb,
+            table.as_deref(),
+            query.as_deref(),
+            path,
+            format.as_deref(),
+            session,
+            params.clone(),
+        ),
         Statement::Begin => empty(LogicalPlan::Begin),
         Statement::Commit => empty(LogicalPlan::Commit),
         Statement::Rollback => empty(LogicalPlan::Rollback),
@@ -10471,33 +10482,55 @@ fn bind_delete(
     ))
 }
 
-/// Bind `COPY <table> TO '<path>' [(FORMAT <name>)]` (wave 71): resolve the
-/// source table and the target file format at bind time, so a missing table
-/// or an unregistered format is a clean plan-time error (never a partial
-/// file written by a half-bound statement).
+/// Bind `COPY <source> TO '<path>' [(FORMAT <name>)]` (wave 71): resolve the
+/// source and the target file format at bind time, so a missing table, a
+/// query that fails to bind, or an unregistered format is a clean plan-time
+/// error (never a partial file written by a half-bound statement). The source
+/// is either a catalog table or a parenthesized `SELECT`.
 ///
-/// The source must be a catalog table of the store: views are not tables and
-/// attached lake tables live outside the store, so both are refused with a
-/// message saying what to do instead.
+/// A table source must be a catalog table of the store: views are not tables
+/// and attached lake tables live outside the store, so both are refused with
+/// a message saying what to do instead. A query source is bound like any
+/// other `SELECT`.
+#[allow(clippy::too_many_arguments)]
 fn bind_copy_to(
     db: &PinkDb,
     default_ns: &SchemaPath,
     qdb: &Qualifier,
-    table: &str,
+    table: Option<&str>,
+    query: Option<&Select>,
     path: &str,
     format: Option<&str>,
     session: &Session,
+    params: Option<ParamSlots>,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_ns)
-        .with_session(session.clone())
-        .resolve_table_ns(qdb, table)?;
-    let t = db.table_in(&table_db, table).map_err(|_| {
-        PinkDbError::Catalog(format!(
-            "COPY source table \"{table}\" does not exist in database \"{table_db}\" \
-             (COPY writes plain catalog tables; views and attached lake tables are \
-             not supported — materialize the query into a table first)"
-        ))
-    })?;
+    let (table_db, table_name, source) = match (table, query) {
+        (_, Some(select)) => {
+            let mut binder = Binder::new(db, default_ns)
+                .with_session(session.clone())
+                .with_params(params);
+            let plan = bind_select_in(db, &mut binder, select)?;
+            (None, String::new(), Some(Box::new(plan)))
+        }
+        (Some(table), None) => {
+            let table_db = Binder::new(db, default_ns)
+                .with_session(session.clone())
+                .resolve_table_ns(qdb, table)?;
+            let t = db.table_in(&table_db, table).map_err(|_| {
+                PinkDbError::Catalog(format!(
+                    "COPY source table \"{table}\" does not exist in database \"{table_db}\" \
+                     (COPY writes plain catalog tables; views and attached lake tables are \
+                     not supported — materialize the query into a table first)"
+                ))
+            })?;
+            (Some(table_db), t.name.clone(), None)
+        }
+        (None, None) => {
+            return Err(PinkDbError::Catalog(
+                "COPY needs a source table or query".to_string(),
+            ));
+        }
+    };
     let fmt = match format {
         Some(name) => db.file_format(name).ok_or_else(|| {
             PinkDbError::Catalog(format!(
@@ -10518,8 +10551,9 @@ fn bind_copy_to(
         .map(|p| p.to_ascii_lowercase());
     Ok((
         LogicalPlan::CopyTo {
-            ns: Some(table_db),
-            table: t.name.clone(),
+            ns: table_db,
+            table: table_name,
+            source,
             format: fmt.name().to_string(),
             path: path.to_string(),
         },
