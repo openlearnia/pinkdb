@@ -8,6 +8,17 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2>2026-11-05</h2>
+<h3>Wave 138 — QuackLab's <code>/sql</code> adapter, over a local or a lake warehouse ✅</h3>
+<p><code>pinkdb-server --quacklab-bind ADDR</code> (feature <code>quacklab</code>, or <code>DUCKDB_BIND</code>) serves the HTTP contract of QuackLab's Go warehouse service, so QuackLab's API, ETL and console can talk to pinkdb unchanged. Plan and contract: <code>docs/wave-138-plan.md</code>; test-drive runbook: <code>docs/quacklab-test-drive.md</code>.</p>
+<ul>
+<li><strong>The endpoints</strong>: <code>POST /sql</code> (a script; the last statement's result in DuckDB's shapes, Go's cell encoding, the row cap with an exact count), <code>GET /health</code>, <code>POST /recover</code>, and the loopback-only write-lease routes (<code>acquire</code>, <code>renew</code>, <code>release</code>, the holder's own <code>sql</code>, a TTL watchdog). Errors carry DuckDB's prefixes, and the catalog misses QuackLab branches on use DuckDB's wording.</li>
+<li><strong>The lake warehouse</strong> (<code>GRAIN_DUCKLAKE=1</code>): the warehouse is a pinkdb lake database, with its catalog in <code>DUCKLAKE_PG_URI</code> (optionally in its own Postgres schema, <code>PINKDB_LAKE_CATALOG_SCHEMA</code>) and its data in <code>DUCKLAKE_DATA_PATH</code>, using the R2, AWS or Bunny credentials the Go service reads. A write lease detaches the lake for an outside writer, and release re-attaches it at the new head. A Cloud Run rollout's new instance waits for the old one's writer lease. <code>DUCKLAKE_ENCRYPTED=1</code> is refused, so a lake is never written unencrypted by surprise.</li>
+<li><strong>The image</strong>: <code>docker build --build-arg VARIANT=quacklab</code>, which accepts QuackLab's <code>duckdb</code> argument and serves <code>$PORT</code>.</li>
+<li><strong>Shadow run</strong> against the Go service over DuckDB: typed cells 6 of 7 (pinkdb has no <code>TIME</code>), the lease choreography 18 of 18, and QuackLab's goldens 234 of 249 before this wave's two error-text fixes, with every success identical. The results are the same on a local and on a lake warehouse.</li>
+<li><strong>Engine fixes</strong>: <code>DELETE</code>/<code>UPDATE</code> on a view says <code>Can only delete from base table</code> / <code>Can only update base table</code> (it said the table did not exist); the server's lake policy accepts a libpq conninfo catalog (<code>postgres:host=…</code>).</li>
+<li><strong>Not yet</strong>: lake writes still materialize the lake and diff whole tables (wave 134), so a one-row insert into a 2M-row lake table takes about 1 s; DuckLake's materialized-view functions (wave 137); a read-only attachment does not follow the writer; there are no JS procedures in the server build.</li>
+</ul>
 <h2>2026-11-04</h2>
 <h3>WAL format 8 — appender flushes are logged column by column ✅</h3>
 <p>A durable appender flush no longer records its values one tagged row at a time: the chunk the appender built goes into the log as typed columns, and replay rebuilds the vectors instead of re-reading a value stream.</p>

@@ -149,6 +149,9 @@ jobs:
               # Wave 121b: imports (CSV/Parquet readers) and the console over
               # lake catalogs (.pink, SQLite) with S3 data on the mock.
               cargo test -p pinkdb-server --features ui,parquet,httpfs,catalog-sqlite,lake-s3
+              # Wave 138: QuackLab's /sql adapter, local and lake warehouses
+              # (the Postgres lake test runs in the catalog-postgres job).
+              cargo test -p pinkdb-server --features quacklab,parquet,httpfs,lake-s3,catalog-sqlite
               ! cargo tree -p pinkdb-server | grep -q tokio
               ! cargo tree -p pinkdb-server -e normal | grep -qE "pinkdb-parquet|pinkdb-httpfs"
           - name: vss
@@ -246,6 +249,9 @@ jobs:
       - name: the console over a Postgres catalog (wave 121b)
         run: cargo test -p pinkdb-server --features ui,catalog-postgres,catalog-sqlite --test console_storage
 
+      - name: the QuackLab adapter over a Postgres lake with S3 data (wave 138)
+        run: cargo test -p pinkdb-server --features quacklab,lake-s3,catalog-postgres --test quacklab_lake
+
       # The default build must stay lean even after the feature tests above.
       - name: default build links no SQL or Postgres client
         run: '! cargo tree -p pinkdb-cli -e normal | grep -qE "postgres|rusqlite"'
@@ -291,6 +297,7 @@ jobs:
           cargo clippy --all-targets -p pinkdb-cli --features iceberg,httpfs -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features s3 -- -D warnings
           cargo clippy --all-targets -p pinkdb-server --features async-server -- -D warnings
+          cargo clippy --all-targets -p pinkdb-server --features quacklab,parquet,httpfs,lake-s3,catalog-postgres,catalog-sqlite -- -D warnings
           cargo clippy --all-targets -p pinkdb-js --features engine -- -D warnings
           cargo clippy --all-targets -p pinkdb --features js -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features js -- -D warnings

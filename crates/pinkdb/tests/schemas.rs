@@ -467,3 +467,19 @@ fn created_schema_keeps_its_quoted_case() {
     run(&mut db, "INSERT INTO \"Master\".t VALUES (1);");
     assert_eq!(ints(&mut db, "SELECT * FROM master.t;"), vec![1]);
 }
+
+/// Wave 138: `DELETE`/`UPDATE` on a view is refused with DuckDB's binder
+/// error, not reported as a missing table (QuackLab reads "does not exist"
+/// as a missing object).
+#[test]
+fn dml_on_a_view_names_the_base_table_rule() {
+    let db = Database::new();
+    let mut conn = db.connect();
+    conn.execute(
+        "CREATE SCHEMA s; CREATE TABLE s.t (a INTEGER); CREATE VIEW s.v AS SELECT * FROM s.t",
+    )
+    .unwrap();
+    assert!(conn_err(&mut conn, "DELETE FROM s.v").contains("Can only delete from base table"));
+    assert!(conn_err(&mut conn, "UPDATE s.v SET a = 1").contains("Can only update base table"));
+    assert!(conn_err(&mut conn, "DELETE FROM s.nope").contains("not found"));
+}

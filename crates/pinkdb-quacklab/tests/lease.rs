@@ -21,7 +21,11 @@ const WRONG_ID: &str = "00000000000000000000000000000000";
 
 /// Holds the store's write lock long enough for a drain to wait on it and,
 /// with a short drain timeout, long enough to defeat that drain.
-const SLOW_WRITE: &str = "INSERT INTO t SELECT count(*) FROM range(60000000)";
+// A filter the engine has to evaluate row by row: a bare `count(*)` over a
+// range is answered without scanning it, which made the window too short to
+// observe (2026-11-05).
+const SLOW_WRITE: &str =
+    "INSERT INTO t SELECT count(*) FROM range(30000000) r WHERE (r.range * 7919) % 104729 = 1";
 
 fn options() -> QuacklabOptions {
     QuacklabOptions {

@@ -10233,6 +10233,24 @@ fn bind_create_view(
 /// scope (no aggregates, windows, or aliases), check Boolean WHERE. A bare
 /// `?` SET value takes the target column's type.
 #[allow(clippy::too_many_arguments)]
+/// The target of `UPDATE`/`DELETE`: a base table. A view of that name is
+/// refused with DuckDB's binder error (`refusal`) instead of a "not found"
+/// that would read as a missing object to a caller branching on the text.
+fn dml_base_table<'a>(
+    db: &'a PinkDb,
+    ns: &SchemaPath,
+    table: &str,
+    refusal: &str,
+) -> Result<&'a DataTable> {
+    match db.table_in(ns.clone(), table) {
+        Ok(t) => Ok(t),
+        Err(_) if db.view_in(ns.clone(), table).is_ok() => {
+            Err(PinkDbError::Type(refusal.to_string()))
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn bind_update(
     db: &PinkDb,
     default_ns: &SchemaPath,
@@ -10251,7 +10269,7 @@ fn bind_update(
     if let Some(err) = db.attached_read_only(&table_db, table) {
         return Err(err);
     }
-    let t = db.table_in(&table_db, table)?;
+    let t = dml_base_table(db, &table_db, table, "Can only update base table")?;
     if sets.is_empty() {
         return Err(PinkDbError::Parse(
             "UPDATE needs at least one SET assignment".to_string(),
@@ -10418,7 +10436,7 @@ fn bind_delete(
     if let Some(err) = db.attached_read_only(&table_db, table) {
         return Err(err);
     }
-    let t = db.table_in(&table_db, table)?;
+    let t = dml_base_table(db, &table_db, table, "Can only delete from base table")?;
     let mut binder = Binder::new(db, &table_db)
         .with_session(session.clone())
         .with_params(params.clone());

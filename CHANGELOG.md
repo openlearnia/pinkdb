@@ -8,6 +8,44 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-11-05
+
+### Wave 138 — QuackLab's `/sql` adapter, over a local or a lake warehouse ✅
+
+`pinkdb-server --quacklab-bind ADDR` (feature `quacklab`, or `DUCKDB_BIND`)
+serves the HTTP contract of QuackLab's Go warehouse service, so QuackLab's
+API, ETL and console can talk to pinkdb unchanged. Plan and contract:
+`docs/wave-138-plan.md`; test-drive runbook: `docs/quacklab-test-drive.md`.
+
+- **The endpoints**: `POST /sql` (a script; the last statement's result in
+  DuckDB's shapes, Go's cell encoding, the row cap with an exact count),
+  `GET /health`, `POST /recover`, and the loopback-only write-lease routes
+  (`acquire`, `renew`, `release`, the holder's own `sql`, a TTL watchdog).
+  Errors carry DuckDB's prefixes, and the catalog misses QuackLab branches on
+  use DuckDB's wording.
+- **The lake warehouse** (`GRAIN_DUCKLAKE=1`): the warehouse is a pinkdb lake
+  database, with its catalog in `DUCKLAKE_PG_URI` (optionally in its own
+  Postgres schema, `PINKDB_LAKE_CATALOG_SCHEMA`) and its data in
+  `DUCKLAKE_DATA_PATH`, using the R2, AWS or Bunny credentials the Go service
+  reads. A write lease detaches the lake for an outside writer, and release
+  re-attaches it at the new head. A Cloud Run rollout's new instance waits for
+  the old one's writer lease. `DUCKLAKE_ENCRYPTED=1` is refused, so a lake
+  is never written unencrypted by surprise.
+- **The image**: `docker build --build-arg VARIANT=quacklab`, which accepts
+  QuackLab's `duckdb` argument and serves `$PORT`.
+- **Shadow run** against the Go service over DuckDB: typed cells 6 of 7
+  (pinkdb has no `TIME`), the lease choreography 18 of 18, and QuackLab's
+  goldens 234 of 249 before this wave's two error-text fixes, with every
+  success identical. The results are the same on a local and on a lake
+  warehouse.
+- **Engine fixes**: `DELETE`/`UPDATE` on a view says `Can only delete from base
+  table` / `Can only update base table` (it said the table did not exist); the
+  server's lake policy accepts a libpq conninfo catalog (`postgres:host=…`).
+- **Not yet**: lake writes still materialize the lake and diff whole tables
+  (wave 134), so a one-row insert into a 2M-row lake table takes about 1 s;
+  DuckLake's materialized-view functions (wave 137); a read-only attachment
+  does not follow the writer; there are no JS procedures in the server build.
+
 ## 2026-11-04
 
 ### WAL format 8 — appender flushes are logged column by column ✅

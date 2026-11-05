@@ -381,7 +381,7 @@ fn postgres_conninfo(url: &str, schema: &str) -> String {
         .trim_start_matches("postgresql://")
         .trim_start_matches("postgres://");
     let (authority, tail) = rest.split_once('/').unwrap_or((rest, "postgres"));
-    let dbname = tail.split('?').next().unwrap_or("postgres");
+    let (dbname, query) = tail.split_once('?').unwrap_or((tail, ""));
     let (userinfo, hostport) = authority.rsplit_once('@').unwrap_or(("", authority));
     let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
     let (host, port) = hostport.split_once(':').unwrap_or((hostport, "5432"));
@@ -391,6 +391,9 @@ fn postgres_conninfo(url: &str, schema: &str) -> String {
     }
     if !password.is_empty() {
         conninfo.push_str(&format!(" password={password}"));
+    }
+    for pair in query.split('&').filter(|p| p.starts_with("sslmode=")) {
+        conninfo.push_str(&format!(" {pair}"));
     }
     conninfo.push_str(&format!(" schema={schema}"));
     conninfo

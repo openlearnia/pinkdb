@@ -50,6 +50,10 @@ pub(crate) fn engine_message(err: &PinkDbError) -> String {
     let prefix = match err {
         PinkDbError::Parse(_) => "Parser Error: ",
         PinkDbError::Catalog(_) => "Catalog Error: ",
+        // A value that does not convert (`cannot CAST "v0" AS BIGINT`) is
+        // DuckDB's Conversion Error even when pinkdb finds it while binding
+        // (a constant-folded cast, a typed `read_csv` column).
+        PinkDbError::Type(_) if message.starts_with("cannot CAST \"") => "Conversion Error: ",
         PinkDbError::Type(_) => "Binder Error: ",
         _ => {
             // Execution, Parameter, Permission, Io and Csv all come out of the
@@ -94,6 +98,17 @@ mod tests {
         assert!(engine_message(&constraint).starts_with("Constraint Error: "));
         let txn = PinkDbError::Execution("no transaction in progress".to_string());
         assert!(engine_message(&txn).starts_with("TransactionContext Error: "));
+    }
+
+    #[test]
+    fn a_value_that_does_not_cast_is_a_conversion_error() {
+        let bind = PinkDbError::Type("cannot CAST \"v0\" AS BIGINT".to_string());
+        assert_eq!(
+            engine_message(&bind),
+            "Conversion Error: cannot CAST \"v0\" AS BIGINT"
+        );
+        let other = PinkDbError::Type("WHERE needs a BOOLEAN expression".to_string());
+        assert!(engine_message(&other).starts_with("Binder Error: "));
     }
 
     #[test]
